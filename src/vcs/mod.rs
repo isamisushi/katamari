@@ -4,6 +4,7 @@
 //! touching anything upstream of it.
 
 pub mod git;
+pub mod jj;
 
 use anyhow::Result;
 use std::path::PathBuf;

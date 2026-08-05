@@ -14,9 +14,11 @@ use diff::{
 };
 use std::path::PathBuf;
 use ui::app::Layout;
+use ui::timeline_view::TimelineView;
 use ui::{App, FileView, View, ViewStack};
 use vcs::DiffSource;
 use vcs::git::GitSource;
+use vcs::jj;
 
 #[derive(Parser)]
 #[command(
@@ -63,6 +65,30 @@ enum Command {
     Open {
         /// Path to the file to open.
         file: PathBuf,
+    },
+    /// Opens directly into the jj snapshot timeline (see `t` from `ktmr
+    /// diff`). Requires a colocated jj repository — a `.jj` directory
+    /// alongside `.git`, with `jj` on PATH — and fails with a clear error
+    /// otherwise, rather than the silent-fallback behavior `t` uses when
+    /// it's just one option among several in a live session.
+    Timeline {
+        /// Print the snapshot list as plain text and exit, instead of
+        /// launching the TUI — for headless verification.
+        #[arg(long, hide = true)]
+        dump: bool,
+        /// With `--dump`, print this operation's diff against its
+        /// immediate predecessor in the snapshot list, instead of the list
+        /// itself. Accepts any prefix of a full operation id, as printed by
+        /// a plain `--dump`.
+        #[arg(long, hide = true, requires = "dump")]
+        op: Option<String>,
+        /// Triggers a working-copy snapshot via `JjRepo::snapshot` — the
+        /// same call `JjPreRefreshHook` makes before every watch-mode
+        /// refresh — and prints whether it created a new operation, then
+        /// exits. For headless E2E verification of the snapshot trigger
+        /// without a live `--watch` session.
+        #[arg(long, hide = true, conflicts_with = "dump")]
+        snapshot: bool,
     },
     /// Spawns a language server, requests hover (or, with a mode flag,
     /// go-to-definition/references/diagnostics) at one position, prints the
@@ -147,6 +173,7 @@ fn main() -> Result<()> {
             watch,
         } => run_diff(dump, layout, staged, range, watch),
         Command::Open { file } => run_open(file),
+        Command::Timeline { dump, op, snapshot } => run_timeline(dump, op, snapshot),
         Command::LspCheck {
             file,
             line,
@@ -236,6 +263,97 @@ fn run_open(file: PathBuf) -> Result<()> {
     let view = FileView::with_hover_target(display_path, &source, Some((absolute_file, git_root)));
     let mut stack = ViewStack::new(View::File(view));
     ui::run(&mut stack, None)
+}
+
+/// Resolves the jj repository for the current directory, the same way
+/// [`run_diff`] resolves a `GitSource` — via `git`'s own idea of the
+/// repository root, so `ktmr timeline` finds the same repo `ktmr diff`
+/// would in the same directory. Fails with a message naming exactly what's
+/// missing (no `jj` on PATH, or no colocated `.jj`), since unlike `t` inside
+/// a live session — which falls back to a status-bar hint because there's a
+/// diff already on screen to fall back *to* — this command has nothing else
+/// to show.
+fn discover_jj_repo() -> Result<jj::JjRepo> {
+    let cwd = std::env::current_dir()?;
+    let repo_root = GitSource::discover(&cwd)?.repo_root()?;
+    let jj_bin = jj::resolve_jj_bin()
+        .context("jj not found on PATH; `ktmr timeline` needs a `jj` binary to read")?;
+    jj::JjRepo::detect(&repo_root, jj_bin).with_context(|| {
+        format!(
+            "no colocated jj repository at {} (expected a `.jj` directory alongside `.git`)",
+            repo_root.display()
+        )
+    })
+}
+
+/// `ktmr timeline [--dump [--op <id>]]` — opens directly into
+/// [`TimelineView`], or (hidden, for headless E2E verification) dumps the
+/// snapshot list or one operation's diff as plain text. See
+/// [`discover_jj_repo`] for what "requires a jj repo" means here.
+fn run_timeline(dump: bool, op: Option<String>, snapshot: bool) -> Result<()> {
+    let jj_repo = discover_jj_repo()?;
+
+    if snapshot {
+        let created = jj_repo.snapshot()?;
+        println!(
+            "{}",
+            if created {
+                "snapshot: created a new operation"
+            } else {
+                "snapshot: no changes since the last snapshot"
+            }
+        );
+        return Ok(());
+    }
+
+    if dump {
+        return run_timeline_dump(&jj_repo, op);
+    }
+
+    let timeline = TimelineView::new(jj_repo, ui::timeline_view::DEFAULT_OP_LOG_LIMIT)?;
+    let mut stack = ViewStack::new(View::Timeline(timeline));
+    ui::run(&mut stack, None)
+}
+
+/// Prints the snapshot list (`op_id  unix_time  description`, one per
+/// line, newest first) or, with `op` set, that operation's diff against its
+/// immediate predecessor in the list — the plain-text shape an E2E test
+/// script can assert against without a terminal, mirroring what `ktmr diff
+/// --dump` already does for the parser.
+fn run_timeline_dump(jj_repo: &jj::JjRepo, op: Option<String>) -> Result<()> {
+    let ops = jj_repo.snapshot_ops(ui::timeline_view::DEFAULT_OP_LOG_LIMIT)?;
+
+    let Some(op_prefix) = op else {
+        if ops.is_empty() {
+            println!("(no snapshots yet)");
+        }
+        for entry in &ops {
+            println!(
+                "{}  {}  {}",
+                entry.op_id, entry.time_unix, entry.description
+            );
+        }
+        return Ok(());
+    };
+
+    let idx = ops
+        .iter()
+        .position(|o| o.op_id.starts_with(&op_prefix))
+        .with_context(|| {
+            format!(
+                "no snapshot with id prefix {op_prefix:?} among the {} loaded",
+                ops.len()
+            )
+        })?;
+    let Some(previous) = ops.get(idx + 1) else {
+        bail!(
+            "{} is the oldest loaded snapshot; nothing earlier to diff against",
+            ops[idx].op_id
+        );
+    };
+    let diff = jj_repo.op_diff(&previous.op_id, &ops[idx].op_id)?;
+    print!("{diff}");
+    Ok(())
 }
 
 /// `ktmr lsp-check <file> <line> <col> [--definition|--references|--diagnostics]`

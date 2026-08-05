@@ -253,6 +253,11 @@ impl App {
             | Action::JumpBack
             | Action::JumpForward
             | Action::Confirm => {}
+            // `ui::mod` intercepts `ToggleTimeline` before it reaches here
+            // (constructing/tearing down a `TimelineView` isn't a pure state
+            // transition); `ToggleRangeSelect` only means something inside
+            // `TimelineView` itself.
+            Action::ToggleTimeline | Action::ToggleRangeSelect => {}
             Action::Quit => self.should_quit = true,
         }
         if self.cursor != cursor_before {

@@ -186,13 +186,18 @@ impl FileView {
             // A single file has no hunks, no other files, no sidebar, and
             // only one column — these diff-view actions are no-ops here
             // rather than unreachable, so the shared keymap doesn't need a
-            // per-view binding table.
+            // per-view binding table. `ToggleTimeline`/`ToggleRangeSelect`
+            // are the same story: the timeline only relates to the root
+            // diff, and `ui::mod` never even offers `t` a `TimelineView` to
+            // push when a `FileView` is on top (see `handle_action`).
             Action::NextHunk
             | Action::PrevHunk
             | Action::NextFile
             | Action::PrevFile
             | Action::ToggleSidebar
-            | Action::ToggleLayout => {}
+            | Action::ToggleLayout
+            | Action::ToggleTimeline
+            | Action::ToggleRangeSelect => {}
         }
         if self.cursor != cursor_before {
             self.active_symbol = 0;

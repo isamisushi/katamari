@@ -69,9 +69,21 @@ pub enum Action {
     JumpBack,
     JumpForward,
     /// Selects the highlighted entry in an open references panel and
-    /// navigates to it. A no-op with nothing open — the panel is the only
-    /// place this milestone binds Enter to anything.
+    /// navigates to it. Also how [`crate::ui::timeline_view::TimelineView`]
+    /// treats Enter: jump back to the diff view being reviewed.
     Confirm,
+    /// Opens [`crate::ui::timeline_view::TimelineView`] on top of the root
+    /// diff (when a jj repository was detected), or closes it back to the
+    /// diff view if it's already open — `ui::mod`'s event loop intercepts
+    /// this rather than forwarding it through `App`/`FileView::update`,
+    /// since deciding whether jj is available and constructing the view
+    /// aren't pure state transitions.
+    ToggleTimeline,
+    /// Timeline-only: enters/exits "range mode," where the two most
+    /// recently visited list positions become the endpoints of a combined
+    /// diff instead of one snapshot's diff against its immediate
+    /// predecessor. A no-op in every other view.
+    ToggleRangeSelect,
     Quit,
 }
 
@@ -296,6 +308,8 @@ pub fn vim_preset() -> Vec<(KeySeq, Action)> {
         ("Tab", Action::NextSymbol),
         ("BackTab", Action::PrevSymbol),
         ("Esc", Action::Cancel),
+        ("t", Action::ToggleTimeline),
+        ("v", Action::ToggleRangeSelect),
         ("q", Action::Quit),
     ]
     .into_iter()
@@ -385,5 +399,19 @@ mod tests {
         let mut resolver = keymap.resolver();
         let shifted = KeyChord::new(KeyCode::Char('G'), KeyModifiers::SHIFT);
         assert_eq!(resolver.feed(shifted), StepResult::Matched(Action::Bottom));
+    }
+
+    #[test]
+    fn t_resolves_to_toggle_timeline_and_v_to_toggle_range_select() {
+        let keymap = Keymap::from_bindings(&vim_preset());
+        let mut resolver = keymap.resolver();
+        assert_eq!(
+            resolver.feed(chord('t')),
+            StepResult::Matched(Action::ToggleTimeline)
+        );
+        assert_eq!(
+            resolver.feed(chord('v')),
+            StepResult::Matched(Action::ToggleRangeSelect)
+        );
     }
 }

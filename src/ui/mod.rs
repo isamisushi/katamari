@@ -25,6 +25,7 @@ pub mod sidebar;
 pub mod status_bar;
 pub mod symbols;
 pub mod text;
+pub mod timeline_view;
 pub mod view;
 
 pub use app::App;
@@ -44,8 +45,10 @@ use crate::lsp::{
 };
 use crate::ui::navigation::{JumpEntry, JumpStack, navigate_to};
 use crate::ui::refs_panel::RefsPanel;
+use crate::ui::timeline_view::TimelineView;
 use crate::vcs::DiffSource;
 use crate::vcs::git::GitSource;
+use crate::vcs::jj::{self, JjRepo};
 use crate::watch::{self, WatchSignal};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyEventKind};
@@ -83,6 +86,63 @@ enum AppEvent {
     Terminal(Event),
     Lsp(ServerEvent),
     Watch(WatchSignal),
+    /// [`JjPreRefreshHook`] created a new jj operation this refresh cycle —
+    /// forwarded so an open [`View::Timeline`] can prepend it live instead
+    /// of only picking it up the next time the timeline is reopened. Not
+    /// sent when [`crate::vcs::jj::JjRepo::snapshot`] ran but found nothing
+    /// to snapshot (a no-op refresh cycle isn't a new timeline entry).
+    JjSnapshot,
+}
+
+/// The M5 [`PreRefreshHook`]: snapshots the working copy via jj (see
+/// [`JjRepo::snapshot`]) before every watch-triggered refresh, and forwards
+/// [`AppEvent::JjSnapshot`] when that actually created a new operation, so
+/// an open [`View::Timeline`] updates live rather than only on next open.
+/// Lives here rather than in `vcs::jj` because it needs [`AppEvent`], which
+/// is private to this module by design (see `AppEvent`'s docs) — `vcs::jj`
+/// has no business knowing this crate has a terminal UI at all.
+///
+/// `repo_root` is deliberately ignored in [`Self::before_refresh`]: this
+/// hook is only ever constructed (see [`run`]) for the same repo root its
+/// held [`JjRepo`] was already detected against, and watch mode never
+/// refreshes any repo but the one it started with.
+struct JjPreRefreshHook {
+    jj_repo: JjRepo,
+    tx: Sender<AppEvent>,
+}
+
+impl PreRefreshHook for JjPreRefreshHook {
+    fn before_refresh(&self, _repo_root: &std::path::Path) {
+        match self.jj_repo.snapshot() {
+            Ok(true) => {
+                let _ = self.tx.send(AppEvent::JjSnapshot);
+            }
+            Ok(false) => {} // nothing changed since the last snapshot
+            Err(_) => {
+                // A transient jj failure (e.g. racing another jj process
+                // touching the same working copy) isn't fatal to the
+                // refresh pipeline: the diff re-run right after this still
+                // reads the working tree via `git diff` directly, so the
+                // reviewer sees the edit either way — it just won't gain
+                // its own timeline entry this cycle.
+            }
+        }
+    }
+}
+
+/// Detects a colocated jj repository for `view`'s repository root, if any —
+/// `None` for anything but [`View::Diff`] (a `FileView`/`TimelineView`
+/// session has no "root diff repo" the timeline could relate to) or when jj
+/// itself isn't detected (see [`JjRepo::detect`]'s docs on what "detected"
+/// requires). Used both to decide whether watch mode's [`PreRefreshHook`]
+/// should be a real [`JjPreRefreshHook`] instead of [`NoopPreRefreshHook`],
+/// and — regardless of watch mode — whether `Action::ToggleTimeline` has
+/// anything to open at all.
+fn detect_jj_repo(view: &View) -> Option<JjRepo> {
+    let View::Diff(app) = view else {
+        return None;
+    };
+    jj::resolve_jj_bin().and_then(|bin| JjRepo::detect(&app.repo_root, bin))
 }
 
 /// Runs the full-screen UI until the view stack empties (every view has been
@@ -117,6 +177,26 @@ pub fn run(stack: &mut ViewStack, pre_refresh_hook: Option<Box<dyn PreRefreshHoo
     // alone isn't enough to make that happen promptly.
     let startup_status = warm_up_root(stack.top(), &lsp_manager);
 
+    // M5: detected once, regardless of watch mode — `Action::ToggleTimeline`
+    // needs this even in a plain (non-`--watch`) session, since existing jj
+    // history is browsable any time, not just while katamari is actively
+    // creating new snapshots. See `detect_jj_repo`'s docs.
+    let jj_repo = detect_jj_repo(stack.top());
+
+    // "Wire in ui::run when jj detected + watch mode" (the milestone plan's
+    // words): a `--watch` session's hook starts as whatever the caller
+    // passed (`NoopPreRefreshHook`, per `main.rs`'s docs) and is upgraded to
+    // a real `JjPreRefreshHook` here, the one place that already knows both
+    // "is this watching at all" (`pre_refresh_hook.is_some()`) and "is this
+    // a jj repo" (`jj_repo`) — callers don't need to know jj exists.
+    let pre_refresh_hook: Option<Box<dyn PreRefreshHook>> = match (&pre_refresh_hook, &jj_repo) {
+        (Some(_), Some(repo)) => Some(Box::new(JjPreRefreshHook {
+            jj_repo: repo.clone(),
+            tx: app_tx.clone(),
+        })),
+        _ => pre_refresh_hook,
+    };
+
     let watch_startup_status = pre_refresh_hook
         .is_some()
         .then(|| start_watch(stack, app_tx))
@@ -132,6 +212,7 @@ pub fn run(stack: &mut ViewStack, pre_refresh_hook: Option<Box<dyn PreRefreshHoo
         startup_status,
         pre_refresh_hook,
         watch_startup_status,
+        jj_repo,
     );
 
     restore_terminal(&mut terminal)?;
@@ -203,6 +284,11 @@ fn warm_up_root(view: &View, lsp_manager: &LspManager) -> Option<String> {
             }
             None
         }
+        // Read-only and LSP-free by design (see `TimelineView::hover_query`'s
+        // docs) — a timeline session, whether reached via `ktmr timeline` or
+        // by toggling from the root diff, has nothing for `LspManager` to
+        // warm up.
+        View::Timeline(_) => None,
     }
 }
 
@@ -311,6 +397,7 @@ fn event_loop(
     startup_status: Option<String>,
     pre_refresh_hook: Option<Box<dyn PreRefreshHook>>,
     initial_watch_status: Option<String>,
+    jj_repo: Option<JjRepo>,
 ) -> Result<()> {
     let mut hover_state = hover_popup::HoverState::default();
     let mut pending_hover: Option<(u64, Receiver<Result<HoverResult, LspError>>)> = None;
@@ -329,6 +416,7 @@ fn event_loop(
         let content_height = match stack.top() {
             View::Diff(app) => diff_layout(area, app.sidebar_visible).diff.height,
             View::File(_) => file_view::layout(area).content.height,
+            View::Timeline(_) => timeline_view::layout(area).diff.height,
         };
         stack.top_mut().set_viewport_height(content_height as usize);
 
@@ -428,6 +516,7 @@ fn event_loop(
                                 &diagnostics,
                                 &mut goto_status,
                                 lsp_manager,
+                                jj_repo.as_ref(),
                             );
                         }
                         StepResult::Pending => {
@@ -478,6 +567,15 @@ fn event_loop(
                     &mut watch_status,
                 );
             }
+            Ok(AppEvent::JjSnapshot) => {
+                if let View::Timeline(timeline) = stack.top_mut() {
+                    timeline.refresh_live();
+                }
+                // If the timeline isn't the view on top right now, there's
+                // nothing to do: `TimelineView::new` always fetches fresh
+                // from jj, so reopening it later picks up this snapshot
+                // anyway.
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
@@ -513,6 +611,7 @@ fn handle_action(
     diagnostics: &DiagnosticsStore,
     goto_status: &mut Option<String>,
     lsp_manager: &LspManager,
+    jj_repo: Option<&JjRepo>,
 ) {
     if let Some(state) = refs_panel {
         match action {
@@ -625,7 +724,25 @@ fn handle_action(
                 None => *goto_status = Some("jump: no later position".to_owned()),
             }
         }
-        Action::Cancel | Action::Confirm => {} // nothing open; no effect
+        Action::Cancel => {} // nothing open; no effect
+        Action::ToggleTimeline => match stack.top_mut() {
+            View::Timeline(timeline) => timeline.should_quit = true, // closes back to the diff
+            View::Diff(_) => match jj_repo {
+                Some(repo) => {
+                    match TimelineView::new(repo.clone(), timeline_view::DEFAULT_OP_LOG_LIMIT) {
+                        Ok(timeline) => stack.push(View::Timeline(timeline)),
+                        Err(e) => *goto_status = Some(format!("timeline: {e}")),
+                    }
+                }
+                None => {
+                    *goto_status = Some("jj not detected — timeline unavailable".to_owned());
+                }
+            },
+            // The timeline only relates to the root diff; a `FileView`
+            // pushed on top of it (via goto-definition) has nothing for
+            // `t` to open.
+            View::File(_) => {}
+        },
         other => {
             let before = stack.top().hover_cursor_key();
             stack.top_mut().update(other);
@@ -872,6 +989,10 @@ fn draw(
             if let Some(panel) = refs_panel {
                 refs_panel::render(frame, areas.content, panel);
             }
+        }
+        View::Timeline(timeline) => {
+            let area = frame.area();
+            timeline_view::render(frame, area, timeline, highlighter);
         }
     }
 }

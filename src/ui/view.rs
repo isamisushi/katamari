@@ -10,14 +10,17 @@ use crate::lsp::DiagnosticsStore;
 use crate::ui::app::App;
 use crate::ui::file_view::FileView;
 use crate::ui::hover_popup::HoverQuery;
+use crate::ui::timeline_view::TimelineView;
 
 /// One screen's worth of state. The event loop talks to whichever variant
 /// is on top of the [`ViewStack`] only through this enum — never reaching
-/// into `App` or `FileView` fields directly — so adding a third view later
-/// means adding one more match arm here, not touching the loop.
+/// into `App`, `FileView`, or `TimelineView` fields directly — so adding
+/// another view later means adding one more match arm here, not touching
+/// the loop.
 pub enum View {
     Diff(App),
     File(FileView),
+    Timeline(TimelineView),
 }
 
 impl View {
@@ -25,6 +28,7 @@ impl View {
         match self {
             View::Diff(app) => app.should_quit,
             View::File(file) => file.should_quit,
+            View::Timeline(timeline) => timeline.should_quit,
         }
     }
 
@@ -32,6 +36,7 @@ impl View {
         match self {
             View::Diff(app) => app.update(action),
             View::File(file) => file.update(action),
+            View::Timeline(timeline) => timeline.update(action),
         }
     }
 
@@ -39,6 +44,7 @@ impl View {
         match self {
             View::Diff(app) => app.set_viewport_height(height),
             View::File(file) => file.set_viewport_height(height),
+            View::Timeline(timeline) => timeline.set_viewport_height(height),
         }
     }
 
@@ -46,6 +52,7 @@ impl View {
         match self {
             View::Diff(app) => app.pending_keys = keys,
             View::File(file) => file.pending_keys = keys,
+            View::Timeline(timeline) => timeline.pending_keys = keys,
         }
     }
 
@@ -60,6 +67,7 @@ impl View {
         match self {
             View::Diff(app) => app.hover_query(),
             View::File(file) => file.hover_query(),
+            View::Timeline(timeline) => timeline.hover_query(),
         }
     }
 
@@ -72,6 +80,7 @@ impl View {
         match self {
             View::Diff(app) => (app.cursor, app.active_symbol),
             View::File(file) => (file.cursor, file.active_symbol),
+            View::Timeline(timeline) => timeline.cursor_key(),
         }
     }
 
@@ -84,6 +93,9 @@ impl View {
         let (cursor, scroll_offset) = match self {
             View::Diff(app) => (app.cursor, app.scroll_offset),
             View::File(file) => (file.cursor, file.scroll_offset),
+            // Never opens a hover popup — see `TimelineView::hover_query`'s
+            // docs — so there's no anchor row to report here.
+            View::Timeline(_) => return None,
         };
         u16::try_from(cursor.checked_sub(scroll_offset)?).ok()
     }
@@ -96,6 +108,7 @@ impl View {
         match self {
             View::Diff(app) => app.jump_to_diagnostic(diagnostics, forward),
             View::File(file) => file.jump_to_diagnostic(diagnostics, forward),
+            View::Timeline(_) => {} // no diagnostics in a read-only timeline
         }
     }
 }
