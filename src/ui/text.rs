@@ -1,9 +1,12 @@
-//! Display-width helpers shared by every pane. All column math in the UI
-//! goes through here rather than `str::len`/`chars().count()`, because a
-//! Japanese line must not misalign gutters or wrap mid-character: East Asian
-//! wide characters occupy two terminal columns, and `unicode-width` is the
-//! only thing that knows that.
+//! Text-rendering helpers shared by every pane that draws highlighted source
+//! lines (the diff view's unified and side-by-side columns, the file view).
+//! All column math goes through here rather than `str::len`/`chars().count()`,
+//! because a Japanese line must not misalign gutters or wrap mid-character:
+//! East Asian wide characters occupy two terminal columns, and
+//! `unicode-width` is the only thing that knows that.
 
+use crate::highlight::{HighlightKind, Span as HlSpan};
+use ratatui::style::Color;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -28,6 +31,49 @@ pub fn truncate_to_width(s: &str, max_width: usize) -> String {
         width += grapheme_width;
     }
     out
+}
+
+/// Walks highlighted spans in order, dropping/truncating them once the
+/// cumulative display width reaches `max_width`, so a highlighted line never
+/// overflows its pane even when the cut falls mid-span.
+pub fn truncate_spans_to_width(spans: &[HlSpan], max_width: usize) -> Vec<HlSpan> {
+    let mut out = Vec::new();
+    let mut used = 0;
+    for span in spans {
+        if used >= max_width {
+            break;
+        }
+        let remaining = max_width - used;
+        let span_width = display_width(&span.text);
+        if span_width <= remaining {
+            used += span_width;
+            out.push(span.clone());
+        } else {
+            out.push(HlSpan {
+                text: truncate_to_width(&span.text, remaining),
+                kind: span.kind,
+            });
+            break;
+        }
+    }
+    out
+}
+
+/// Maps a highlighter's coarse semantic category onto a terminal color. The
+/// single mapping every pane with syntax highlighting shares, so the diff
+/// view and the file view always agree on what a keyword or a string looks
+/// like.
+pub fn highlight_color(kind: HighlightKind) -> Color {
+    match kind {
+        HighlightKind::Keyword => Color::Magenta,
+        HighlightKind::String => Color::Yellow,
+        HighlightKind::Comment => Color::DarkGray,
+        HighlightKind::Function => Color::Blue,
+        HighlightKind::Type => Color::Cyan,
+        HighlightKind::Number => Color::LightMagenta,
+        HighlightKind::Operator => Color::Gray,
+        HighlightKind::Variable | HighlightKind::Plain => Color::Reset,
+    }
 }
 
 #[cfg(test)]

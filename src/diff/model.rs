@@ -50,6 +50,10 @@ pub struct DiffFile {
     pub is_new: bool,
     pub is_deleted: bool,
     pub is_renamed: bool,
+    /// Set from git's `Binary files ... differ` notice. Binary files carry
+    /// no hunks — `flatten` renders a single marker row for them instead of
+    /// attempting to show content.
+    pub is_binary: bool,
 }
 
 impl DiffFile {
@@ -142,6 +146,8 @@ pub fn parse_unified_diff(text: &str) -> Vec<DiffFile> {
             } else {
                 file.new_path = Some(strip_ab_prefix(rest).to_owned());
             }
+        } else if line.starts_with("Binary files ") && line.ends_with(" differ") {
+            file.is_binary = true;
         } else if line.starts_with("@@ ") {
             flush_hunk!(file);
             if let Some((old_start, old_lines, new_start, new_lines, header)) =
@@ -265,6 +271,11 @@ pub enum RenderRow {
     FileHeader {
         file_idx: usize,
     },
+    /// A binary file's content marker — stands in for the hunks a binary
+    /// file never has.
+    BinaryNotice {
+        file_idx: usize,
+    },
     HunkHeader {
         file_idx: usize,
         hunk_idx: usize,
@@ -282,6 +293,9 @@ pub fn flatten(files: &[DiffFile]) -> Vec<RenderRow> {
     let mut rows = Vec::new();
     for (file_idx, file) in files.iter().enumerate() {
         rows.push(RenderRow::FileHeader { file_idx });
+        if file.is_binary {
+            rows.push(RenderRow::BinaryNotice { file_idx });
+        }
         for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
             rows.push(RenderRow::HunkHeader { file_idx, hunk_idx });
             for row_idx in 0..hunk.rows.len() {
@@ -296,12 +310,147 @@ pub fn flatten(files: &[DiffFile]) -> Vec<RenderRow> {
     rows
 }
 
+/// One cell of a [`SideBySideRow`]: either a line that exists on this side,
+/// addressed by its position in [`flatten`]'s output (so cursor
+/// highlighting and scrolling stay keyed to the same index space the
+/// unified view uses), or [`SideCell::Empty`] when the other side has no
+/// counterpart here — a pure add has nothing to show on the old side, and
+/// vice versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SideCell {
+    Line { flat_idx: usize },
+    Empty,
+}
+
+impl SideCell {
+    fn flat_idx(self) -> Option<usize> {
+        match self {
+            SideCell::Line { flat_idx } => Some(flat_idx),
+            SideCell::Empty => None,
+        }
+    }
+}
+
+/// One row of the side-by-side layout: a file/hunk/binary header spanning
+/// both columns, or a pair of old/new cells within a hunk body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SideBySideRow {
+    Full { flat_idx: usize },
+    Paired { old: SideCell, new: SideCell },
+}
+
+impl SideBySideRow {
+    /// The largest flat-row index referenced by this row. Used by
+    /// [`side_by_side_scroll_start`] to find where a unified-space scroll
+    /// offset lands in side-by-side space.
+    fn max_flat_idx(self) -> usize {
+        match self {
+            SideBySideRow::Full { flat_idx } => flat_idx,
+            SideBySideRow::Paired { old, new } => old
+                .flat_idx()
+                .into_iter()
+                .chain(new.flat_idx())
+                .max()
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// Pairs up del/add runs within each hunk into row-aligned old/new columns,
+/// for the side-by-side layout. Context lines appear identically on both
+/// sides; a hunk's deleted lines and inserted lines are each a contiguous
+/// run (unified diff format always lists a change block's deletions before
+/// its insertions), so consecutive runs are zipped index-by-index with
+/// [`SideCell::Empty`] filling out whichever run is shorter.
+///
+/// Every cell addresses back into [`flatten`]'s output by index rather than
+/// duplicating line data, so a cursor position computed against the unified
+/// row list highlights the correct cell here too.
+pub fn flatten_side_by_side(files: &[DiffFile]) -> Vec<SideBySideRow> {
+    let rows = flatten(files);
+    let mut out = Vec::with_capacity(rows.len());
+    let mut i = 0;
+    while i < rows.len() {
+        let Some(kind) = line_kind(files, &rows, i) else {
+            out.push(SideBySideRow::Full { flat_idx: i });
+            i += 1;
+            continue;
+        };
+
+        if kind == DiffLineKind::Context {
+            out.push(SideBySideRow::Paired {
+                old: SideCell::Line { flat_idx: i },
+                new: SideCell::Line { flat_idx: i },
+            });
+            i += 1;
+            continue;
+        }
+
+        let del_start = i;
+        let mut j = i;
+        while line_kind(files, &rows, j) == Some(DiffLineKind::Del) {
+            j += 1;
+        }
+        let add_start = j;
+        while line_kind(files, &rows, j) == Some(DiffLineKind::Add) {
+            j += 1;
+        }
+        let del_len = add_start - del_start;
+        let add_len = j - add_start;
+        for k in 0..del_len.max(add_len) {
+            let old = if k < del_len {
+                SideCell::Line {
+                    flat_idx: del_start + k,
+                }
+            } else {
+                SideCell::Empty
+            };
+            let new = if k < add_len {
+                SideCell::Line {
+                    flat_idx: add_start + k,
+                }
+            } else {
+                SideCell::Empty
+            };
+            out.push(SideBySideRow::Paired { old, new });
+        }
+        i = j;
+    }
+    out
+}
+
+fn line_kind(files: &[DiffFile], rows: &[RenderRow], idx: usize) -> Option<DiffLineKind> {
+    match rows.get(idx)? {
+        RenderRow::Line {
+            file_idx,
+            hunk_idx,
+            row_idx,
+        } => Some(files[*file_idx].hunks[*hunk_idx].rows[*row_idx].kind),
+        _ => None,
+    }
+}
+
+/// Maps a unified-space scroll offset (an index into [`flatten`]'s output)
+/// to the first [`SideBySideRow`] that reaches at least that far, so the
+/// side-by-side view scrolls in lockstep with the unified one. Comparing
+/// against each row's *maximum* flat index (rather than its minimum) is
+/// what keeps the cursor's row on screen even when the cursor sits on the
+/// later of a row's two cells (e.g. scrolled exactly to an add line whose
+/// paired del line has a smaller index) — a minimum-based comparison would
+/// skip past that row and scroll the cursor off the top.
+pub fn side_by_side_scroll_start(rows: &[SideBySideRow], flat_scroll_offset: usize) -> usize {
+    rows.iter()
+        .position(|row| row.max_flat_idx() >= flat_scroll_offset)
+        .unwrap_or_else(|| rows.len().saturating_sub(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const MULTI_FILE_FIXTURE: &str = include_str!("fixtures/multi_file.diff");
     const JAPANESE_FIXTURE: &str = include_str!("fixtures/japanese.diff");
+    const BINARY_FIXTURE: &str = include_str!("fixtures/binary.diff");
 
     #[test]
     fn parses_modified_file_hunk_with_line_numbers() {
@@ -425,5 +574,109 @@ mod tests {
                 row_idx: 0
             }
         ));
+    }
+
+    #[test]
+    fn parses_binary_file_notice_without_hunks() {
+        let files = parse_unified_diff(BINARY_FIXTURE);
+        assert_eq!(files.len(), 1);
+        let file = &files[0];
+        assert!(file.is_binary);
+        assert!(file.is_new);
+        assert!(file.hunks.is_empty());
+    }
+
+    #[test]
+    fn flatten_inserts_binary_notice_row_after_file_header() {
+        let files = parse_unified_diff(BINARY_FIXTURE);
+        let rows = flatten(&files);
+        assert_eq!(
+            rows,
+            vec![
+                RenderRow::FileHeader { file_idx: 0 },
+                RenderRow::BinaryNotice { file_idx: 0 },
+            ]
+        );
+    }
+
+    /// The `src/lib.rs` hunk in [`MULTI_FILE_FIXTURE`] has kinds
+    /// `[Context, Del, Add, Add, Context, Context]` — one deleted line
+    /// followed by two added lines is exactly the "uneven run" case the
+    /// side-by-side layout must fill with a blank cell rather than
+    /// misaligning the columns.
+    #[test]
+    fn side_by_side_pairs_del_and_add_runs_with_filler_for_uneven_lengths() {
+        let files = parse_unified_diff(MULTI_FILE_FIXTURE);
+        let rows = flatten(&files);
+        let hunk_header_idx = rows
+            .iter()
+            .position(|r| matches!(r, RenderRow::HunkHeader { file_idx: 0, .. }))
+            .expect("lib.rs has a hunk");
+        let ctx1 = hunk_header_idx + 1;
+        let del = hunk_header_idx + 2;
+        let add1 = hunk_header_idx + 3;
+        let add2 = hunk_header_idx + 4;
+        let ctx2 = hunk_header_idx + 5;
+
+        let paired = flatten_side_by_side(&files);
+        let start = paired
+            .iter()
+            .position(|r| {
+                matches!(r, SideBySideRow::Paired { old: SideCell::Line { flat_idx }, .. } if *flat_idx == ctx1)
+            })
+            .expect("context row present in side-by-side output");
+
+        assert_eq!(
+            &paired[start..start + 4],
+            &[
+                SideBySideRow::Paired {
+                    old: SideCell::Line { flat_idx: ctx1 },
+                    new: SideCell::Line { flat_idx: ctx1 },
+                },
+                SideBySideRow::Paired {
+                    old: SideCell::Line { flat_idx: del },
+                    new: SideCell::Line { flat_idx: add1 },
+                },
+                SideBySideRow::Paired {
+                    old: SideCell::Empty,
+                    new: SideCell::Line { flat_idx: add2 },
+                },
+                SideBySideRow::Paired {
+                    old: SideCell::Line { flat_idx: ctx2 },
+                    new: SideCell::Line { flat_idx: ctx2 },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn side_by_side_preserves_file_and_hunk_headers_as_full_width_rows() {
+        let files = parse_unified_diff(MULTI_FILE_FIXTURE);
+        let paired = flatten_side_by_side(&files);
+        assert_eq!(paired[0], SideBySideRow::Full { flat_idx: 0 });
+    }
+
+    #[test]
+    fn side_by_side_scroll_start_lands_on_the_row_whose_later_cell_covers_the_offset() {
+        let files = parse_unified_diff(MULTI_FILE_FIXTURE);
+        let rows = flatten(&files);
+        let hunk_header_idx = rows
+            .iter()
+            .position(|r| matches!(r, RenderRow::HunkHeader { file_idx: 0, .. }))
+            .expect("lib.rs has a hunk");
+        let add2 = hunk_header_idx + 4;
+
+        let paired = flatten_side_by_side(&files);
+        // Scrolling to add2's flat index must not skip the paired row it
+        // belongs to, even though that row's old-side cell (Empty) has no
+        // flat index of its own and the row's del-side sibling is earlier.
+        let start = side_by_side_scroll_start(&paired, add2);
+        assert_eq!(
+            paired[start],
+            SideBySideRow::Paired {
+                old: SideCell::Empty,
+                new: SideCell::Line { flat_idx: add2 },
+            }
+        );
     }
 }

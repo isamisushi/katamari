@@ -255,6 +255,119 @@ impl Default for LineHighlighter {
     }
 }
 
+/// Highlights an entire file in a single parse, then serves spans back one
+/// line at a time. Unlike [`LineHighlighter`] (which treats each line as an
+/// independent snippet — cheap to redo per visible row, but blind to
+/// constructs that span lines, like block comments), `FileHighlighter` sees
+/// the file's real syntax tree. [`ui::file_view::FileView`] builds one per
+/// opened file; it isn't meant to be reused across files or re-highlighted
+/// per frame the way `LineHighlighter` is.
+///
+/// [`ui::file_view::FileView`]: crate::ui::file_view::FileView
+pub struct FileHighlighter {
+    lines: Vec<Vec<Span>>,
+}
+
+impl FileHighlighter {
+    /// Parses `source` once and splits the resulting spans across line
+    /// boundaries. On any parse or query failure, or for [`Language::Plain`],
+    /// falls back to one unhighlighted [`HighlightKind::Plain`] span per
+    /// line — highlighting is a rendering nicety, never a reason to fail
+    /// opening a file.
+    pub fn new(language: Language, source: &str) -> Self {
+        let plain = || FileHighlighter {
+            lines: source
+                .lines()
+                .map(|line| {
+                    vec![Span {
+                        text: line.to_owned(),
+                        kind: HighlightKind::Plain,
+                    }]
+                })
+                .collect(),
+        };
+
+        let Some(config) = build_config(language) else {
+            return plain();
+        };
+
+        let mut highlighter = Highlighter::new();
+        let events = match highlighter.highlight(&config, source.as_bytes(), None, |_| None) {
+            Ok(events) => events,
+            Err(_) => return plain(),
+        };
+
+        let mut lines: Vec<Vec<Span>> = Vec::new();
+        let mut current_line: Vec<Span> = Vec::new();
+        let mut kind_stack: Vec<HighlightKind> = Vec::new();
+
+        for event in events {
+            let Ok(event) = event else { return plain() };
+            match event {
+                HighlightEvent::HighlightStart(h) => kind_stack.push(kind_for_index(h.0)),
+                HighlightEvent::HighlightEnd => {
+                    kind_stack.pop();
+                }
+                HighlightEvent::Source { start, end } => {
+                    let Some(text) = source.get(start..end) else {
+                        continue;
+                    };
+                    let kind = kind_stack.last().copied().unwrap_or(HighlightKind::Plain);
+                    push_source_chunk(&mut lines, &mut current_line, text, kind);
+                }
+            }
+        }
+        if !current_line.is_empty() {
+            lines.push(current_line);
+        }
+
+        FileHighlighter { lines }
+    }
+
+    /// The spans making up line `idx` (0-indexed). Empty for a blank line or
+    /// an out-of-range index — [`ui::file_view`] treats both the same way,
+    /// as a line with nothing to draw.
+    ///
+    /// [`ui::file_view`]: crate::ui::file_view
+    pub fn line(&self, idx: usize) -> &[Span] {
+        self.lines.get(idx).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+}
+
+/// Splits one highlighted chunk of source text (which may itself span
+/// several lines, e.g. a block comment) across `lines`/`current_line`,
+/// matching `str::lines()`'s notion of line boundaries: a trailing `\n` ends
+/// a line without starting a new, empty one after it.
+fn push_source_chunk(
+    lines: &mut Vec<Vec<Span>>,
+    current_line: &mut Vec<Span>,
+    text: &str,
+    kind: HighlightKind,
+) {
+    let mut parts = text.split('\n');
+    if let Some(first) = parts.next()
+        && !first.is_empty()
+    {
+        current_line.push(Span {
+            text: first.to_owned(),
+            kind,
+        });
+    }
+    for part in parts {
+        lines.push(std::mem::take(current_line));
+        if !part.is_empty() {
+            current_line.push(Span {
+                text: part.to_owned(),
+                kind,
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +413,57 @@ mod tests {
     fn empty_line_yields_no_spans() {
         let mut hl = LineHighlighter::new();
         assert_eq!(hl.highlight_line(Language::Rust, ""), Vec::new());
+    }
+
+    #[test]
+    fn file_highlighter_splits_spans_across_line_boundaries() {
+        let source = "fn main() {\n    let x = 1;\n}\n";
+        let hl = FileHighlighter::new(Language::Rust, source);
+        assert_eq!(hl.line_count(), 3);
+        assert!(
+            hl.line(0)
+                .iter()
+                .any(|s| s.kind == HighlightKind::Keyword && s.text == "fn")
+        );
+        assert!(
+            hl.line(1)
+                .iter()
+                .any(|s| s.kind == HighlightKind::Keyword && s.text == "let")
+        );
+        let joined: String = hl
+            .line(1)
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(joined, "    let x = 1;");
+    }
+
+    #[test]
+    fn file_highlighter_line_count_matches_str_lines_with_and_without_trailing_newline() {
+        assert_eq!(
+            FileHighlighter::new(Language::Plain, "a\nb\nc\n").line_count(),
+            "a\nb\nc\n".lines().count()
+        );
+        assert_eq!(
+            FileHighlighter::new(Language::Plain, "a\nb\nc").line_count(),
+            "a\nb\nc".lines().count()
+        );
+        assert_eq!(FileHighlighter::new(Language::Plain, "").line_count(), 0);
+    }
+
+    #[test]
+    fn file_highlighter_out_of_range_line_is_empty() {
+        let hl = FileHighlighter::new(Language::Plain, "only line\n");
+        assert_eq!(hl.line(5), &[] as &[Span]);
+    }
+
+    #[test]
+    fn file_highlighter_multiline_comment_carries_its_kind_onto_every_line_it_spans() {
+        let source = "/* line one\nline two */\nfn f() {}\n";
+        let hl = FileHighlighter::new(Language::Rust, source);
+        assert_eq!(hl.line_count(), 3);
+        assert!(hl.line(0).iter().all(|s| s.kind == HighlightKind::Comment));
+        assert!(hl.line(1).iter().all(|s| s.kind == HighlightKind::Comment));
     }
 }

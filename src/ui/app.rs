@@ -3,17 +3,44 @@
 //! entirely with parsed diff data and [`Action`]s, which is what makes it
 //! testable without a real terminal.
 
-use crate::diff::{DiffFile, RenderRow, flatten};
+use crate::diff::{DiffFile, RenderRow, SideBySideRow, flatten, flatten_side_by_side};
 use crate::keymap::Action;
+use crate::ui::scroll;
+
+/// Which of the two diff layouts the diff pane renders. Toggled by
+/// [`Action::ToggleLayout`]; [`crate::ui::diff_view`] may still render
+/// unified even when this is [`Layout::SideBySide`] if the pane is too
+/// narrow to show two columns (see `diff_view::effective_layout`) — that
+/// fallback is a rendering concern, so it doesn't change this field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Layout {
+    #[default]
+    Unified,
+    SideBySide,
+}
+
+impl Layout {
+    fn toggled(self) -> Self {
+        match self {
+            Layout::Unified => Layout::SideBySide,
+            Layout::SideBySide => Layout::Unified,
+        }
+    }
+}
 
 /// All state the UI needs to render a frame and respond to input.
 pub struct App {
     pub repo_name: String,
     pub files: Vec<DiffFile>,
     pub rows: Vec<RenderRow>,
+    /// Del/add-run pairing of `rows` for the side-by-side layout, computed
+    /// once at load time alongside `rows` rather than per frame — see
+    /// [`crate::diff::flatten_side_by_side`].
+    pub side_by_side_rows: Vec<SideBySideRow>,
     pub cursor: usize,
     pub scroll_offset: usize,
     pub sidebar_visible: bool,
+    pub layout: Layout,
     pub pending_keys: String,
     pub should_quit: bool,
     viewport_height: usize,
@@ -22,13 +49,16 @@ pub struct App {
 impl App {
     pub fn new(repo_name: String, files: Vec<DiffFile>) -> Self {
         let rows = flatten(&files);
+        let side_by_side_rows = flatten_side_by_side(&files);
         Self {
             repo_name,
             files,
             rows,
+            side_by_side_rows,
             cursor: 0,
             scroll_offset: 0,
             sidebar_visible: true,
+            layout: Layout::default(),
             pending_keys: String::new(),
             should_quit: false,
             viewport_height: 1,
@@ -48,6 +78,7 @@ impl App {
     pub fn selected_file(&self) -> usize {
         match self.rows.get(self.cursor) {
             Some(RenderRow::FileHeader { file_idx }) => *file_idx,
+            Some(RenderRow::BinaryNotice { file_idx }) => *file_idx,
             Some(RenderRow::HunkHeader { file_idx, .. }) => *file_idx,
             Some(RenderRow::Line { file_idx, .. }) => *file_idx,
             None => 0,
@@ -80,13 +111,14 @@ impl App {
                 self.jump_to_prev(|row| matches!(row, RenderRow::FileHeader { .. }))
             }
             Action::ToggleSidebar => self.sidebar_visible = !self.sidebar_visible,
+            Action::ToggleLayout => self.layout = self.layout.toggled(),
             Action::Quit => self.should_quit = true,
         }
         self.clamp_scroll();
     }
 
     fn half_page(&self) -> usize {
-        (self.viewport_height / 2).max(1)
+        scroll::half_page(self.viewport_height)
     }
 
     fn jump_to(&mut self, is_target: impl Fn(&RenderRow) -> bool) {
@@ -115,11 +147,8 @@ impl App {
     }
 
     fn clamp_scroll(&mut self) {
-        if self.cursor < self.scroll_offset {
-            self.scroll_offset = self.cursor;
-        } else if self.cursor >= self.scroll_offset + self.viewport_height {
-            self.scroll_offset = self.cursor + 1 - self.viewport_height;
-        }
+        self.scroll_offset =
+            scroll::clamp_scroll(self.cursor, self.viewport_height, self.scroll_offset);
     }
 }
 
@@ -181,6 +210,16 @@ mod tests {
         assert!(app.sidebar_visible);
         app.update(Action::ToggleSidebar);
         assert!(!app.sidebar_visible);
+    }
+
+    #[test]
+    fn toggle_layout_flips_between_unified_and_side_by_side() {
+        let mut app = test_app();
+        assert_eq!(app.layout, Layout::Unified);
+        app.update(Action::ToggleLayout);
+        assert_eq!(app.layout, Layout::SideBySide);
+        app.update(Action::ToggleLayout);
+        assert_eq!(app.layout, Layout::Unified);
     }
 
     #[test]

@@ -1,17 +1,22 @@
 //! Owns the terminal session: entering/leaving the alternate screen, the
 //! panic hook that guarantees the terminal is restored even on a crash, and
 //! the draw/input loop that turns key presses into [`Action`]s via the
-//! keymap trie. `main.rs` only ever calls [`run`] — everything about how
-//! the screen is laid out into sidebar/diff/status panes lives here, not in
-//! the entrypoint.
+//! keymap trie. `main.rs` only ever calls [`run`] — everything about how a
+//! screen is laid out into panes, and which screen is currently active,
+//! lives here, not in the entrypoint.
 
 pub mod app;
 pub mod diff_view;
+pub mod file_view;
+pub mod scroll;
 pub mod sidebar;
 pub mod status_bar;
 pub mod text;
+pub mod view;
 
 pub use app::App;
+pub use file_view::FileView;
+pub use view::{View, ViewStack};
 
 use crate::highlight::LineHighlighter;
 use crate::keymap::{KeyChord, Keymap, Resolver, StepResult, vim_preset};
@@ -24,16 +29,17 @@ use crossterm::terminal::{
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout as RatatuiLayout, Rect};
 use std::io::{self, Stdout};
 
 const SIDEBAR_WIDTH: u16 = 30;
 const STATUS_BAR_HEIGHT: u16 = 1;
 
-/// Runs the full-screen diff review UI until the user quits. Installs a
-/// panic hook and enters the alternate screen on the way in, and restores
-/// the terminal on every exit path, including panics.
-pub fn run(app: &mut App) -> Result<()> {
+/// Runs the full-screen UI until the view stack empties (every view has been
+/// quit or popped back past the root). Installs a panic hook and enters the
+/// alternate screen on the way in, and restores the terminal on every exit
+/// path, including panics.
+pub fn run(stack: &mut ViewStack) -> Result<()> {
     install_panic_hook();
     let mut terminal = init_terminal()?;
 
@@ -41,7 +47,7 @@ pub fn run(app: &mut App) -> Result<()> {
     let mut resolver = keymap.resolver();
     let mut highlighter = LineHighlighter::new();
 
-    let result = event_loop(&mut terminal, app, &mut resolver, &mut highlighter);
+    let result = event_loop(&mut terminal, stack, &mut resolver, &mut highlighter);
 
     restore_terminal(&mut terminal)?;
     result
@@ -49,19 +55,20 @@ pub fn run(app: &mut App) -> Result<()> {
 
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    app: &mut App,
+    stack: &mut ViewStack,
     resolver: &mut Resolver<'_>,
     highlighter: &mut LineHighlighter,
 ) -> Result<()> {
     loop {
         let size = terminal.size()?;
-        let areas = layout(
-            Rect::new(0, 0, size.width, size.height),
-            app.sidebar_visible,
-        );
-        app.set_viewport_height(areas.diff.height as usize);
+        let area = Rect::new(0, 0, size.width, size.height);
+        let content_height = match stack.top() {
+            View::Diff(app) => diff_layout(area, app.sidebar_visible).diff.height,
+            View::File(_) => file_view::layout(area).content.height,
+        };
+        stack.top_mut().set_viewport_height(content_height as usize);
 
-        terminal.draw(|frame| draw(frame, app, highlighter))?;
+        terminal.draw(|frame| draw(frame, stack.top(), highlighter))?;
 
         if let Event::Key(key) = event::read()? {
             if key.kind != KeyEventKind::Press {
@@ -69,54 +76,64 @@ fn event_loop(
             }
             match resolver.feed(KeyChord::from(key)) {
                 StepResult::Matched(action) => {
-                    app.pending_keys.clear();
-                    app.update(action);
+                    stack.top_mut().clear_pending_keys();
+                    stack.top_mut().update(action);
                 }
-                StepResult::Pending => app.pending_keys = resolver.pending_display(),
-                StepResult::Cancelled => app.pending_keys.clear(),
+                StepResult::Pending => stack.top_mut().set_pending_keys(resolver.pending_display()),
+                StepResult::Cancelled => stack.top_mut().clear_pending_keys(),
             }
         }
 
-        if app.should_quit {
+        if stack.top().should_quit() && !stack.pop() {
             return Ok(());
         }
     }
 }
 
-fn draw(frame: &mut Frame, app: &App, highlighter: &mut LineHighlighter) {
-    let areas = layout(frame.area(), app.sidebar_visible);
-    if let Some(sidebar_area) = areas.sidebar {
-        sidebar::render(frame, sidebar_area, app);
+fn draw(frame: &mut Frame, view: &View, highlighter: &mut LineHighlighter) {
+    match view {
+        View::Diff(app) => {
+            let areas = diff_layout(frame.area(), app.sidebar_visible);
+            if let Some(sidebar_area) = areas.sidebar {
+                sidebar::render(frame, sidebar_area, app);
+            }
+            let effective_layout = diff_view::effective_layout(app.layout, areas.diff.width);
+            diff_view::render(frame, areas.diff, app, highlighter, effective_layout);
+            status_bar::render(frame, areas.status, app, effective_layout);
+        }
+        View::File(file) => {
+            let areas = file_view::layout(frame.area());
+            file_view::render(frame, areas.content, file);
+            file_view::render_status(frame, areas.status, file);
+        }
     }
-    diff_view::render(frame, areas.diff, app, highlighter);
-    status_bar::render(frame, areas.status, app);
 }
 
-struct Areas {
+struct DiffAreas {
     sidebar: Option<Rect>,
     diff: Rect,
     status: Rect,
 }
 
-fn layout(area: Rect, sidebar_visible: bool) -> Areas {
-    let rows = Layout::default()
+fn diff_layout(area: Rect, sidebar_visible: bool) -> DiffAreas {
+    let rows = RatatuiLayout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(STATUS_BAR_HEIGHT)])
         .split(area);
     let (main, status) = (rows[0], rows[1]);
 
     if sidebar_visible {
-        let cols = Layout::default()
+        let cols = RatatuiLayout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(SIDEBAR_WIDTH), Constraint::Min(0)])
             .split(main);
-        Areas {
+        DiffAreas {
             sidebar: Some(cols[0]),
             diff: cols[1],
             status,
         }
     } else {
-        Areas {
+        DiffAreas {
             sidebar: None,
             diff: main,
             status,

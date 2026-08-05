@@ -24,6 +24,7 @@ pub enum Action {
     NextFile,
     PrevFile,
     ToggleSidebar,
+    ToggleLayout,
     Quit,
 }
 
@@ -234,6 +235,7 @@ pub fn vim_preset() -> Vec<(KeySeq, Action)> {
         ("] f", Action::NextFile),
         ("[ f", Action::PrevFile),
         ("b", Action::ToggleSidebar),
+        ("s", Action::ToggleLayout),
         ("q", Action::Quit),
     ]
     .into_iter()

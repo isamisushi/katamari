@@ -4,9 +4,15 @@ mod keymap;
 mod ui;
 mod vcs;
 
-use anyhow::Result;
-use clap::{Parser, Subcommand};
-use diff::{DiffFile, DiffLineKind, RenderRow, flatten, parse_unified_diff};
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand, ValueEnum};
+use diff::{
+    DiffFile, DiffLineKind, RenderRow, SideBySideRow, SideCell, flatten, flatten_side_by_side,
+    parse_unified_diff,
+};
+use std::path::PathBuf;
+use ui::app::Layout;
+use ui::{App, FileView, View, ViewStack};
 use vcs::DiffSource;
 use vcs::git::GitSource;
 
@@ -23,30 +29,89 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Show the working-tree diff against HEAD in a full-screen TUI.
+    /// Show a diff in a full-screen TUI. Defaults to the working tree
+    /// against HEAD; `--staged` or a revision narrows the scope.
     Diff {
         /// Print parsed render rows as plain text and exit, instead of
         /// launching the TUI. Useful for scripting and for verifying
         /// parsing without a terminal.
         #[arg(long, hide = true)]
         dump: bool,
+        /// With `--dump`, print the side-by-side pairing instead of the
+        /// unified row sequence. Also sets the TUI's initial layout.
+        #[arg(long, value_enum, hide = true, default_value_t = LayoutArg::Unified)]
+        layout: LayoutArg,
+        /// Show staged (index) changes against HEAD instead of the working
+        /// tree. Cannot be combined with a revision.
+        #[arg(long)]
+        staged: bool,
+        /// A single revision (that commit's own changes against its
+        /// parent) or a `<rev>..<rev>` / `<rev>...<rev>` range, passed to
+        /// git. Defaults to the working tree.
+        range: Option<String>,
     },
+    /// Open a single file in a read-only, syntax-highlighted viewer.
+    Open {
+        /// Path to the file to open.
+        file: PathBuf,
+    },
+}
+
+/// `--layout`'s value space in clap-friendly form. `ui::app::Layout` is the
+/// type the rest of the program actually uses; this exists only so clap has
+/// something with kebab-case `ValueEnum` variants to parse `--layout=side`
+/// into.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LayoutArg {
+    Unified,
+    Side,
+}
+
+impl From<LayoutArg> for Layout {
+    fn from(arg: LayoutArg) -> Self {
+        match arg {
+            LayoutArg::Unified => Layout::Unified,
+            LayoutArg::Side => Layout::SideBySide,
+        }
+    }
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Diff { dump: false }) {
-        Command::Diff { dump } => run_diff(dump),
+    match cli.command.unwrap_or(Command::Diff {
+        dump: false,
+        layout: LayoutArg::Unified,
+        staged: false,
+        range: None,
+    }) {
+        Command::Diff {
+            dump,
+            layout,
+            staged,
+            range,
+        } => run_diff(dump, layout, staged, range),
+        Command::Open { file } => run_open(file),
     }
 }
 
-fn run_diff(dump: bool) -> Result<()> {
+fn run_diff(dump: bool, layout: LayoutArg, staged: bool, range: Option<String>) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let source = GitSource::discover(&cwd)?;
-    let files = parse_unified_diff(&source.working_tree_diff()?);
+
+    let diff_text = match (staged, range.as_deref()) {
+        (true, Some(_)) => bail!("--staged cannot be combined with a revision range"),
+        (true, None) => source.staged_diff()?,
+        (false, Some(range)) => source.range_diff(range)?,
+        (false, None) => source.working_tree_diff()?,
+    };
+    let files = parse_unified_diff(&diff_text);
 
     if dump {
-        print!("{}", format_dump(&files));
+        let text = match layout {
+            LayoutArg::Unified => format_dump(&files),
+            LayoutArg::Side => format_dump_side_by_side(&files),
+        };
+        print!("{text}");
         return Ok(());
     }
 
@@ -56,81 +121,156 @@ fn run_diff(dump: bool) -> Result<()> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| repo_root.display().to_string());
 
-    let mut app = ui::App::new(repo_name, files);
-    ui::run(&mut app)
+    let mut app = App::new(repo_name, files);
+    app.layout = layout.into();
+    let mut stack = ViewStack::new(View::Diff(app));
+    ui::run(&mut stack)
 }
 
-/// Plain-text rendering of the parsed, flattened diff: one line per file
-/// header, hunk header, and content row, with the same line numbers and
-/// kinds the TUI would show. Exists so parsing correctness can be checked
-/// against `git diff` output without a terminal.
-fn format_dump(files: &[DiffFile]) -> String {
-    let (total_added, total_deleted) = files.iter().fold((0u32, 0u32), |(a, d), f| {
+fn run_open(file: PathBuf) -> Result<()> {
+    let source = std::fs::read_to_string(&file)
+        .with_context(|| format!("failed to read {}", file.display()))?;
+    let display_path = file.display().to_string();
+
+    let view = FileView::new(display_path, &source);
+    let mut stack = ViewStack::new(View::File(view));
+    ui::run(&mut stack)
+}
+
+/// Plain-text rendering of one flattened row, shared by [`format_dump`] and
+/// [`format_dump_side_by_side`] for the rows that render identically in
+/// both layouts (file/hunk headers, binary notices): only hunk bodies
+/// differ between unified and side-by-side, since side-by-side pairs them
+/// up instead of listing them one after another.
+fn format_render_row(files: &[DiffFile], row: RenderRow) -> String {
+    match row {
+        RenderRow::FileHeader { file_idx } => {
+            let file = &files[file_idx];
+            let (added, deleted) = file.stat();
+            let status = if file.is_new {
+                "new"
+            } else if file.is_deleted {
+                "deleted"
+            } else if file.is_renamed {
+                "renamed"
+            } else {
+                "modified"
+            };
+            let mut out = format!(
+                "FILE {} [{status}] +{added} -{deleted}\n",
+                file.display_path()
+            );
+            if file.is_renamed {
+                out.push_str(&format!(
+                    "  renamed from {}\n",
+                    file.old_path.as_deref().unwrap_or("?")
+                ));
+            }
+            out
+        }
+        RenderRow::BinaryNotice { .. } => "  BINARY (contents not shown)\n".to_owned(),
+        RenderRow::HunkHeader { file_idx, hunk_idx } => {
+            let hunk = &files[file_idx].hunks[hunk_idx];
+            format!(
+                "  HUNK @@ -{},{} +{},{} @@ {}\n",
+                hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines, hunk.header
+            )
+        }
+        RenderRow::Line {
+            file_idx,
+            hunk_idx,
+            row_idx,
+        } => format_line_row(&files[file_idx].hunks[hunk_idx].rows[row_idx]),
+    }
+}
+
+fn format_line_row(row: &diff::DiffRow) -> String {
+    let kind = match row.kind {
+        DiffLineKind::Context => "ctx",
+        DiffLineKind::Add => "add",
+        DiffLineKind::Del => "del",
+    };
+    let old = row
+        .old_line
+        .map_or_else(|| "-".to_owned(), |n| n.to_string());
+    let new = row
+        .new_line
+        .map_or_else(|| "-".to_owned(), |n| n.to_string());
+    format!("    LINE {kind:<3} {old:>5} {new:>5}  {}\n", row.text)
+}
+
+fn total_stat(files: &[DiffFile]) -> (u32, u32) {
+    files.iter().fold((0u32, 0u32), |(a, d), f| {
         let (fa, fd) = f.stat();
         (a + fa, d + fd)
-    });
+    })
+}
 
+/// Plain-text rendering of the parsed, flattened unified diff: one line per
+/// file header, hunk header, and content row, with the same line numbers
+/// and kinds the TUI would show. Exists so parsing correctness can be
+/// checked against `git diff` output without a terminal.
+fn format_dump(files: &[DiffFile]) -> String {
+    let (total_added, total_deleted) = total_stat(files);
     let mut out = format!(
         "files: {}  +{total_added} -{total_deleted}\n\n",
         files.len()
     );
-
     for row in flatten(files) {
-        match row {
-            RenderRow::FileHeader { file_idx } => {
-                let file = &files[file_idx];
-                let (added, deleted) = file.stat();
-                let status = if file.is_new {
-                    "new"
-                } else if file.is_deleted {
-                    "deleted"
-                } else if file.is_renamed {
-                    "renamed"
-                } else {
-                    "modified"
-                };
-                out.push_str(&format!(
-                    "FILE {} [{status}] +{added} -{deleted}\n",
-                    file.display_path()
-                ));
-                if file.is_renamed {
-                    out.push_str(&format!(
-                        "  renamed from {}\n",
-                        file.old_path.as_deref().unwrap_or("?")
-                    ));
-                }
+        out.push_str(&format_render_row(files, row));
+    }
+    out
+}
+
+/// Plain-text rendering of the side-by-side pairing: file/hunk headers as in
+/// [`format_dump`], but each hunk body row becomes an `OLD`/`NEW` pair (`--`
+/// for a filler cell with no counterpart on that side) instead of a flat
+/// list — the same grouping `diff_view::render` draws as two columns.
+fn format_dump_side_by_side(files: &[DiffFile]) -> String {
+    let (total_added, total_deleted) = total_stat(files);
+    let mut out = format!(
+        "files: {}  +{total_added} -{total_deleted}  layout=side\n\n",
+        files.len()
+    );
+    let rows = flatten(files);
+    for paired in flatten_side_by_side(files) {
+        match paired {
+            SideBySideRow::Full { flat_idx } => {
+                out.push_str(&format_render_row(files, rows[flat_idx]))
             }
-            RenderRow::HunkHeader { file_idx, hunk_idx } => {
-                let hunk = &files[file_idx].hunks[hunk_idx];
-                out.push_str(&format!(
-                    "  HUNK @@ -{},{} +{},{} @@ {}\n",
-                    hunk.old_start, hunk.old_lines, hunk.new_start, hunk.new_lines, hunk.header
-                ));
-            }
-            RenderRow::Line {
-                file_idx,
-                hunk_idx,
-                row_idx,
-            } => {
-                let row = &files[file_idx].hunks[hunk_idx].rows[row_idx];
-                let kind = match row.kind {
-                    DiffLineKind::Context => "ctx",
-                    DiffLineKind::Add => "add",
-                    DiffLineKind::Del => "del",
-                };
-                let old = row
-                    .old_line
-                    .map_or_else(|| "-".to_owned(), |n| n.to_string());
-                let new = row
-                    .new_line
-                    .map_or_else(|| "-".to_owned(), |n| n.to_string());
-                out.push_str(&format!(
-                    "    LINE {kind:<3} {old:>5} {new:>5}  {}\n",
-                    row.text
-                ));
+            SideBySideRow::Paired { old, new } => {
+                out.push_str("    PAIR\n");
+                out.push_str(&format_side_cell("OLD", files, &rows, old));
+                out.push_str(&format_side_cell("NEW", files, &rows, new));
             }
         }
     }
-
     out
+}
+
+fn format_side_cell(label: &str, files: &[DiffFile], rows: &[RenderRow], cell: SideCell) -> String {
+    let SideCell::Line { flat_idx } = cell else {
+        return format!("      {label}  --\n");
+    };
+    let RenderRow::Line {
+        file_idx,
+        hunk_idx,
+        row_idx,
+    } = rows[flat_idx]
+    else {
+        unreachable!("flatten_side_by_side only ever addresses RenderRow::Line entries");
+    };
+    let row = &files[file_idx].hunks[hunk_idx].rows[row_idx];
+    let kind = match row.kind {
+        DiffLineKind::Context => "ctx",
+        DiffLineKind::Add => "add",
+        DiffLineKind::Del => "del",
+    };
+    let num = if label == "OLD" {
+        row.old_line
+    } else {
+        row.new_line
+    };
+    let num = num.map_or_else(|| "-".to_owned(), |n| n.to_string());
+    format!("      {label}  {kind:<3} {num:>5}  {}\n", row.text)
 }
