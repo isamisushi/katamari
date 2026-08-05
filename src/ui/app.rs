@@ -66,6 +66,12 @@ pub struct App {
     /// so this field can never drift into claiming watch mode is on when
     /// nothing is watching.
     pub watch_mode: bool,
+    /// Whether a commented row's body renders as an inline block underneath
+    /// it — `Action::ToggleComments`, default on. The gutter marker itself
+    /// is unaffected by this: it's compact enough to always show, so
+    /// turning inline bodies off is purely about screen real estate on a
+    /// heavily annotated diff, not about hiding that comments exist at all.
+    pub comments_visible: bool,
     viewport_height: usize,
 }
 
@@ -87,6 +93,7 @@ impl App {
             pending_keys: String::new(),
             should_quit: false,
             watch_mode: false,
+            comments_visible: true,
             viewport_height: 1,
         }
     }
@@ -149,6 +156,29 @@ impl App {
             line_text: row.text.clone(),
             display_col: symbol.display_start,
         })
+    }
+
+    /// The file (repo-relative, exactly as it appears in the diff) and
+    /// 1-based working-tree line `Action::AddComment` would anchor a new
+    /// comment to: the cursor's current row, when it's eligible the same
+    /// way [`Self::hover_query`]'s target is — a `Context`/`Add` row on a
+    /// file that's still present on disk (see [`lsp_target`]'s docs for the
+    /// exact rule). `None` on a header row, a `Del` row, or a
+    /// deleted/binary file, none of which have a current line for a
+    /// comment to be *about*.
+    pub fn comment_target(&self) -> Option<(String, u32)> {
+        let RenderRow::Line {
+            file_idx,
+            hunk_idx,
+            row_idx,
+        } = self.rows.get(self.cursor)?
+        else {
+            return None;
+        };
+        let file = &self.files[*file_idx];
+        let row = &file.hunks[*hunk_idx].rows[*row_idx];
+        let (relative_path, line0) = lsp_target(row, file)?;
+        Some((relative_path.to_string_lossy().into_owned(), line0 + 1))
     }
 
     /// The diff pane's visible row count changes on terminal resize; the
@@ -238,12 +268,14 @@ impl App {
             }
             Action::ToggleSidebar => self.sidebar_visible = !self.sidebar_visible,
             Action::ToggleLayout => self.layout = self.layout.toggled(),
+            Action::ToggleComments => self.comments_visible = !self.comments_visible,
             Action::NextSymbol => self.cycle_symbol(1),
             Action::PrevSymbol => self.cycle_symbol(-1),
             // `ui::mod`'s event loop intercepts all of these before they
             // reach here — each needs either the LSP manager, the
-            // diagnostics store, or the jump stack, none of which `App`
-            // owns — so they're no-ops from `App`'s own point of view.
+            // diagnostics store, the jump stack, or (for `AddComment`) the
+            // repo root and comment store, none of which `App` owns — so
+            // they're no-ops from `App`'s own point of view.
             Action::Hover
             | Action::Cancel
             | Action::GotoDefinition
@@ -252,6 +284,7 @@ impl App {
             | Action::PrevDiagnostic
             | Action::JumpBack
             | Action::JumpForward
+            | Action::AddComment
             | Action::Confirm => {}
             // `ui::mod` intercepts `ToggleTimeline` before it reaches here
             // (constructing/tearing down a `TimelineView` isn't a pure state

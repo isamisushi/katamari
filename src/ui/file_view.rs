@@ -197,7 +197,9 @@ impl FileView {
             | Action::ToggleSidebar
             | Action::ToggleLayout
             | Action::ToggleTimeline
-            | Action::ToggleRangeSelect => {}
+            | Action::ToggleRangeSelect
+            | Action::AddComment
+            | Action::ToggleComments => {}
         }
         if self.cursor != cursor_before {
             self.active_symbol = 0;

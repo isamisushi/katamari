@@ -50,6 +50,14 @@ pub struct WatchBatch {
     pub changes: Vec<ChangedPath>,
 }
 
+/// How long [`spawn_comments_watcher`] waits after one signal before it will
+/// send another — small, since a comment-log append is a tiny, infrequent
+/// write (nothing like the "formatter rewrites a whole crate" burst
+/// [`DEBOUNCE_QUIET`] exists for), but still enough to collapse the couple
+/// of raw filesystem events a single `write()` can generate on some
+/// platforms into one reload.
+const COMMENTS_DEBOUNCE: Duration = Duration::from_millis(100);
+
 /// What the watcher thread sends: either a flushed batch, or a lightweight
 /// heads-up that a debounce window just opened (the first change since the
 /// last flush) — purely a UI hint so a status bar can show "something's
@@ -188,6 +196,89 @@ fn is_excluded(repo_root: &Path, path: &Path, ignore: &Gitignore) -> bool {
         ignore.matched_path_or_any_parents(relative, is_dir),
         Match::Ignore(_)
     )
+}
+
+/// Watches `<repo_root>/.katamari/` for changes to `comments.jsonl` and
+/// sends a signal on `tx` each time it does — the M6 secondary watch the
+/// milestone spec calls for: independent of [`spawn`] (which excludes all
+/// of `.katamari/` from the *diff*-refresh watch — see
+/// [`HARDCODED_EXCLUDES`] — since a comment being added or resolved is
+/// never a reason to re-run `git diff`) and independent of `--watch` mode
+/// entirely. `ui::run` starts this unconditionally for any session with a
+/// root diff, so live comment reload works in a plain `ktmr diff` just as
+/// much as `ktmr diff --watch`.
+///
+/// Creates `.katamari/` if it doesn't exist yet (nobody has written a
+/// comment in this repo before) so there's always a directory to watch —
+/// `notify` can't watch a path that isn't there.
+pub fn spawn_comments_watcher(repo_root: PathBuf, tx: Sender<()>) -> notify::Result<()> {
+    let session = CommentsWatchSession::start(repo_root)?;
+    std::thread::spawn(move || session.run(tx));
+    Ok(())
+}
+
+struct CommentsWatchSession {
+    comments_path: PathBuf,
+    notify_rx: mpsc::Receiver<notify::Result<Event>>,
+    _watcher: RecommendedWatcher,
+}
+
+impl CommentsWatchSession {
+    fn start(repo_root: PathBuf) -> notify::Result<Self> {
+        // Deriving the watched directory and target filename from
+        // `CommentStore::path` (rather than hardcoding `.katamari`/
+        // `comments.jsonl` here too) keeps the on-disk layout decision
+        // owned by exactly one place — see that method's docs.
+        let comments_path = crate::comments::CommentStore::new(&repo_root)
+            .path()
+            .to_path_buf();
+        let dir = comments_path
+            .parent()
+            .expect("comments.jsonl always has a parent")
+            .to_path_buf();
+        std::fs::create_dir_all(&dir).map_err(notify::Error::io)?;
+
+        let (notify_tx, notify_rx) = mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |res| {
+            let _ = notify_tx.send(res);
+        })?;
+        watcher.watch(&dir, RecursiveMode::NonRecursive)?;
+        Ok(Self {
+            comments_path,
+            notify_rx,
+            _watcher: watcher,
+        })
+    }
+
+    fn run(self, tx: Sender<()>) {
+        let mut last_sent: Option<Instant> = None;
+        let target_name = self.comments_path.file_name();
+        loop {
+            match self.notify_rx.recv_timeout(POLL_TICK) {
+                Ok(Ok(event)) => {
+                    let touches_comments =
+                        matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_))
+                            && event.paths.iter().any(|p| p.file_name() == target_name);
+                    if !touches_comments {
+                        continue;
+                    }
+                    let now = Instant::now();
+                    if last_sent.is_none_or(|t| now.duration_since(t) >= COMMENTS_DEBOUNCE) {
+                        last_sent = Some(now);
+                        if tx.send(()).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Ok(Err(_)) => {
+                    // As in `WatchSession::run`: one bad event from the
+                    // platform backend doesn't invalidate the session.
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
 }
 
 /// Builds the gitignore filter from `repo_root`'s top-level `.gitignore`

@@ -374,6 +374,11 @@ pub fn render(
     let areas = layout(area);
     render_list(frame, areas.list, view);
     let diagnostics = DiagnosticsStore::new();
+    // A past snapshot's diff has nothing in `.katamari/comments.jsonl` to
+    // relate to — comments anchor to the working tree, not to jj history —
+    // so this always renders with an empty index rather than threading a
+    // real one through from `ui::mod`.
+    let comments = crate::comments::CommentIndex::default();
     crate::ui::diff_view::render(
         frame,
         areas.diff,
@@ -381,6 +386,7 @@ pub fn render(
         highlighter,
         Layout::Unified,
         &diagnostics,
+        &comments,
     );
     render_status(frame, areas.status, view);
 }

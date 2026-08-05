@@ -84,6 +84,18 @@ pub enum Action {
     /// diff instead of one snapshot's diff against its immediate
     /// predecessor. A no-op in every other view.
     ToggleRangeSelect,
+    /// Opens the M6 comment-compose overlay, anchored to the cursor's
+    /// current row — `ui::mod`'s event loop intercepts this rather than
+    /// forwarding it through `App::update`, since it needs the repo root
+    /// and the comment store, neither of which `App` owns. A no-op outside
+    /// [`crate::ui::view::View::Diff`] or on a row with nothing to anchor
+    /// to (a header, or a `Del` row — see `App::comment_target`).
+    AddComment,
+    /// Toggles whether a commented row's body renders as an inline block
+    /// underneath it; the gutter marker itself always shows regardless.
+    /// Unlike `AddComment`, this *is* a pure state flip handled inside
+    /// `App::update`, mirroring `ToggleSidebar`.
+    ToggleComments,
     Quit,
 }
 
@@ -310,6 +322,8 @@ pub fn vim_preset() -> Vec<(KeySeq, Action)> {
         ("Esc", Action::Cancel),
         ("t", Action::ToggleTimeline),
         ("v", Action::ToggleRangeSelect),
+        ("c", Action::AddComment),
+        ("C", Action::ToggleComments),
         ("q", Action::Quit),
     ]
     .into_iter()

@@ -14,6 +14,7 @@
 //! to wait, with a short timeout, for "anything worth redrawing for."
 
 pub mod app;
+pub mod compose;
 pub mod diff_view;
 pub mod file_view;
 pub mod hover_popup;
@@ -33,6 +34,7 @@ pub use file_view::FileView;
 pub use refresh::{NoopPreRefreshHook, PreRefreshHook};
 pub use view::{View, ViewStack};
 
+use crate::comments::{self, Comment, CommentIndex, CommentStore};
 use crate::diff::parse_unified_diff;
 use crate::highlight::LineHighlighter;
 use crate::keymap::{Action, KeyChord, Keymap, Resolver, StepResult, vim_preset};
@@ -43,6 +45,7 @@ use crate::lsp::{
     DefinitionResult, DiagnosticsStore, HoverResult, LspError, LspManager, ReferencesResult,
     ServerEvent, parse_publish_diagnostics, progress_status_text,
 };
+use crate::ui::compose::{ComposeOutcome, ComposeState};
 use crate::ui::navigation::{JumpEntry, JumpStack, navigate_to};
 use crate::ui::refs_panel::RefsPanel;
 use crate::ui::timeline_view::TimelineView;
@@ -63,7 +66,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout as RatatuiLayout, Rect};
 use std::collections::HashSet;
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
@@ -92,6 +95,14 @@ enum AppEvent {
     /// sent when [`crate::vcs::jj::JjRepo::snapshot`] ran but found nothing
     /// to snapshot (a no-op refresh cycle isn't a new timeline entry).
     JjSnapshot,
+    /// `.katamari/comments.jsonl` changed on disk — forwarded by
+    /// [`crate::watch::spawn_comments_watcher`], which runs for every
+    /// session with a root diff regardless of `--watch`. Triggers a
+    /// comments-only reload (re-read the log, rebuild the
+    /// [`comments::CommentIndex`]) without re-running `git diff` — an
+    /// agent resolving comments via `ktmr comments resolve` shouldn't need
+    /// an unrelated file edit to make the reviewer's session notice.
+    CommentsChanged,
 }
 
 /// The M5 [`PreRefreshHook`]: snapshots the working copy via jj (see
@@ -199,8 +210,16 @@ pub fn run(stack: &mut ViewStack, pre_refresh_hook: Option<Box<dyn PreRefreshHoo
 
     let watch_startup_status = pre_refresh_hook
         .is_some()
-        .then(|| start_watch(stack, app_tx))
+        .then(|| start_watch(stack, app_tx.clone()))
         .flatten();
+
+    // M6: a root diff's comments are loaded and watched unconditionally —
+    // unlike the working-tree watcher above, this has nothing to do with
+    // `--watch`. See [`AppEvent::CommentsChanged`]'s docs and
+    // `watch::spawn_comments_watcher`.
+    let (comments_repo_root, initial_comments, comments_startup_status) =
+        start_comments(stack.top(), app_tx);
+    let startup_status = startup_status.or(comments_startup_status);
 
     let result = event_loop(
         &mut terminal,
@@ -213,6 +232,8 @@ pub fn run(stack: &mut ViewStack, pre_refresh_hook: Option<Box<dyn PreRefreshHoo
         pre_refresh_hook,
         watch_startup_status,
         jj_repo,
+        comments_repo_root,
+        initial_comments,
     );
 
     restore_terminal(&mut terminal)?;
@@ -252,6 +273,49 @@ fn start_watch(stack: &mut ViewStack, app_tx: Sender<AppEvent>) -> Option<String
         }
         Err(e) => Some(format!("watch: failed to start: {e}")),
     }
+}
+
+/// Loads the root diff's comment log (empty if there isn't one yet or the
+/// view has no comments concept at all — see below) and starts the M6
+/// comments watcher against it, unconditionally, for every session with a
+/// [`View::Diff`] root — see [`AppEvent::CommentsChanged`]'s docs on why
+/// this doesn't gate on `--watch`. Returns the repo root comments are keyed
+/// against (`None` for a [`View::File`]/[`View::Timeline`] root, which have
+/// no working-tree diff for a comment to anchor into), the comments loaded
+/// so far, and a status-bar note if the watcher itself failed to start —
+/// the same "don't silently not-watch" principle [`start_watch`] follows.
+fn start_comments(
+    view: &View,
+    app_tx: Sender<AppEvent>,
+) -> (Option<PathBuf>, Vec<Comment>, Option<String>) {
+    let View::Diff(app) = view else {
+        return (None, Vec::new(), None);
+    };
+    let repo_root = app.repo_root.clone();
+    let loaded = CommentStore::new(&repo_root).load().unwrap_or_default();
+
+    let (tx, rx) = mpsc::channel::<()>();
+    let status = match watch::spawn_comments_watcher(repo_root.clone(), tx) {
+        Ok(()) => {
+            spawn_comments_forwarder(rx, app_tx);
+            None
+        }
+        Err(e) => Some(format!("comments watch: failed to start: {e}")),
+    };
+    (Some(repo_root), loaded, status)
+}
+
+/// As [`spawn_watch_forwarder`], relaying the comments watcher's bare `()`
+/// signals onto the shared [`AppEvent`] channel as
+/// [`AppEvent::CommentsChanged`].
+fn spawn_comments_forwarder(rx: Receiver<()>, tx: Sender<AppEvent>) {
+    std::thread::spawn(move || {
+        for () in rx {
+            if tx.send(AppEvent::CommentsChanged).is_err() {
+                break;
+            }
+        }
+    });
 }
 
 /// Proactively opens whichever files `view` starts out showing —
@@ -398,6 +462,8 @@ fn event_loop(
     pre_refresh_hook: Option<Box<dyn PreRefreshHook>>,
     initial_watch_status: Option<String>,
     jj_repo: Option<JjRepo>,
+    comments_repo_root: Option<PathBuf>,
+    initial_comments: Vec<Comment>,
 ) -> Result<()> {
     let mut hover_state = hover_popup::HoverState::default();
     let mut pending_hover: Option<(u64, Receiver<Result<HoverResult, LspError>>)> = None;
@@ -409,6 +475,12 @@ fn event_loop(
     let mut goto_status: Option<String> = None;
     let mut watch_status: Option<WatchStatus> = initial_watch_status.map(WatchStatus::new);
     let mut warned_languages: HashSet<Language> = HashSet::new();
+    let mut compose: Option<ComposeState> = None;
+    let mut comment_list: Vec<Comment> = initial_comments;
+    let mut comment_index: CommentIndex = comments_repo_root
+        .as_deref()
+        .map(|root| comments::build_index(root, &comment_list))
+        .unwrap_or_default();
 
     loop {
         let size = terminal.size()?;
@@ -495,12 +567,36 @@ fn event_loop(
                 &diagnostics,
                 refs_panel.as_ref().map(|s| &s.panel),
                 status_note.as_deref(),
+                &comment_index,
+                compose.as_ref(),
             )
         })?;
 
         match app_rx.recv_timeout(EVENT_POLL_INTERVAL) {
             Ok(AppEvent::Terminal(Event::Key(key))) => {
-                if key.kind == KeyEventKind::Press {
+                if key.kind != KeyEventKind::Press {
+                    // no-op; falls through to the loop's bottom
+                } else if let Some(state) = compose.as_mut() {
+                    // The compose overlay wants raw characters, not
+                    // `Action`s — see `ui::compose::handle_key`'s docs on
+                    // why this bypasses the keymap resolver entirely rather
+                    // than only intercepting a few already-resolved
+                    // actions the way the hover popup/references panel do
+                    // below.
+                    match compose::handle_key(state.buffer_mut(), key) {
+                        ComposeOutcome::Continue => {}
+                        ComposeOutcome::Cancel => compose = None,
+                        ComposeOutcome::Save => {
+                            goto_status = Some(finish_compose(
+                                state,
+                                comments_repo_root.as_deref(),
+                                &mut comment_list,
+                                &mut comment_index,
+                            ));
+                            compose = None;
+                        }
+                    }
+                } else {
                     match resolver.feed(KeyChord::from(key)) {
                         StepResult::Matched(action) => {
                             stack.top_mut().clear_pending_keys();
@@ -517,6 +613,7 @@ fn event_loop(
                                 &mut goto_status,
                                 lsp_manager,
                                 jj_repo.as_ref(),
+                                &mut compose,
                             );
                         }
                         StepResult::Pending => {
@@ -566,6 +663,28 @@ fn event_loop(
                     &mut refs_panel,
                     &mut watch_status,
                 );
+                // The working tree just changed, which can shift where
+                // every comment relocates to even though the comment log
+                // itself didn't — rebuild against the fresh file content
+                // rather than waiting for a `.katamari/comments.jsonl`
+                // write that isn't coming.
+                if let Some(root) = &comments_repo_root {
+                    comment_index = comments::build_index(root, &comment_list);
+                }
+            }
+            Ok(AppEvent::CommentsChanged) => {
+                if let Some(root) = &comments_repo_root {
+                    match CommentStore::new(root).load() {
+                        Ok(loaded) => {
+                            comment_list = loaded;
+                            comment_index = comments::build_index(root, &comment_list);
+                        }
+                        Err(e) => {
+                            watch_status =
+                                Some(WatchStatus::new(format!("comments: reload failed: {e}")));
+                        }
+                    }
+                }
             }
             Ok(AppEvent::JjSnapshot) => {
                 if let View::Timeline(timeline) = stack.top_mut() {
@@ -584,6 +703,67 @@ fn event_loop(
             return Ok(());
         }
     }
+}
+
+/// Persists a finished compose overlay's buffer as a new comment (`C-s`)
+/// and reports what happened as a status-bar note — a blank buffer, a
+/// vanished `comments_repo_root` (shouldn't happen: the overlay only ever
+/// opens from `App::comment_target`, which only exists on a `View::Diff`
+/// root, exactly when `comments_repo_root` is `Some`), the target file
+/// having disappeared or shrunk out from under the comment since the
+/// overlay was opened, or a store I/O failure are all reported the same
+/// way rather than silently dropping the comment. On success, appends the
+/// new [`Comment`] to `comment_list` and rebuilds `comment_index` in place
+/// so the newly saved comment renders immediately, without waiting for the
+/// comments watcher's own filesystem round trip.
+fn finish_compose(
+    state: &ComposeState,
+    repo_root: Option<&Path>,
+    comment_list: &mut Vec<Comment>,
+    comment_index: &mut CommentIndex,
+) -> String {
+    let Some(repo_root) = repo_root else {
+        return "comment: no repository root to save against".to_owned();
+    };
+    if state.buffer().is_blank() {
+        return "comment: discarded (empty)".to_owned();
+    }
+    match save_comment(repo_root, state) {
+        Ok(comment) => {
+            comment_list.push(comment);
+            *comment_index = comments::build_index(repo_root, comment_list);
+            "comment: saved".to_owned()
+        }
+        Err(e) => format!("comment: {e}"),
+    }
+}
+
+/// Builds and appends the [`Comment`] a finished compose overlay describes:
+/// re-reads `state.file`'s current content (rather than trusting whatever
+/// it was when the overlay opened, in case it changed mid-edit) to compute
+/// a fresh [`comments::Anchor`], then writes it through
+/// [`CommentStore::append_comment`].
+fn save_comment(repo_root: &Path, state: &ComposeState) -> std::result::Result<Comment, String> {
+    let absolute = repo_root.join(&state.file);
+    let content = std::fs::read_to_string(&absolute)
+        .map_err(|e| format!("couldn't re-read {}: {e}", state.file))?;
+    let lines: Vec<&str> = content.lines().collect();
+    let anchor = comments::anchor_for(&lines, state.line)
+        .ok_or_else(|| format!("line {} no longer exists in {}", state.line, state.file))?;
+
+    let comment = Comment {
+        id: comments::generate_id(),
+        created_at: comments::now_unix(),
+        file: state.file.clone(),
+        anchor,
+        body: state.buffer().text(),
+        status: comments::Status::Open,
+        resolved_at: None,
+    };
+    CommentStore::new(repo_root)
+        .append_comment(&comment)
+        .map_err(|e| e.to_string())?;
+    Ok(comment)
 }
 
 /// Applies one matched [`Action`], handling every concern the pure
@@ -612,6 +792,7 @@ fn handle_action(
     goto_status: &mut Option<String>,
     lsp_manager: &LspManager,
     jj_repo: Option<&JjRepo>,
+    compose: &mut Option<ComposeState>,
 ) {
     if let Some(state) = refs_panel {
         match action {
@@ -695,6 +876,15 @@ fn handle_action(
                 *goto_status = Some("references: \u{2026}".to_owned());
             }
             None => *goto_status = Some("references: nothing to jump from here".to_owned()),
+        },
+        Action::AddComment => match stack.top() {
+            View::Diff(app) => match app.comment_target() {
+                Some((file, line)) => *compose = Some(ComposeState::new(file, line)),
+                None => *goto_status = Some("comment: nothing to annotate on this row".to_owned()),
+            },
+            View::File(_) | View::Timeline(_) => {
+                *goto_status = Some("comment: only available in the diff view".to_owned());
+            }
         },
         Action::NextDiagnostic | Action::PrevDiagnostic => {
             let forward = action == Action::NextDiagnostic;
@@ -947,6 +1137,9 @@ fn apply_references_result(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // one render pass threading through
+// every overlay/lookaside table the frame might need to draw; see
+// `handle_action`'s comment for why a struct wouldn't reduce this.
 fn draw(
     frame: &mut Frame,
     view: &View,
@@ -955,6 +1148,8 @@ fn draw(
     diagnostics: &DiagnosticsStore,
     refs_panel: Option<&RefsPanel>,
     status_note: Option<&str>,
+    comments: &CommentIndex,
+    compose: Option<&ComposeState>,
 ) {
     match view {
         View::Diff(app) => {
@@ -970,6 +1165,7 @@ fn draw(
                 highlighter,
                 effective_layout,
                 diagnostics,
+                comments,
             );
             status_bar::render(frame, areas.status, app, effective_layout, status_note);
             if let Some(row) = view.cursor_screen_row() {
@@ -977,6 +1173,11 @@ fn draw(
             }
             if let Some(panel) = refs_panel {
                 refs_panel::render(frame, areas.diff, panel);
+            }
+            if let Some(state) = compose
+                && let Some(row) = view.cursor_screen_row()
+            {
+                compose::render(frame, areas.diff, row, state);
             }
         }
         View::File(file) => {

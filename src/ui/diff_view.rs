@@ -3,6 +3,7 @@
 //! goes through `ui::text`'s display-width helpers so CJK content lines
 //! neither misalign the gutter nor wrap.
 
+use crate::comments::{CommentAnnotation, CommentIndex, Status as CommentStatus};
 use crate::diff::{
     DiffFile, DiffLineKind, DiffRow, RenderRow, SideBySideRow, SideCell, lsp_target,
     side_by_side_scroll_start,
@@ -13,6 +14,7 @@ use crate::ui::app::{App, Layout};
 use crate::ui::symbols;
 use crate::ui::text::{
     display_width, highlight_color, mark_range, truncate_spans_to_width, truncate_to_width,
+    wrap_text,
 };
 use lsp_types::DiagnosticSeverity;
 use ratatui::Frame;
@@ -51,44 +53,95 @@ pub fn render(
     highlighter: &mut LineHighlighter,
     layout: Layout,
     diagnostics: &DiagnosticsStore,
+    comments: &CommentIndex,
 ) {
     let block = Block::default().borders(Borders::LEFT).title(" diff ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     match layout {
-        Layout::Unified => render_unified(frame, inner, app, highlighter, diagnostics),
-        Layout::SideBySide => render_side_by_side(frame, inner, app, highlighter, diagnostics),
+        Layout::Unified => render_unified(frame, inner, app, highlighter, diagnostics, comments),
+        Layout::SideBySide => {
+            render_side_by_side(frame, inner, app, highlighter, diagnostics, comments)
+        }
     }
 }
 
+/// The comments anchored (after relocation) to `row`'s current line, or
+/// `&[]` for anything but a [`RenderRow::Line`] — file/hunk headers and
+/// binary notices have no `(file, new_line)` a comment could be anchored
+/// to. Shared by the gutter marker (always drawn) and the inline body block
+/// (drawn only when `App::comments_visible`), so both agree on exactly
+/// which comments belong to a row.
+fn comments_for_row<'a>(
+    app: &App,
+    row: RenderRow,
+    comments: &'a CommentIndex,
+) -> &'a [CommentAnnotation] {
+    let RenderRow::Line {
+        file_idx,
+        hunk_idx,
+        row_idx,
+    } = row
+    else {
+        return &[];
+    };
+    let file = &app.files[file_idx];
+    let diff_row = &file.hunks[hunk_idx].rows[row_idx];
+    match diff_row.new_line {
+        Some(line) => comments.at(file.display_path(), line),
+        None => &[],
+    }
+}
+
+/// Renders the unified layout's visible window, interleaving each row with
+/// its inline comment block (when `App::comments_visible`) directly
+/// underneath it rather than as a fixed one-row-per-`RenderRow` mapping —
+/// unlike every other row kind, a commented row can occupy more than one
+/// terminal line. `app.scroll_offset`/`app.cursor` still index `app.rows`
+/// itself (a comment block is never a distinct, independently-scrollable
+/// row), so a heavily annotated diff's scroll position is measured in
+/// `RenderRow`s the same way it always has been — the comment blocks below
+/// the fold just consume more of the *visible* window per row than an
+/// uncommented one would, a deliberate simplification over teaching the
+/// scroll/cursor model about sub-row lines (see M6's notes for a possible
+/// M7 revisit if that trade-off proves visually confusing in practice).
 fn render_unified(
     frame: &mut Frame,
     inner: Rect,
     app: &App,
     highlighter: &mut LineHighlighter,
     diagnostics: &DiagnosticsStore,
+    comments: &CommentIndex,
 ) {
     let content_width = inner.width as usize;
-    let visible = app
-        .rows
-        .iter()
-        .enumerate()
-        .skip(app.scroll_offset)
-        .take(inner.height as usize);
+    let viewport_height = inner.height as usize;
+    let mut lines: Vec<Line> = Vec::with_capacity(viewport_height);
 
-    let lines: Vec<Line> = visible
-        .map(|(idx, row)| {
-            render_row(
-                app,
-                *row,
-                idx == app.cursor,
-                content_width,
-                highlighter,
-                diagnostics,
-            )
-        })
-        .collect();
+    let mut idx = app.scroll_offset;
+    while lines.len() < viewport_height && idx < app.rows.len() {
+        let row = app.rows[idx];
+        lines.push(render_row(
+            app,
+            row,
+            idx == app.cursor,
+            content_width,
+            highlighter,
+            diagnostics,
+            comments,
+        ));
+        if app.comments_visible {
+            for block_line in
+                comment_block_lines(comments_for_row(app, row, comments), content_width)
+            {
+                if lines.len() >= viewport_height {
+                    break;
+                }
+                lines.push(block_line);
+            }
+        }
+        idx += 1;
+    }
 
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -104,28 +157,73 @@ fn render_side_by_side(
     app: &App,
     highlighter: &mut LineHighlighter,
     diagnostics: &DiagnosticsStore,
+    comments: &CommentIndex,
 ) {
     let width = inner.width as usize;
     let divider_width = 1;
     let left_width = width.saturating_sub(divider_width) / 2;
     let right_width = width.saturating_sub(divider_width + left_width);
+    let viewport_height = inner.height as usize;
 
     let start = side_by_side_scroll_start(&app.side_by_side_rows, app.scroll_offset);
-    let visible = app
-        .side_by_side_rows
-        .iter()
-        .skip(start)
-        .take(inner.height as usize);
+    let mut lines: Vec<Line> = Vec::with_capacity(viewport_height);
 
-    let lines: Vec<Line> = visible
-        .map(|row| {
-            side_by_side_row_line(app, *row, left_width, right_width, highlighter, diagnostics)
-        })
-        .collect();
+    let mut idx = start;
+    while lines.len() < viewport_height && idx < app.side_by_side_rows.len() {
+        let row = app.side_by_side_rows[idx];
+        lines.push(side_by_side_row_line(
+            app,
+            row,
+            left_width,
+            right_width,
+            highlighter,
+            diagnostics,
+            comments,
+        ));
+        if app.comments_visible {
+            let annotations = side_by_side_row_comments(app, row, comments);
+            for block_line in comment_block_lines(annotations, width) {
+                if lines.len() >= viewport_height {
+                    break;
+                }
+                lines.push(block_line);
+            }
+        }
+        idx += 1;
+    }
 
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// As [`comments_for_row`], for one [`SideBySideRow`] — only the *new* side
+/// carries comment anchors (comments are only ever left on a `Context`/`Add`
+/// row, which always has a `new_line` — see `App::comment_target`), so a
+/// `Paired` row's old-side cell is never consulted here.
+fn side_by_side_row_comments<'a>(
+    app: &App,
+    row: SideBySideRow,
+    comments: &'a CommentIndex,
+) -> &'a [CommentAnnotation] {
+    let flat_idx = match row {
+        SideBySideRow::Full { flat_idx } => Some(flat_idx),
+        SideBySideRow::Paired {
+            new: SideCell::Line { flat_idx },
+            ..
+        } => Some(flat_idx),
+        SideBySideRow::Paired {
+            new: SideCell::Empty,
+            ..
+        } => None,
+    };
+    match flat_idx {
+        Some(flat_idx) => comments_for_row(app, app.rows[flat_idx], comments),
+        None => &[],
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // mirrors `content_line`'s: every
+// parameter is a distinct piece of what one paired row needs — see that
+// function's comment for why bundling into a struct wouldn't help.
 fn side_by_side_row_line(
     app: &App,
     row: SideBySideRow,
@@ -133,6 +231,7 @@ fn side_by_side_row_line(
     right_width: usize,
     highlighter: &mut LineHighlighter,
     diagnostics: &DiagnosticsStore,
+    comments: &CommentIndex,
 ) -> Line<'static> {
     match row {
         SideBySideRow::Full { flat_idx } => render_row(
@@ -142,14 +241,18 @@ fn side_by_side_row_line(
             left_width + 1 + right_width,
             highlighter,
             diagnostics,
+            comments,
         ),
         SideBySideRow::Paired { old, new } => {
-            let mut spans = side_cell_spans(app, old, left_width, highlighter, diagnostics).spans;
+            let mut spans =
+                side_cell_spans(app, old, left_width, highlighter, diagnostics, comments).spans;
             spans.push(Span::styled(
                 "\u{2502}",
                 Style::default().fg(Color::DarkGray),
             ));
-            spans.extend(side_cell_spans(app, new, right_width, highlighter, diagnostics).spans);
+            spans.extend(
+                side_cell_spans(app, new, right_width, highlighter, diagnostics, comments).spans,
+            );
             Line::from(spans)
         }
     }
@@ -159,12 +262,14 @@ fn side_by_side_row_line(
 /// `render_row` already produces for that flat row when populated, or a
 /// blank filler line at `width` when the other side has no counterpart
 /// here.
+#[allow(clippy::too_many_arguments)] // see `content_line`'s comment
 fn side_cell_spans(
     app: &App,
     cell: SideCell,
     width: usize,
     highlighter: &mut LineHighlighter,
     diagnostics: &DiagnosticsStore,
+    comments: &CommentIndex,
 ) -> Line<'static> {
     match cell {
         SideCell::Line { flat_idx } => render_row(
@@ -174,6 +279,7 @@ fn side_cell_spans(
             width,
             highlighter,
             diagnostics,
+            comments,
         ),
         SideCell::Empty => Line::from(Span::raw(" ".repeat(width))),
     }
@@ -186,6 +292,7 @@ fn render_row(
     width: usize,
     highlighter: &mut LineHighlighter,
     diagnostics: &DiagnosticsStore,
+    comments: &CommentIndex,
 ) -> Line<'static> {
     match row {
         RenderRow::FileHeader { file_idx } => file_header_line(app, file_idx, width, is_cursor),
@@ -206,6 +313,7 @@ fn render_row(
             is_cursor,
             highlighter,
             diagnostics,
+            comments_for_row(app, row, comments),
         ),
     }
 }
@@ -237,6 +345,78 @@ fn diagnostic_glyph_span(severity: Option<DiagnosticSeverity>, bg: Option<Color>
         None => (" ", Color::Reset),
     };
     Span::styled(format!("{glyph} "), base_style(bg).fg(color))
+}
+
+/// The gutter's comment marker: a bright cyan `◆` when `annotations`
+/// includes at least one open, still-anchored comment, a dim `◇` when it
+/// only has resolved and/or detached ones, or a blank space when there's
+/// nothing to show — matching [`diagnostic_glyph_span`]'s "always reserve
+/// the width" convention so every content row's gutter stays the same size
+/// whether or not it happens to carry a comment.
+fn comment_marker_span(annotations: &[CommentAnnotation], bg: Option<Color>) -> Span<'static> {
+    if annotations.is_empty() {
+        return Span::styled(" ", base_style(bg));
+    }
+    let has_active_open = annotations
+        .iter()
+        .any(|a| !a.detached && a.status == CommentStatus::Open);
+    if has_active_open {
+        Span::styled("\u{25C6}", base_style(bg).fg(Color::Cyan))
+    } else {
+        Span::styled("\u{25C7}", base_style(bg).fg(Color::DarkGray))
+    }
+}
+
+/// Renders the inline comment block for one row's `annotations`: one
+/// dimmed/labeled header line per comment (`[open]`/`[resolved]`/
+/// `[detached]` plus a short id prefix, so `ktmr comments resolve <id>`'s
+/// argument is visible without leaving the TUI) followed by its
+/// word-wrapped body, indented so it reads as subordinate to the diff line
+/// above it rather than another row of the diff itself. A resolved
+/// comment's body renders struck through and dimmed; an open one in plain
+/// (but still slightly indented) text.
+fn comment_block_lines(annotations: &[CommentAnnotation], width: usize) -> Vec<Line<'static>> {
+    const INDENT: &str = "      ";
+    let body_width = width.saturating_sub(display_width(INDENT));
+    let mut out = Vec::new();
+
+    for annotation in annotations {
+        let label = if annotation.detached {
+            "detached"
+        } else if annotation.status == CommentStatus::Resolved {
+            "resolved"
+        } else {
+            "open"
+        };
+        let dimmed = annotation.detached || annotation.status == CommentStatus::Resolved;
+        let header_style = if dimmed {
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        let id_prefix = &annotation.id[..annotation.id.len().min(8)];
+        out.push(Line::from(Span::styled(
+            format!("{INDENT}[{label} {id_prefix}]"),
+            header_style,
+        )));
+
+        let mut body_style = Style::default().fg(Color::Gray);
+        if annotation.status == CommentStatus::Resolved {
+            body_style = body_style.add_modifier(Modifier::CROSSED_OUT);
+        }
+        if dimmed {
+            body_style = body_style.fg(Color::DarkGray);
+        }
+        for wrapped in wrap_text(&annotation.body, body_width) {
+            out.push(Line::from(Span::styled(
+                format!("{INDENT}{wrapped}"),
+                body_style,
+            )));
+        }
+    }
+    out
 }
 
 fn cursor_style(base: Style, is_cursor: bool) -> Style {
@@ -303,10 +483,10 @@ fn binary_notice_line(
 
 #[allow(clippy::too_many_arguments)] // every parameter is a distinct piece
 // of what one content row needs to render (which row, whether it's under
-// the cursor, how wide it can be, and the three lookaside tables —
-// highlighter, diagnostics, active-symbol state via `app` — it draws from);
-// bundling them into a struct would just move the same fields one level
-// down.
+// the cursor, how wide it can be, and the lookaside tables — highlighter,
+// diagnostics, comment annotations, active-symbol state via `app` — it
+// draws from); bundling them into a struct would just move the same fields
+// one level down.
 fn content_line(
     app: &App,
     file_idx: usize,
@@ -316,6 +496,7 @@ fn content_line(
     is_cursor: bool,
     highlighter: &mut LineHighlighter,
     diagnostics: &DiagnosticsStore,
+    comments: &[CommentAnnotation],
 ) -> Line<'static> {
     let file = &app.files[file_idx];
     let row = &file.hunks[hunk_idx].rows[row_idx];
@@ -328,12 +509,15 @@ fn content_line(
 
     let severity = row_diagnostic_severity(app, file, row, diagnostics);
     let diagnostic_span = diagnostic_glyph_span(severity, bg);
+    let comment_span = comment_marker_span(comments, bg);
     let gutter = format!(
         "{marker} {} {} \u{2502} ",
         format_line_number(row.old_line),
         format_line_number(row.new_line),
     );
-    let gutter_width = display_width(&gutter) + display_width(diagnostic_span.content.as_ref());
+    let gutter_width = display_width(&gutter)
+        + display_width(diagnostic_span.content.as_ref())
+        + display_width(comment_span.content.as_ref());
     let content_width = width.saturating_sub(gutter_width);
 
     let language = Language::detect(file.display_path());
@@ -355,6 +539,7 @@ fn content_line(
 
     let mut line_spans = vec![
         diagnostic_span,
+        comment_span,
         Span::styled(
             gutter,
             base_style(bg).fg(marker_color).add_modifier(Modifier::BOLD),

@@ -1,3 +1,4 @@
+mod comments;
 mod diff;
 mod highlight;
 mod keymap;
@@ -8,11 +9,13 @@ mod watch;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use comments::{Comment, CommentAnnotation, CommentIndex, CommentStore, Status as CommentStatus};
 use diff::{
     DiffFile, DiffLineKind, RenderRow, SideBySideRow, SideCell, flatten, flatten_side_by_side,
     parse_unified_diff,
 };
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use ui::app::Layout;
 use ui::timeline_view::TimelineView;
 use ui::{App, FileView, View, ViewStack};
@@ -135,6 +138,91 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         timeout_secs: u64,
     },
+    /// Read and update review comments left via `ktmr diff`'s compose
+    /// overlay (`c`) — the CLI half of M6's comment round trip, for an AI
+    /// coding agent (see `skills/katamari-review/SKILL.md`) or a script to
+    /// drive without a terminal. Every subcommand operates on
+    /// `<repo_root>/.katamari/comments.jsonl` for the repository containing
+    /// the current directory.
+    Comments {
+        #[command(subcommand)]
+        action: CommentsCommand,
+    },
+    /// Installs the bundled `katamari-review` Claude Code skill into the
+    /// current repository, so an agent working in it picks up the
+    /// `ktmr comments` workflow automatically.
+    Skill {
+        #[command(subcommand)]
+        action: SkillCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CommentsCommand {
+    /// Lists comments: a human-readable table by default, or one JSON
+    /// object per line with `--json` — for a script or agent to parse.
+    List {
+        #[arg(long)]
+        json: bool,
+        #[arg(long, value_enum, default_value_t = StatusFilter::Open)]
+        status: StatusFilter,
+    },
+    /// Prints a paste-ready report of comments: markdown grouped by file
+    /// (default), or a JSON array with `--format=json`. The markdown form
+    /// opens with an instruction line meant to be handed straight to an
+    /// AI coding agent as a prompt.
+    Export {
+        #[arg(long, value_enum, default_value_t = ExportFormat::Md)]
+        format: ExportFormat,
+        #[arg(long, value_enum, default_value_t = StatusFilter::Open)]
+        status: StatusFilter,
+    },
+    /// Adds a comment programmatically — the scripted/agent equivalent of
+    /// the TUI's compose overlay.
+    Add {
+        /// Repo-relative path, as it appears in `ktmr diff`.
+        file: String,
+        /// 1-based line number in the file's current working-tree content.
+        line: u32,
+        body: String,
+    },
+    /// Marks a comment resolved.
+    Resolve { id: String },
+    /// Marks a resolved comment open again.
+    Reopen { id: String },
+}
+
+/// `ktmr comments list/export`'s `--status` filter. `Open` is the default
+/// for both — an agent (or a reviewer) asking "what's outstanding" wants
+/// open comments, not the full history, unless it says otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum StatusFilter {
+    Open,
+    Resolved,
+    All,
+}
+
+impl StatusFilter {
+    fn matches(self, status: CommentStatus) -> bool {
+        match self {
+            StatusFilter::Open => status == CommentStatus::Open,
+            StatusFilter::Resolved => status == CommentStatus::Resolved,
+            StatusFilter::All => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ExportFormat {
+    Md,
+    Json,
+}
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// Copies the bundled `SKILL.md` to
+    /// `<repo_root>/.claude/skills/katamari-review/SKILL.md`.
+    Install,
 }
 
 /// `--layout`'s value space in clap-friendly form. `ui::app::Layout` is the
@@ -187,6 +275,8 @@ fn main() -> Result<()> {
             flushes,
             timeout_secs,
         } => run_watch_check(dir, flushes, timeout_secs),
+        Command::Comments { action } => run_comments(action),
+        Command::Skill { action } => run_skill(action),
     }
 }
 
@@ -205,6 +295,7 @@ fn run_diff(
 
     let cwd = std::env::current_dir()?;
     let source = GitSource::discover(&cwd)?;
+    let repo_root = source.repo_root()?;
 
     let diff_text = match (staged, range.as_deref()) {
         (true, Some(_)) => bail!("--staged cannot be combined with a revision range"),
@@ -215,15 +306,23 @@ fn run_diff(
     let files = parse_unified_diff(&diff_text);
 
     if dump {
+        // Comments always anchor to the working tree, regardless of which
+        // scope `--dump` is showing — relocating against the repo's
+        // current on-disk content (not whatever `diff_text` above happens
+        // to cover) is what `CommentIndex` always does anyway (see
+        // `comments::build_index`), so this is correct even for
+        // `--staged`/a revision range, not just the plain working-tree
+        // diff.
+        let loaded = CommentStore::new(&repo_root).load().unwrap_or_default();
+        let comments = comments::build_index(&repo_root, &loaded);
         let text = match layout {
-            LayoutArg::Unified => format_dump(&files),
-            LayoutArg::Side => format_dump_side_by_side(&files),
+            LayoutArg::Unified => format_dump(&files, &comments),
+            LayoutArg::Side => format_dump_side_by_side(&files, &comments),
         };
         print!("{text}");
         return Ok(());
     }
 
-    let repo_root = source.repo_root()?;
     let repo_name = repo_root
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -494,6 +593,197 @@ fn run_watch_check(dir: PathBuf, flushes: usize, timeout_secs: u64) -> Result<()
             }
         }
     }
+    Ok(())
+}
+
+/// The repository root `ktmr comments`/`ktmr skill install` operate
+/// against: the same `git`-rooted discovery [`run_diff`] uses, from the
+/// current directory — every comments subcommand is meant to be run from
+/// anywhere inside the repo being reviewed, the same way `git` commands
+/// are.
+fn comments_repo_root() -> Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    GitSource::discover(&cwd)?.repo_root()
+}
+
+fn comment_status_label(status: CommentStatus) -> &'static str {
+    match status {
+        CommentStatus::Open => "open",
+        CommentStatus::Resolved => "resolved",
+    }
+}
+
+fn run_comments(action: CommentsCommand) -> Result<()> {
+    match action {
+        CommentsCommand::List { json, status } => run_comments_list(json, status),
+        CommentsCommand::Export { format, status } => run_comments_export(format, status),
+        CommentsCommand::Add { file, line, body } => run_comments_add(file, line, body),
+        CommentsCommand::Resolve { id } => run_comments_set_status(id, CommentStatus::Resolved),
+        CommentsCommand::Reopen { id } => run_comments_set_status(id, CommentStatus::Open),
+    }
+}
+
+fn run_comments_list(json: bool, status: StatusFilter) -> Result<()> {
+    let repo_root = comments_repo_root()?;
+    let filtered: Vec<Comment> = CommentStore::new(&repo_root)
+        .load()?
+        .into_iter()
+        .filter(|c| status.matches(c.status))
+        .collect();
+
+    if json {
+        for comment in &filtered {
+            println!("{}", serde_json::to_string(comment)?);
+        }
+        return Ok(());
+    }
+
+    if filtered.is_empty() {
+        println!("(no comments)");
+        return Ok(());
+    }
+    println!("{:<10} {:<9} {:<32} comment", "id", "status", "location");
+    for comment in &filtered {
+        let location = format!("{}:{}", comment.file, comment.anchor.new_line);
+        let first_line = comment.body.lines().next().unwrap_or("");
+        println!(
+            "{:<10} {:<9} {:<32} {first_line}",
+            comment.id,
+            comment_status_label(comment.status),
+            location,
+        );
+    }
+    Ok(())
+}
+
+fn run_comments_export(format: ExportFormat, status: StatusFilter) -> Result<()> {
+    let repo_root = comments_repo_root()?;
+    let filtered: Vec<Comment> = CommentStore::new(&repo_root)
+        .load()?
+        .into_iter()
+        .filter(|c| status.matches(c.status))
+        .collect();
+
+    match format {
+        ExportFormat::Json => println!("{}", serde_json::to_string_pretty(&filtered)?),
+        ExportFormat::Md => print!("{}", format_export_markdown(&repo_root, &filtered)),
+    }
+    Ok(())
+}
+
+/// Groups `comments` by file (in first-appearance order) and renders each as
+/// a `### file:line` heading, the anchored line's current text (relocated
+/// against `repo_root`'s on-disk content, so the quoted line matches what
+/// the agent will actually see when it opens the file), the comment body,
+/// and an id/status footer — directly pasteable into an AI coding agent's
+/// prompt, per the milestone spec, opening with an instruction line to that
+/// effect.
+fn format_export_markdown(repo_root: &Path, comments: &[Comment]) -> String {
+    let mut out = String::from(
+        "Address the following review comments; after fixing each, run `ktmr comments resolve <id>`.\n\n",
+    );
+
+    let mut file_order: Vec<&str> = Vec::new();
+    let mut by_file: HashMap<&str, Vec<&Comment>> = HashMap::new();
+    for comment in comments {
+        if !by_file.contains_key(comment.file.as_str()) {
+            file_order.push(comment.file.as_str());
+        }
+        by_file
+            .entry(comment.file.as_str())
+            .or_default()
+            .push(comment);
+    }
+
+    for file in file_order {
+        let content = std::fs::read_to_string(repo_root.join(file)).ok();
+        let lines: Vec<&str> = content
+            .as_deref()
+            .map(|s| s.lines().collect())
+            .unwrap_or_default();
+
+        for comment in &by_file[file] {
+            let (line, quoted) = match comments::relocate(comment, &lines) {
+                Some(line) => (
+                    line,
+                    lines
+                        .get((line - 1) as usize)
+                        .map_or_else(String::new, |l| l.trim().to_owned()),
+                ),
+                None => (
+                    comment.anchor.new_line,
+                    "(line not found — the file has changed since this comment was written)"
+                        .to_owned(),
+                ),
+            };
+            out.push_str(&format!("### {file}:{line}\n"));
+            out.push_str(&format!("> {quoted}\n\n"));
+            out.push_str(&comment.body);
+            out.push_str(&format!(
+                "\n\n_id: {} · status: {}_\n\n",
+                comment.id,
+                comment_status_label(comment.status)
+            ));
+        }
+    }
+    out
+}
+
+fn run_comments_add(file: String, line: u32, body: String) -> Result<()> {
+    let repo_root = comments_repo_root()?;
+    let content = std::fs::read_to_string(repo_root.join(&file))
+        .with_context(|| format!("failed to read {file}"))?;
+    let lines: Vec<&str> = content.lines().collect();
+    let anchor =
+        comments::anchor_for(&lines, line).with_context(|| format!("{file} has no line {line}"))?;
+
+    let comment = Comment {
+        id: comments::generate_id(),
+        created_at: comments::now_unix(),
+        file: file.clone(),
+        anchor,
+        body,
+        status: CommentStatus::Open,
+        resolved_at: None,
+    };
+    CommentStore::new(&repo_root).append_comment(&comment)?;
+    println!("added comment {} on {file}:{line}", comment.id);
+    Ok(())
+}
+
+fn run_comments_set_status(id: String, status: CommentStatus) -> Result<()> {
+    let repo_root = comments_repo_root()?;
+    let resolved_at = (status == CommentStatus::Resolved).then(comments::now_unix);
+    CommentStore::new(&repo_root)
+        .set_status(&id, status, resolved_at)
+        .with_context(|| format!("failed to update comment {id}"))?;
+    println!("{id}: {}", comment_status_label(status));
+    Ok(())
+}
+
+/// The bundled Claude Code skill, embedded at compile time so `ktmr skill
+/// install` works from the installed binary alone — no separate asset to
+/// ship or locate on disk.
+const SKILL_MD: &str = include_str!("../skills/katamari-review/SKILL.md");
+
+fn run_skill(action: SkillCommand) -> Result<()> {
+    match action {
+        SkillCommand::Install => run_skill_install(),
+    }
+}
+
+fn run_skill_install() -> Result<()> {
+    let repo_root = comments_repo_root()?;
+    let dest_dir = repo_root
+        .join(".claude")
+        .join("skills")
+        .join("katamari-review");
+    std::fs::create_dir_all(&dest_dir)
+        .with_context(|| format!("failed to create {}", dest_dir.display()))?;
+    let dest = dest_dir.join("SKILL.md");
+    std::fs::write(&dest, SKILL_MD)
+        .with_context(|| format!("failed to write {}", dest.display()))?;
+    println!("installed katamari-review skill to {}", dest.display());
     Ok(())
 }
 
@@ -887,9 +1177,11 @@ fn total_stat(files: &[DiffFile]) -> (u32, u32) {
 
 /// Plain-text rendering of the parsed, flattened unified diff: one line per
 /// file header, hunk header, and content row, with the same line numbers
-/// and kinds the TUI would show. Exists so parsing correctness can be
-/// checked against `git diff` output without a terminal.
-fn format_dump(files: &[DiffFile]) -> String {
+/// and kinds the TUI would show, plus one `COMMENT` line per comment
+/// anchored (after relocation — see `comments::build_index`) to that row.
+/// Exists so parsing correctness — and, since M6, comment placement — can
+/// be checked against `git diff` output without a terminal.
+fn format_dump(files: &[DiffFile], comments: &CommentIndex) -> String {
     let (total_added, total_deleted) = total_stat(files);
     let mut out = format!(
         "files: {}  +{total_added} -{total_deleted}\n\n",
@@ -897,6 +1189,16 @@ fn format_dump(files: &[DiffFile]) -> String {
     );
     for row in flatten(files) {
         out.push_str(&format_render_row(files, row));
+        if let RenderRow::Line {
+            file_idx,
+            hunk_idx,
+            row_idx,
+        } = row
+        {
+            out.push_str(&format_comment_markers(
+                files, file_idx, hunk_idx, row_idx, comments,
+            ));
+        }
     }
     out
 }
@@ -905,7 +1207,9 @@ fn format_dump(files: &[DiffFile]) -> String {
 /// [`format_dump`], but each hunk body row becomes an `OLD`/`NEW` pair (`--`
 /// for a filler cell with no counterpart on that side) instead of a flat
 /// list — the same grouping `diff_view::render` draws as two columns.
-fn format_dump_side_by_side(files: &[DiffFile]) -> String {
+/// Comment markers follow the `NEW` cell only, matching where a comment can
+/// ever be anchored (see `App::comment_target`'s docs).
+fn format_dump_side_by_side(files: &[DiffFile], comments: &CommentIndex) -> String {
     let (total_added, total_deleted) = total_stat(files);
     let mut out = format!(
         "files: {}  +{total_added} -{total_deleted}  layout=side\n\n",
@@ -915,12 +1219,20 @@ fn format_dump_side_by_side(files: &[DiffFile]) -> String {
     for paired in flatten_side_by_side(files) {
         match paired {
             SideBySideRow::Full { flat_idx } => {
-                out.push_str(&format_render_row(files, rows[flat_idx]))
+                out.push_str(&format_render_row(files, rows[flat_idx]));
+                out.push_str(&format_comment_markers_for_flat_row(
+                    files, &rows, flat_idx, comments,
+                ));
             }
             SideBySideRow::Paired { old, new } => {
                 out.push_str("    PAIR\n");
                 out.push_str(&format_side_cell("OLD", files, &rows, old));
                 out.push_str(&format_side_cell("NEW", files, &rows, new));
+                if let SideCell::Line { flat_idx } = new {
+                    out.push_str(&format_comment_markers_for_flat_row(
+                        files, &rows, flat_idx, comments,
+                    ));
+                }
             }
         }
     }
@@ -952,4 +1264,61 @@ fn format_side_cell(label: &str, files: &[DiffFile], rows: &[RenderRow], cell: S
     };
     let num = num.map_or_else(|| "-".to_owned(), |n| n.to_string());
     format!("      {label}  {kind:<3} {num:>5}  {}\n", row.text)
+}
+
+/// One `      COMMENT <id> [status] <first line of body>` line per comment
+/// anchored to `files[file_idx].hunks[hunk_idx].rows[row_idx]`'s current
+/// line — empty when there are none. Shared by [`format_dump`] and (via
+/// [`format_comment_markers_for_flat_row`]) [`format_dump_side_by_side`], so
+/// both dump modes agree on exactly what counts as "annotated."
+fn format_comment_markers(
+    files: &[DiffFile],
+    file_idx: usize,
+    hunk_idx: usize,
+    row_idx: usize,
+    comments: &CommentIndex,
+) -> String {
+    let file = &files[file_idx];
+    let row = &file.hunks[hunk_idx].rows[row_idx];
+    let Some(new_line) = row.new_line else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for annotation in comments.at(file.display_path(), new_line) {
+        out.push_str(&format_comment_marker(annotation));
+    }
+    out
+}
+
+/// As [`format_comment_markers`], addressing the row by its flat index into
+/// `rows` (as [`flatten_side_by_side`] does) rather than by
+/// `(file_idx, hunk_idx, row_idx)` directly.
+fn format_comment_markers_for_flat_row(
+    files: &[DiffFile],
+    rows: &[RenderRow],
+    flat_idx: usize,
+    comments: &CommentIndex,
+) -> String {
+    let RenderRow::Line {
+        file_idx,
+        hunk_idx,
+        row_idx,
+    } = rows[flat_idx]
+    else {
+        return String::new();
+    };
+    format_comment_markers(files, file_idx, hunk_idx, row_idx, comments)
+}
+
+fn format_comment_marker(annotation: &CommentAnnotation) -> String {
+    let status = if annotation.detached {
+        "detached"
+    } else {
+        match annotation.status {
+            CommentStatus::Open => "open",
+            CommentStatus::Resolved => "resolved",
+        }
+    };
+    let first_line = annotation.body.lines().next().unwrap_or("");
+    format!("      COMMENT {} [{status}] {first_line}\n", annotation.id)
 }

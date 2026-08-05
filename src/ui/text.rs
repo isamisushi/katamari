@@ -117,6 +117,53 @@ pub fn mark_range(
     out
 }
 
+/// Word-wraps `text` to at most `width` display columns per line, splitting
+/// only on whitespace boundaries (never mid-word) — used to fit a comment
+/// body's free-form prose into the diff pane's inline comment block, where
+/// unlike a syntax-highlighted source line, there are no existing span
+/// boundaries to truncate at. A single word wider than `width` on its own
+/// is left to overflow rather than broken mid-character, since character-
+/// splitting a URL or an identifier the reviewer wrote in a comment reads
+/// worse than an occasionally-overflowing line.
+///
+/// Each input line (split on `\n`) wraps independently, so a comment's own
+/// paragraph breaks are preserved; a blank input line stays blank. `width ==
+/// 0` degrades to one line per input line, unwrapped, rather than looping
+/// forever trying to fit words into no space at all.
+pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return text.lines().map(str::to_owned).collect();
+    }
+    let mut out = Vec::new();
+    for raw_line in text.lines() {
+        if raw_line.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        let mut current_width = 0;
+        for word in raw_line.split_whitespace() {
+            let word_width = display_width(word);
+            let sep_width = if current.is_empty() { 0 } else { 1 };
+            if !current.is_empty() && current_width + sep_width + word_width > width {
+                out.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            if !current.is_empty() {
+                current.push(' ');
+                current_width += 1;
+            }
+            current.push_str(word);
+            current_width += word_width;
+        }
+        out.push(current);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
 /// Maps a highlighter's coarse semantic category onto a terminal color. The
 /// single mapping every pane with syntax highlighting shares, so the diff
 /// view and the file view always agree on what a keyword or a string looks
@@ -233,6 +280,29 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert_eq!(underlined, "日");
+    }
+
+    #[test]
+    fn wrap_text_breaks_only_on_whitespace_boundaries() {
+        let wrapped = wrap_text("the quick brown fox jumps", 10);
+        assert_eq!(wrapped, vec!["the quick", "brown fox", "jumps"]);
+    }
+
+    #[test]
+    fn wrap_text_preserves_blank_lines_and_paragraph_breaks() {
+        let wrapped = wrap_text("first\n\nsecond", 20);
+        assert_eq!(wrapped, vec!["first", "", "second"]);
+    }
+
+    #[test]
+    fn wrap_text_leaves_an_overlong_single_word_unsplit() {
+        let wrapped = wrap_text("https://example.com/very/long/path", 10);
+        assert_eq!(wrapped, vec!["https://example.com/very/long/path"]);
+    }
+
+    #[test]
+    fn wrap_text_with_zero_width_returns_lines_unwrapped() {
+        assert_eq!(wrap_text("a b c", 0), vec!["a b c"]);
     }
 
     #[test]
