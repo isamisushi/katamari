@@ -239,33 +239,147 @@ fn root_markers(language: Language) -> &'static [&'static str] {
     }
 }
 
-/// Walks up from `file`'s directory to the nearest ancestor containing one
-/// of `language`'s root markers, refusing to search past `git_root` — a
-/// workspace root for a file under review is never outside the repository
-/// that file belongs to, even if some unrelated project happens to sit
-/// further up the real filesystem tree. Falls back to `git_root` itself
-/// when no marker is found anywhere in between, rather than `None` — most
-/// language servers work fine pointed at a directory with no project file
-/// (rust-analyzer being the outlier that actually needs `Cargo.toml`, which
-/// is why *its* root marker is checked first and would already have
-/// matched if one existed).
+/// Finds a language server's root in two tiers, both bounded by `git_root`
+/// (a workspace root for a file under review is never outside the
+/// repository that file belongs to, even if some unrelated project happens
+/// to sit further up the real filesystem tree):
+///
+/// 1. **Nearest marker** — walk up from `file`'s directory to the closest
+///    ancestor containing one of `language`'s root markers (as before this
+///    two-tier search existed).
+/// 2. **Topmost workspace marker** — separately walk the same range for a
+///    marker that declares its directory a *monorepo* workspace root (an
+///    ancestor `Cargo.toml` with a `[workspace]` table, a `pnpm-workspace.yaml`
+///    or `package.json` with a `"workspaces"` key, or a `go.work`). If one
+///    exists, it wins over the nearest package-level marker, and if several
+///    exist (nested workspaces), the one closest to `git_root` wins.
+///
+/// The second tier is what makes this monorepo-correct. Tier 1 alone picks
+/// the *nearest* marker, which in a monorepo is almost always a member
+/// package, not the workspace: a Cargo workspace member's own `Cargo.toml`
+/// would win over the workspace root's, so opening `crates/a` and
+/// `crates/b` in the same session spawns two independent rust-analyzers,
+/// each redundantly indexing the whole workspace's dependency graph; every
+/// npm/pnpm package has its own `package.json`, so each gets its own
+/// typescript-language-server and cross-package go-to-definition never
+/// connects. VSCode and rust-analyzer both root at the workspace for
+/// exactly this reason — one server per monorepo, not one per package. When
+/// no workspace-level marker exists anywhere in range, tier 2 finds
+/// nothing and this function's behavior is identical to a plain
+/// nearest-marker walk. Python is deliberately tier-1-only: pyright has no
+/// comparable workspace-of-workspaces concept to key off here.
+///
+/// Falls back to `git_root` itself when neither tier finds anything, rather
+/// than `None` — most language servers work fine pointed at a directory
+/// with no project file (rust-analyzer being the outlier that actually
+/// needs `Cargo.toml`, which is why *its* root marker is checked first and
+/// would already have matched if one existed).
 pub fn workspace_root(file: &Path, git_root: &Path, language: Language) -> PathBuf {
-    let markers = root_markers(language);
-    let Some(mut dir) = file.parent() else {
+    let Some(start) = file.parent() else {
         return git_root.to_path_buf();
     };
+    if let Some(workspace) = topmost_workspace_marker_dir(start, git_root, language) {
+        return workspace;
+    }
+    nearest_marker_dir(start, git_root, language).unwrap_or_else(|| git_root.to_path_buf())
+}
+
+/// Tier 1 of [`workspace_root`]: the closest ancestor of `start` (bounded by
+/// `git_root`) containing one of `language`'s package-level root markers,
+/// or `None` if there isn't one in range.
+fn nearest_marker_dir(start: &Path, git_root: &Path, language: Language) -> Option<PathBuf> {
+    let markers = root_markers(language);
+    let mut dir = start;
     loop {
         if markers.iter().any(|marker| dir.join(marker).is_file()) {
-            return dir.to_path_buf();
+            return Some(dir.to_path_buf());
         }
         if dir == git_root {
-            return git_root.to_path_buf();
+            return None;
         }
         match dir.parent() {
             Some(parent) => dir = parent,
-            None => return git_root.to_path_buf(),
+            None => return None,
         }
     }
+}
+
+/// Tier 2 of [`workspace_root`]: scans every ancestor of `start` up to and
+/// including `git_root` for a workspace-level marker (see
+/// [`is_workspace_root_marker`]), returning the topmost match. Walks the
+/// full range rather than stopping at the first hit — nested workspaces are
+/// rare but not invalid, and "closest to `git_root`" is the one whose
+/// server would actually cover every package underneath it, so a match
+/// found later in the ascent (closer to `git_root`) always overwrites an
+/// earlier, nearer one.
+fn topmost_workspace_marker_dir(
+    start: &Path,
+    git_root: &Path,
+    language: Language,
+) -> Option<PathBuf> {
+    let mut topmost = None;
+    let mut dir = start;
+    loop {
+        if is_workspace_root_marker(dir, language) {
+            topmost = Some(dir.to_path_buf());
+        }
+        if dir == git_root {
+            break;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => break,
+        }
+    }
+    topmost
+}
+
+/// Whether `dir` itself declares a monorepo workspace root for `language`.
+/// Unreadable or unparseable marker files are treated as absent rather than
+/// erroring — a malformed `Cargo.toml`/`package.json` somewhere above the
+/// file being viewed shouldn't break root resolution for it; it just falls
+/// through to tier 1's nearest-marker behavior, same as if the file weren't
+/// there at all.
+fn is_workspace_root_marker(dir: &Path, language: Language) -> bool {
+    match language {
+        Language::Rust => cargo_toml_declares_workspace(&dir.join("Cargo.toml")),
+        Language::TypeScript => {
+            dir.join("pnpm-workspace.yaml").is_file()
+                || package_json_declares_workspaces(&dir.join("package.json"))
+        }
+        Language::Go => dir.join("go.work").is_file(),
+        Language::Python => false,
+    }
+}
+
+/// True if `path` parses as TOML and has a top-level `[workspace]` table —
+/// note this is also true for a workspace root that's simultaneously a
+/// member crate (a root package with `[workspace]` *and* `[package]` in the
+/// same file, a common Cargo layout); that's fine, since such a directory
+/// is correctly both the nearest marker and the workspace marker.
+fn cargo_toml_declares_workspace(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return false;
+    };
+    table.contains_key("workspace")
+}
+
+/// True if `path` parses as JSON and has a top-level `"workspaces"` key —
+/// the npm/yarn/pnpm convention for listing member package globs, checked
+/// only for presence (its value's shape isn't this function's concern).
+fn package_json_declares_workspaces(path: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    value
+        .as_object()
+        .is_some_and(|obj| obj.contains_key("workspaces"))
 }
 
 #[cfg(test)]
@@ -401,6 +515,183 @@ mod tests {
         assert_eq!(
             workspace_root(&file, repo_root, Language::Go),
             repo_root.to_path_buf()
+        );
+    }
+
+    #[test]
+    fn workspace_root_prefers_the_cargo_workspace_root_over_a_members_own_cargo_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+        std::fs::write(
+            repo_root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/a\"]\n",
+        )
+        .unwrap();
+        let crate_dir = repo_root.join("crates").join("a");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        std::fs::write(crate_dir.join("Cargo.toml"), "[package]\nname = \"a\"\n").unwrap();
+        let file = crate_dir.join("src").join("lib.rs");
+        std::fs::write(&file, "").unwrap();
+
+        assert_eq!(
+            workspace_root(&file, repo_root, Language::Rust),
+            repo_root.to_path_buf()
+        );
+    }
+
+    #[test]
+    fn workspace_root_finds_npm_workspaces_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+        std::fs::write(
+            repo_root.join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        let project_dir = repo_root.join("packages").join("web");
+        std::fs::create_dir_all(project_dir.join("src")).unwrap();
+        std::fs::write(project_dir.join("package.json"), "{}").unwrap();
+        std::fs::write(project_dir.join("tsconfig.json"), "{}").unwrap();
+        let file = project_dir.join("src").join("index.ts");
+        std::fs::write(&file, "").unwrap();
+
+        assert_eq!(
+            workspace_root(&file, repo_root, Language::TypeScript),
+            repo_root.to_path_buf()
+        );
+    }
+
+    #[test]
+    fn workspace_root_finds_pnpm_workspace_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+        std::fs::write(
+            repo_root.join("pnpm-workspace.yaml"),
+            "packages:\n  - packages/*\n",
+        )
+        .unwrap();
+        let project_dir = repo_root.join("packages").join("web");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join("package.json"), "{}").unwrap();
+        let file = project_dir.join("index.ts");
+        std::fs::write(&file, "").unwrap();
+
+        assert_eq!(
+            workspace_root(&file, repo_root, Language::TypeScript),
+            repo_root.to_path_buf()
+        );
+    }
+
+    #[test]
+    fn workspace_root_does_not_mistake_a_plain_package_json_for_a_workspace_root() {
+        // A `package.json` at the repo root with no `"workspaces"` key isn't
+        // a workspace marker — the nearest marker (the nested project's own
+        // `tsconfig.json`) must still win, same as before this feature
+        // existed. This guards against a false-positive that would collapse
+        // every independent TS project sharing a git repo into one server.
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+        std::fs::write(
+            repo_root.join("package.json"),
+            r#"{"name":"monorepo-tools"}"#,
+        )
+        .unwrap();
+        let project_dir = repo_root.join("packages").join("web");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join("tsconfig.json"), "{}").unwrap();
+        let file = project_dir.join("index.ts");
+        std::fs::write(&file, "").unwrap();
+
+        assert_eq!(
+            workspace_root(&file, repo_root, Language::TypeScript),
+            project_dir
+        );
+    }
+
+    #[test]
+    fn workspace_root_finds_go_work_root_over_a_nested_go_mod() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+        std::fs::write(repo_root.join("go.work"), "go 1.22\n\nuse ./services/api\n").unwrap();
+        let service_dir = repo_root.join("services").join("api");
+        std::fs::create_dir_all(&service_dir).unwrap();
+        std::fs::write(service_dir.join("go.mod"), "module api\n").unwrap();
+        let file = service_dir.join("main.go");
+        std::fs::write(&file, "").unwrap();
+
+        assert_eq!(
+            workspace_root(&file, repo_root, Language::Go),
+            repo_root.to_path_buf()
+        );
+    }
+
+    #[test]
+    fn workspace_root_picks_the_topmost_workspace_marker_when_nested() {
+        // An outer Cargo workspace containing an inner one (unusual, but not
+        // invalid) — the server covering the whole monorepo should win, not
+        // the inner sub-workspace.
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+        std::fs::write(
+            repo_root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"nested\"]\n",
+        )
+        .unwrap();
+        let nested_root = repo_root.join("nested");
+        std::fs::create_dir_all(nested_root.join("crates").join("b").join("src")).unwrap();
+        std::fs::write(
+            nested_root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/b\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            nested_root.join("crates").join("b").join("Cargo.toml"),
+            "[package]\n",
+        )
+        .unwrap();
+        let file = nested_root
+            .join("crates")
+            .join("b")
+            .join("src")
+            .join("lib.rs");
+        std::fs::write(&file, "").unwrap();
+
+        assert_eq!(
+            workspace_root(&file, repo_root, Language::Rust),
+            repo_root.to_path_buf()
+        );
+    }
+
+    #[test]
+    fn workspace_root_treats_a_malformed_cargo_toml_ancestor_as_non_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+        // Not valid TOML at all — must be skipped, not panic, falling
+        // through to the nearest marker (the crate's own `Cargo.toml`).
+        std::fs::write(repo_root.join("Cargo.toml"), "this is not valid { toml").unwrap();
+        let crate_dir = repo_root.join("crates").join("a");
+        std::fs::create_dir_all(crate_dir.join("src")).unwrap();
+        std::fs::write(crate_dir.join("Cargo.toml"), "[package]\n").unwrap();
+        let file = crate_dir.join("src").join("lib.rs");
+        std::fs::write(&file, "").unwrap();
+
+        assert_eq!(workspace_root(&file, repo_root, Language::Rust), crate_dir);
+    }
+
+    #[test]
+    fn workspace_root_treats_a_malformed_package_json_ancestor_as_non_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+        std::fs::write(repo_root.join("package.json"), "{not valid json").unwrap();
+        let project_dir = repo_root.join("packages").join("web");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join("tsconfig.json"), "{}").unwrap();
+        let file = project_dir.join("index.ts");
+        std::fs::write(&file, "").unwrap();
+
+        assert_eq!(
+            workspace_root(&file, repo_root, Language::TypeScript),
+            project_dir
         );
     }
 

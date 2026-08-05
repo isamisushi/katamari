@@ -19,7 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long a single hover round-trip is allowed to take before this
 /// manager gives up on it and reports a timeout — long enough to cover a
@@ -42,6 +42,16 @@ const MAX_QUEUED_PER_SERVER: usize = 4;
 /// How many files [`LspManager::warm_up`] will proactively `didOpen` for a
 /// single call — see that method's docs for why this exists at all.
 const WARM_UP_CAP: usize = 20;
+
+/// Hard cap on how many servers this session keeps `Ready` at once.
+/// Workspace-level root selection (see [`adapter::workspace_root`])
+/// collapses most of the duplication that used to drive this number up — a
+/// 20-crate Cargo workspace now spawns one rust-analyzer, not 20 — so this
+/// exists purely as a memory safety net for the layouts that still fan out
+/// wide (many independent single-package repos worth of languages reviewed
+/// in one session, say). Hitting it in practice means an unusual repo
+/// layout, not a bug; see [`evict_lru_if_at_capacity`].
+const MAX_LIVE_SERVERS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerState {
@@ -137,6 +147,13 @@ struct ServerEntry {
     /// place that version counter lives, so a resync can never reuse or
     /// skip a number.
     versions: HashMap<PathBuf, i32>,
+    /// When this server last had a request dispatched to it (see
+    /// [`dispatch`]) — the input to [`evict_lru_if_at_capacity`]'s
+    /// least-recently-used eviction policy once [`MAX_LIVE_SERVERS`] is
+    /// reached. Set at entry creation too, so a server that's still
+    /// `Starting` (never yet dispatched anything) has a well-defined, if
+    /// stale-looking, timestamp rather than needing an `Option`.
+    last_touched: Instant,
 }
 
 impl ServerEntry {
@@ -146,6 +163,7 @@ impl ServerEntry {
             client: None,
             queue: VecDeque::new(),
             versions: HashMap::new(),
+            last_touched: Instant::now(),
         }
     }
 }
@@ -492,6 +510,13 @@ impl LspManager {
         std::thread::spawn(move || {
             let (language, workspace_root) = key.clone();
 
+            // Off the caller of `hover`/`definition`/`references`, which
+            // must return immediately — eviction can block for as long as
+            // `Client::shutdown`'s grace period, and this spawn thread is
+            // the only place already expected to do slow, blocking work
+            // before a new server is usable.
+            evict_lru_if_at_capacity(&servers, &key);
+
             let mut command = match adapter::resolve_server(language, &workspace_root, &overrides) {
                 Ok(command) => command,
                 Err(unavailable) => {
@@ -613,6 +638,68 @@ fn fail_entry(
     }
 }
 
+/// If [`MAX_LIVE_SERVERS`] servers other than `new_key` are already
+/// `Ready`, shuts down and resets to [`ServerState::NotStarted`] whichever
+/// one was least recently touched (see [`select_lru_victim`]), freeing a
+/// slot for `new_key`. A no-op otherwise. Called from [`LspManager::spawn_server`]'s
+/// own thread, before it does the actual (slow, network- and
+/// process-bound) work of resolving and starting `new_key`'s server — see
+/// that call site for why it must not run on `submit`'s caller.
+///
+/// Only `Ready` servers are eviction candidates. A `Starting` one has no
+/// `Client` yet for this function to shut down, and forcing its state back
+/// to `NotStarted` here would just race its own in-flight spawn thread —
+/// which knows nothing about this eviction and will call [`mark_ready`] on
+/// it regardless, silently undoing the eviction once that thread catches
+/// up. Leaving `Starting` entries alone means capacity can transiently
+/// exceed `MAX_LIVE_SERVERS` by however many servers are mid-start at once
+/// — acceptable for a safety net sized generously above normal usage.
+fn evict_lru_if_at_capacity(
+    servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
+    new_key: &ServerKey,
+) {
+    let victim_key = {
+        let guard = servers.lock().unwrap_or_else(|e| e.into_inner());
+        let ready: Vec<(&ServerKey, &Instant)> = guard
+            .iter()
+            .filter(|(k, e)| *k != new_key && e.state == ServerState::Ready)
+            .map(|(k, e)| (k, &e.last_touched))
+            .collect();
+        if ready.len() < MAX_LIVE_SERVERS {
+            None
+        } else {
+            select_lru_victim(ready).cloned()
+        }
+    };
+    let Some(victim_key) = victim_key else {
+        return;
+    };
+    let client = {
+        let mut guard = servers.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get_mut(&victim_key).and_then(|entry| {
+            entry.state = ServerState::NotStarted;
+            entry.client.take()
+        })
+    };
+    if let Some(client) = client {
+        client.shutdown();
+    }
+}
+
+/// Picks the least-recently-used server among `candidates` — the one whose
+/// `last_touched` is oldest. Pure over `(key, last_touched)` pairs rather
+/// than `&ServerEntry`/the manager's `Mutex`-guarded map, so the eviction
+/// *policy* is unit-testable on its own, with no `Client`, spawned process,
+/// or lock in the picture (see the tests below).
+fn select_lru_victim<'a>(
+    candidates: impl IntoIterator<Item = (&'a ServerKey, &'a Instant)>,
+) -> Option<&'a ServerKey> {
+    candidates
+        .into_iter()
+        .min_by_key(|(_, touched)| **touched)
+        .map(|(key, _)| key)
+}
+
 /// Marks `key`'s entry `Ready` and hands back whatever accumulated in its
 /// queue while it was starting, for the caller to dispatch now that a
 /// client exists.
@@ -661,12 +748,9 @@ fn dispatch(
 
         let needs_open = {
             let mut servers = servers.lock().unwrap_or_else(|e| e.into_inner());
-            servers
-                .entry(key.clone())
-                .or_insert_with(ServerEntry::new)
-                .versions
-                .insert(request.file.clone(), 1)
-                .is_none()
+            let entry = servers.entry(key.clone()).or_insert_with(ServerEntry::new);
+            entry.last_touched = Instant::now();
+            entry.versions.insert(request.file.clone(), 1).is_none()
         };
         if needs_open {
             let language_id = adapter::lsp_language_id(key.0, &request.file);
@@ -767,5 +851,43 @@ mod tests {
             .map(|_| bump_version(&mut versions, Path::new("/repo/a.rs")).unwrap())
             .collect();
         assert_eq!(seen, vec![2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn select_lru_victim_picks_the_least_recently_touched_server() {
+        let now = Instant::now();
+        let a = (Language::Rust, PathBuf::from("/repo/a"));
+        let b = (Language::TypeScript, PathBuf::from("/repo/b"));
+        let c = (Language::Go, PathBuf::from("/repo/c"));
+        // `a` touched longest ago, `c` most recently — `a` should be picked
+        // regardless of map iteration order, which is why the candidates
+        // below are deliberately not given in oldest-to-newest order.
+        let a_touched = now;
+        let b_touched = now + Duration::from_secs(30);
+        let c_touched = now + Duration::from_secs(60);
+        let candidates = [(&b, &b_touched), (&c, &c_touched), (&a, &a_touched)];
+
+        assert_eq!(select_lru_victim(candidates), Some(&a));
+    }
+
+    #[test]
+    fn select_lru_victim_is_none_with_no_candidates() {
+        let candidates: Vec<(&ServerKey, &Instant)> = Vec::new();
+        assert_eq!(select_lru_victim(candidates), None);
+    }
+
+    #[test]
+    fn select_lru_victim_is_indifferent_to_which_server_is_asked_about() {
+        // A server is "least recently used" purely by comparing
+        // `last_touched` across candidates — its language or workspace root
+        // plays no role in the ordering.
+        let now = Instant::now();
+        let older = (Language::Python, PathBuf::from("/repo/py"));
+        let newer = (Language::Python, PathBuf::from("/repo/py2"));
+        let older_touched = now;
+        let newer_touched = now + Duration::from_millis(1);
+        let candidates = [(&newer, &newer_touched), (&older, &older_touched)];
+
+        assert_eq!(select_lru_victim(candidates), Some(&older));
     }
 }
