@@ -170,13 +170,22 @@ impl WarmUpSummary {
 pub struct LspManager {
     events_tx: Sender<ServerEvent>,
     servers: Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
+    /// Config's `[lsp.servers.<lang>]` overrides — see
+    /// [`adapter::resolve_server`]'s docs. Shared via `Arc` rather than
+    /// cloned per spawn, since it's read-only for this manager's whole
+    /// lifetime and every `spawn_server` thread needs its own handle.
+    overrides: Arc<HashMap<String, crate::config::ServerOverride>>,
 }
 
 impl LspManager {
-    pub fn new(events_tx: Sender<ServerEvent>) -> Self {
+    pub fn new(
+        events_tx: Sender<ServerEvent>,
+        overrides: Arc<HashMap<String, crate::config::ServerOverride>>,
+    ) -> Self {
         Self {
             events_tx,
             servers: Arc::new(Mutex::new(HashMap::new())),
+            overrides,
         }
     }
 
@@ -478,11 +487,12 @@ impl LspManager {
     fn spawn_server(&self, key: ServerKey) {
         let servers = Arc::clone(&self.servers);
         let events_tx = self.events_tx.clone();
+        let overrides = Arc::clone(&self.overrides);
 
         std::thread::spawn(move || {
             let (language, workspace_root) = key.clone();
 
-            let mut command = match adapter::resolve_server(language, &workspace_root) {
+            let mut command = match adapter::resolve_server(language, &workspace_root, &overrides) {
                 Ok(command) => command,
                 Err(unavailable) => {
                     fail_entry(

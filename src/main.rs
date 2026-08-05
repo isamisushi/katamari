@@ -1,4 +1,7 @@
+#[cfg(test)]
+mod cjk_regression;
 mod comments;
+mod config;
 mod diff;
 mod highlight;
 mod keymap;
@@ -63,6 +66,17 @@ enum Command {
         /// refresh against the way the working tree does.
         #[arg(long)]
         watch: bool,
+        /// Renders this many frames of the diff pane offscreen (a
+        /// `ratatui::backend::TestBackend`, no real terminal involved) and
+        /// prints timing, then exits — a headless way to measure
+        /// `ui::diff_view`'s rendering cost, most usefully against a very
+        /// large synthetic diff, without a human watching a real session.
+        /// Reports the first frame's time (a cold highlight cache) and the
+        /// steady-state average over every frame after it (memoized —see
+        /// `highlight::LineHighlighter`'s cache) separately, since those two
+        /// numbers are the whole point of measuring this at all.
+        #[arg(long, hide = true, value_name = "N")]
+        bench_render: Option<usize>,
     },
     /// Open a single file in a read-only, syntax-highlighted viewer.
     Open {
@@ -252,6 +266,7 @@ fn main() -> Result<()> {
         staged: false,
         range: None,
         watch: false,
+        bench_render: None,
     }) {
         Command::Diff {
             dump,
@@ -259,7 +274,8 @@ fn main() -> Result<()> {
             staged,
             range,
             watch,
-        } => run_diff(dump, layout, staged, range, watch),
+            bench_render,
+        } => run_diff(dump, layout, staged, range, watch, bench_render),
         Command::Open { file } => run_open(file),
         Command::Timeline { dump, op, snapshot } => run_timeline(dump, op, snapshot),
         Command::LspCheck {
@@ -286,6 +302,7 @@ fn run_diff(
     staged: bool,
     range: Option<String>,
     watch: bool,
+    bench_render: Option<usize>,
 ) -> Result<()> {
     if watch && (staged || range.is_some()) {
         bail!(
@@ -296,6 +313,8 @@ fn run_diff(
     let cwd = std::env::current_dir()?;
     let source = GitSource::discover(&cwd)?;
     let repo_root = source.repo_root()?;
+    let config = config::load_merged(&repo_root);
+    config::install(&config);
 
     let diff_text = match (staged, range.as_deref()) {
         (true, Some(_)) => bail!("--staged cannot be combined with a revision range"),
@@ -330,10 +349,85 @@ fn run_diff(
 
     let mut app = App::new(repo_name, repo_root, files);
     app.layout = layout.into();
+
+    if let Some(frames) = bench_render {
+        return run_bench_render(app, frames);
+    }
+
     let mut stack = ViewStack::new(View::Diff(app));
     let pre_refresh_hook: Option<Box<dyn ui::PreRefreshHook>> =
         watch.then(|| Box::new(ui::NoopPreRefreshHook) as Box<dyn ui::PreRefreshHook>);
-    ui::run(&mut stack, pre_refresh_hook)
+    ui::run(&mut stack, pre_refresh_hook, &config)
+}
+
+/// `ktmr diff --bench-render N` — see that flag's doc comment on `Command::Diff`.
+/// Renders `app`'s diff pane `frames` times into an offscreen
+/// `ratatui::backend::TestBackend` (120x40, a representative terminal size —
+/// no real terminal or event loop involved) and prints the first frame's
+/// time separately from the steady-state average over the rest, so a
+/// synthetic large-diff benchmark shows `highlight::LineHighlighter`'s
+/// per-line memoization actually paying off frame-over-frame, not just a
+/// single aggregate number that would hide it.
+fn run_bench_render(app: App, frames: usize) -> Result<()> {
+    use crate::comments::CommentIndex;
+    use crate::highlight::LineHighlighter;
+    use crate::lsp::DiagnosticsStore;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use std::time::Duration;
+
+    if frames == 0 {
+        bail!("--bench-render needs at least 1 frame");
+    }
+
+    const WIDTH: u16 = 120;
+    const HEIGHT: u16 = 40;
+    let backend = TestBackend::new(WIDTH, HEIGHT);
+    let mut terminal = Terminal::new(backend)?;
+    let mut highlighter = LineHighlighter::new();
+    let diagnostics = DiagnosticsStore::new();
+    let comments = CommentIndex::default();
+    let layout = ui::diff_view::effective_layout(app.layout, WIDTH);
+
+    let mut first_frame = Duration::ZERO;
+    let mut rest_total = Duration::ZERO;
+    for i in 0..frames {
+        let started = std::time::Instant::now();
+        terminal.draw(|frame| {
+            ui::diff_view::render(
+                frame,
+                frame.area(),
+                &app,
+                &mut highlighter,
+                layout,
+                &diagnostics,
+                &comments,
+            );
+        })?;
+        let elapsed = started.elapsed();
+        if i == 0 {
+            first_frame = elapsed;
+        } else {
+            rest_total += elapsed;
+        }
+    }
+
+    println!(
+        "bench-render: {frames} frame(s), {WIDTH}x{HEIGHT} pane, {} diff rows",
+        app.rows.len()
+    );
+    println!(
+        "  first frame  (cold highlight cache): {:.3} ms",
+        first_frame.as_secs_f64() * 1000.0
+    );
+    if frames > 1 {
+        let steady_avg_ms = rest_total.as_secs_f64() * 1000.0 / (frames - 1) as f64;
+        println!(
+            "  steady state (memoized, avg of {} frames): {steady_avg_ms:.3} ms/frame",
+            frames - 1
+        );
+    }
+    Ok(())
 }
 
 fn run_open(file: PathBuf) -> Result<()> {
@@ -359,9 +453,12 @@ fn run_open(file: PathBuf) -> Result<()> {
                 .to_path_buf()
         });
 
+    let config = config::load_merged(&git_root);
+    config::install(&config);
+
     let view = FileView::with_hover_target(display_path, &source, Some((absolute_file, git_root)));
     let mut stack = ViewStack::new(View::File(view));
-    ui::run(&mut stack, None)
+    ui::run(&mut stack, None, &config)
 }
 
 /// Resolves the jj repository for the current directory, the same way
@@ -409,9 +506,12 @@ fn run_timeline(dump: bool, op: Option<String>, snapshot: bool) -> Result<()> {
         return run_timeline_dump(&jj_repo, op);
     }
 
+    let config = config::load_merged(jj_repo.repo_root());
+    config::install(&config);
+
     let timeline = TimelineView::new(jj_repo, ui::timeline_view::DEFAULT_OP_LOG_LIMIT)?;
     let mut stack = ViewStack::new(View::Timeline(timeline));
-    ui::run(&mut stack, None)
+    ui::run(&mut stack, None, &config)
 }
 
 /// Prints the snapshot list (`op_id  unix_time  description`, one per
@@ -505,7 +605,10 @@ fn run_lsp_check(
     println!();
 
     let (events_tx, events_rx) = std::sync::mpsc::channel();
-    let manager = lsp::LspManager::new(events_tx);
+    // `lsp-check` is a headless smoke test for the `lsp` module itself
+    // (see this command's doc comment) — it has no config file to load, so
+    // it always resolves servers the built-in way, with no overrides.
+    let manager = lsp::LspManager::new(events_tx, std::sync::Arc::new(HashMap::new()));
 
     let line0 = line.saturating_sub(1);
     let col0 = col.saturating_sub(1);
@@ -559,7 +662,8 @@ fn run_watch_check(dir: PathBuf, flushes: usize, timeout_secs: u64) -> Result<()
     println!("watching: {}", repo_root.display());
 
     let (tx, rx) = std::sync::mpsc::channel();
-    watch::spawn(repo_root, tx).map_err(|e| anyhow::anyhow!("failed to start watcher: {e}"))?;
+    watch::spawn(repo_root, tx, watch::DEBOUNCE_QUIET)
+        .map_err(|e| anyhow::anyhow!("failed to start watcher: {e}"))?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut seen = 0usize;

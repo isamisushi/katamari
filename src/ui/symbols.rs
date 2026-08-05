@@ -10,8 +10,9 @@
 //! only needs to be a good enough guess at "where would a person's eye land
 //! for a symbol."
 
+use crate::config;
+use crate::ui::text::tab_aware_width;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 /// One identifier-like token's span, in the same display-column coordinate
 /// space [`crate::diff::ColumnMap`] uses — `[display_start, display_end)`.
@@ -21,11 +22,26 @@ pub struct Symbol {
     pub display_end: usize,
 }
 
-/// Scans `line` for maximal runs of word graphemes, in left-to-right order.
-/// A grapheme cluster counts as part of a word if its *first* codepoint is
+/// Scans `line` (raw, unexpanded source text — as [`crate::diff::ColumnMap`]
+/// also consumes it) for maximal runs of word graphemes, in left-to-right
+/// order, using the configured `[ui] tab_width` (see [`config::tab_width`])
+/// to advance the display column across any literal tab the same way
+/// `ColumnMap` and `ui::text::expand_tabs_in_spans` do — see
+/// [`scan_with_tab_width`] for the explicit-width entry point tests use. A
+/// grapheme cluster counts as part of a word if its *first* codepoint is
 /// alphanumeric or `_`; combining marks attached to a word character stay
-/// part of that word regardless of their own category.
+/// part of that word regardless of their own category. A tab is never a
+/// word character, so this only affects *where* a symbol after it starts,
+/// not word boundaries themselves.
 pub fn scan(line: &str) -> Vec<Symbol> {
+    scan_with_tab_width(line, config::tab_width())
+}
+
+/// As [`scan`], with an explicit `tab_width` rather than reading the
+/// installed [`Config`](crate::config::Config)'s — what this module's own
+/// tab-stop tests use to stay independent of whatever a given test binary
+/// run happens to have installed.
+pub fn scan_with_tab_width(line: &str, tab_width: usize) -> Vec<Symbol> {
     let mut symbols = Vec::new();
     let mut current_start: Option<usize> = None;
     let mut display_col = 0usize;
@@ -43,7 +59,7 @@ pub fn scan(line: &str) -> Vec<Symbol> {
                 display_end: display_col,
             });
         }
-        display_col += grapheme.width();
+        display_col += tab_aware_width(grapheme, display_col, tab_width);
     }
     if let Some(start) = current_start.take() {
         symbols.push(Symbol {
@@ -124,6 +140,21 @@ mod tests {
                 display_start: 7,
                 display_end: 9
             })
+        );
+    }
+
+    #[test]
+    fn a_symbol_after_a_leading_tab_starts_at_the_tab_stop_not_column_one() {
+        // Tab width 4: the tab (col 0) expands to width 4, so "x" starts at
+        // display column 4 — matching `ColumnMap`'s tab-aware rule, not the
+        // pre-M7 "a tab is one column" behavior.
+        let symbols = scan_with_tab_width("\tx", 4);
+        assert_eq!(
+            symbols,
+            vec![Symbol {
+                display_start: 4,
+                display_end: 5
+            }]
         );
     }
 }

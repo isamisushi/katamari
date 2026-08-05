@@ -8,13 +8,13 @@ use crate::diff::{
     DiffFile, DiffLineKind, DiffRow, RenderRow, SideBySideRow, SideCell, lsp_target,
     side_by_side_scroll_start,
 };
-use crate::highlight::{Language, LineHighlighter};
+use crate::highlight::{HighlightKind, Language, LineHighlighter, Span as HlSpan};
 use crate::lsp::DiagnosticsStore;
 use crate::ui::app::{App, Layout};
 use crate::ui::symbols;
 use crate::ui::text::{
-    display_width, highlight_color, mark_range, truncate_spans_to_width, truncate_to_width,
-    wrap_text,
+    display_width, expand_tabs_in_spans, highlight_color, mark_range, truncate_spans_to_width,
+    truncate_to_width, wrap_text,
 };
 use lsp_types::DiagnosticSeverity;
 use ratatui::Frame;
@@ -439,8 +439,13 @@ fn file_header_line(app: &App, file_idx: usize, width: usize, is_cursor: bool) -
     } else {
         ""
     };
+    let highlight_note = if file.skip_highlighting(crate::config::highlight_max_lines()) {
+        "  \u{00b7} highlight off (large file)"
+    } else {
+        ""
+    };
     let text = format!(
-        "{}{status} (+{added} -{deleted})",
+        "{}{status} (+{added} -{deleted}){highlight_note}",
         truncate_to_width(file.display_path(), width.saturating_sub(20))
     );
     let style = cursor_style(
@@ -520,8 +525,23 @@ fn content_line(
         + display_width(comment_span.content.as_ref());
     let content_width = width.saturating_sub(gutter_width);
 
-    let language = Language::detect(file.display_path());
-    let spans = highlighter.highlight_line(language, &row.text);
+    let spans = if file.skip_highlighting(crate::config::highlight_max_lines()) {
+        // Large/lockfile-ish files skip tree-sitter entirely (see
+        // `DiffFile::skip_highlighting`'s docs) — a single unhighlighted
+        // span rendered in the theme's plain color, exactly like
+        // `LineHighlighter`'s own fallback for a parse failure. The file
+        // header (see `file_header_line`) carries the "highlight off"
+        // status note; nothing about a single content row needs to repeat
+        // it.
+        vec![HlSpan {
+            text: row.text.clone(),
+            kind: HighlightKind::Plain,
+        }]
+    } else {
+        let language = Language::detect(file.display_path());
+        highlighter.highlight_line(language, &row.text)
+    };
+    let spans = expand_tabs_in_spans(spans, crate::config::tab_width());
     let spans = truncate_spans_to_width(&spans, content_width);
 
     let mut content_spans: Vec<Span<'static>> = spans

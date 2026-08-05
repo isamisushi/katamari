@@ -14,22 +14,26 @@
 //! column can never land "inside" a grapheme the way it could land inside a
 //! `char`'s byte encoding.
 //!
-//! Width accounting deliberately mirrors [`crate::ui::text::truncate_to_width`]
-//! exactly rather than inventing its own rule: both walk `line.graphemes(true)`
-//! and size each cluster with `UnicodeWidthStr::width`. That includes how
-//! `unicode-width` 0.2 treats control characters — a tab has display width 1
-//! there, *not* an expansion to the next 4-column stop, because
-//! `ui::diff_view` never special-cases `\t` before handing text to ratatui.
-//! An earlier plan note assumed tab-stop expansion; this module matches the
-//! renderer as it actually behaves instead, since a `ColumnMap` that
-//! disagreed with what's on screen would defeat its own purpose. See the
-//! module-level test `tab_is_one_display_column_like_diff_view_renders_it`
-//! for the empirical check this claim rests on.
+//! Width accounting deliberately mirrors [`crate::ui::text::tab_aware_width`]
+//! exactly rather than inventing its own rule: both walk graphemes in order,
+//! sizing each with [`UnicodeWidthStr::width`] — *except* a literal tab,
+//! which expands to the distance to the next `tab_width`-column stop (the
+//! configured `[ui] tab_width`, default 4 — see `crate::config`), matching
+//! what `ui::text::expand_tabs_in_spans` rewrites that same tab into before
+//! it reaches the terminal. Both must agree on where a tab lands: this
+//! module's display columns are what an LSP request's byte/UTF-16 offset
+//! gets converted to/from (via [`Self::display_to_utf8`]/
+//! [`Self::display_to_utf16`] and their inverses), so a mismatch here would
+//! send a server a column that doesn't match where the cursor visually sits
+//! on a line containing a tab. See the module-level
+//! `tab_expands_to_the_next_stop_and_agrees_with_ui_text` test for the
+//! empirical check this claim rests on.
 
+use crate::config;
 use crate::diff::model::{DiffFile, DiffLineKind, DiffRow};
+use crate::ui::text::tab_aware_width;
 use std::path::PathBuf;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 /// One grapheme cluster's position in all three coordinate systems. `_len`
 /// fields (not `_end`) because that's what every caller actually wants —
@@ -58,12 +62,20 @@ pub struct ColumnMap {
 }
 
 impl ColumnMap {
+    /// Builds a `ColumnMap` using the configured `[ui] tab_width` (see
+    /// `crate::config::tab_width`) — every production call site's entry
+    /// point. Tests that want to pin an exact tab width regardless of what
+    /// happens to be configured use [`Self::with_tab_width`] directly.
     pub fn new(line_text: &str) -> Self {
+        Self::with_tab_width(line_text, config::tab_width())
+    }
+
+    pub fn with_tab_width(line_text: &str, tab_width: usize) -> Self {
         let mut segments = Vec::new();
         let (mut display_pos, mut utf8_pos, mut utf16_pos) = (0usize, 0usize, 0usize);
 
         for grapheme in line_text.graphemes(true) {
-            let display_width = grapheme.width();
+            let display_width = tab_aware_width(grapheme, display_pos, tab_width);
             let utf8_len = grapheme.len();
             let utf16_len: usize = grapheme.chars().map(char::len_utf16).sum();
 
@@ -283,25 +295,56 @@ mod tests {
         assert_eq!(map.utf8_to_display(eq_utf8), 9);
     }
 
-    /// Empirical backing for this module's doc comment: `ui::text` never
-    /// special-cases `\t`, so `unicode-width` 0.2's default width for it (1
-    /// column, not an expansion to a 4-column stop) is what actually ends up
-    /// on screen. `ColumnMap` must agree with that, not with a nicer rule
-    /// the renderer doesn't implement.
+    /// Empirical backing for this module's doc comment: a tab expands to
+    /// the next `tab_width`-column stop, and `ColumnMap`'s display columns
+    /// (used for `display_to_utf8`/`display_to_utf16`, i.e. what an LSP
+    /// request's position is built from) must agree with what
+    /// `ui::text::expand_tabs_in_spans` actually draws for the same line —
+    /// see `ui::text`'s own
+    /// `expand_tabs_in_spans_matches_the_display_width_a_tab_aware_line_would_report`
+    /// test for the other half of this equivalence.
     #[test]
-    fn tab_is_one_display_column_like_diff_view_renders_it() {
-        use crate::ui::text::display_width;
-        assert_eq!(
-            display_width("\t"),
-            1,
-            "ui::text must still not expand tabs for this test's premise to hold"
-        );
+    fn tab_expands_to_the_next_stop_and_agrees_with_ui_text() {
+        use crate::highlight::{HighlightKind, Span as HlSpan};
+        use crate::ui::text::{display_width, expand_tabs_in_spans};
 
-        let map = ColumnMap::new("a\tb");
-        assert_eq!(map.display_len(), 3);
-        assert_eq!(map.display_to_utf8(1), 1); // the tab itself
-        assert_eq!(map.display_to_utf8(2), 2); // 'b', immediately after
-        assert_eq!(map.utf8_to_display(2), 2);
+        // "a\tb" with tab width 4: 'a' at display col 0 (width 1), the tab
+        // at col 1 expands to width 3 (reaching col 4), 'b' at col 4.
+        let map = ColumnMap::with_tab_width("a\tb", 4);
+        assert_eq!(map.display_len(), 5);
+        assert_eq!(map.display_to_utf8(0), 0); // 'a'
+        assert_eq!(map.display_to_utf8(1), 1); // the tab itself, still one byte
+        assert_eq!(map.display_to_utf8(4), 2); // 'b', immediately after the tab's 3-column span
+        assert_eq!(map.utf8_to_display(2), 4);
+        // A display column mid-tab (2 or 3) snaps back to the tab's own
+        // start, the same "no half a character" rule wide CJK characters
+        // already follow.
+        assert_eq!(map.display_to_utf8(2), 1);
+        assert_eq!(map.display_to_utf8(3), 1);
+
+        // The equivalence this whole design rests on: expanding the same
+        // raw text via `ui::text::expand_tabs_in_spans` and measuring with
+        // plain `display_width` reports the identical total width
+        // `ColumnMap`'s tab-aware rule computed directly.
+        let expanded = expand_tabs_in_spans(
+            vec![HlSpan {
+                text: "a\tb".to_owned(),
+                kind: HighlightKind::Plain,
+            }],
+            4,
+        );
+        let rendered: String = expanded.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(display_width(&rendered), map.display_len());
+    }
+
+    #[test]
+    fn tab_sitting_exactly_on_a_stop_still_advances_a_full_stop() {
+        // Tab width 4, four leading spaces already at columns 0-3 (col 4 is
+        // itself a stop) — the tab must still advance to column 8, not stay
+        // at 4, matching `tab_aware_width`'s "minimum one full stop" rule.
+        let map = ColumnMap::with_tab_width("    \tx", 4);
+        assert_eq!(map.display_len(), 9); // 4 spaces + 4-wide tab + 'x'
+        assert_eq!(map.display_to_utf8(8), 5); // 'x', right after the tab
     }
 
     #[test]

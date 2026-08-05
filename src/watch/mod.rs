@@ -76,9 +76,16 @@ pub enum WatchSignal {
 /// initialized — rather than only via a batch that silently never arrives;
 /// the debounce loop itself then runs on its own thread for the rest of the
 /// session.
-pub fn spawn(repo_root: PathBuf, tx: Sender<WatchSignal>) -> notify::Result<()> {
+/// `quiet` is the trailing-edge debounce window (config's `[watch]
+/// debounce_ms`, default [`DEBOUNCE_QUIET`]) — how long a burst of changes
+/// must go silent before it flushes. [`DEBOUNCE_MAX_LATENCY`]'s backstop is
+/// not configurable: it exists to bound worst-case staleness under a
+/// continuous stream of writes, a concern orthogonal to how snappy an
+/// ordinary quiet-period flush feels, which is the only thing `quiet`
+/// tunes.
+pub fn spawn(repo_root: PathBuf, tx: Sender<WatchSignal>, quiet: Duration) -> notify::Result<()> {
     let session = WatchSession::start(repo_root)?;
-    std::thread::spawn(move || session.run(tx));
+    std::thread::spawn(move || session.run(tx, quiet));
     Ok(())
 }
 
@@ -115,9 +122,9 @@ impl WatchSession {
     /// died, which nothing currently recovers from — a watch session that
     /// silently stopped noticing changes would be worse than one that's
     /// visibly gone).
-    fn run(self, tx: Sender<WatchSignal>) {
+    fn run(self, tx: Sender<WatchSignal>, quiet: Duration) {
         let start = Instant::now();
-        let mut debounce = Debounce::new(DEBOUNCE_QUIET, DEBOUNCE_MAX_LATENCY);
+        let mut debounce = Debounce::new(quiet, DEBOUNCE_MAX_LATENCY);
 
         loop {
             match self.notify_rx.recv_timeout(POLL_TICK) {

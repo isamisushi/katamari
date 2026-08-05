@@ -119,23 +119,36 @@ impl KeyChord {
     }
 
     /// Parses one whitespace-delimited token of key-sequence notation:
-    /// `C-d` for Ctrl-d, `]` or `g` for a plain char, or a named key like
-    /// `Esc`/`Enter`/`Tab`.
-    fn parse_token(token: &str) -> Self {
+    /// `C-d` for Ctrl-d, `M-x` for Alt/Meta-x (the emacs preset's prefix
+    /// keys — see [`emacs_preset`]), `]` or `g` for a plain char, or a named
+    /// key like `Esc`/`Enter`/`Tab`/`Space`. Returns a plain `Err` naming the
+    /// bad token rather than panicking — [`KeySeq::parse`] (the built-in
+    /// presets' trusted, fixed notation) turns that into a panic itself;
+    /// config's `[keys]` overrides (user-supplied notation) surface it as a
+    /// normal startup error instead, via [`KeySeq::try_parse`].
+    fn try_parse_token(token: &str) -> Result<Self, String> {
         if let Some(rest) = token.strip_prefix("C-") {
-            let code = Self::parse_key_name(rest);
-            return Self::new(code, KeyModifiers::CONTROL);
+            let code = Self::try_parse_key_name(rest)?;
+            return Ok(Self::new(code, KeyModifiers::CONTROL));
         }
-        Self::new(Self::parse_key_name(token), KeyModifiers::NONE)
+        if let Some(rest) = token.strip_prefix("M-") {
+            let code = Self::try_parse_key_name(rest)?;
+            return Ok(Self::new(code, KeyModifiers::ALT));
+        }
+        Ok(Self::new(
+            Self::try_parse_key_name(token)?,
+            KeyModifiers::NONE,
+        ))
     }
 
-    fn parse_key_name(name: &str) -> KeyCode {
-        match name {
+    fn try_parse_key_name(name: &str) -> Result<KeyCode, String> {
+        Ok(match name {
             "Esc" => KeyCode::Esc,
             "Enter" => KeyCode::Enter,
             "Tab" => KeyCode::Tab,
             "BackTab" => KeyCode::BackTab,
             "Backspace" => KeyCode::Backspace,
+            "Space" => KeyCode::Char(' '),
             "Left" => KeyCode::Left,
             "Right" => KeyCode::Right,
             "Up" => KeyCode::Up,
@@ -145,14 +158,20 @@ impl KeyChord {
             "PageUp" => KeyCode::PageUp,
             "PageDown" => KeyCode::PageDown,
             single if single.chars().count() == 1 => KeyCode::Char(single.chars().next().unwrap()),
-            other => panic!("unrecognized key name in keymap notation: {other:?}"),
-        }
+            other => {
+                return Err(format!(
+                    "unrecognized key name in keymap notation: {other:?}"
+                ));
+            }
+        })
     }
 
     /// Notation for the status bar's pending-sequence indicator; the inverse
-    /// of [`Self::parse_token`] for the cases the vim preset uses.
+    /// of [`Self::try_parse_token`] for the cases the vim and emacs presets
+    /// use.
     fn notation(self) -> String {
         let key = match self.code {
+            KeyCode::Char(' ') => "Space".to_string(),
             KeyCode::Char(c) => c.to_string(),
             KeyCode::Esc => "Esc".to_string(),
             KeyCode::Enter => "Enter".to_string(),
@@ -171,6 +190,8 @@ impl KeyChord {
         };
         if self.modifiers.contains(KeyModifiers::CONTROL) {
             format!("C-{key}")
+        } else if self.modifiers.contains(KeyModifiers::ALT) {
+            format!("M-{key}")
         } else {
             key
         }
@@ -189,13 +210,24 @@ impl From<crossterm::event::KeyEvent> for KeyChord {
 pub struct KeySeq(Vec<KeyChord>);
 
 impl KeySeq {
+    /// Parses trusted, fixed notation — the built-in presets below. Panics
+    /// on a malformed token, since that can only mean a bug in this
+    /// module's own preset tables, caught immediately by any test that
+    /// constructs a [`Keymap`] from them.
     pub fn parse(notation: &str) -> Self {
-        Self(
-            notation
-                .split_whitespace()
-                .map(KeyChord::parse_token)
-                .collect(),
-        )
+        Self::try_parse(notation).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// As [`Self::parse`], but returning a `Result` instead of panicking —
+    /// what config's `[keys]` overrides parse user-supplied notation
+    /// strings through, so a typo becomes a startup error naming the entry
+    /// (see `config::apply_key_overrides`) rather than a crash.
+    pub fn try_parse(notation: &str) -> Result<Self, String> {
+        notation
+            .split_whitespace()
+            .map(KeyChord::try_parse_token)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Self)
     }
 }
 
@@ -331,6 +363,145 @@ pub fn vim_preset() -> Vec<(KeySeq, Action)> {
     .collect()
 }
 
+/// An emacs-style keymap, the same shape as [`vim_preset`] so both flow
+/// through the identical trie/`Resolver` machinery — nothing about
+/// multi-key resolution is vim-specific. Bindings follow real emacs
+/// conventions where one exists (`M-.`/`M-?` are `xref-find-definitions`/
+/// `xref-find-references`'s actual default keys; `C-Space` is
+/// `set-mark-command`, the closest emacs analogue to "start a range
+/// selection"; `M-g M-n`/`M-g M-p` mirror `next-error`/`previous-error`'s
+/// `M-g` prefix), and a small app-specific choice where none does (`C-h`
+/// for hover — this app owns every key at the terminal level, so there's no
+/// real help-prefix conflict to avoid the way there would be inside actual
+/// emacs). `C-x n`/`C-x p` for next/prev file exercise the same
+/// two-chord-with-a-shared-prefix shape `C-x` itself is famous for, without
+/// this app actually needing a `C-x` prefix for anything else. A handful of
+/// bindings that have no strong identity in either editor (the sidebar/
+/// layout/timeline/comments toggles, symbol cycling, confirm/cancel) keep
+/// vim's keys rather than invent an arbitrary emacs-flavored alternative —
+/// `q` for quit most of all, kept identical across both presets by design
+/// (documented here rather than duplicated in each preset's own bindings).
+pub fn emacs_preset() -> Vec<(KeySeq, Action)> {
+    [
+        ("C-n", Action::CursorDown),
+        ("C-p", Action::CursorUp),
+        ("C-v", Action::HalfPageDown),
+        ("M-v", Action::HalfPageUp),
+        ("M-<", Action::Top),
+        ("M->", Action::Bottom),
+        ("M-n", Action::NextHunk),
+        ("M-p", Action::PrevHunk),
+        ("C-x n", Action::NextFile),
+        ("C-x p", Action::PrevFile),
+        ("b", Action::ToggleSidebar),
+        ("s", Action::ToggleLayout),
+        ("C-h", Action::Hover),
+        ("M-.", Action::GotoDefinition),
+        ("M-?", Action::FindReferences),
+        ("M-g M-n", Action::NextDiagnostic),
+        ("M-g M-p", Action::PrevDiagnostic),
+        ("C-o", Action::JumpBack),
+        ("C-t", Action::JumpForward),
+        ("Enter", Action::Confirm),
+        ("Tab", Action::NextSymbol),
+        ("BackTab", Action::PrevSymbol),
+        ("Esc", Action::Cancel),
+        ("t", Action::ToggleTimeline),
+        ("C-Space", Action::ToggleRangeSelect),
+        ("C-c C-c", Action::AddComment),
+        ("C", Action::ToggleComments),
+        ("q", Action::Quit),
+    ]
+    .into_iter()
+    .map(|(notation, action)| (KeySeq::parse(notation), action))
+    .collect()
+}
+
+/// `action`'s kebab-case name in config's `[keys]` table — e.g.
+/// `Action::HalfPageDown` is `half-page-down`. The single source of truth
+/// both directions of that table's parsing share: [`action_by_name`] is its
+/// exact inverse, so a name printed by one always round-trips through the
+/// other. Kept as two matches rather than a derive, since neither `Action`
+/// nor this mapping has any reason to live in a proc-macro-worthy crate for
+/// what's fundamentally a 28-line lookup table.
+///
+/// No production caller yet — only [`action_by_name`] (config's `[keys]`
+/// parsing) is on that path today. Kept anyway, the same way
+/// `diff::coords::ColumnMap`'s `display_len`/`utf8_len` are: it's the other
+/// half of a documented round-trip this module's own tests hold it to, and
+/// a natural fit for a future `ktmr config keys` listing/validation command.
+#[allow(dead_code)]
+pub fn action_name(action: Action) -> &'static str {
+    match action {
+        Action::CursorDown => "cursor-down",
+        Action::CursorUp => "cursor-up",
+        Action::HalfPageDown => "half-page-down",
+        Action::HalfPageUp => "half-page-up",
+        Action::Top => "top",
+        Action::Bottom => "bottom",
+        Action::NextHunk => "next-hunk",
+        Action::PrevHunk => "prev-hunk",
+        Action::NextFile => "next-file",
+        Action::PrevFile => "prev-file",
+        Action::ToggleSidebar => "toggle-sidebar",
+        Action::ToggleLayout => "toggle-layout",
+        Action::Hover => "hover",
+        Action::NextSymbol => "next-symbol",
+        Action::PrevSymbol => "prev-symbol",
+        Action::Cancel => "cancel",
+        Action::GotoDefinition => "goto-definition",
+        Action::FindReferences => "find-references",
+        Action::NextDiagnostic => "next-diagnostic",
+        Action::PrevDiagnostic => "prev-diagnostic",
+        Action::JumpBack => "jump-back",
+        Action::JumpForward => "jump-forward",
+        Action::Confirm => "confirm",
+        Action::ToggleTimeline => "toggle-timeline",
+        Action::ToggleRangeSelect => "toggle-range-select",
+        Action::AddComment => "add-comment",
+        Action::ToggleComments => "toggle-comments",
+        Action::Quit => "quit",
+    }
+}
+
+/// The inverse of [`action_name`] — parses a config `[keys]` entry's key
+/// (e.g. `"half-page-down"`) back into an [`Action`]. `None` for anything
+/// not in that table, which `config::apply_key_overrides` turns into a
+/// startup error naming the unrecognized entry.
+pub fn action_by_name(name: &str) -> Option<Action> {
+    Some(match name {
+        "cursor-down" => Action::CursorDown,
+        "cursor-up" => Action::CursorUp,
+        "half-page-down" => Action::HalfPageDown,
+        "half-page-up" => Action::HalfPageUp,
+        "top" => Action::Top,
+        "bottom" => Action::Bottom,
+        "next-hunk" => Action::NextHunk,
+        "prev-hunk" => Action::PrevHunk,
+        "next-file" => Action::NextFile,
+        "prev-file" => Action::PrevFile,
+        "toggle-sidebar" => Action::ToggleSidebar,
+        "toggle-layout" => Action::ToggleLayout,
+        "hover" => Action::Hover,
+        "next-symbol" => Action::NextSymbol,
+        "prev-symbol" => Action::PrevSymbol,
+        "cancel" => Action::Cancel,
+        "goto-definition" => Action::GotoDefinition,
+        "find-references" => Action::FindReferences,
+        "next-diagnostic" => Action::NextDiagnostic,
+        "prev-diagnostic" => Action::PrevDiagnostic,
+        "jump-back" => Action::JumpBack,
+        "jump-forward" => Action::JumpForward,
+        "confirm" => Action::Confirm,
+        "toggle-timeline" => Action::ToggleTimeline,
+        "toggle-range-select" => Action::ToggleRangeSelect,
+        "add-comment" => Action::AddComment,
+        "toggle-comments" => Action::ToggleComments,
+        "quit" => Action::Quit,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +598,157 @@ mod tests {
             resolver.feed(chord('v')),
             StepResult::Matched(Action::ToggleRangeSelect)
         );
+    }
+
+    fn alt(c: char) -> KeyChord {
+        KeyChord::new(KeyCode::Char(c), KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn emacs_preset_single_key_control_n_matches_cursor_down() {
+        let keymap = Keymap::from_bindings(&emacs_preset());
+        let mut resolver = keymap.resolver();
+        assert_eq!(
+            resolver.feed(ctrl('n')),
+            StepResult::Matched(Action::CursorDown)
+        );
+    }
+
+    #[test]
+    fn emacs_preset_meta_dot_matches_goto_definition() {
+        let keymap = Keymap::from_bindings(&emacs_preset());
+        let mut resolver = keymap.resolver();
+        assert_eq!(
+            resolver.feed(alt('.')),
+            StepResult::Matched(Action::GotoDefinition)
+        );
+    }
+
+    #[test]
+    fn emacs_preset_c_x_n_two_chord_sequence_resolves_to_next_file() {
+        let keymap = Keymap::from_bindings(&emacs_preset());
+        let mut resolver = keymap.resolver();
+        assert_eq!(resolver.feed(ctrl('x')), StepResult::Pending);
+        assert_eq!(resolver.pending_display(), "C-x");
+        assert_eq!(
+            resolver.feed(chord('n')),
+            StepResult::Matched(Action::NextFile)
+        );
+
+        // The shared `C-x` prefix resolves its sibling chord too, proving
+        // the trie handles a branching two-chord prefix generically rather
+        // than special-casing this one sequence.
+        assert_eq!(resolver.feed(ctrl('x')), StepResult::Pending);
+        assert_eq!(
+            resolver.feed(chord('p')),
+            StepResult::Matched(Action::PrevFile)
+        );
+    }
+
+    #[test]
+    fn emacs_preset_m_g_m_n_two_chord_sequence_resolves_to_next_diagnostic() {
+        let keymap = Keymap::from_bindings(&emacs_preset());
+        let mut resolver = keymap.resolver();
+        assert_eq!(resolver.feed(alt('g')), StepResult::Pending);
+        assert_eq!(
+            resolver.feed(alt('n')),
+            StepResult::Matched(Action::NextDiagnostic)
+        );
+    }
+
+    #[test]
+    fn emacs_preset_c_c_c_c_resolves_to_add_comment() {
+        let keymap = Keymap::from_bindings(&emacs_preset());
+        let mut resolver = keymap.resolver();
+        assert_eq!(resolver.feed(ctrl('c')), StepResult::Pending);
+        assert_eq!(
+            resolver.feed(ctrl('c')),
+            StepResult::Matched(Action::AddComment)
+        );
+    }
+
+    #[test]
+    fn emacs_preset_control_space_resolves_to_toggle_range_select() {
+        let keymap = Keymap::from_bindings(&emacs_preset());
+        let mut resolver = keymap.resolver();
+        let control_space = KeyChord::new(KeyCode::Char(' '), KeyModifiers::CONTROL);
+        assert_eq!(
+            resolver.feed(control_space),
+            StepResult::Matched(Action::ToggleRangeSelect)
+        );
+    }
+
+    #[test]
+    fn emacs_preset_q_quits_same_as_vim() {
+        let keymap = Keymap::from_bindings(&emacs_preset());
+        let mut resolver = keymap.resolver();
+        assert_eq!(resolver.feed(chord('q')), StepResult::Matched(Action::Quit));
+    }
+
+    #[test]
+    fn action_name_and_action_by_name_round_trip_every_variant() {
+        let all = [
+            Action::CursorDown,
+            Action::CursorUp,
+            Action::HalfPageDown,
+            Action::HalfPageUp,
+            Action::Top,
+            Action::Bottom,
+            Action::NextHunk,
+            Action::PrevHunk,
+            Action::NextFile,
+            Action::PrevFile,
+            Action::ToggleSidebar,
+            Action::ToggleLayout,
+            Action::Hover,
+            Action::NextSymbol,
+            Action::PrevSymbol,
+            Action::Cancel,
+            Action::GotoDefinition,
+            Action::FindReferences,
+            Action::NextDiagnostic,
+            Action::PrevDiagnostic,
+            Action::JumpBack,
+            Action::JumpForward,
+            Action::Confirm,
+            Action::ToggleTimeline,
+            Action::ToggleRangeSelect,
+            Action::AddComment,
+            Action::ToggleComments,
+            Action::Quit,
+        ];
+        for action in all {
+            let name = action_name(action);
+            assert_eq!(
+                action_by_name(name),
+                Some(action),
+                "round trip failed for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn action_by_name_rejects_unknown_names() {
+        assert_eq!(action_by_name("not-a-real-action"), None);
+    }
+
+    #[test]
+    fn try_parse_reports_an_error_instead_of_panicking_on_a_bad_token() {
+        assert!(KeySeq::try_parse("C-d NotAKey g").is_err());
+        assert!(KeySeq::try_parse("g g").is_ok());
+    }
+
+    #[test]
+    fn every_vim_and_emacs_binding_covers_every_action_exactly_once() {
+        for preset in [vim_preset(), emacs_preset()] {
+            let mut actions: Vec<Action> = preset.iter().map(|(_, a)| *a).collect();
+            actions.sort_by_key(|a| action_name(*a));
+            actions.dedup();
+            assert_eq!(
+                actions.len(),
+                preset.len(),
+                "every action should be bound exactly once per preset"
+            );
+        }
     }
 }

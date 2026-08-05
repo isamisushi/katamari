@@ -5,6 +5,8 @@
 //! means adding one more match arm, not touching the manager's
 //! spawn/queue/state-machine logic.
 
+use crate::config::ServerOverride;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -86,8 +88,22 @@ impl std::fmt::Display for Unavailable {
 
 /// Builds the command to launch `language`'s server. Never runs it —
 /// spawning is [`crate::lsp::transport::Transport::spawn`]'s job — so this
-/// stays testable as pure path resolution.
-pub fn resolve_server(language: Language, workspace_root: &Path) -> Result<Command, Unavailable> {
+/// stays testable as pure path resolution. `overrides` (config's
+/// `[lsp.servers.<lang>]`, keyed by [`Language::lsp_id`]) takes priority
+/// over every built-in lookup below when it has an entry for `language`,
+/// exactly as a user's explicit config should — a pinned server version, a
+/// wrapper script, or a server this module has no built-in support for at
+/// all.
+pub fn resolve_server(
+    language: Language,
+    workspace_root: &Path,
+    overrides: &HashMap<String, ServerOverride>,
+) -> Result<Command, Unavailable> {
+    if let Some(over) = overrides.get(language.lsp_id()) {
+        let mut command = Command::new(&over.command);
+        command.args(&over.args);
+        return Ok(command);
+    }
     match language {
         Language::Rust => resolve_rust_analyzer(),
         Language::TypeScript => resolve_typescript_language_server(workspace_root),
@@ -397,6 +413,32 @@ mod tests {
         // that's fine too; only the failure message's shape is asserted.
         if let Err(unavailable) = resolve_gopls() {
             assert!(unavailable.reason.contains("gopls"));
+            assert!(unavailable.reason.starts_with("LSP: go"));
+        }
+    }
+
+    #[test]
+    fn a_config_override_takes_priority_over_the_built_in_lookup() {
+        let overrides = HashMap::from([(
+            "go".to_owned(),
+            ServerOverride {
+                command: "/opt/bin/my-gopls".to_owned(),
+                args: vec!["--stdio".to_owned()],
+            },
+        )]);
+        let command = resolve_server(Language::Go, Path::new("/repo"), &overrides).unwrap();
+        assert_eq!(command.get_program(), "/opt/bin/my-gopls");
+        assert_eq!(command.get_args().collect::<Vec<_>>(), vec!["--stdio"]);
+    }
+
+    #[test]
+    fn no_override_falls_through_to_the_built_in_lookup() {
+        // No "go" entry in `overrides` — resolution falls through to
+        // `resolve_gopls`, matching `resolve_server_reports_a_hint_when_a_binary_is_missing`'s
+        // own caveat about this workspace's PATH.
+        let overrides = HashMap::new();
+        let result = resolve_server(Language::Go, Path::new("/repo"), &overrides);
+        if let Err(unavailable) = result {
             assert!(unavailable.reason.starts_with("LSP: go"));
         }
     }

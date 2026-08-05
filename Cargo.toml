@@ -27,8 +27,14 @@ tree-sitter-highlight = "0.26.11"
 tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
 tree-sitter-typescript = "0.23.2"
+toml = "0.9.7"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

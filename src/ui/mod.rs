@@ -35,9 +35,10 @@ pub use refresh::{NoopPreRefreshHook, PreRefreshHook};
 pub use view::{View, ViewStack};
 
 use crate::comments::{self, Comment, CommentIndex, CommentStore};
+use crate::config::{self, Config};
 use crate::diff::parse_unified_diff;
 use crate::highlight::LineHighlighter;
-use crate::keymap::{Action, KeyChord, Keymap, Resolver, StepResult, vim_preset};
+use crate::keymap::{Action, KeyChord, Keymap, Resolver, StepResult, emacs_preset, vim_preset};
 use crate::lsp::adapter::Language;
 use crate::lsp::client::uri_to_path;
 use crate::lsp::manager::ServerState;
@@ -67,6 +68,7 @@ use ratatui::layout::{Constraint, Direction, Layout as RatatuiLayout, Rect};
 use std::collections::HashSet;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
@@ -167,11 +169,31 @@ fn detect_jj_repo(view: &View) -> Option<JjRepo> {
 /// `None` is a plain, non-watching session and never spawns a watcher at
 /// all. `ktmr diff --watch` passes [`crate::ui::NoopPreRefreshHook`]; every
 /// other command passes `None`.
-pub fn run(stack: &mut ViewStack, pre_refresh_hook: Option<Box<dyn PreRefreshHook>>) -> Result<()> {
+///
+/// `config` selects the keymap preset (plus any `[keys]` rebinding — see
+/// [`config::apply_key_overrides`]), the LSP server command overrides
+/// [`crate::lsp::LspManager`] resolves against, and watch mode's debounce
+/// duration; every caller loads it once via [`config::load_merged`] before
+/// reaching here. A malformed `[keys]` entry surfaces as a plain startup
+/// error naming the bad entry (see `apply_key_overrides`'s docs) rather than
+/// a panic or a silently-ignored override — this is the one place a bad
+/// config value can actually stop the session from starting, since
+/// everything else `Config` carries has a safe built-in fallback.
+pub fn run(
+    stack: &mut ViewStack,
+    pre_refresh_hook: Option<Box<dyn PreRefreshHook>>,
+    config: &Config,
+) -> Result<()> {
     install_panic_hook();
     let mut terminal = init_terminal()?;
 
-    let keymap = Keymap::from_bindings(&vim_preset());
+    let preset = match config.keymap {
+        config::KeymapPreset::Vim => vim_preset(),
+        config::KeymapPreset::Emacs => emacs_preset(),
+    };
+    let bindings = config::apply_key_overrides(preset, &config.key_overrides)
+        .map_err(|e| anyhow::anyhow!("config: {e}"))?;
+    let keymap = Keymap::from_bindings(&bindings);
     let mut resolver = keymap.resolver();
     let mut highlighter = LineHighlighter::new();
 
@@ -180,7 +202,7 @@ pub fn run(stack: &mut ViewStack, pre_refresh_hook: Option<Box<dyn PreRefreshHoo
 
     let (lsp_tx, lsp_rx) = mpsc::channel::<ServerEvent>();
     spawn_lsp_forwarder(lsp_rx, app_tx.clone());
-    let lsp_manager = LspManager::new(lsp_tx);
+    let lsp_manager = LspManager::new(lsp_tx, Arc::new(config.lsp_servers.clone()));
 
     // Proactively `didOpen`s the files this session starts out looking at,
     // so diagnostics gutters have something to show without the user
@@ -208,9 +230,10 @@ pub fn run(stack: &mut ViewStack, pre_refresh_hook: Option<Box<dyn PreRefreshHoo
         _ => pre_refresh_hook,
     };
 
+    let debounce_quiet = Duration::from_millis(config.debounce_ms);
     let watch_startup_status = pre_refresh_hook
         .is_some()
-        .then(|| start_watch(stack, app_tx.clone()))
+        .then(|| start_watch(stack, app_tx.clone(), debounce_quiet))
         .flatten();
 
     // M6: a root diff's comments are loaded and watched unconditionally —
@@ -256,7 +279,7 @@ pub fn run(stack: &mut ViewStack, pre_refresh_hook: Option<Box<dyn PreRefreshHoo
 /// the platform's file-watching backend couldn't be initialized) — a
 /// session that asked for `--watch` and silently isn't watching would be a
 /// much worse failure mode than one that says so up front.
-fn start_watch(stack: &mut ViewStack, app_tx: Sender<AppEvent>) -> Option<String> {
+fn start_watch(stack: &mut ViewStack, app_tx: Sender<AppEvent>, quiet: Duration) -> Option<String> {
     let View::Diff(app) = stack.root_mut() else {
         // `main.rs` only ever offers `--watch` alongside the plain diff
         // view (not `ktmr open`'s single-file view), so this doesn't
@@ -266,7 +289,7 @@ fn start_watch(stack: &mut ViewStack, app_tx: Sender<AppEvent>) -> Option<String
     };
     app.watch_mode = true;
     let (watch_tx, watch_rx) = mpsc::channel::<WatchSignal>();
-    match watch::spawn(app.repo_root.clone(), watch_tx) {
+    match watch::spawn(app.repo_root.clone(), watch_tx, quiet) {
         Ok(()) => {
             spawn_watch_forwarder(watch_rx, app_tx);
             None
@@ -327,10 +350,11 @@ fn spawn_comments_forwarder(rx: Receiver<()>, tx: Sender<AppEvent>) {
 fn warm_up_root(view: &View, lsp_manager: &LspManager) -> Option<String> {
     match view {
         View::Diff(app) => {
+            let max_lines = crate::config::highlight_max_lines();
             let files: Vec<PathBuf> = app
                 .files
                 .iter()
-                .filter(|f| !f.is_deleted && !f.is_binary)
+                .filter(|f| !f.is_deleted && !f.is_binary && !f.skip_highlighting(max_lines))
                 .filter_map(|f| f.new_path.as_deref())
                 .map(|relative| app.repo_root.join(relative))
                 .collect();
@@ -343,7 +367,9 @@ fn warm_up_root(view: &View, lsp_manager: &LspManager) -> Option<String> {
             })
         }
         View::File(file) => {
-            if let Some(path) = file.file_path() {
+            if !file.highlight_skipped
+                && let Some(path) = file.file_path()
+            {
                 lsp_manager.warm_up(std::slice::from_ref(&path.to_path_buf()), file.git_root());
             }
             None
@@ -659,6 +685,7 @@ fn event_loop(
                     stack,
                     pre_refresh_hook.as_deref(),
                     lsp_manager,
+                    highlighter,
                     &mut hover_state,
                     &mut refs_panel,
                     &mut watch_status,
@@ -959,11 +986,15 @@ fn handle_action(
 /// racing an in-progress `git rebase`) is left as a status note rather than
 /// treated as fatal — the diff already on screen stays put, and the next
 /// flush gets another chance.
+#[allow(clippy::too_many_arguments)] // each parameter is a distinct piece
+// of session state one refresh cycle touches — see `handle_action`'s
+// comment for why bundling into a struct wouldn't reduce this.
 fn handle_watch_refresh(
     batch: watch::WatchBatch,
     stack: &mut ViewStack,
     pre_refresh_hook: Option<&dyn PreRefreshHook>,
     lsp_manager: &LspManager,
+    highlighter: &mut LineHighlighter,
     hover_state: &mut hover_popup::HoverState,
     refs_panel: &mut Option<RefsPanelState>,
     watch_status: &mut Option<WatchStatus>,
@@ -986,6 +1017,11 @@ fn handle_watch_refresh(
 
     let overlay_survives = app.apply_refresh(files);
     hover_state.bump_generation_for_refresh();
+    // Bounds the highlight cache's memory to roughly one diff's worth of
+    // content rather than accumulating across every refresh of a long
+    // watch session — see `LineHighlighter::clear_cache`'s docs on why this
+    // is a memory-management call, not a correctness one.
+    highlighter.clear_cache();
 
     let mut overlay_closed = false;
     if !overlay_survives {
@@ -1031,10 +1067,11 @@ fn sync_lsp_after_refresh(app: &App, lsp_manager: &LspManager, changes: &[watch:
         .collect();
     lsp_manager.notify_watched_files(&watched);
 
+    let max_lines = crate::config::highlight_max_lines();
     let current_files: Vec<PathBuf> = app
         .files
         .iter()
-        .filter(|f| !f.is_deleted && !f.is_binary)
+        .filter(|f| !f.is_deleted && !f.is_binary && !f.skip_highlighting(max_lines))
         .filter_map(|f| f.new_path.as_deref())
         .map(|relative| app.repo_root.join(relative))
         .collect();

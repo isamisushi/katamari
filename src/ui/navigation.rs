@@ -234,9 +234,16 @@ pub fn navigate_to(
         Some((target.file.clone(), target.git_root.clone())),
     );
     view.jump_cursor_to(target.line as usize, target.col);
+    let highlight_skipped = view.highlight_skipped;
     stack.push(View::File(view));
 
-    lsp_manager.warm_up(std::slice::from_ref(&target.file), &target.git_root);
+    // Large/lockfile-ish files skip warm-up too — see
+    // `FileView::highlight_skipped`'s docs and `ui::warm_up_root`, which
+    // this mirrors for the "jumped to a file, rather than opened one at
+    // startup" path.
+    if !highlight_skipped {
+        lsp_manager.warm_up(std::slice::from_ref(&target.file), &target.git_root);
+    }
     Ok(())
 }
 

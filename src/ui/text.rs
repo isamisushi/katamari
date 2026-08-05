@@ -12,9 +12,81 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 /// The terminal column width of `s`, accounting for wide (e.g. CJK)
-/// characters.
+/// characters. Assumes `s` contains no raw tab characters — every span this
+/// is called on has already passed through [`expand_tabs_in_spans`], which
+/// replaces each tab with the right number of literal spaces for wherever
+/// it fell in its line, so by the time width math like this runs there's
+/// nothing tab-shaped left to account for specially.
 pub fn display_width(s: &str) -> usize {
     s.width()
+}
+
+/// One grapheme's on-screen width at display column `col` of its line, with
+/// tab stops every `tab_width` columns — the single width rule
+/// [`crate::diff::ColumnMap`] (for converting a display column to/from an
+/// LSP request's byte/UTF-16 offset) and [`crate::ui::symbols::scan`] (for
+/// where the active-symbol underline falls) both apply directly to raw,
+/// unexpanded line text, and that [`expand_tabs_in_spans`] applies while
+/// rewriting a tab into literal spaces. All three must agree pixel-for-
+/// pixel on where a tab lands, or the cursor, an LSP position, and what's
+/// actually drawn would each compute a different column for the same
+/// character — see this module's and `ColumnMap`'s tests for the tab-stop
+/// cases that pin this down. A non-tab grapheme's width is
+/// [`unicode_width`]'s ordinary answer, unaffected by `col`.
+pub fn tab_aware_width(grapheme: &str, col: usize, tab_width: usize) -> usize {
+    if grapheme == "\t" {
+        // Distance to the next multiple of `tab_width`, minimum 1 so a tab
+        // sitting exactly on a stop still advances a full stop rather than
+        // vanishing — the same rule a terminal's own tab stops follow.
+        let into_stop = col % tab_width;
+        tab_width - into_stop
+    } else {
+        grapheme.width()
+    }
+}
+
+/// Rewrites every literal tab character across a line's highlighted
+/// `spans`, in place of the tab, into the number of literal space
+/// characters [`tab_aware_width`] says that tab occupies at its position in
+/// the line — tracking display column continuously *across* every span in
+/// order, not restarting at 0 per span, since a tab's width depends on
+/// where in the whole line it falls, not where it falls within whichever
+/// highlighted token happens to contain it.
+///
+/// Run this once per line, right after highlighting and before any
+/// width/truncation math (`truncate_spans_to_width`, `mark_range`, gutter
+/// width arithmetic) — everything downstream of it can then assume, as
+/// [`display_width`] does, that no span it sees still contains a raw tab.
+/// A terminal has no reliable, pane-relative notion of "tab stop" of its
+/// own (it would expand a literal `\t` using its *own* tab settings,
+/// measured from the terminal's left edge, not this pane's content column)
+/// — so a tab must become real spaces before it ever reaches ratatui, or
+/// on-screen alignment would silently stop matching what [`ColumnMap`] and
+/// [`symbols::scan`] computed for the LSP-facing coordinate space.
+///
+/// [`ColumnMap`]: crate::diff::ColumnMap
+/// [`symbols::scan`]: crate::ui::symbols::scan
+pub fn expand_tabs_in_spans(spans: Vec<HlSpan>, tab_width: usize) -> Vec<HlSpan> {
+    let mut col = 0usize;
+    spans
+        .into_iter()
+        .map(|span| {
+            let mut text = String::with_capacity(span.text.len());
+            for grapheme in span.text.graphemes(true) {
+                let width = tab_aware_width(grapheme, col, tab_width);
+                if grapheme == "\t" {
+                    text.extend(std::iter::repeat_n(' ', width));
+                } else {
+                    text.push_str(grapheme);
+                }
+                col += width;
+            }
+            HlSpan {
+                text,
+                kind: span.kind,
+            }
+        })
+        .collect()
 }
 
 /// Truncates `s` to at most `max_width` display columns, splitting only on
@@ -312,5 +384,72 @@ mod tests {
         assert_eq!(plain_text(&marked), "hello");
         assert_eq!(marked.len(), 1);
         assert!(!marked[0].style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn tab_aware_width_advances_to_the_next_stop() {
+        // Tab width 4: a tab at column 0 reaches column 4 (width 4); a tab
+        // at column 1 also reaches column 4 (width 3) — a tab always lands
+        // *on* a stop, however far away that stop currently is.
+        assert_eq!(tab_aware_width("\t", 0, 4), 4);
+        assert_eq!(tab_aware_width("\t", 1, 4), 3);
+        assert_eq!(tab_aware_width("\t", 3, 4), 1);
+    }
+
+    #[test]
+    fn tab_aware_width_sitting_exactly_on_a_stop_advances_a_full_stop() {
+        // A tab at column 4 (already on a stop) advances to column 8, not
+        // column 4 again — matches a real terminal's own tab-stop behavior.
+        assert_eq!(tab_aware_width("\t", 4, 4), 4);
+    }
+
+    #[test]
+    fn tab_aware_width_is_ordinary_grapheme_width_for_non_tab_input() {
+        assert_eq!(tab_aware_width("a", 7, 4), 1);
+        assert_eq!(tab_aware_width("日", 1, 4), 2);
+    }
+
+    fn plain_hl(text: &str) -> HlSpan {
+        HlSpan {
+            text: text.to_owned(),
+            kind: HighlightKind::Plain,
+        }
+    }
+
+    #[test]
+    fn expand_tabs_in_spans_replaces_a_leading_tab_with_spaces_to_the_first_stop() {
+        let spans = vec![plain_hl("\tx")];
+        let expanded = expand_tabs_in_spans(spans, 4);
+        assert_eq!(expanded.len(), 1);
+        assert_eq!(expanded[0].text, "    x");
+    }
+
+    #[test]
+    fn expand_tabs_in_spans_tracks_display_column_across_span_boundaries() {
+        // "ab" (cols 0-1) then a tab in a *second* span starting at col 2:
+        // with tab width 4 that tab must reach col 4 (width 2), not restart
+        // counting from 0 as if the second span were its own line.
+        let spans = vec![plain_hl("ab"), plain_hl("\tc")];
+        let expanded = expand_tabs_in_spans(spans, 4);
+        assert_eq!(expanded[0].text, "ab");
+        assert_eq!(expanded[1].text, "  c");
+    }
+
+    #[test]
+    fn expand_tabs_in_spans_leaves_tab_free_text_unchanged() {
+        let spans = vec![plain_hl("no tabs here")];
+        let expanded = expand_tabs_in_spans(spans.clone(), 4);
+        assert_eq!(expanded, spans);
+    }
+
+    #[test]
+    fn expand_tabs_in_spans_matches_the_display_width_a_tab_aware_line_would_report() {
+        // Expanding "a\tb" (tab width 4) then measuring with plain
+        // `display_width` must agree with what `ColumnMap`'s tab-aware rule
+        // computes directly on the raw text — the equivalence the whole
+        // tab-stop design rests on (see this function's doc comment).
+        let expanded = expand_tabs_in_spans(vec![plain_hl("a\tb")], 4);
+        let rendered: String = expanded.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(display_width(&rendered), 5); // 'a' (1) + tab-to-stop (3) + 'b' (1)
     }
 }

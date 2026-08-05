@@ -82,6 +82,37 @@ impl DiffFile {
         }
         (added, deleted)
     }
+
+    /// Whether this file's diff is expensive enough — by changed-line count,
+    /// or by a lockfile-ish name regardless of size — that syntax
+    /// highlighting (and, sharing the same call, LSP warm-up's `didOpen`)
+    /// should be skipped in favor of plain styling. `max_changed_lines` is
+    /// `config::highlight_max_lines()` at every real call site; threaded in
+    /// explicitly here rather than read from `config` directly so this stays
+    /// a pure, independently testable function of its own inputs, matching
+    /// every other predicate in this module.
+    pub fn skip_highlighting(&self, max_changed_lines: usize) -> bool {
+        if is_lockfile_ish(self.display_path()) {
+            return true;
+        }
+        let (added, deleted) = self.stat();
+        (added + deleted) as usize > max_changed_lines
+    }
+}
+
+/// Names that call for skipping syntax highlighting regardless of how small
+/// the change is: lockfiles and minified bundles are enormous, mechanically
+/// generated walls of text that a syntax tree never helps a reviewer read,
+/// and are relatively expensive per byte for tree-sitter to tokenize for
+/// zero benefit — a two-line change to a `package-lock.json` still means
+/// tokenizing however many thousand bytes that one changed line happens to
+/// be part of. `pub`, not just used by [`DiffFile::skip_highlighting`],
+/// since [`crate::ui::file_view::FileView`] applies the identical name rule
+/// to a whole opened file (which has no "changed lines" of its own to
+/// threshold on) via [`crate::ui::file_view::FileView::with_hover_target`].
+pub fn is_lockfile_ish(display_path: &str) -> bool {
+    let name = display_path.rsplit('/').next().unwrap_or(display_path);
+    name.ends_with(".lock") || name == "package-lock.json" || name.ends_with(".min.js")
 }
 
 /// Parses the output of `git diff --no-color --no-ext-diff` into structured
@@ -678,5 +709,61 @@ mod tests {
                 new: SideCell::Line { flat_idx: add2 },
             }
         );
+    }
+
+    fn file_with_changed_lines(path: &str, added: u32, deleted: u32) -> DiffFile {
+        let mut rows = Vec::new();
+        for n in 0..added {
+            rows.push(DiffRow {
+                kind: DiffLineKind::Add,
+                text: format!("added {n}"),
+                old_line: None,
+                new_line: Some(n),
+            });
+        }
+        for n in 0..deleted {
+            rows.push(DiffRow {
+                kind: DiffLineKind::Del,
+                text: format!("deleted {n}"),
+                old_line: Some(n),
+                new_line: None,
+            });
+        }
+        DiffFile {
+            new_path: Some(path.to_owned()),
+            hunks: vec![DiffHunk {
+                rows,
+                ..DiffHunk::default()
+            }],
+            ..DiffFile::default()
+        }
+    }
+
+    #[test]
+    fn skip_highlighting_is_false_for_a_small_diff_on_an_ordinary_file() {
+        let file = file_with_changed_lines("src/main.rs", 3, 2);
+        assert!(!file.skip_highlighting(5000));
+    }
+
+    #[test]
+    fn skip_highlighting_is_true_once_changed_lines_exceed_the_threshold() {
+        let file = file_with_changed_lines("src/generated.rs", 4000, 4000);
+        assert!(file.skip_highlighting(5000));
+    }
+
+    #[test]
+    fn skip_highlighting_is_true_for_lockfile_ish_names_regardless_of_size() {
+        for path in [
+            "Cargo.lock",
+            "package-lock.json",
+            "vendor/bundle.min.js",
+            "yarn.lock",
+        ] {
+            let file = file_with_changed_lines(path, 1, 0);
+            assert!(
+                file.skip_highlighting(5000),
+                "{path} should skip highlighting regardless of its tiny diff"
+            );
+        }
     }
 }

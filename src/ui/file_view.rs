@@ -16,7 +16,9 @@ use crate::lsp::DiagnosticsStore;
 use crate::ui::hover_popup::HoverQuery;
 use crate::ui::scroll;
 use crate::ui::symbols;
-use crate::ui::text::{display_width, highlight_color, mark_range, truncate_spans_to_width};
+use crate::ui::text::{
+    display_width, expand_tabs_in_spans, highlight_color, mark_range, truncate_spans_to_width,
+};
 use lsp_types::DiagnosticSeverity;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -43,6 +45,15 @@ pub struct FileView {
     file_path: Option<PathBuf>,
     git_root: PathBuf,
     highlighter: FileHighlighter,
+    /// Set when this file's name is lockfile-ish or its line count exceeds
+    /// `[ui] highlight_max_lines` — mirrors `DiffFile::skip_highlighting`
+    /// for the single-file case (see that method's docs). `highlighter`
+    /// above was already built with [`Language::Plain`] when this is `true`
+    /// (tree-sitter never ran at all, not just "ran and got discarded"),
+    /// and [`Self::file_path`] is excluded from LSP warm-up's `didOpen` —
+    /// see `ui::warm_up_root`'s docs on why that shares this same
+    /// threshold. `render_status` shows a note when this is set.
+    pub highlight_skipped: bool,
     pub cursor: usize,
     pub scroll_offset: usize,
     /// Index into the current line's [`symbols::scan`] output — mirrors
@@ -64,7 +75,13 @@ impl FileView {
         source: &str,
         target: Option<(PathBuf, PathBuf)>,
     ) -> Self {
-        let language = Language::detect(&display_path);
+        let highlight_skipped = crate::diff::is_lockfile_ish(&display_path)
+            || source.lines().count() > crate::config::highlight_max_lines();
+        let language = if highlight_skipped {
+            Language::Plain
+        } else {
+            Language::detect(&display_path)
+        };
         let (file_path, git_root) = match target {
             Some((file, root)) => (Some(file), root),
             None => (None, PathBuf::new()),
@@ -74,6 +91,7 @@ impl FileView {
             display_path,
             file_path,
             git_root,
+            highlight_skipped,
             cursor: 0,
             scroll_offset: 0,
             active_symbol: 0,
@@ -322,7 +340,11 @@ fn content_line(
     let gutter_width = display_width(&gutter) + display_width(diagnostic_span.content.as_ref());
     let content_width = width.saturating_sub(gutter_width);
 
-    let spans = truncate_spans_to_width(view.highlighter.line(idx), content_width);
+    let spans = expand_tabs_in_spans(
+        view.highlighter.line(idx).to_vec(),
+        crate::config::tab_width(),
+    );
+    let spans = truncate_spans_to_width(&spans, content_width);
 
     let mut content_spans: Vec<Span<'static>> = spans
         .into_iter()
@@ -373,6 +395,13 @@ pub fn render_status(frame: &mut Frame, area: Rect, view: &FileView, status_note
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    if view.highlight_skipped {
+        spans.push(Span::styled(
+            "· highlight off (large file) ",
+            Style::default().fg(Color::DarkGray),
         ));
     }
 

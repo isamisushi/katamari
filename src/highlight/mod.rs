@@ -11,7 +11,7 @@
 //! Keeping the mapping in the UI layer is what lets the UI's color choices
 //! change without this module caring.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
 /// A source language this module can highlight. Detected from file
@@ -169,13 +169,34 @@ fn language_name(language: Language) -> &'static str {
     }
 }
 
+/// The most (language, line-text) entries [`LineHighlighter`]'s cache keeps
+/// before evicting the oldest — generous relative to a terminal's visible
+/// rows plus the small overscan `ui::diff_view`/`ui::file_view` highlight
+/// per frame, so an ordinary review session's redraws at a fixed scroll
+/// position never evict anything, while a very long session that's scrolled
+/// through many distinct lines still has a bound on memory rather than
+/// growing forever.
+const CACHE_CAPACITY: usize = 4096;
+
 /// Highlights individual lines, caching one compiled [`HighlightConfiguration`]
 /// per language so repeated calls (once per visible diff line, every frame)
-/// don't recompile grammar queries. Construction is cheap; the expensive
-/// grammar setup happens lazily, only for languages actually encountered.
+/// don't recompile grammar queries, *and* caching each line's own resulting
+/// spans by `(language, line text)` so redrawing the same visible window
+/// across frames — the overwhelming common case, since nothing about a
+/// terminal UI's own idle redraws changes line content — never re-runs
+/// tree-sitter at all for a line it's already highlighted. Construction is
+/// cheap; the expensive grammar setup and per-line highlighting both happen
+/// lazily, only for content actually encountered.
 pub struct LineHighlighter {
     highlighter: Highlighter,
     configs: HashMap<Language, Option<HighlightConfiguration>>,
+    cache: HashMap<(Language, String), Vec<Span>>,
+    /// Insertion order for [`CACHE_CAPACITY`]-bounded eviction — a plain
+    /// FIFO rather than true LRU, since a diff review's access pattern
+    /// (mostly: redraw whatever's currently visible) doesn't reward the
+    /// extra bookkeeping true LRU would need to tell "reused often" from
+    /// "inserted long ago" apart.
+    cache_order: VecDeque<(Language, String)>,
 }
 
 impl LineHighlighter {
@@ -183,6 +204,8 @@ impl LineHighlighter {
         Self {
             highlighter: Highlighter::new(),
             configs: HashMap::new(),
+            cache: HashMap::new(),
+            cache_order: VecDeque::new(),
         }
     }
 
@@ -190,8 +213,53 @@ impl LineHighlighter {
     /// any parse or query failure, returns the whole line as a single
     /// [`HighlightKind::Plain`] span rather than propagating an error —
     /// highlighting is a rendering nicety, never a reason to fail the diff
-    /// view.
+    /// view. Content-addressed: a cache hit for the exact same `(language,
+    /// line)` pair skips tree-sitter entirely, regardless of which row or
+    /// file that text happens to be rendering for this time.
     pub fn highlight_line(&mut self, language: Language, line: &str) -> Vec<Span> {
+        if line.is_empty() {
+            return Vec::new();
+        }
+
+        let key = (language, line.to_owned());
+        if let Some(cached) = self.cache.get(&key) {
+            return cached.clone();
+        }
+
+        let spans =
+            Self::highlight_uncached(&mut self.highlighter, &mut self.configs, language, line);
+        self.insert_cache(key, spans.clone());
+        spans
+    }
+
+    fn insert_cache(&mut self, key: (Language, String), spans: Vec<Span>) {
+        if self.cache.len() >= CACHE_CAPACITY
+            && let Some(oldest) = self.cache_order.pop_front()
+        {
+            self.cache.remove(&oldest);
+        }
+        self.cache_order.push_back(key.clone());
+        self.cache.insert(key, spans);
+    }
+
+    /// Drops every cached line — called once a diff has been re-run (watch
+    /// mode's refresh, or a fresh `App`/`FileView` swapped in) so stale
+    /// entries from content the reviewer has moved past don't sit in memory
+    /// for the rest of a long session. Not required for *correctness*: the
+    /// cache is keyed by exact line text, so a stale entry for text that
+    /// still exists somewhere would still be the right answer if reused —
+    /// this is purely a memory-bound housekeeping call.
+    pub fn clear_cache(&mut self) {
+        self.cache.clear();
+        self.cache_order.clear();
+    }
+
+    fn highlight_uncached(
+        highlighter: &mut Highlighter,
+        configs: &mut HashMap<Language, Option<HighlightConfiguration>>,
+        language: Language,
+        line: &str,
+    ) -> Vec<Span> {
         let plain = || {
             vec![Span {
                 text: line.to_owned(),
@@ -199,12 +267,7 @@ impl LineHighlighter {
             }]
         };
 
-        if line.is_empty() {
-            return Vec::new();
-        }
-
-        let config = match self
-            .configs
+        let config = match configs
             .entry(language)
             .or_insert_with(|| build_config(language))
         {
@@ -212,10 +275,7 @@ impl LineHighlighter {
             None => return plain(),
         };
 
-        let events = match self
-            .highlighter
-            .highlight(config, line.as_bytes(), None, |_| None)
-        {
+        let events = match highlighter.highlight(config, line.as_bytes(), None, |_| None) {
             Ok(events) => events,
             Err(_) => return plain(),
         };
@@ -393,6 +453,52 @@ mod tests {
                 text: "some text".to_owned(),
                 kind: HighlightKind::Plain
             }]
+        );
+    }
+
+    #[test]
+    fn a_repeated_call_with_the_same_language_and_text_returns_the_same_spans_from_cache() {
+        let mut hl = LineHighlighter::new();
+        let first = hl.highlight_line(Language::Rust, "fn main() {}");
+        let second = hl.highlight_line(Language::Rust, "fn main() {}");
+        assert_eq!(first, second);
+        assert_eq!(
+            hl.cache.len(),
+            1,
+            "one cache entry for the one distinct line"
+        );
+    }
+
+    #[test]
+    fn clear_cache_empties_the_cache_but_highlighting_still_works_afterward() {
+        let mut hl = LineHighlighter::new();
+        hl.highlight_line(Language::Rust, "fn main() {}");
+        assert_eq!(hl.cache.len(), 1);
+        hl.clear_cache();
+        assert_eq!(hl.cache.len(), 0);
+        let spans = hl.highlight_line(Language::Rust, "fn main() {}");
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.kind == HighlightKind::Keyword && s.text == "fn")
+        );
+    }
+
+    #[test]
+    fn cache_evicts_the_oldest_entry_once_past_capacity() {
+        let mut hl = LineHighlighter::new();
+        for n in 0..CACHE_CAPACITY + 1 {
+            hl.highlight_line(Language::Plain, &format!("line {n}"));
+        }
+        assert_eq!(
+            hl.cache.len(),
+            CACHE_CAPACITY,
+            "capacity is enforced rather than growing without bound"
+        );
+        assert!(
+            !hl.cache
+                .contains_key(&(Language::Plain, "line 0".to_owned())),
+            "the oldest entry was evicted to make room for the newest"
         );
     }
 
