@@ -1,0 +1,39 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 1111111..2222222 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,4 +1,5 @@
+ fn helper() {}
+-fn old_name() {}
++fn new_name() {}
++fn new_name2() {}
+ fn tail() {}
+ fn unchanged() {}
+diff --git a/src/new_module.rs b/src/new_module.rs
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/src/new_module.rs
+@@ -0,0 +1,2 @@
++pub fn added_one() {}
++pub fn added_two() {}
+diff --git a/src/old_module.rs b/src/old_module.rs
+deleted file mode 100644
+index 4444444..0000000
+--- a/src/old_module.rs
++++ /dev/null
+@@ -1,2 +0,0 @@
+-pub fn removed_one() {}
+-pub fn removed_two() {}
+diff --git a/src/renamed_from.rs b/src/renamed_to.rs
+similarity index 100%
+rename from src/renamed_from.rs
+rename to src/renamed_to.rs
+diff --git a/src/no_trailing_newline.rs b/src/no_trailing_newline.rs
+new file mode 100644
+index 0000000..5555555
+--- /dev/null
++++ b/src/no_trailing_newline.rs
+@@ -0,0 +1 @@
++no trailing newline here
+\ No newline at end of file

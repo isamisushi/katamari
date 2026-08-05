@@ -1,0 +1,22 @@
+[tools]
+rust = "latest"
+
+[tasks.build]
+run = "cargo build"
+description = "Debug build"
+
+[tasks.test]
+run = "cargo test"
+description = "Run unit and integration tests"
+
+[tasks.lint]
+run = "cargo clippy -- -D warnings"
+description = "Lint with clippy"
+
+[tasks.fmt]
+run = "cargo fmt"
+description = "Format code"
+
+[tasks.run]
+run = "cargo run --bin katamari --"
+description = "Run katamari"
