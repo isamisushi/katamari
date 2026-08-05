@@ -3,9 +3,12 @@
 //! entirely with parsed diff data and [`Action`]s, which is what makes it
 //! testable without a real terminal.
 
-use crate::diff::{DiffFile, RenderRow, SideBySideRow, flatten, flatten_side_by_side};
+use crate::diff::{DiffFile, RenderRow, SideBySideRow, flatten, flatten_side_by_side, lsp_target};
 use crate::keymap::Action;
+use crate::ui::hover_popup::HoverQuery;
 use crate::ui::scroll;
+use crate::ui::symbols;
+use std::path::PathBuf;
 
 /// Which of the two diff layouts the diff pane renders. Toggled by
 /// [`Action::ToggleLayout`]; [`crate::ui::diff_view`] may still render
@@ -31,6 +34,12 @@ impl Layout {
 /// All state the UI needs to render a frame and respond to input.
 pub struct App {
     pub repo_name: String,
+    /// Absolute repository root. Every path in `files` is relative to this
+    /// — it's what turns a diff's `new_path` into a file `Action::Hover`
+    /// can actually open, and it's the boundary
+    /// [`crate::lsp::adapter::workspace_root`] searches within when it
+    /// walks up from that file looking for a `Cargo.toml`.
+    pub repo_root: PathBuf,
     pub files: Vec<DiffFile>,
     pub rows: Vec<RenderRow>,
     /// Del/add-run pairing of `rows` for the side-by-side layout, computed
@@ -39,6 +48,11 @@ pub struct App {
     pub side_by_side_rows: Vec<SideBySideRow>,
     pub cursor: usize,
     pub scroll_offset: usize,
+    /// Index into the current row's [`symbols::scan`] output — which
+    /// identifier-like token `Action::Hover` would target. Reset to `0`
+    /// whenever the cursor moves to a different row; cycled by
+    /// `Action::NextSymbol`/`PrevSymbol` without moving the cursor.
+    pub active_symbol: usize,
     pub sidebar_visible: bool,
     pub layout: Layout,
     pub pending_keys: String,
@@ -47,22 +61,84 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(repo_name: String, files: Vec<DiffFile>) -> Self {
+    pub fn new(repo_name: String, repo_root: PathBuf, files: Vec<DiffFile>) -> Self {
         let rows = flatten(&files);
         let side_by_side_rows = flatten_side_by_side(&files);
         Self {
             repo_name,
+            repo_root,
             files,
             rows,
             side_by_side_rows,
             cursor: 0,
             scroll_offset: 0,
+            active_symbol: 0,
             sidebar_visible: true,
             layout: Layout::default(),
             pending_keys: String::new(),
             should_quit: false,
             viewport_height: 1,
         }
+    }
+
+    /// The raw text of the row at `cursor`, for [`symbols::scan`] — `None`
+    /// for a file/hunk header or binary notice, which have no line content
+    /// to scan.
+    fn cursor_row_text(&self) -> Option<&str> {
+        match self.rows.get(self.cursor)? {
+            RenderRow::Line {
+                file_idx,
+                hunk_idx,
+                row_idx,
+            } => Some(
+                self.files[*file_idx].hunks[*hunk_idx].rows[*row_idx]
+                    .text
+                    .as_str(),
+            ),
+            _ => None,
+        }
+    }
+
+    fn cycle_symbol(&mut self, delta: isize) {
+        let Some(text) = self.cursor_row_text() else {
+            return;
+        };
+        let symbols = symbols::scan(text);
+        if symbols.is_empty() {
+            return;
+        }
+        let len = symbols.len() as isize;
+        let next = (self.active_symbol as isize + delta).rem_euclid(len);
+        self.active_symbol = next as usize;
+    }
+
+    /// What `Action::Hover` should ask a language server about right now:
+    /// the file and 0-based line the cursor's row targets (via
+    /// [`lsp_target`]), the line's text (needed to convert the active
+    /// symbol's display column into the server's encoding), and that
+    /// column itself. `None` when the cursor isn't on an eligible row (a
+    /// header, a `Del` line, a deleted/binary file) or the row has no
+    /// identifier-like token to target.
+    pub fn hover_query(&self) -> Option<HoverQuery> {
+        let RenderRow::Line {
+            file_idx,
+            hunk_idx,
+            row_idx,
+        } = self.rows.get(self.cursor)?
+        else {
+            return None;
+        };
+        let file = &self.files[*file_idx];
+        let row = &file.hunks[*hunk_idx].rows[*row_idx];
+        let (relative_path, line) = lsp_target(row, file)?;
+        let symbol = symbols::scan(&row.text).get(self.active_symbol).copied()?;
+        Some(HoverQuery {
+            file: self.repo_root.join(relative_path),
+            git_root: self.repo_root.clone(),
+            line,
+            line_text: row.text.clone(),
+            display_col: symbol.display_start,
+        })
     }
 
     /// The diff pane's visible row count changes on terminal resize; the
@@ -91,6 +167,7 @@ impl App {
             return;
         }
         let last = self.rows.len() - 1;
+        let cursor_before = self.cursor;
         match action {
             Action::CursorDown => self.cursor = (self.cursor + 1).min(last),
             Action::CursorUp => self.cursor = self.cursor.saturating_sub(1),
@@ -112,7 +189,17 @@ impl App {
             }
             Action::ToggleSidebar => self.sidebar_visible = !self.sidebar_visible,
             Action::ToggleLayout => self.layout = self.layout.toggled(),
+            Action::NextSymbol => self.cycle_symbol(1),
+            Action::PrevSymbol => self.cycle_symbol(-1),
+            // `ui::mod`'s event loop intercepts `Hover` before it reaches
+            // here (issuing it needs the LSP manager, not just `App`
+            // state) and `Cancel` (closing a popup `App` doesn't know
+            // about) — both are no-ops from `App`'s own point of view.
+            Action::Hover | Action::Cancel => {}
             Action::Quit => self.should_quit = true,
+        }
+        if self.cursor != cursor_before {
+            self.active_symbol = 0;
         }
         self.clamp_scroll();
     }
@@ -161,7 +248,7 @@ mod tests {
 
     fn test_app() -> App {
         let files = parse_unified_diff(FIXTURE);
-        let mut app = App::new("test-repo".to_owned(), files);
+        let mut app = App::new("test-repo".to_owned(), PathBuf::from("/repo"), files);
         app.set_viewport_height(10);
         app
     }
@@ -228,6 +315,64 @@ mod tests {
         assert!(!app.should_quit);
         app.update(Action::Quit);
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn next_symbol_cycles_and_wraps_and_resets_when_cursor_moves() {
+        let mut app = test_app();
+        app.update(Action::Top);
+        app.update(Action::CursorDown); // row 1: the hunk header
+        app.update(Action::CursorDown); // row 2: "fn helper() {}" — two symbols
+
+        assert_eq!(app.active_symbol, 0);
+        app.update(Action::NextSymbol);
+        assert_eq!(app.active_symbol, 1);
+        app.update(Action::NextSymbol);
+        assert_eq!(
+            app.active_symbol, 0,
+            "cycling past the last symbol wraps around"
+        );
+        app.update(Action::PrevSymbol);
+        assert_eq!(
+            app.active_symbol, 1,
+            "cycling before the first symbol wraps backward"
+        );
+
+        app.update(Action::CursorDown);
+        assert_eq!(
+            app.active_symbol, 0,
+            "moving to a new row resets the active symbol"
+        );
+    }
+
+    #[test]
+    fn hover_query_targets_the_active_symbol_on_an_add_row() {
+        let mut app = test_app();
+        app.update(Action::Top);
+        for _ in 0..4 {
+            app.update(Action::CursorDown);
+        }
+        // Row 4 is the "+fn new_name() {}" add line in src/lib.rs's hunk.
+        let query = app.hover_query().expect("add row is hover-eligible");
+        assert_eq!(query.file, PathBuf::from("/repo/src/lib.rs"));
+        assert_eq!(query.line, 1); // new_line 2, 0-based
+        assert_eq!(query.line_text, "fn new_name() {}");
+        assert_eq!(query.display_col, 0); // "fn", the first symbol
+
+        app.update(Action::NextSymbol);
+        let query = app.hover_query().expect("still on the same row");
+        assert_eq!(query.display_col, 3); // "new_name"
+    }
+
+    #[test]
+    fn hover_query_is_none_on_a_del_row() {
+        let mut app = test_app();
+        app.update(Action::Top);
+        for _ in 0..3 {
+            app.update(Action::CursorDown);
+        }
+        // Row 3 is the "-fn old_name() {}" del line — nothing to hover.
+        assert_eq!(app.hover_query(), None);
     }
 
     #[test]

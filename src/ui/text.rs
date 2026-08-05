@@ -6,7 +6,8 @@
 //! `unicode-width` is the only thing that knows that.
 
 use crate::highlight::{HighlightKind, Span as HlSpan};
-use ratatui::style::Color;
+use ratatui::style::{Color, Style};
+use ratatui::text::Span;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -54,6 +55,63 @@ pub fn truncate_spans_to_width(spans: &[HlSpan], max_width: usize) -> Vec<HlSpan
                 kind: span.kind,
             });
             break;
+        }
+    }
+    out
+}
+
+/// Patches an extra [`Style`] (e.g. underline) onto whichever part of
+/// `spans` falls within the display-column window `[start, end)`, splitting
+/// spans at the window's boundaries as needed so the rest of each span's
+/// styling is untouched. Used to mark the row's active hover symbol without
+/// the syntax highlighter needing to know that concept exists — it only
+/// ever produces spans for *syntax*; this layers a second, independent
+/// decoration on top by display column, the same coordinate space
+/// [`crate::ui::symbols::scan`] reports symbol positions in.
+///
+/// A no-op if `start >= end` (nothing to mark).
+pub fn mark_range(
+    spans: Vec<Span<'static>>,
+    start: usize,
+    end: usize,
+    extra: Style,
+) -> Vec<Span<'static>> {
+    if start >= end {
+        return spans;
+    }
+    let mut out = Vec::with_capacity(spans.len());
+    let mut col = 0usize;
+    for span in spans {
+        let text = span.content.into_owned();
+        let width = display_width(&text);
+        let span_start = col;
+        let span_end = col + width;
+        col = span_end;
+
+        if end <= span_start || start >= span_end {
+            out.push(Span::styled(text, span.style));
+            continue;
+        }
+
+        let local_start = start.saturating_sub(span_start).min(width);
+        let local_end = end.saturating_sub(span_start).min(width);
+
+        // Both are grapheme-safe prefixes of `text`, and `up_to_end` is
+        // always at least as long as `before` (`local_start <= local_end`),
+        // so slicing between their byte lengths never lands mid-character.
+        let before = truncate_to_width(&text, local_start);
+        let up_to_end = truncate_to_width(&text, local_end);
+        let mid = &text[before.len()..up_to_end.len()];
+        let after = &text[up_to_end.len()..];
+
+        if !before.is_empty() {
+            out.push(Span::styled(before, span.style));
+        }
+        if !mid.is_empty() {
+            out.push(Span::styled(mid.to_owned(), span.style.patch(extra)));
+        }
+        if !after.is_empty() {
+            out.push(Span::styled(after.to_owned(), span.style));
         }
     }
     out
@@ -111,5 +169,78 @@ mod tests {
     #[test]
     fn truncate_leaves_short_strings_unchanged() {
         assert_eq!(truncate_to_width("hi", 10), "hi");
+    }
+
+    use ratatui::style::Modifier;
+
+    fn underline() -> Style {
+        Style::default().add_modifier(Modifier::UNDERLINED)
+    }
+
+    fn plain_text(spans: &[Span<'static>]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn mark_range_splits_a_single_span_into_three_pieces() {
+        let spans = vec![Span::raw("hello world")];
+        let marked = mark_range(spans, 2, 7, underline());
+        assert_eq!(plain_text(&marked), "hello world");
+        assert_eq!(marked.len(), 3);
+        assert_eq!(marked[0].content.as_ref(), "he");
+        assert_eq!(marked[1].content.as_ref(), "llo w");
+        assert_eq!(marked[2].content.as_ref(), "orld");
+        assert!(!marked[0].style.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(marked[1].style.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(!marked[2].style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn mark_range_spans_a_boundary_between_two_input_spans() {
+        let spans = vec![Span::raw("foo"), Span::raw("bar")];
+        // Range [2, 4) covers the last char of "foo" and the first of "bar".
+        let marked = mark_range(spans, 2, 4, underline());
+        assert_eq!(plain_text(&marked), "foobar");
+        let underlined: String = marked
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(underlined, "ob");
+    }
+
+    #[test]
+    fn mark_range_never_splits_a_wide_character_in_half() {
+        let spans = vec![Span::raw("日本語")]; // each char is 2 display columns
+        // Range [1, 3) lands mid-character on both ends. Splitting reuses
+        // `truncate_to_width`, which only ever includes a grapheme once its
+        // *whole* width fits the budget — so both boundaries snap down to
+        // the nearest earlier character edge rather than cutting "日" or
+        // "本" in half. The output must still concatenate back to the
+        // original text no matter where the marked region ends up.
+        let marked = mark_range(spans, 1, 3, underline());
+        assert_eq!(plain_text(&marked), "日本語");
+        for span in &marked {
+            assert!(
+                span.content.chars().count() <= 1
+                    || !span.style.add_modifier.contains(Modifier::UNDERLINED),
+                "no span mixes multiple characters with a partial underline in a way that implies mid-character splitting"
+            );
+        }
+        let underlined: String = marked
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(underlined, "日");
+    }
+
+    #[test]
+    fn mark_range_is_a_no_op_when_start_is_not_before_end() {
+        let spans = vec![Span::raw("hello")];
+        let marked = mark_range(spans.clone(), 3, 3, underline());
+        assert_eq!(plain_text(&marked), "hello");
+        assert_eq!(marked.len(), 1);
+        assert!(!marked[0].style.add_modifier.contains(Modifier::UNDERLINED));
     }
 }

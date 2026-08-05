@@ -8,6 +8,7 @@
 use crate::keymap::Action;
 use crate::ui::app::App;
 use crate::ui::file_view::FileView;
+use crate::ui::hover_popup::HoverQuery;
 
 /// One screen's worth of state. The event loop talks to whichever variant
 /// is on top of the [`ViewStack`] only through this enum — never reaching
@@ -49,6 +50,41 @@ impl View {
 
     pub fn clear_pending_keys(&mut self) {
         self.set_pending_keys(String::new());
+    }
+
+    /// What `Action::Hover` should ask a language server about, per
+    /// whichever view is on top — see [`App::hover_query`] /
+    /// [`FileView::hover_query`].
+    pub fn hover_query(&self) -> Option<HoverQuery> {
+        match self {
+            View::Diff(app) => app.hover_query(),
+            View::File(file) => file.hover_query(),
+        }
+    }
+
+    /// `(cursor, active_symbol)` — a cheap, comparable snapshot of "what's
+    /// under the cursor for hover purposes." `ui::mod`'s event loop
+    /// compares this before and after every action to decide whether an
+    /// open or in-flight hover popup is now stale, without needing to know
+    /// which actions move the cursor or the active symbol and which don't.
+    pub fn hover_cursor_key(&self) -> (usize, usize) {
+        match self {
+            View::Diff(app) => (app.cursor, app.active_symbol),
+            View::File(file) => (file.cursor, file.active_symbol),
+        }
+    }
+
+    /// The cursor's row within the view's content pane, for positioning the
+    /// hover popup near it. `None` when the cursor is above the current
+    /// scroll offset (shouldn't happen in practice — the cursor is always
+    /// kept on screen — but a popup with nowhere sensible to anchor is
+    /// simply not drawn rather than drawn somewhere wrong).
+    pub fn cursor_screen_row(&self) -> Option<u16> {
+        let (cursor, scroll_offset) = match self {
+            View::Diff(app) => (app.cursor, app.scroll_offset),
+            View::File(file) => (file.cursor, file.scroll_offset),
+        };
+        u16::try_from(cursor.checked_sub(scroll_offset)?).ok()
     }
 }
 

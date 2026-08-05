@@ -12,43 +12,108 @@
 
 use crate::highlight::{FileHighlighter, Language};
 use crate::keymap::Action;
+use crate::ui::hover_popup::HoverQuery;
 use crate::ui::scroll;
-use crate::ui::text::{display_width, highlight_color, truncate_spans_to_width};
+use crate::ui::symbols;
+use crate::ui::text::{display_width, highlight_color, mark_range, truncate_spans_to_width};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use std::path::PathBuf;
 
 const LINE_NUMBER_WIDTH: usize = 5;
 const STATUS_BAR_HEIGHT: u16 = 1;
-const HINTS: &str = "j/k move  C-d/C-u half-page  gg/G top/bottom  q quit";
+const HINTS: &str = "j/k move  C-d/C-u half-page  gg/G top/bottom  K hover  Tab symbol  q quit";
 
 /// State for one open file. Construction does the (comparatively) expensive
 /// work — reading line boundaries and running the whole-file highlight pass
 /// once — so scrolling and rendering afterward touch nothing but indices.
 pub struct FileView {
     pub display_path: String,
+    /// Absolute path to the file on disk, and the boundary
+    /// [`crate::lsp::adapter::workspace_root`] searches within — `None`
+    /// when the source came from somewhere `Action::Hover` can't target
+    /// (currently unused by any caller, but kept optional rather than
+    /// requiring every `FileView` construction site to fabricate a path,
+    /// e.g. for a future "preview" viewer over unsaved content).
+    file_path: Option<PathBuf>,
+    git_root: PathBuf,
     highlighter: FileHighlighter,
     pub cursor: usize,
     pub scroll_offset: usize,
+    /// Index into the current line's [`symbols::scan`] output — mirrors
+    /// [`crate::ui::app::App::active_symbol`]; see that field's docs.
+    pub active_symbol: usize,
     pub pending_keys: String,
     pub should_quit: bool,
     viewport_height: usize,
 }
 
 impl FileView {
-    pub fn new(display_path: String, source: &str) -> Self {
+    /// Builds a view over `source`, optionally recording `target` — the
+    /// absolute path on disk and its git root — so `Action::Hover` has
+    /// somewhere to send a request. `ktmr open` always has a real file and
+    /// passes `Some`; tests that only exercise scrolling/highlighting pass
+    /// `None`.
+    pub fn with_hover_target(
+        display_path: String,
+        source: &str,
+        target: Option<(PathBuf, PathBuf)>,
+    ) -> Self {
         let language = Language::detect(&display_path);
+        let (file_path, git_root) = match target {
+            Some((file, root)) => (Some(file), root),
+            None => (None, PathBuf::new()),
+        };
         Self {
             highlighter: FileHighlighter::new(language, source),
             display_path,
+            file_path,
+            git_root,
             cursor: 0,
             scroll_offset: 0,
+            active_symbol: 0,
             pending_keys: String::new(),
             should_quit: false,
             viewport_height: 1,
         }
+    }
+
+    fn cursor_line_text(&self) -> String {
+        self.highlighter
+            .line(self.cursor)
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect()
+    }
+
+    fn cycle_symbol(&mut self, delta: isize) {
+        let text = self.cursor_line_text();
+        let symbols = symbols::scan(&text);
+        if symbols.is_empty() {
+            return;
+        }
+        let len = symbols.len() as isize;
+        let next = (self.active_symbol as isize + delta).rem_euclid(len);
+        self.active_symbol = next as usize;
+    }
+
+    /// As [`crate::ui::app::App::hover_query`]: what `Action::Hover` should
+    /// ask about, or `None` when this view has no hover target (see
+    /// `file_path`) or the current line has no identifier-like token.
+    pub fn hover_query(&self) -> Option<HoverQuery> {
+        let file = self.file_path.clone()?;
+        let line_text = self.cursor_line_text();
+        let symbol = symbols::scan(&line_text).get(self.active_symbol).copied()?;
+        Some(HoverQuery {
+            file,
+            git_root: self.git_root.clone(),
+            line: self.cursor as u32,
+            line_text,
+            display_col: symbol.display_start,
+        })
     }
 
     /// The number of lines in the opened file — the file view's analogue of
@@ -70,6 +135,7 @@ impl FileView {
             return;
         }
         let last = self.line_count() - 1;
+        let cursor_before = self.cursor;
         match action {
             Action::CursorDown => self.cursor = (self.cursor + 1).min(last),
             Action::CursorUp => self.cursor = self.cursor.saturating_sub(1),
@@ -83,7 +149,12 @@ impl FileView {
             }
             Action::Top => self.cursor = 0,
             Action::Bottom => self.cursor = last,
+            Action::NextSymbol => self.cycle_symbol(1),
+            Action::PrevSymbol => self.cycle_symbol(-1),
             Action::Quit => self.should_quit = true,
+            // `ui::mod` intercepts `Hover`/`Cancel` before they reach here,
+            // same as in `App::update` — see that method's comment.
+            Action::Hover | Action::Cancel => {}
             // A single file has no hunks, no other files, no sidebar, and
             // only one column — these diff-view actions are no-ops here
             // rather than unreachable, so the shared keymap doesn't need a
@@ -94,6 +165,9 @@ impl FileView {
             | Action::PrevFile
             | Action::ToggleSidebar
             | Action::ToggleLayout => {}
+        }
+        if self.cursor != cursor_before {
+            self.active_symbol = 0;
         }
         self.clamp_scroll();
     }
@@ -142,13 +216,23 @@ fn content_line(view: &FileView, idx: usize, is_cursor: bool, width: usize) -> L
 
     let spans = truncate_spans_to_width(view.highlighter.line(idx), content_width);
 
-    let mut line_spans = vec![Span::styled(gutter, Style::default().fg(Color::DarkGray))];
-    for span in spans {
-        line_spans.push(Span::styled(
-            span.text,
-            Style::default().fg(highlight_color(span.kind)),
-        ));
+    let mut content_spans: Vec<Span<'static>> = spans
+        .into_iter()
+        .map(|span| Span::styled(span.text, Style::default().fg(highlight_color(span.kind))))
+        .collect();
+    if is_cursor
+        && let Some(active) = symbols::scan(&view.cursor_line_text()).get(view.active_symbol)
+    {
+        content_spans = mark_range(
+            content_spans,
+            active.display_start,
+            active.display_end,
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        );
     }
+
+    let mut line_spans = vec![Span::styled(gutter, Style::default().fg(Color::DarkGray))];
+    line_spans.extend(content_spans);
 
     let rendered_width: usize = line_spans.iter().map(ratatui::text::Span::width).sum();
     if rendered_width < width {
@@ -162,7 +246,7 @@ fn content_line(view: &FileView, idx: usize, is_cursor: bool, width: usize) -> L
     line
 }
 
-pub fn render_status(frame: &mut Frame, area: Rect, view: &FileView) {
+pub fn render_status(frame: &mut Frame, area: Rect, view: &FileView, status_note: Option<&str>) {
     let position = format!("{}/{}", view.cursor + 1, view.line_count().max(1));
     let mut spans = vec![
         Span::styled(
@@ -181,6 +265,15 @@ pub fn render_status(frame: &mut Frame, area: Rect, view: &FileView) {
         ));
     }
 
+    if let Some(note) = status_note {
+        spans.push(Span::styled(
+            format!("· {note} "),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     spans.push(Span::styled(
         format!("· {HINTS}"),
         Style::default().fg(Color::DarkGray),
@@ -195,7 +288,7 @@ mod tests {
 
     fn test_view() -> FileView {
         let source = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
-        let mut view = FileView::new("src/main.rs".to_owned(), source);
+        let mut view = FileView::with_hover_target("src/main.rs".to_owned(), source, None);
         view.set_viewport_height(2);
         view
     }
@@ -243,5 +336,48 @@ mod tests {
         view.update(Action::Bottom);
         assert!(view.cursor >= view.scroll_offset);
         assert!(view.cursor < view.scroll_offset + 2);
+    }
+
+    #[test]
+    fn plain_new_has_no_hover_target() {
+        let view = test_view();
+        assert_eq!(view.hover_query(), None);
+    }
+
+    #[test]
+    fn next_symbol_cycles_and_resets_on_cursor_move() {
+        let mut view = test_view();
+        // Line 0 is "fn main() {" — two symbols: "fn", "main".
+        assert_eq!(view.active_symbol, 0);
+        view.update(Action::NextSymbol);
+        assert_eq!(view.active_symbol, 1);
+        view.update(Action::NextSymbol);
+        assert_eq!(view.active_symbol, 0, "wraps back to the first symbol");
+        view.update(Action::CursorDown);
+        assert_eq!(
+            view.active_symbol, 0,
+            "moving the cursor resets the active symbol"
+        );
+    }
+
+    #[test]
+    fn hover_query_targets_the_active_symbol_when_a_hover_target_is_configured() {
+        let source = "fn main() {\n    let x = 1;\n}\n";
+        let mut view = FileView::with_hover_target(
+            "src/main.rs".to_owned(),
+            source,
+            Some((PathBuf::from("/repo/src/main.rs"), PathBuf::from("/repo"))),
+        );
+        view.set_viewport_height(2);
+
+        let query = view.hover_query().expect("first line has symbols");
+        assert_eq!(query.file, PathBuf::from("/repo/src/main.rs"));
+        assert_eq!(query.line, 0);
+        assert_eq!(query.line_text, "fn main() {");
+        assert_eq!(query.display_col, 0); // "fn"
+
+        view.update(Action::NextSymbol);
+        let query = view.hover_query().expect("still line 0");
+        assert_eq!(query.display_col, 3); // "main"
     }
 }

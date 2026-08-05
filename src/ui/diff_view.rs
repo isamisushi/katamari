@@ -6,7 +6,10 @@
 use crate::diff::{DiffLineKind, RenderRow, SideBySideRow, SideCell, side_by_side_scroll_start};
 use crate::highlight::{Language, LineHighlighter};
 use crate::ui::app::{App, Layout};
-use crate::ui::text::{display_width, highlight_color, truncate_spans_to_width, truncate_to_width};
+use crate::ui::symbols;
+use crate::ui::text::{
+    display_width, highlight_color, mark_range, truncate_spans_to_width, truncate_to_width,
+};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -269,16 +272,24 @@ fn content_line(
     let spans = highlighter.highlight_line(language, &row.text);
     let spans = truncate_spans_to_width(&spans, content_width);
 
+    let mut content_spans: Vec<Span<'static>> = spans
+        .into_iter()
+        .map(|span| Span::styled(span.text, base_style(bg).fg(highlight_color(span.kind))))
+        .collect();
+    if is_cursor && let Some(active) = symbols::scan(&row.text).get(app.active_symbol) {
+        content_spans = mark_range(
+            content_spans,
+            active.display_start,
+            active.display_end,
+            Style::default().add_modifier(Modifier::UNDERLINED),
+        );
+    }
+
     let mut line_spans = vec![Span::styled(
         gutter,
         base_style(bg).fg(marker_color).add_modifier(Modifier::BOLD),
     )];
-    for span in spans {
-        line_spans.push(Span::styled(
-            span.text,
-            base_style(bg).fg(highlight_color(span.kind)),
-        ));
-    }
+    line_spans.extend(content_spans);
 
     let rendered_width: usize = line_spans.iter().map(ratatui::text::Span::width).sum();
     if rendered_width < width {

@@ -25,6 +25,26 @@ pub enum Action {
     PrevFile,
     ToggleSidebar,
     ToggleLayout,
+    /// Requests hover information for the row's active symbol (see
+    /// [`NextSymbol`](Action::NextSymbol)) — or, while a hover popup is
+    /// already open, closes it. `ui::mod`'s event loop intercepts this
+    /// action rather than forwarding it through `App`/`FileView::update`,
+    /// since resolving and issuing the LSP request is not a pure state
+    /// transition.
+    Hover,
+    /// Moves the row's "active symbol" — the identifier-like token `Hover`
+    /// targets — to the next/previous one on the current line. Purely a
+    /// cursor-adjacent selection index, so unlike `Hover` this *is* handled
+    /// inside `App`/`FileView::update`.
+    NextSymbol,
+    PrevSymbol,
+    /// Closes an open hover popup; otherwise a no-op. Separate from `Quit`
+    /// because Esc closing a transient overlay and `q` quitting the whole
+    /// view are different intents that happen to share "get me out of
+    /// this" — conflating them would make Esc quit the app the moment no
+    /// popup happens to be open, which is not what a user pressing Esc to
+    /// dismiss something expects.
+    Cancel,
     Quit,
 }
 
@@ -63,6 +83,7 @@ impl KeyChord {
             "Esc" => KeyCode::Esc,
             "Enter" => KeyCode::Enter,
             "Tab" => KeyCode::Tab,
+            "BackTab" => KeyCode::BackTab,
             "Backspace" => KeyCode::Backspace,
             "Left" => KeyCode::Left,
             "Right" => KeyCode::Right,
@@ -85,6 +106,7 @@ impl KeyChord {
             KeyCode::Esc => "Esc".to_string(),
             KeyCode::Enter => "Enter".to_string(),
             KeyCode::Tab => "Tab".to_string(),
+            KeyCode::BackTab => "BackTab".to_string(),
             KeyCode::Backspace => "Backspace".to_string(),
             KeyCode::Left => "Left".to_string(),
             KeyCode::Right => "Right".to_string(),
@@ -236,6 +258,10 @@ pub fn vim_preset() -> Vec<(KeySeq, Action)> {
         ("[ f", Action::PrevFile),
         ("b", Action::ToggleSidebar),
         ("s", Action::ToggleLayout),
+        ("K", Action::Hover),
+        ("Tab", Action::NextSymbol),
+        ("BackTab", Action::PrevSymbol),
+        ("Esc", Action::Cancel),
         ("q", Action::Quit),
     ]
     .into_iter()
@@ -294,6 +320,28 @@ mod tests {
         assert_eq!(
             resolver.feed(ctrl('d')),
             StepResult::Matched(Action::HalfPageDown)
+        );
+    }
+
+    #[test]
+    fn hover_and_symbol_cycling_keys_resolve() {
+        let keymap = Keymap::from_bindings(&vim_preset());
+        let mut resolver = keymap.resolver();
+        assert_eq!(
+            resolver.feed(chord('K')),
+            StepResult::Matched(Action::Hover)
+        );
+        assert_eq!(
+            resolver.feed(KeyChord::new(KeyCode::Tab, KeyModifiers::NONE)),
+            StepResult::Matched(Action::NextSymbol)
+        );
+        assert_eq!(
+            resolver.feed(KeyChord::new(KeyCode::BackTab, KeyModifiers::NONE)),
+            StepResult::Matched(Action::PrevSymbol)
+        );
+        assert_eq!(
+            resolver.feed(KeyChord::new(KeyCode::Esc, KeyModifiers::NONE)),
+            StepResult::Matched(Action::Cancel)
         );
     }
 
