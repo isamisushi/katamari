@@ -109,6 +109,23 @@ impl HoverState {
         self.status = Status::Pending;
     }
 
+    /// Bumps the generation counter without touching whatever's currently
+    /// shown or pending — a watch-mode refresh's way of discarding any
+    /// hover/definition/references request issued before the refresh (its
+    /// answer, whenever it arrives, will carry a now-stale generation and
+    /// be dropped on arrival, the same check [`Self::apply`] already makes
+    /// for a cursor move) without also closing a popup that's already
+    /// *showing* content whose anchored row survived the refresh
+    /// unchanged. Contrast with [`Self::invalidate`], which additionally
+    /// resets to `Idle` — the right choice for a cursor move, since
+    /// whatever was shown no longer describes what's under the cursor, but
+    /// the wrong one here, since a surviving row's popup content is still
+    /// exactly correct and closing it would just be disruptive churn on
+    /// every refresh.
+    pub fn bump_generation_for_refresh(&mut self) {
+        self.generation += 1;
+    }
+
     /// Records the "Diagnostics" section [`Self::apply`] should prepend to
     /// whatever hover content arrives — computed by `ui::mod` from
     /// whichever diagnostics overlap the row `Action::Hover` was issued on,
@@ -557,6 +574,36 @@ mod tests {
         };
         state.apply(generation, Ok(Some(hover)), &mut hl);
         assert!(state.is_open());
+    }
+
+    #[test]
+    fn bump_generation_for_refresh_discards_a_stale_pending_response_but_keeps_shown_content() {
+        let mut hl = LineHighlighter::new();
+        let mut state = HoverState::default();
+        state.invalidate();
+        let generation = state.generation();
+        let hover = lsp_types::Hover {
+            contents: HoverContents::Scalar(MarkedString::String("hello".to_owned())),
+            range: None,
+        };
+        state.apply(generation, Ok(Some(hover)), &mut hl);
+        assert!(state.is_open());
+
+        // A refresh happens while this content is showing; unlike
+        // `invalidate`, it must not close the popup.
+        state.bump_generation_for_refresh();
+        assert!(
+            state.is_open(),
+            "bump_generation_for_refresh must not close an already-shown popup"
+        );
+
+        // But a response for the pre-refresh generation must still be
+        // dropped as stale.
+        state.apply(generation, Ok(None), &mut hl);
+        assert!(
+            state.is_open(),
+            "a response tagged with the pre-refresh generation must not overwrite the current content"
+        );
     }
 
     #[test]

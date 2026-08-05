@@ -6,12 +6,13 @@
 
 use crate::lsp::transport::{LspError, Transport};
 use lsp_types::{
-    ClientCapabilities, ClientInfo, DidOpenTextDocumentParams, GeneralClientCapabilities,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverClientCapabilities, HoverParams,
-    InitializeParams, InitializeResult, InitializedParams, Location, MarkupKind,
-    PartialResultParams, Position, PositionEncodingKind, ReferenceContext, ReferenceParams,
-    ServerCapabilities, TextDocumentClientCapabilities, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    ClientCapabilities, ClientInfo, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidOpenTextDocumentParams, FileEvent, GeneralClientCapabilities, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverClientCapabilities, HoverParams, InitializeParams,
+    InitializeResult, InitializedParams, Location, MarkupKind, PartialResultParams, Position,
+    PositionEncodingKind, ReferenceContext, ReferenceParams, ServerCapabilities,
+    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier,
     WindowClientCapabilities, WorkspaceFolder,
 };
 use std::path::{Path, PathBuf};
@@ -139,8 +140,8 @@ impl Client {
 
     /// Announces a file's full content to the server. `version` is the
     /// document's LSP version counter — 1 for a file the server has never
-    /// seen before; M3a never edits a document after opening it, so callers
-    /// never need to send anything above 1.
+    /// seen before; a document that's since changed on disk is resynced via
+    /// [`Self::did_change`] instead, never by opening it a second time.
     pub fn did_open(&self, uri: Uri, language_id: &str, version: i32, content: &str) {
         self.transport.notify(
             "textDocument/didOpen",
@@ -152,6 +153,49 @@ impl Client {
                     text: content.to_owned(),
                 },
             },
+        );
+    }
+
+    /// Resyncs an already-open document to `content` — the working-tree
+    /// watch's way of telling a server "this file changed on disk" for a
+    /// document it already has open. Always a full-document replacement
+    /// (one `contentChanges` entry with no `range`, i.e.
+    /// `TextDocumentSyncKind::FULL`) rather than an incremental edit: this
+    /// client never tracks the fine-grained edit that produced the new
+    /// content (it only ever sees "the file is different now," from a
+    /// filesystem watcher, not a keystroke), so full-document sync is the
+    /// only form that's actually available to send, and every server this
+    /// client talks to accepts it regardless of which sync kind it
+    /// negotiated. `version` must be strictly greater than whatever this
+    /// document's last announced version was — callers get that from
+    /// [`crate::lsp::manager::LspManager`]'s per-file version counter, never
+    /// by guessing.
+    pub fn did_change(&self, uri: Uri, version: i32, content: &str) {
+        self.transport.notify(
+            "textDocument/didChange",
+            DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier { uri, version },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: content.to_owned(),
+                }],
+            },
+        );
+    }
+
+    /// Tells the server about changes to files it was never `didOpen`'d
+    /// for — a plain notification, not scoped to any one document, so a
+    /// server can invalidate whatever project-wide state (dependency
+    /// graphs, cross-file resolution caches) it keeps for files outside the
+    /// editor's open set. This is the complement to [`Self::did_change`]:
+    /// that method resyncs a document's *content* for a server that already
+    /// has it open; this one is the only way a server learns about a
+    /// filesystem change to a file it doesn't.
+    pub fn did_change_watched_files(&self, changes: Vec<FileEvent>) {
+        self.transport.notify(
+            "workspace/didChangeWatchedFiles",
+            DidChangeWatchedFilesParams { changes },
         );
     }
 
@@ -276,18 +320,6 @@ fn client_capabilities() -> ClientCapabilities {
         }),
         ..Default::default()
     }
-}
-
-/// The `TextDocumentSyncCapability` this client would request if it
-/// declared one explicitly. M3a never edits documents (it only opens files
-/// read-only to hover over them), so nothing in `client_capabilities` above
-/// actually asks for change notifications — this exists only as the
-/// documented value a future milestone's edit support would wire in, kept
-/// here rather than invented fresh so the "full, not incremental" choice the
-/// milestone spec calls for is recorded in one place.
-#[allow(dead_code)]
-fn intended_sync_capability() -> TextDocumentSyncCapability {
-    TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)
 }
 
 /// Converts an absolute filesystem path to a `file://` URI, percent-encoding

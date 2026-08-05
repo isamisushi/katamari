@@ -4,6 +4,7 @@ mod keymap;
 mod lsp;
 mod ui;
 mod vcs;
+mod watch;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -50,6 +51,13 @@ enum Command {
         /// parent) or a `<rev>..<rev>` / `<rev>...<rev>` range, passed to
         /// git. Defaults to the working tree.
         range: Option<String>,
+        /// Watch the repository for filesystem changes and refresh the
+        /// diff automatically. Working-tree scope only — combining this
+        /// with `--staged` or a revision range is rejected, since neither
+        /// has a stable "current" version for a filesystem watcher to
+        /// refresh against the way the working tree does.
+        #[arg(long)]
+        watch: bool,
     },
     /// Open a single file in a read-only, syntax-highlighted viewer.
     Open {
@@ -82,6 +90,25 @@ enum Command {
         #[arg(long)]
         diagnostics: bool,
     },
+    /// Runs the working-tree watcher (no TUI) against a repository and
+    /// prints each flushed batch of changes as one line, then exits — an
+    /// E2E smoke test for the `watch` module runnable without a terminal,
+    /// the same role `lsp-check` plays for `lsp`. Not part of the reviewing
+    /// workflow, so hidden from `--help`.
+    #[command(hide = true)]
+    WatchCheck {
+        /// Repository (or any directory inside one) to watch. Defaults to
+        /// the current directory.
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+        /// Exit successfully after this many flushed batches.
+        #[arg(long, default_value_t = 3)]
+        flushes: usize,
+        /// Exit with an error if that many flushes haven't arrived within
+        /// this many seconds.
+        #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
+    },
 }
 
 /// `--layout`'s value space in clap-friendly form. `ui::app::Layout` is the
@@ -110,13 +137,15 @@ fn main() -> Result<()> {
         layout: LayoutArg::Unified,
         staged: false,
         range: None,
+        watch: false,
     }) {
         Command::Diff {
             dump,
             layout,
             staged,
             range,
-        } => run_diff(dump, layout, staged, range),
+            watch,
+        } => run_diff(dump, layout, staged, range, watch),
         Command::Open { file } => run_open(file),
         Command::LspCheck {
             file,
@@ -126,10 +155,27 @@ fn main() -> Result<()> {
             references,
             diagnostics,
         } => run_lsp_check(file, line, col, definition, references, diagnostics),
+        Command::WatchCheck {
+            dir,
+            flushes,
+            timeout_secs,
+        } => run_watch_check(dir, flushes, timeout_secs),
     }
 }
 
-fn run_diff(dump: bool, layout: LayoutArg, staged: bool, range: Option<String>) -> Result<()> {
+fn run_diff(
+    dump: bool,
+    layout: LayoutArg,
+    staged: bool,
+    range: Option<String>,
+    watch: bool,
+) -> Result<()> {
+    if watch && (staged || range.is_some()) {
+        bail!(
+            "--watch only supports the working tree; it cannot be combined with --staged or a revision range"
+        );
+    }
+
     let cwd = std::env::current_dir()?;
     let source = GitSource::discover(&cwd)?;
 
@@ -159,7 +205,9 @@ fn run_diff(dump: bool, layout: LayoutArg, staged: bool, range: Option<String>) 
     let mut app = App::new(repo_name, repo_root, files);
     app.layout = layout.into();
     let mut stack = ViewStack::new(View::Diff(app));
-    ui::run(&mut stack)
+    let pre_refresh_hook: Option<Box<dyn ui::PreRefreshHook>> =
+        watch.then(|| Box::new(ui::NoopPreRefreshHook) as Box<dyn ui::PreRefreshHook>);
+    ui::run(&mut stack, pre_refresh_hook)
 }
 
 fn run_open(file: PathBuf) -> Result<()> {
@@ -187,7 +235,7 @@ fn run_open(file: PathBuf) -> Result<()> {
 
     let view = FileView::with_hover_target(display_path, &source, Some((absolute_file, git_root)));
     let mut stack = ViewStack::new(View::File(view));
-    ui::run(&mut stack)
+    ui::run(&mut stack, None)
 }
 
 /// `ktmr lsp-check <file> <line> <col> [--definition|--references|--diagnostics]`
@@ -280,6 +328,54 @@ fn run_lsp_check(
     }
 
     manager.shutdown_all();
+    Ok(())
+}
+
+/// `ktmr watch-check --dir <dir> [--flushes N] [--timeout-secs S]` — an E2E
+/// smoke test for the whole `watch` module without a terminal: starts the
+/// same [`watch::spawn`] the TUI's `--watch` mode uses, prints each flushed
+/// batch as one line (change kind and path, one entry per change, sorted
+/// for deterministic output a test script can diff against), and exits
+/// once `flushes` have arrived or `timeout_secs` have passed without them.
+fn run_watch_check(dir: PathBuf, flushes: usize, timeout_secs: u64) -> Result<()> {
+    let repo_root = dir.canonicalize().unwrap_or(dir);
+    println!("watching: {}", repo_root.display());
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    watch::spawn(repo_root, tx).map_err(|e| anyhow::anyhow!("failed to start watcher: {e}"))?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let mut seen = 0usize;
+    while seen < flushes {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "watch-check: timed out after {timeout_secs}s waiting for {flushes} flush(es); saw {seen}"
+            );
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(watch::WatchSignal::Pending) => println!("[pending]"),
+            Ok(watch::WatchSignal::Flushed(batch)) => {
+                seen += 1;
+                let mut lines: Vec<String> = batch
+                    .changes
+                    .iter()
+                    .map(|c| format!("{:?} {}", c.kind, c.path.display()))
+                    .collect();
+                lines.sort();
+                println!("[flush {seen}] {}", lines.join(", "));
+            }
+            // A plain timeout just means no signal arrived within
+            // `remaining` — the top of the loop re-checks the real
+            // deadline and bails with a clear message once it's actually
+            // passed, so this iterates rather than misreporting an
+            // ordinary wait as the watcher having died.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("watch-check: watcher thread ended unexpectedly")
+            }
+        }
+    }
     Ok(())
 }
 

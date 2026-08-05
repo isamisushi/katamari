@@ -18,6 +18,7 @@ pub mod diff_view;
 pub mod file_view;
 pub mod hover_popup;
 pub mod navigation;
+pub mod refresh;
 pub mod refs_panel;
 pub mod scroll;
 pub mod sidebar;
@@ -28,8 +29,10 @@ pub mod view;
 
 pub use app::App;
 pub use file_view::FileView;
+pub use refresh::{NoopPreRefreshHook, PreRefreshHook};
 pub use view::{View, ViewStack};
 
+use crate::diff::parse_unified_diff;
 use crate::highlight::LineHighlighter;
 use crate::keymap::{Action, KeyChord, Keymap, Resolver, StepResult, vim_preset};
 use crate::lsp::adapter::Language;
@@ -41,13 +44,16 @@ use crate::lsp::{
 };
 use crate::ui::navigation::{JumpEntry, JumpStack, navigate_to};
 use crate::ui::refs_panel::RefsPanel;
+use crate::vcs::DiffSource;
+use crate::vcs::git::GitSource;
+use crate::watch::{self, WatchSignal};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use lsp_types::PositionEncodingKind;
+use lsp_types::{FileChangeType, PositionEncodingKind};
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -56,7 +62,7 @@ use std::collections::HashSet;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SIDEBAR_WIDTH: u16 = 30;
 const STATUS_BAR_HEIGHT: u16 = 1;
@@ -76,13 +82,21 @@ const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 enum AppEvent {
     Terminal(Event),
     Lsp(ServerEvent),
+    Watch(WatchSignal),
 }
 
 /// Runs the full-screen UI until the view stack empties (every view has been
 /// quit or popped back past the root). Installs a panic hook and enters the
 /// alternate screen on the way in, and restores the terminal on every exit
 /// path, including panics.
-pub fn run(stack: &mut ViewStack) -> Result<()> {
+///
+/// `pre_refresh_hook` doubles as the watch-mode switch: `Some` both enables
+/// watching the root diff's repository for changes and supplies the M5 seam
+/// (see [`PreRefreshHook`]) each refresh calls before re-running the diff;
+/// `None` is a plain, non-watching session and never spawns a watcher at
+/// all. `ktmr diff --watch` passes [`crate::ui::NoopPreRefreshHook`]; every
+/// other command passes `None`.
+pub fn run(stack: &mut ViewStack, pre_refresh_hook: Option<Box<dyn PreRefreshHook>>) -> Result<()> {
     install_panic_hook();
     let mut terminal = init_terminal()?;
 
@@ -94,7 +108,7 @@ pub fn run(stack: &mut ViewStack) -> Result<()> {
     spawn_input_thread(app_tx.clone());
 
     let (lsp_tx, lsp_rx) = mpsc::channel::<ServerEvent>();
-    spawn_lsp_forwarder(lsp_rx, app_tx);
+    spawn_lsp_forwarder(lsp_rx, app_tx.clone());
     let lsp_manager = LspManager::new(lsp_tx);
 
     // Proactively `didOpen`s the files this session starts out looking at,
@@ -102,6 +116,11 @@ pub fn run(stack: &mut ViewStack) -> Result<()> {
     // hovering first — see `LspManager::warm_up`'s docs for why hovering
     // alone isn't enough to make that happen promptly.
     let startup_status = warm_up_root(stack.top(), &lsp_manager);
+
+    let watch_startup_status = pre_refresh_hook
+        .is_some()
+        .then(|| start_watch(stack, app_tx))
+        .flatten();
 
     let result = event_loop(
         &mut terminal,
@@ -111,6 +130,8 @@ pub fn run(stack: &mut ViewStack) -> Result<()> {
         &app_rx,
         &lsp_manager,
         startup_status,
+        pre_refresh_hook,
+        watch_startup_status,
     );
 
     restore_terminal(&mut terminal)?;
@@ -125,6 +146,31 @@ pub fn run(stack: &mut ViewStack) -> Result<()> {
     lsp_manager.shutdown_all();
 
     result
+}
+
+/// Starts watching the root diff's repository and wires its events onto
+/// `app_tx`, marking the root [`App`] as being in watch mode along the way.
+/// Returns a status-bar note if the watcher itself failed to start (e.g.
+/// the platform's file-watching backend couldn't be initialized) — a
+/// session that asked for `--watch` and silently isn't watching would be a
+/// much worse failure mode than one that says so up front.
+fn start_watch(stack: &mut ViewStack, app_tx: Sender<AppEvent>) -> Option<String> {
+    let View::Diff(app) = stack.root_mut() else {
+        // `main.rs` only ever offers `--watch` alongside the plain diff
+        // view (not `ktmr open`'s single-file view), so this doesn't
+        // happen in practice — but reaching it silently, without a
+        // watcher, would be a worse failure than declining loudly.
+        return Some("watch: not available for this view".to_owned());
+    };
+    app.watch_mode = true;
+    let (watch_tx, watch_rx) = mpsc::channel::<WatchSignal>();
+    match watch::spawn(app.repo_root.clone(), watch_tx) {
+        Ok(()) => {
+            spawn_watch_forwarder(watch_rx, app_tx);
+            None
+        }
+        Err(e) => Some(format!("watch: failed to start: {e}")),
+    }
 }
 
 /// Proactively opens whichever files `view` starts out showing —
@@ -189,6 +235,20 @@ fn spawn_lsp_forwarder(rx: Receiver<ServerEvent>, tx: Sender<AppEvent>) {
     });
 }
 
+/// Relays the watcher's [`WatchSignal`]s onto the shared [`AppEvent`]
+/// channel — the same pattern as [`spawn_lsp_forwarder`], for the same
+/// reason: [`crate::watch`] stays free of any dependency on `ui`'s
+/// event-loop plumbing.
+fn spawn_watch_forwarder(rx: Receiver<WatchSignal>, tx: Sender<AppEvent>) {
+    std::thread::spawn(move || {
+        for signal in rx {
+            if tx.send(AppEvent::Watch(signal)).is_err() {
+                break;
+            }
+        }
+    });
+}
+
 /// What a `textDocument/definition`/`references` request is currently
 /// waiting on — kept alongside the [`JumpEntry`] the cursor was at when the
 /// request was issued, since that's what a single-result definition (or a
@@ -209,6 +269,38 @@ struct RefsPanelState {
     panel: RefsPanel,
 }
 
+/// A transient status-bar note about watch-mode activity ("updated",
+/// "closed: file changed", a debounce-pending hint). Unlike `goto_status`
+/// (cleared the moment the next key is pressed) or `lsp_status` (superseded
+/// by the next progress tick), nothing else in the event loop naturally
+/// clears a watch note on its own timeline — a refresh might be the last
+/// thing that happens for a while if the reviewer just sits reading — so it
+/// carries its own expiry rather than lingering indefinitely.
+struct WatchStatus {
+    text: String,
+    set_at: Instant,
+}
+
+impl WatchStatus {
+    fn new(text: String) -> Self {
+        Self {
+            text,
+            set_at: Instant::now(),
+        }
+    }
+}
+
+/// How long a [`WatchStatus`] note stays in the status bar before clearing
+/// itself — long enough to read at a glance, short enough not to crowd out
+/// the hover/goto/LSP notes that share the same status-bar slot.
+const WATCH_STATUS_FLASH: Duration = Duration::from_secs(3);
+
+#[allow(clippy::too_many_arguments)] // mirrors `handle_action`'s: this is
+// `ui::mod`'s one render/dispatch loop, already threading through every
+// long-lived piece of session state (hover, jump history, diagnostics,
+// LSP, and now watch-mode) that a single frame's worth of work touches;
+// splitting the signature into a struct would just move the same fields
+// one level down without reducing how many things one iteration needs.
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     stack: &mut ViewStack,
@@ -217,6 +309,8 @@ fn event_loop(
     app_rx: &Receiver<AppEvent>,
     lsp_manager: &LspManager,
     startup_status: Option<String>,
+    pre_refresh_hook: Option<Box<dyn PreRefreshHook>>,
+    initial_watch_status: Option<String>,
 ) -> Result<()> {
     let mut hover_state = hover_popup::HoverState::default();
     let mut pending_hover: Option<(u64, Receiver<Result<HoverResult, LspError>>)> = None;
@@ -226,6 +320,7 @@ fn event_loop(
     let mut diagnostics = DiagnosticsStore::new();
     let mut lsp_status: Option<String> = startup_status;
     let mut goto_status: Option<String> = None;
+    let mut watch_status: Option<WatchStatus> = initial_watch_status.map(WatchStatus::new);
     let mut warned_languages: HashSet<Language> = HashSet::new();
 
     loop {
@@ -292,10 +387,17 @@ fn event_loop(
             warned_languages.insert(language);
         }
 
+        if watch_status
+            .as_ref()
+            .is_some_and(|s| s.set_at.elapsed() > WATCH_STATUS_FLASH)
+        {
+            watch_status = None;
+        }
         let status_note = hover_state
             .status_hint()
             .or_else(|| goto_status.clone())
-            .or_else(|| lsp_status.clone());
+            .or_else(|| lsp_status.clone())
+            .or_else(|| watch_status.as_ref().map(|s| s.text.clone()));
         terminal.draw(|frame| {
             draw(
                 frame,
@@ -362,6 +464,20 @@ fn event_loop(
                 }
                 crate::lsp::LspEvent::Closed { .. } => lsp_status = None,
             },
+            Ok(AppEvent::Watch(WatchSignal::Pending)) => {
+                watch_status = Some(WatchStatus::new("watch: pending\u{2026}".to_owned()));
+            }
+            Ok(AppEvent::Watch(WatchSignal::Flushed(batch))) => {
+                handle_watch_refresh(
+                    batch,
+                    stack,
+                    pre_refresh_hook.as_deref(),
+                    lsp_manager,
+                    &mut hover_state,
+                    &mut refs_panel,
+                    &mut watch_status,
+                );
+            }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
@@ -517,6 +633,117 @@ fn handle_action(
                 hover_state.invalidate();
             }
         }
+    }
+}
+
+/// Applies one flushed watch batch: runs the M5 pre-refresh hook, re-runs
+/// the working-tree diff, re-parses it, and swaps it into the root diff via
+/// [`App::apply_refresh`] (which owns cursor/scroll preservation — see its
+/// docs), then resyncs every language server that has anything to say about
+/// the files that changed. Closes an open hover/references overlay whose
+/// anchored row didn't survive the swap unchanged, and always bumps the
+/// hover generation counter regardless, so any request issued before the
+/// refresh can never land after it (mirrors what a cursor move already does
+/// via [`hover_popup::HoverState::invalidate`] — see
+/// [`hover_popup::HoverState::bump_generation_for_refresh`]'s docs for why
+/// this refresh path needs the non-closing variant instead).
+///
+/// A transient failure re-running or re-parsing the diff (e.g. `git diff`
+/// racing an in-progress `git rebase`) is left as a status note rather than
+/// treated as fatal — the diff already on screen stays put, and the next
+/// flush gets another chance.
+fn handle_watch_refresh(
+    batch: watch::WatchBatch,
+    stack: &mut ViewStack,
+    pre_refresh_hook: Option<&dyn PreRefreshHook>,
+    lsp_manager: &LspManager,
+    hover_state: &mut hover_popup::HoverState,
+    refs_panel: &mut Option<RefsPanelState>,
+    watch_status: &mut Option<WatchStatus>,
+) {
+    let View::Diff(app) = stack.root_mut() else {
+        return; // watch mode only ever runs against the root diff view
+    };
+
+    if let Some(hook) = pre_refresh_hook {
+        hook.before_refresh(&app.repo_root);
+    }
+
+    let files = match GitSource::discover(&app.repo_root).and_then(|s| s.working_tree_diff()) {
+        Ok(diff_text) => parse_unified_diff(&diff_text),
+        Err(e) => {
+            *watch_status = Some(WatchStatus::new(format!("watch: refresh failed: {e}")));
+            return;
+        }
+    };
+
+    let overlay_survives = app.apply_refresh(files);
+    hover_state.bump_generation_for_refresh();
+
+    let mut overlay_closed = false;
+    if !overlay_survives {
+        if hover_state.is_open() {
+            hover_state.close();
+            overlay_closed = true;
+        }
+        if refs_panel.is_some() {
+            *refs_panel = None;
+            overlay_closed = true;
+        }
+    }
+
+    sync_lsp_after_refresh(app, lsp_manager, &batch.changes);
+
+    *watch_status = Some(WatchStatus::new(
+        if overlay_closed {
+            "closed: file changed"
+        } else {
+            "updated"
+        }
+        .to_owned(),
+    ));
+}
+
+/// Keeps every language server in sync with the files a watch batch
+/// touched: already-open documents get a full-text `textDocument/didChange`
+/// (see [`LspManager::sync_changed_files`] on why that's uncapped), every
+/// running server whose workspace root contains a changed path gets
+/// `workspace/didChangeWatchedFiles` so it can invalidate project state for
+/// files it never opened, and newly-appearing diff entries get `didOpen`'d
+/// through the same capped [`LspManager::warm_up`] machinery startup uses —
+/// already-open files are cheap no-ops there, so calling it with the full
+/// current file list on every refresh is simpler than tracking "which files
+/// are new" separately.
+fn sync_lsp_after_refresh(app: &App, lsp_manager: &LspManager, changes: &[watch::ChangedPath]) {
+    let changed_paths: Vec<PathBuf> = changes.iter().map(|c| c.path.clone()).collect();
+    lsp_manager.sync_changed_files(&changed_paths, &app.repo_root);
+
+    let watched: Vec<(PathBuf, FileChangeType)> = changes
+        .iter()
+        .map(|c| (c.path.clone(), file_change_type(c.kind)))
+        .collect();
+    lsp_manager.notify_watched_files(&watched);
+
+    let current_files: Vec<PathBuf> = app
+        .files
+        .iter()
+        .filter(|f| !f.is_deleted && !f.is_binary)
+        .filter_map(|f| f.new_path.as_deref())
+        .map(|relative| app.repo_root.join(relative))
+        .collect();
+    lsp_manager.warm_up(&current_files, &app.repo_root);
+}
+
+/// Maps a filesystem watcher's [`watch::ChangeKind`] onto LSP's
+/// `FileChangeType` — the vocabulary conversion between "what `notify` saw"
+/// and "what `workspace/didChangeWatchedFiles` expects," which belongs at
+/// this integration layer rather than in either `watch` (no LSP knowledge)
+/// or `lsp` (no filesystem-watcher knowledge).
+fn file_change_type(kind: watch::ChangeKind) -> FileChangeType {
+    match kind {
+        watch::ChangeKind::Created => FileChangeType::CREATED,
+        watch::ChangeKind::Changed => FileChangeType::CHANGED,
+        watch::ChangeKind::Deleted => FileChangeType::DELETED,
     }
 }
 

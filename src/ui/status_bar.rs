@@ -47,6 +47,15 @@ pub fn render(
         ));
     }
 
+    if app.watch_mode {
+        spans.push(Span::styled(
+            "· \u{29BF} watch ", // ⦿ — BULLSEYE
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     if app.layout == Layout::SideBySide && effective_layout == Layout::Unified {
         spans.push(Span::styled(
             "· side-by-side needs a wider terminal, showing unified ",

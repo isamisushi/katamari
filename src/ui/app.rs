@@ -7,6 +7,7 @@ use crate::diff::{DiffFile, RenderRow, SideBySideRow, flatten, flatten_side_by_s
 use crate::keymap::Action;
 use crate::lsp::DiagnosticsStore;
 use crate::ui::hover_popup::HoverQuery;
+use crate::ui::refresh;
 use crate::ui::scroll;
 use crate::ui::symbols;
 use std::path::{Path, PathBuf};
@@ -58,6 +59,13 @@ pub struct App {
     pub layout: Layout,
     pub pending_keys: String,
     pub should_quit: bool,
+    /// Whether this session is running `ktmr diff --watch` — purely a
+    /// display flag for the status bar's "⦿ watch" indicator; `ui::mod`'s
+    /// event loop decides independently (via whether it was handed a
+    /// [`crate::ui::PreRefreshHook`]) whether to actually spawn a watcher,
+    /// so this field can never drift into claiming watch mode is on when
+    /// nothing is watching.
+    pub watch_mode: bool,
     viewport_height: usize,
 }
 
@@ -78,6 +86,7 @@ impl App {
             layout: Layout::default(),
             pending_keys: String::new(),
             should_quit: false,
+            watch_mode: false,
             viewport_height: 1,
         }
     }
@@ -148,6 +157,45 @@ impl App {
     pub fn set_viewport_height(&mut self, height: usize) {
         self.viewport_height = height.max(1);
         self.clamp_scroll();
+    }
+
+    /// Swaps in a freshly re-parsed diff — watch mode's refresh pipeline
+    /// calls this after every debounced batch of filesystem changes (see
+    /// `ui::mod`'s `handle_watch_refresh`). Preserves the cursor's logical
+    /// position via [`refresh::capture_anchor`]/[`refresh::restore_anchor`]
+    /// rather than reusing the old flat index blindly, which after an edit
+    /// anywhere else in the diff would typically now point at unrelated
+    /// content; the scroll offset is restored the same way, keeping the
+    /// cursor's on-screen row stable rather than re-centering on every
+    /// refresh.
+    ///
+    /// Returns whether the cursor's landed-on row is *exactly* the row it
+    /// was anchored to before the refresh (same file, line, and text) —
+    /// `ui::mod` uses this to decide whether an open hover/references
+    /// overlay, always anchored to whatever's under the cursor, should
+    /// survive the swap or close.
+    pub fn apply_refresh(&mut self, files: Vec<DiffFile>) -> bool {
+        let anchor =
+            refresh::capture_anchor(&self.files, &self.rows, self.cursor, self.scroll_offset);
+
+        self.files = files;
+        self.rows = flatten(&self.files);
+        self.side_by_side_rows = flatten_side_by_side(&self.files);
+        self.active_symbol = 0;
+
+        if self.rows.is_empty() {
+            self.cursor = 0;
+            self.scroll_offset = 0;
+            return false;
+        }
+
+        let restored = refresh::restore_anchor(&self.files, &self.rows, &anchor);
+        self.cursor = restored.row_index;
+        self.scroll_offset = restored
+            .row_index
+            .saturating_sub(refresh::scroll_delta(&anchor));
+        self.clamp_scroll();
+        restored.overlay_survives
     }
 
     /// Index into `files`/`rows` for whichever file the cursor currently
@@ -487,5 +535,35 @@ mod tests {
         app.update(Action::Bottom);
         assert!(app.cursor >= app.scroll_offset);
         assert!(app.cursor < app.scroll_offset + 3);
+    }
+
+    #[test]
+    fn apply_refresh_with_an_identical_diff_keeps_the_cursor_in_place_and_reports_survival() {
+        let mut app = test_app();
+        app.update(Action::Top);
+        for _ in 0..4 {
+            app.update(Action::CursorDown);
+        }
+        let cursor_before = app.cursor;
+
+        let same_files = parse_unified_diff(FIXTURE);
+        let survived = app.apply_refresh(same_files);
+
+        assert!(
+            survived,
+            "identical content at the same position must survive"
+        );
+        assert_eq!(app.cursor, cursor_before);
+    }
+
+    #[test]
+    fn apply_refresh_on_an_empty_diff_resets_cursor_and_scroll_without_panicking() {
+        let mut app = test_app();
+        app.update(Action::Bottom);
+        let survived = app.apply_refresh(Vec::new());
+        assert!(!survived);
+        assert_eq!(app.cursor, 0);
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.rows.is_empty());
     }
 }

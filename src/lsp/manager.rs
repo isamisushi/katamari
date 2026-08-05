@@ -14,8 +14,8 @@ use crate::diff::ColumnMap;
 use crate::lsp::adapter::{self, Language};
 use crate::lsp::client::{Client, DefinitionResult, HoverResult, ReferencesResult, file_uri};
 use crate::lsp::transport::{LspError, LspEvent};
-use lsp_types::{Position, PositionEncodingKind};
-use std::collections::{HashMap, HashSet, VecDeque};
+use lsp_types::{FileChangeType, FileEvent, Position, PositionEncodingKind};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -126,11 +126,17 @@ struct ServerEntry {
     state: ServerState,
     client: Option<Arc<Client>>,
     queue: VecDeque<QueuedRequest>,
-    /// Files already announced to this server via `textDocument/didOpen`.
-    /// Re-sending `didOpen` for the same URI without a `didClose` in
-    /// between is a protocol violation most servers won't like, so every
-    /// dispatch checks this before opening.
-    opened: HashSet<PathBuf>,
+    /// Files already announced to this server via `textDocument/didOpen`,
+    /// mapped to the LSP version number last sent for them. A file with no
+    /// entry here has never been opened; re-sending `didOpen` for one that
+    /// does (without an intervening `didClose`) is a protocol violation
+    /// most servers won't like, so every dispatch checks this map before
+    /// opening. Once a file is open, [`LspManager::sync_changed_files`]
+    /// bumps its version and sends `textDocument/didChange` here whenever a
+    /// watch-mode refresh finds it changed on disk — this map is the only
+    /// place that version counter lives, so a resync can never reuse or
+    /// skip a number.
+    versions: HashMap<PathBuf, i32>,
 }
 
 impl ServerEntry {
@@ -139,7 +145,7 @@ impl ServerEntry {
             state: ServerState::NotStarted,
             client: None,
             queue: VecDeque::new(),
-            opened: HashSet::new(),
+            versions: HashMap::new(),
         }
     }
 }
@@ -299,6 +305,80 @@ impl LspManager {
         WarmUpSummary {
             opened,
             total_eligible,
+        }
+    }
+
+    /// Resyncs every file in `changed` that some server already has open
+    /// (per [`ServerEntry::versions`]) to its current on-disk content, via
+    /// `textDocument/didChange` with that document's version bumped past
+    /// whatever was last sent for it. Deliberately uncapped, unlike
+    /// [`Self::warm_up`]: an already-open document staying in sync with
+    /// disk isn't optional the way proactively opening a *new* file is —
+    /// every one of them gets resynced on every refresh, regardless of how
+    /// many that is. Files nothing has opened yet are left alone; a watch
+    /// refresh opens newly-appearing diff entries separately, through
+    /// [`Self::warm_up`], which *is* capped.
+    pub fn sync_changed_files(&self, changed: &[PathBuf], git_root: &Path) {
+        for file in changed {
+            let Some(key) = self.key_for(file, git_root) else {
+                continue;
+            };
+            let next = {
+                let mut servers = self.servers.lock().unwrap_or_else(|e| e.into_inner());
+                let Some(entry) = servers.get_mut(&key) else {
+                    continue;
+                };
+                let Some(client) = entry.client.clone() else {
+                    continue;
+                };
+                let Some(version) = bump_version(&mut entry.versions, file) else {
+                    continue; // no server has this file open; nothing to resync
+                };
+                (client, version)
+            };
+            let (client, version) = next;
+            let file = file.clone();
+            std::thread::spawn(move || {
+                // A file a watch batch reported as changed may have been
+                // deleted again (or be mid-write) by the time this thread
+                // gets to read it; either way there's no content to send,
+                // and `workspace/didChangeWatchedFiles` (see
+                // `Self::notify_watched_files`) is the mechanism that tells
+                // the server about deletion, not this one.
+                let Ok(content) = std::fs::read_to_string(&file) else {
+                    return;
+                };
+                let Ok(uri) = file_uri(&file) else { return };
+                client.did_change(uri, version, &content);
+            });
+        }
+    }
+
+    /// Sends `workspace/didChangeWatchedFiles` to every running server whose
+    /// workspace root contains at least one of `changed`'s paths — the
+    /// mechanism a server uses to invalidate project-wide state (dependency
+    /// graphs, cross-file caches) for files it was never `didOpen`'d for,
+    /// which [`Self::sync_changed_files`]'s per-open-document
+    /// `didChange` doesn't reach. A server whose root contains none of the
+    /// changed paths hears nothing, rather than every server hearing about
+    /// every change regardless of relevance.
+    pub fn notify_watched_files(&self, changed: &[(PathBuf, FileChangeType)]) {
+        let servers = self.servers.lock().unwrap_or_else(|e| e.into_inner());
+        for (key, entry) in servers.iter() {
+            let Some(client) = &entry.client else {
+                continue;
+            };
+            let workspace_root = &key.1;
+            let events: Vec<FileEvent> = changed
+                .iter()
+                .filter(|(path, _)| path.starts_with(workspace_root))
+                .filter_map(|(path, typ)| {
+                    file_uri(path).ok().map(|uri| FileEvent { uri, typ: *typ })
+                })
+                .collect();
+            if !events.is_empty() {
+                client.did_change_watched_files(events);
+            }
         }
     }
 
@@ -471,6 +551,18 @@ impl LspManager {
     }
 }
 
+/// Bumps `file`'s entry in a server's version map and returns the new
+/// version, or `None` if `file` isn't in the map at all (no server has it
+/// open, so there's nothing to resync). Split out from
+/// [`LspManager::sync_changed_files`] as a plain function over the map
+/// itself so the counter arithmetic is unit-testable without a running
+/// language server.
+fn bump_version(versions: &mut HashMap<PathBuf, i32>, file: &Path) -> Option<i32> {
+    let version = versions.get_mut(file)?;
+    *version += 1;
+    Some(*version)
+}
+
 fn enqueue(
     entry: &mut ServerEntry,
     file: &Path,
@@ -562,8 +654,9 @@ fn dispatch(
             servers
                 .entry(key.clone())
                 .or_insert_with(ServerEntry::new)
-                .opened
-                .insert(request.file.clone())
+                .versions
+                .insert(request.file.clone(), 1)
+                .is_none()
         };
         if needs_open {
             let language_id = adapter::lsp_language_id(key.0, &request.file);
@@ -623,4 +716,46 @@ fn forward<T>(rx: Receiver<Result<T, LspError>>, tx: Sender<Result<T, LspError>>
         .recv_timeout(REQUEST_TIMEOUT)
         .unwrap_or(Err(LspError::Io("request timed out".to_owned())));
     let _ = tx.send(result);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bump_version_increments_an_already_open_files_version() {
+        let mut versions = HashMap::new();
+        versions.insert(PathBuf::from("/repo/src/lib.rs"), 1);
+        assert_eq!(
+            bump_version(&mut versions, Path::new("/repo/src/lib.rs")),
+            Some(2)
+        );
+        assert_eq!(
+            bump_version(&mut versions, Path::new("/repo/src/lib.rs")),
+            Some(3)
+        );
+        assert_eq!(versions[Path::new("/repo/src/lib.rs")], 3);
+    }
+
+    #[test]
+    fn bump_version_is_none_for_a_file_no_server_has_open() {
+        let mut versions = HashMap::new();
+        versions.insert(PathBuf::from("/repo/src/lib.rs"), 1);
+        assert_eq!(
+            bump_version(&mut versions, Path::new("/repo/src/other.rs")),
+            None
+        );
+        // And bumping one file never touches another's counter.
+        assert_eq!(versions[Path::new("/repo/src/lib.rs")], 1);
+    }
+
+    #[test]
+    fn bump_version_never_reuses_or_skips_a_number_across_repeated_changes() {
+        let mut versions = HashMap::new();
+        versions.insert(PathBuf::from("/repo/a.rs"), 1);
+        let seen: Vec<i32> = (0..5)
+            .map(|_| bump_version(&mut versions, Path::new("/repo/a.rs")).unwrap())
+            .collect();
+        assert_eq!(seen, vec![2, 3, 4, 5, 6]);
+    }
 }
