@@ -54,9 +54,9 @@ ktmr diff --watch      # refresh automatically as files change on disk
 
 Inside the diff: `K` hovers the identifier under the cursor, `gd`/`gr` go
 to its definition/references, `]d`/`[d` jump between diagnostics. Language
-servers spawn lazily, the first time something asks — see
-[LSP server install hints](#lsp-server-install-hints) if a feature reports
-a server as unavailable.
+servers spawn lazily, the first time something asks, and auto-install
+themselves if missing — see [Language servers](#language-servers) if a
+feature reports a server as unavailable.
 
 Leave a review comment on the current line with `c`, then `C-s` to save.
 An AI coding agent addresses them with:
@@ -136,6 +136,12 @@ keymap = "vim"  # or "emacs"
 quit = "Z Z"
 next-hunk = "C-n"
 
+[lsp]
+# Whether a missing language server is silently downloaded/built into
+# katamari's own prefix instead of just reporting an install hint. Default
+# true; see "Language servers" below for what each language's strategy is.
+auto_install = true
+
 [lsp.servers.rust]
 # Overrides how a language's server is resolved — highest priority, above
 # PATH and every project-local lookup. `<lang>` is rust/typescript/python/go.
@@ -158,20 +164,48 @@ highlight_max_lines = 5000
 debounce_ms = 200
 ```
 
-## LSP server install hints
+## Language servers
 
-katamari spawns these lazily and reports a specific install hint in the
-status bar if one isn't found — this is the same information, up front:
+katamari spawns servers lazily, the first time a file of that language is
+opened, and looks for each one in this order: config override →
+project-local convention (`node_modules/.bin`, `.venv/bin`) → `PATH` →
+`rustup which`/`mise which` → katamari's own managed install (below). If
+none of those find anything, katamari **auto-installs it** — downloading
+rust-analyzer's prebuilt binary from GitHub releases, or running `npm
+install`/`go install` into a private prefix — with progress shown in the
+status bar, no confirmation prompt, the same "it just works" experience
+VSCode/Zed give you.
 
-| Language | Server | Install |
+| Language | Server | Auto-install strategy |
 | --- | --- | --- |
-| Rust | `rust-analyzer` | `rustup component add rust-analyzer` (found via `PATH` or `rustup which`) |
-| TypeScript/JavaScript | `typescript-language-server` | `npm i -g typescript-language-server typescript` (project-local `node_modules/.bin` preferred if present) |
-| Python | `pyright-langserver` | `npm i -g pyright` (project-local `.venv/bin` preferred if present) |
-| Go | `gopls` | `go install golang.org/x/tools/gopls@latest` |
+| Rust | `rust-analyzer` | prebuilt binary from GitHub releases |
+| TypeScript/JavaScript | `typescript-language-server` | `npm install` (bootstraps a private Node.js runtime first if no `npm` can be found anywhere) |
+| Python | `pyright-langserver` | `npm install` (same Node.js bootstrap fallback) |
+| Go | `gopls` | `go install`, requires an existing go toolchain — katamari won't install Go itself |
+
+Managed installs live under `~/.local/share/katamari/servers/`
+(`$XDG_DATA_HOME/katamari/servers/` if set), one version-stamped
+subdirectory per server — never touched by anything but katamari, and safe
+to delete entirely (everything reinstalls on demand).
 
 `[lsp.servers.<lang>]` in config (above) overrides any of these with an
-explicit command.
+explicit command, taking priority over every lookup including auto-install.
+To disable auto-install and just get the old "here's the install command"
+status-bar hint instead:
+
+```toml
+[lsp]
+auto_install = false
+```
+
+`ktmr lsp` manages installs directly, without waiting for a server to be
+needed:
+
+```
+ktmr lsp doctor              # where each language's server resolves from today (no installs triggered)
+ktmr lsp install <language>  # force an install into katamari's managed prefix (rust/typescript/python/go/all)
+ktmr lsp update              # reinstall any pinned server that's fallen behind the current pin
+```
 
 ## jj colocated setup
 

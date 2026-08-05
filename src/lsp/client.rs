@@ -65,8 +65,18 @@ impl Client {
     /// Spawns `command` and runs the `initialize`/`initialized` handshake to
     /// completion. Blocking — callers run this on a background thread (see
     /// [`crate::lsp::manager`]) so the render loop is never stalled waiting
-    /// on a language server's cold start.
-    pub fn start(command: Command, workspace_root: &Path) -> Result<Self, LspError> {
+    /// on a language server's cold start. `initialization_options` is sent
+    /// verbatim as `initialize`'s server-specific `initializationOptions`
+    /// field — `None` for every server except a katamari-managed
+    /// typescript-language-server, which needs it to find its
+    /// peer-installed `typescript` (see
+    /// [`crate::lsp::adapter::ResolvedServer`]'s docs); every other server
+    /// initializes exactly as before this parameter existed.
+    pub fn start(
+        command: Command,
+        workspace_root: &Path,
+        initialization_options: Option<serde_json::Value>,
+    ) -> Result<Self, LspError> {
         let transport = Transport::spawn(command)?;
         let root_uri = file_uri(workspace_root)?;
         let workspace_name = workspace_root
@@ -90,6 +100,7 @@ impl Client {
                 name: "katamari".to_owned(),
                 version: Some(env!("CARGO_PKG_VERSION").to_owned()),
             }),
+            initialization_options,
             ..Default::default()
         };
 

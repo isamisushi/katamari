@@ -169,6 +169,50 @@ enum Command {
         #[command(subcommand)]
         action: SkillCommand,
     },
+    /// Diagnoses and manages the language-server installs `[lsp]
+    /// auto_install` (on by default) would otherwise trigger silently the
+    /// first time a server is needed — see [`lsp::install`]'s module docs
+    /// for the managed-prefix layout and pinned versions.
+    Lsp {
+        #[command(subcommand)]
+        action: LspCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum LspCommand {
+    /// Prints, for each of the four supported languages, where its server
+    /// would resolve from today (config override / project-local / PATH /
+    /// `mise which` / katamari-managed / not found) and — only when not
+    /// found — whether `[lsp] auto_install` would handle it. Read-only:
+    /// never downloads or installs anything, and runs fully offline.
+    Doctor,
+    /// Installs `language`'s pinned server into katamari's managed prefix,
+    /// streaming progress lines to stdout. Deliberately ignores whatever
+    /// `PATH`/project-local/`rustup which` would otherwise resolve to —
+    /// that's the point of running this explicitly rather than waiting for
+    /// auto-install; `ktmr lsp doctor` shows the *effective* resolution,
+    /// which still prefers those tiers over the managed install. `all` runs
+    /// every language, printing why (not failing the whole command) for any
+    /// whose toolchain prerequisite is missing (gopls without a go
+    /// toolchain, currently the only such case).
+    Install { language: LanguageArg },
+    /// Re-installs every pinned server whose managed install isn't already
+    /// at the current pin — for after a katamari upgrade bumps one of the
+    /// version constants in [`lsp::install`]. Reports, per language,
+    /// whether it was already current or got (re)installed.
+    Update,
+}
+
+/// `ktmr lsp install <language>`'s argument — the four languages plus
+/// `all`, kebab-free since every variant here is already a single word.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LanguageArg {
+    Rust,
+    Typescript,
+    Python,
+    Go,
+    All,
 }
 
 #[derive(Subcommand)]
@@ -293,6 +337,7 @@ fn main() -> Result<()> {
         } => run_watch_check(dir, flushes, timeout_secs),
         Command::Comments { action } => run_comments(action),
         Command::Skill { action } => run_skill(action),
+        Command::Lsp { action } => run_lsp(action),
     }
 }
 
@@ -607,8 +652,10 @@ fn run_lsp_check(
     let (events_tx, events_rx) = std::sync::mpsc::channel();
     // `lsp-check` is a headless smoke test for the `lsp` module itself
     // (see this command's doc comment) — it has no config file to load, so
-    // it always resolves servers the built-in way, with no overrides.
-    let manager = lsp::LspManager::new(events_tx, std::sync::Arc::new(HashMap::new()));
+    // it always resolves servers the built-in way, with no overrides, and
+    // auto-install on (matching the production default, so this command
+    // also exercises `resolve_or_install` when a server is missing).
+    let manager = lsp::LspManager::new(events_tx, std::sync::Arc::new(HashMap::new()), true);
 
     let line0 = line.saturating_sub(1);
     let col0 = col.saturating_sub(1);
@@ -888,6 +935,124 @@ fn run_skill_install() -> Result<()> {
     std::fs::write(&dest, SKILL_MD)
         .with_context(|| format!("failed to write {}", dest.display()))?;
     println!("installed katamari-review skill to {}", dest.display());
+    Ok(())
+}
+
+const ALL_LANGUAGES: [lsp::adapter::Language; 4] = [
+    lsp::adapter::Language::Rust,
+    lsp::adapter::Language::TypeScript,
+    lsp::adapter::Language::Python,
+    lsp::adapter::Language::Go,
+];
+
+fn run_lsp(action: LspCommand) -> Result<()> {
+    match action {
+        LspCommand::Doctor => run_lsp_doctor(),
+        LspCommand::Install { language } => run_lsp_install(language),
+        LspCommand::Update => run_lsp_update(),
+    }
+}
+
+/// The workspace root and `[lsp.servers.<lang>]` overrides `ktmr lsp`'s
+/// three subcommands diagnose/install against — resolved the same way a
+/// live `ktmr diff`/`ktmr open` session would (current directory's git
+/// root, falling back to the directory itself outside a repo), so `doctor`
+/// reports exactly what a real session would see.
+fn lsp_workspace_root_and_overrides() -> Result<(PathBuf, HashMap<String, config::ServerOverride>)>
+{
+    let cwd = std::env::current_dir()?;
+    let repo_root = GitSource::discover(&cwd)
+        .and_then(|source| source.repo_root())
+        .unwrap_or(cwd);
+    let config = config::load_merged(&repo_root);
+    Ok((repo_root, config.lsp_servers))
+}
+
+fn language_label(language: lsp::adapter::Language) -> &'static str {
+    match language {
+        lsp::adapter::Language::Rust => "rust",
+        lsp::adapter::Language::TypeScript => "typescript",
+        lsp::adapter::Language::Python => "python",
+        lsp::adapter::Language::Go => "go",
+    }
+}
+
+fn resolved_from_label(from: lsp::adapter::ResolvedFrom) -> &'static str {
+    use lsp::adapter::ResolvedFrom;
+    match from {
+        ResolvedFrom::ConfigOverride => "override",
+        ResolvedFrom::ProjectLocal => "project-local",
+        ResolvedFrom::Path => "PATH",
+        ResolvedFrom::ToolchainWhich => "toolchain (rustup)",
+        ResolvedFrom::Mise => "mise",
+        ResolvedFrom::KatamariManaged => "katamari-managed",
+    }
+}
+
+fn run_lsp_doctor() -> Result<()> {
+    let (workspace_root, overrides) = lsp_workspace_root_and_overrides()?;
+    println!(
+        "{:<12} {:<20} {:<13} path / notes",
+        "language", "source", "auto-install"
+    );
+    for language in ALL_LANGUAGES {
+        let diagnosis = lsp::adapter::diagnose(language, &workspace_root, &overrides);
+        let (source, detail) = match &diagnosis.found {
+            Some((from, path)) => (resolved_from_label(*from), path.display().to_string()),
+            None => ("not found", String::new()),
+        };
+        let auto_install = if diagnosis.found.is_some() {
+            "n/a"
+        } else if diagnosis.installable_if_missing {
+            "yes"
+        } else {
+            "no"
+        };
+        println!(
+            "{:<12} {source:<20} {auto_install:<13} {detail}",
+            language_label(diagnosis.language)
+        );
+    }
+    Ok(())
+}
+
+fn run_lsp_install(language: LanguageArg) -> Result<()> {
+    let languages: Vec<lsp::adapter::Language> = match language {
+        LanguageArg::All => ALL_LANGUAGES.to_vec(),
+        LanguageArg::Rust => vec![lsp::adapter::Language::Rust],
+        LanguageArg::Typescript => vec![lsp::adapter::Language::TypeScript],
+        LanguageArg::Python => vec![lsp::adapter::Language::Python],
+        LanguageArg::Go => vec![lsp::adapter::Language::Go],
+    };
+    for language in languages {
+        println!("=== {} ===", language_label(language));
+        match lsp::install::ensure(language, |message| println!("  {message}")) {
+            Ok(path) => println!("  installed: {}", path.display()),
+            Err(e) => println!("  skipped: {e}"),
+        }
+    }
+    Ok(())
+}
+
+fn run_lsp_update() -> Result<()> {
+    for language in ALL_LANGUAGES {
+        let prefix = lsp::install::prefix_dir();
+        if lsp::install::installed_binary_path(&prefix, language).is_some() {
+            println!(
+                "{}: already at the pinned version",
+                language_label(language)
+            );
+            continue;
+        }
+        println!(
+            "{}: not at the pinned version, (re)installing",
+            language_label(language)
+        );
+        match lsp::install::ensure(language, |message| println!("  {message}")) {
+            Ok(path) => println!("  (re)installed: {}", path.display()),
+            Err(e) => println!("  skipped: {e}"),
+        }
+    }
     Ok(())
 }
 

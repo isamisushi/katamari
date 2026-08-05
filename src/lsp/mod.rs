@@ -8,11 +8,16 @@
 //! `textDocument/hover`) over one such pipe; [`manager`] and [`adapter`] own
 //! *which* server to spawn for a given file and keep exactly one connection
 //! alive per (language, workspace root) pair, spawning lazily and queuing
-//! requests made before the connection is ready.
+//! requests made before the connection is ready. [`install`] is the M8b
+//! addition that makes "no server binary found anywhere" a recoverable
+//! outcome rather than a dead end: `manager` calls into it when `adapter`
+//! reports a language as installable but not found, downloading (or
+//! `npm`/`go install`-ing) a pinned version into a katamari-owned prefix.
 
 pub mod adapter;
 pub mod client;
 pub mod diagnostics;
+pub mod install;
 pub mod manager;
 pub mod transport;
 

@@ -202,7 +202,11 @@ pub fn run(
 
     let (lsp_tx, lsp_rx) = mpsc::channel::<ServerEvent>();
     spawn_lsp_forwarder(lsp_rx, app_tx.clone());
-    let lsp_manager = LspManager::new(lsp_tx, Arc::new(config.lsp_servers.clone()));
+    let lsp_manager = LspManager::new(
+        lsp_tx,
+        Arc::new(config.lsp_servers.clone()),
+        config.auto_install,
+    );
 
     // Proactively `didOpen`s the files this session starts out looking at,
     // so diagnostics gutters have something to show without the user
@@ -559,18 +563,26 @@ fn event_loop(
             }
         }
 
-        // A once-per-language status hint when the server a hover-eligible
-        // position would use is known to be unavailable — see
-        // `lsp::adapter::resolve_server`'s error messages, which already
-        // read like a status-bar hint ("LSP: typescript ✕ — npm i -g …").
+        // A status hint for the server a hover-eligible position would use,
+        // in two different cadences depending on what's wrong: `Installing`
+        // updates every frame (its `message` changes as an auto-install
+        // progresses — a download percentage, an `npm install` starting —
+        // so the status bar should track it live, not freeze on the first
+        // one seen), while `Unavailable` only warns once per language (its
+        // reason is static, and `lsp::adapter::resolve_server`'s error
+        // messages already read like a status-bar hint — "LSP: typescript
+        // ✕ — npm i -g …" — so repeating it every frame would add nothing).
         if let Some(query) = stack.top().hover_query()
             && let Some(language) = Language::detect(&query.file)
-            && !warned_languages.contains(&language)
-            && let ServerState::Unavailable { reason } =
-                lsp_manager.state(&query.file, &query.git_root)
         {
-            lsp_status = Some(reason);
-            warned_languages.insert(language);
+            match lsp_manager.state(&query.file, &query.git_root) {
+                ServerState::Installing { message } => lsp_status = Some(message),
+                ServerState::Unavailable { reason } if !warned_languages.contains(&language) => {
+                    lsp_status = Some(reason);
+                    warned_languages.insert(language);
+                }
+                _ => {}
+            }
         }
 
         if watch_status

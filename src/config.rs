@@ -64,6 +64,13 @@ pub struct Config {
     /// [`crate::lsp::adapter::Language::lsp_id`] reports (`"rust"`,
     /// `"typescript"`, `"python"`, `"go"`).
     pub lsp_servers: HashMap<String, ServerOverride>,
+    /// `[lsp] auto_install` — whether [`crate::lsp::manager::LspManager`]
+    /// may silently download/build a missing language server into
+    /// katamari's own prefix (see [`crate::lsp::install`]) instead of just
+    /// reporting it unavailable. Defaults to `true`, matching the
+    /// VSCode/Zed-style "it just works" experience this exists for; `false`
+    /// restores the pre-M8b behavior of a manual-install hint only.
+    pub auto_install: bool,
     pub tab_width: usize,
     pub highlight_max_lines: usize,
     pub debounce_ms: u64,
@@ -75,6 +82,7 @@ impl Default for Config {
             keymap: KeymapPreset::Vim,
             key_overrides: HashMap::new(),
             lsp_servers: HashMap::new(),
+            auto_install: true,
             tab_width: DEFAULT_TAB_WIDTH,
             highlight_max_lines: DEFAULT_HIGHLIGHT_MAX_LINES,
             debounce_ms: DEFAULT_DEBOUNCE_MS,
@@ -106,6 +114,7 @@ struct RawFile {
 #[serde(default)]
 struct RawLsp {
     servers: HashMap<String, ServerOverride>,
+    auto_install: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -122,7 +131,7 @@ struct RawWatch {
 }
 
 const TOP_LEVEL_KEYS: &[&str] = &["keymap", "keys", "lsp", "ui", "watch"];
-const LSP_KEYS: &[&str] = &["servers"];
+const LSP_KEYS: &[&str] = &["servers", "auto_install"];
 const SERVER_KEYS: &[&str] = &["command", "args"];
 const UI_KEYS: &[&str] = &["tab_width", "highlight_max_lines"];
 const WATCH_KEYS: &[&str] = &["debounce_ms"];
@@ -143,10 +152,11 @@ fn merge_raw(base: &mut RawFile, overlay: RawFile) {
             .extend(overlay_keys);
     }
     if let Some(overlay_lsp) = overlay.lsp {
-        base.lsp
-            .get_or_insert_with(RawLsp::default)
-            .servers
-            .extend(overlay_lsp.servers);
+        let base_lsp = base.lsp.get_or_insert_with(RawLsp::default);
+        base_lsp.servers.extend(overlay_lsp.servers);
+        if overlay_lsp.auto_install.is_some() {
+            base_lsp.auto_install = overlay_lsp.auto_install;
+        }
     }
     if let Some(overlay_ui) = overlay.ui {
         let base_ui = base.ui.get_or_insert_with(RawUi::default);
@@ -291,10 +301,12 @@ fn finalize(raw: RawFile) -> Config {
     };
     let ui = raw.ui.unwrap_or_default();
     let watch = raw.watch.unwrap_or_default();
+    let lsp = raw.lsp.unwrap_or_default();
     Config {
         keymap,
         key_overrides: raw.keys.unwrap_or_default(),
-        lsp_servers: raw.lsp.map(|l| l.servers).unwrap_or_default(),
+        lsp_servers: lsp.servers,
+        auto_install: lsp.auto_install.unwrap_or(true),
         tab_width: ui.tab_width.unwrap_or(DEFAULT_TAB_WIDTH),
         highlight_max_lines: ui
             .highlight_max_lines
@@ -526,6 +538,25 @@ mod tests {
             KeymapPreset::Vim,
             "an unrecognized preset name warns and falls back to vim rather than crashing"
         );
+    }
+
+    #[test]
+    fn auto_install_defaults_to_true() {
+        let repo = fixture_repo();
+        let config = load_merged(&repo);
+        assert!(config.auto_install);
+    }
+
+    #[test]
+    fn auto_install_can_be_disabled_explicitly() {
+        let repo = fixture_repo();
+        write_repo_config(&repo, "[lsp]\nauto_install = false\n");
+        let config = load_merged(&repo);
+        assert!(!config.auto_install);
+        // Disabling auto-install doesn't reset `[lsp.servers]` overrides
+        // set elsewhere — same field-level merge guarantee every other
+        // section gets.
+        assert!(config.lsp_servers.is_empty());
     }
 
     #[test]

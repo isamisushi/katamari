@@ -13,6 +13,7 @@
 use crate::diff::ColumnMap;
 use crate::lsp::adapter::{self, Language};
 use crate::lsp::client::{Client, DefinitionResult, HoverResult, ReferencesResult, file_uri};
+use crate::lsp::install;
 use crate::lsp::transport::{LspError, LspEvent};
 use lsp_types::{FileChangeType, FileEvent, Position, PositionEncodingKind};
 use std::collections::{HashMap, VecDeque};
@@ -57,9 +58,24 @@ const MAX_LIVE_SERVERS: usize = 8;
 pub enum ServerState {
     NotStarted,
     Starting,
+    /// `[lsp] auto_install` (default on) is downloading or building this
+    /// server because [`adapter::resolve_server`] couldn't find it anywhere
+    /// else — see [`resolve_or_install`]. `message` is the current install
+    /// phase (e.g. "downloading rust-analyzer 2026-08-03", "npm install
+    /// pyright@1.1.411"), updated in place as the install proceeds rather
+    /// than each phase getting its own state transition, so the status bar
+    /// shows real progress instead of a single frozen "starting" the whole
+    /// time a download is in flight.
+    Installing {
+        message: String,
+    },
     Ready,
-    Unavailable { reason: String },
-    Crashed { reason: String },
+    Unavailable {
+        reason: String,
+    },
+    Crashed {
+        reason: String,
+    },
 }
 
 type ServerKey = (Language, PathBuf);
@@ -193,17 +209,25 @@ pub struct LspManager {
     /// cloned per spawn, since it's read-only for this manager's whole
     /// lifetime and every `spawn_server` thread needs its own handle.
     overrides: Arc<HashMap<String, crate::config::ServerOverride>>,
+    /// Config's `[lsp] auto_install` (default `true`) — whether
+    /// [`resolve_or_install`] is allowed to call [`install::ensure`] at all
+    /// when a server is missing but [`adapter::Unavailable::installable`]
+    /// says it could be installed. `false` restores exactly M8a's behavior:
+    /// a missing server just fails with its manual-install hint.
+    auto_install: bool,
 }
 
 impl LspManager {
     pub fn new(
         events_tx: Sender<ServerEvent>,
         overrides: Arc<HashMap<String, crate::config::ServerOverride>>,
+        auto_install: bool,
     ) -> Self {
         Self {
             events_tx,
             servers: Arc::new(Mutex::new(HashMap::new())),
             overrides,
+            auto_install,
         }
     }
 
@@ -485,9 +509,15 @@ impl LspManager {
             ServerState::Unavailable { reason } | ServerState::Crashed { reason } => {
                 op.fail(LspError::Io(reason));
             }
-            ServerState::NotStarted | ServerState::Starting => {
+            ServerState::NotStarted | ServerState::Starting | ServerState::Installing { .. } => {
                 let starting_now = matches!(entry.state, ServerState::NotStarted);
-                entry.state = ServerState::Starting;
+                // Only actually move to `Starting` from `NotStarted` — a
+                // request arriving mid-install must not clobber the
+                // `Installing` message `resolve_or_install`'s progress
+                // callback is actively updating.
+                if starting_now {
+                    entry.state = ServerState::Starting;
+                }
                 enqueue(entry, file, line_text, line, display_col, op);
                 drop(servers);
                 if starting_now {
@@ -506,6 +536,7 @@ impl LspManager {
         let servers = Arc::clone(&self.servers);
         let events_tx = self.events_tx.clone();
         let overrides = Arc::clone(&self.overrides);
+        let auto_install = self.auto_install;
 
         std::thread::spawn(move || {
             let (language, workspace_root) = key.clone();
@@ -514,11 +545,13 @@ impl LspManager {
             // must return immediately — eviction can block for as long as
             // `Client::shutdown`'s grace period, and this spawn thread is
             // the only place already expected to do slow, blocking work
-            // before a new server is usable.
+            // before a new server is usable. The same reasoning is why an
+            // auto-install (see `resolve_or_install`, below) belongs here
+            // too, not behind `submit`.
             evict_lru_if_at_capacity(&servers, &key);
 
-            let mut command = match adapter::resolve_server(language, &workspace_root, &overrides) {
-                Ok(command) => command,
+            let mut resolved = match resolve_or_install(&servers, &key, &overrides, auto_install) {
+                Ok(resolved) => resolved,
                 Err(unavailable) => {
                     fail_entry(
                         &servers,
@@ -530,9 +563,13 @@ impl LspManager {
                     return;
                 }
             };
-            command.current_dir(&workspace_root);
+            resolved.command.current_dir(&workspace_root);
 
-            let client = match Client::start(command, &workspace_root) {
+            let client = match Client::start(
+                resolved.command,
+                &workspace_root,
+                resolved.initialization_options,
+            ) {
                 Ok(client) => Arc::new(client),
                 Err(e) => {
                     fail_entry(
@@ -636,6 +673,61 @@ fn fail_entry(
             "language server became unavailable".to_owned(),
         ));
     }
+}
+
+/// The one seam where a missing server can turn into an install: tries
+/// [`adapter::resolve_server`] first, exactly as before M8b, and only when
+/// that comes back `Unavailable { installable: true, .. }` *and* `[lsp]
+/// auto_install` is on does this reach for the network, via
+/// [`install::ensure`]. Each progress message `ensure` reports is written
+/// straight into `key`'s entry as `ServerState::Installing` (see
+/// [`set_installing`]) so the status bar reflects real download/build
+/// progress rather than sitting on a frozen `Starting` the whole time.
+/// Once `ensure` succeeds, this re-resolves rather than trusting the
+/// installed path directly — the freshly installed binary now sits exactly
+/// where `resolve_server`'s own katamari-managed-prefix tier already looks
+/// (see `adapter::lookup_in_order`), so re-resolving is simpler than
+/// threading a second, install-specific code path through to `Command`
+/// construction, and it re-validates that the binary is actually where
+/// `adapter` expects before this manager trusts it.
+fn resolve_or_install(
+    servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
+    key: &ServerKey,
+    overrides: &HashMap<String, crate::config::ServerOverride>,
+    auto_install: bool,
+) -> Result<adapter::ResolvedServer, adapter::Unavailable> {
+    let (language, workspace_root) = key.clone();
+    match adapter::resolve_server(language, &workspace_root, overrides) {
+        Ok(resolved) => Ok(resolved),
+        Err(unavailable) if unavailable.installable && auto_install => {
+            set_installing(servers, key, format!("installing {}…", language.lsp_id()));
+            match install::ensure(language, |message| set_installing(servers, key, message)) {
+                Ok(_path) => adapter::resolve_server(language, &workspace_root, overrides),
+                Err(install_err) => Err(adapter::Unavailable {
+                    reason: format!(
+                        "{} (auto-install failed: {install_err})",
+                        unavailable.reason
+                    ),
+                    installable: false,
+                }),
+            }
+        }
+        Err(unavailable) => Err(unavailable),
+    }
+}
+
+/// Updates `key`'s entry to `ServerState::Installing { message }` — the
+/// progress-reporting half of [`resolve_or_install`], factored out since
+/// it's called both once up front and once per progress line
+/// [`install::ensure`] reports.
+fn set_installing(
+    servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
+    key: &ServerKey,
+    message: String,
+) {
+    let mut servers = servers.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = servers.entry(key.clone()).or_insert_with(ServerEntry::new);
+    entry.state = ServerState::Installing { message };
 }
 
 /// If [`MAX_LIVE_SERVERS`] servers other than `new_key` are already

@@ -6,6 +6,7 @@
 //! spawn/queue/state-machine logic.
 
 use crate::config::ServerOverride;
+use crate::lsp::install;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -78,6 +79,15 @@ pub fn lsp_language_id(language: Language, path: &Path) -> &'static str {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unavailable {
     pub reason: String,
+    /// Whether [`crate::lsp::install::ensure`] could plausibly turn this
+    /// into a working server — checked here (a cheap subprocess probe for
+    /// gopls's go-toolchain prerequisite; unconditionally `true` for the
+    /// other three languages, see [`diagnose_language`]'s docs) rather than
+    /// by actually attempting an install, so `resolve_server` stays
+    /// network-free. [`crate::lsp::manager::LspManager::spawn_server`] reads
+    /// this to decide whether to call `install::ensure` at all when
+    /// `[lsp] auto_install` is on.
+    pub installable: bool,
 }
 
 impl std::fmt::Display for Unavailable {
@@ -86,9 +96,31 @@ impl std::fmt::Display for Unavailable {
     }
 }
 
-/// Builds the command to launch `language`'s server. Never runs it —
-/// spawning is [`crate::lsp::transport::Transport::spawn`]'s job — so this
-/// stays testable as pure path resolution. `overrides` (config's
+/// [`resolve_server`]'s success case: the `Command` to spawn, plus whatever
+/// extra `initialize` `initializationOptions` that particular resolution
+/// needs beyond katamari's generic handshake (see
+/// [`crate::lsp::client::Client::start`]). `None` for every resolution
+/// except a katamari-managed typescript-language-server, which needs to be
+/// told exactly where its peer-installed `typescript` lives — the server's
+/// own default resolution walks up from the *edited* workspace, which
+/// katamari's managed install directory was never part of, so without this
+/// it fails to initialize entirely for a project with no `typescript`
+/// devDependency of its own (found by hand during M8b's manual E2E
+/// verification — see [`crate::lsp::install::managed_tsserver_path`]'s
+/// docs for the full story).
+pub struct ResolvedServer {
+    pub command: Command,
+    pub initialization_options: Option<serde_json::Value>,
+}
+
+/// Builds the command to launch `language`'s server. Never runs it, and
+/// never touches the network — spawning is
+/// [`crate::lsp::transport::Transport::spawn`]'s job, and installing a
+/// missing server is [`crate::lsp::install::ensure`]'s, called only from
+/// [`crate::lsp::manager::LspManager::spawn_server`] once this function has
+/// already said `Unavailable { installable: true, .. }`. That split is what
+/// keeps this whole module testable as pure path resolution even though it
+/// now has five lookup tiers instead of two. `overrides` (config's
 /// `[lsp.servers.<lang>]`, keyed by [`Language::lsp_id`]) takes priority
 /// over every built-in lookup below when it has an entry for `language`,
 /// exactly as a user's explicit config should — a pinned server version, a
@@ -98,59 +130,158 @@ pub fn resolve_server(
     language: Language,
     workspace_root: &Path,
     overrides: &HashMap<String, ServerOverride>,
-) -> Result<Command, Unavailable> {
+) -> Result<ResolvedServer, Unavailable> {
     if let Some(over) = overrides.get(language.lsp_id()) {
         let mut command = Command::new(&over.command);
         command.args(&over.args);
-        return Ok(command);
+        return Ok(ResolvedServer {
+            command,
+            initialization_options: None,
+        });
     }
+    let (hit, installable) = diagnose_language(language, workspace_root);
+    match hit {
+        Some(hit) => Ok(command_for(language, hit)),
+        None => Err(unavailable(
+            language.lsp_id(),
+            &install_hint(language, installable),
+            installable,
+        )),
+    }
+}
+
+/// `ktmr lsp doctor`'s per-language finding: either where `language`'s
+/// server resolves from today (as [`resolve_server`] would use it), or —
+/// when nowhere — whether auto-install could handle it. Shares
+/// [`diagnose_language`] with `resolve_server` so the two can never
+/// disagree about what's found; the only thing this adds is *which* tier
+/// found it, information `resolve_server`'s `Result<Command, _>` has no
+/// reason to carry for its own caller.
+pub fn diagnose(
+    language: Language,
+    workspace_root: &Path,
+    overrides: &HashMap<String, ServerOverride>,
+) -> Diagnosis {
+    if let Some(over) = overrides.get(language.lsp_id()) {
+        return Diagnosis {
+            language,
+            found: Some((ResolvedFrom::ConfigOverride, PathBuf::from(&over.command))),
+            installable_if_missing: false,
+        };
+    }
+    let (hit, installable) = diagnose_language(language, workspace_root);
+    Diagnosis {
+        language,
+        found: hit.map(|hit| (hit.source(), hit.into_path())),
+        installable_if_missing: installable,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Diagnosis {
+    pub language: Language,
+    /// `Some((tier, path))` when a server was found; the tier it was found
+    /// through and the resolved path.
+    pub found: Option<(ResolvedFrom, PathBuf)>,
+    /// Only meaningful when `found` is `None`: whether
+    /// [`crate::lsp::install::ensure`] could plausibly install this
+    /// language's server.
+    pub installable_if_missing: bool,
+}
+
+/// Which tier of the shared lookup order (see [`lookup_in_order`]) a hit
+/// came from — the detail [`Diagnosis`] exposes for `ktmr lsp doctor` that a
+/// plain `Result<Command, Unavailable>` has no need to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedFrom {
+    ConfigOverride,
+    ProjectLocal,
+    Path,
+    ToolchainWhich,
+    Mise,
+    KatamariManaged,
+}
+
+/// The four-way dispatch [`resolve_server`] and [`diagnose`] both build on:
+/// which lookup tier (if any) finds `language`'s binary, and — only
+/// meaningful when none did — whether it's installable. Go is the one
+/// language where that second question needs an actual check (a go
+/// toolchain to run `go install` against, see [`go_toolchain_available`]);
+/// the other three are always installable when missing, since rust-analyzer
+/// downloads as a standalone binary and the two npm-based servers bootstrap
+/// their own Node.js runtime when npm can't be found anywhere.
+fn diagnose_language(language: Language, workspace_root: &Path) -> (Option<LookupHit>, bool) {
     match language {
-        Language::Rust => resolve_rust_analyzer(),
-        Language::TypeScript => resolve_typescript_language_server(workspace_root),
-        Language::Python => resolve_pyright(workspace_root),
-        Language::Go => resolve_gopls(),
+        Language::Rust => (lookup_rust_analyzer(), true),
+        Language::TypeScript => (lookup_typescript_language_server(workspace_root), true),
+        Language::Python => (lookup_pyright(workspace_root), true),
+        Language::Go => {
+            let hit = lookup_gopls();
+            let installable = hit.is_some() || go_toolchain_available();
+            (hit, installable)
+        }
     }
 }
 
-/// Tries `rust-analyzer` on `PATH` first (the common case: it's a rustup
-/// component and rustup's shims put it on `PATH` directly), then falls back
-/// to `rustup which rust-analyzer` — the form that works when katamari
-/// itself is invoked through `mise exec --`, whose sandboxed `PATH` doesn't
-/// always include rustup's shim directory even though `rustup` itself is
-/// reachable.
-fn resolve_rust_analyzer() -> Result<Command, Unavailable> {
-    if let Some(path) = which_on_path("rust-analyzer") {
-        return Ok(Command::new(path));
+fn install_hint(language: Language, installable: bool) -> String {
+    match language {
+        Language::Rust => "rust-analyzer not found on PATH, via `rustup which`, `mise which`, or \
+            katamari's managed install — install it with `rustup component add rust-analyzer`, \
+            or let katamari auto-install it (`ktmr lsp install rust`)"
+            .to_owned(),
+        Language::TypeScript => "typescript-language-server not found on PATH, via `mise which`, \
+            or katamari's managed install — install it with \
+            `npm i -g typescript-language-server typescript`, or let katamari auto-install it \
+            (`ktmr lsp install typescript`)"
+            .to_owned(),
+        Language::Python => "pyright-langserver not found on PATH, via `mise which`, or \
+            katamari's managed install — install it with `npm i -g pyright`, or let katamari \
+            auto-install it (`ktmr lsp install python`)"
+            .to_owned(),
+        Language::Go if installable => "gopls not found on PATH, via `mise which`, or katamari's \
+            managed install — install it with `go install golang.org/x/tools/gopls@latest`, or \
+            let katamari auto-install it (`ktmr lsp install go`)"
+            .to_owned(),
+        Language::Go => "gopls not found, and no go toolchain is reachable to auto-install it \
+            with — install Go first (https://go.dev/dl/), then \
+            `go install golang.org/x/tools/gopls@latest`"
+            .to_owned(),
     }
-    if let Some(path) = rustup_which("rust-analyzer") {
-        return Ok(Command::new(path));
-    }
-    Err(unavailable(
-        "rust",
-        "rust-analyzer not found on PATH or via `rustup which rust-analyzer` — install it with `rustup component add rust-analyzer`",
-    ))
 }
 
-/// Tries the project-local install first (`node_modules/.bin/...`, the
-/// common case for a JS/TS project that lists it as a devDependency — a
-/// project-pinned server version is more likely to agree with the project's
-/// own `tsconfig.json` than whatever happens to be globally installed),
-/// then falls back to `PATH`.
-fn resolve_typescript_language_server(workspace_root: &Path) -> Result<Command, Unavailable> {
-    let local = workspace_root
-        .join("node_modules")
-        .join(".bin")
-        .join("typescript-language-server");
-    if local.is_file() {
-        return Ok(ts_language_server_command(local));
+fn command_for(language: Language, hit: LookupHit) -> ResolvedServer {
+    let from_katamari_managed = matches!(hit, LookupHit::KatamariManaged(_));
+    let path = hit.into_path();
+    match language {
+        Language::TypeScript => {
+            // A project-local or `PATH` server is left to its own default
+            // `typescript` resolution (more likely to already agree with
+            // that project's own devDependency); katamari's own managed
+            // install isn't reachable that way, so it needs pointing at
+            // its peer-installed `typescript` explicitly, via
+            // `initializationOptions.tsserver.path` — see
+            // `install::managed_tsserver_path`'s and `ResolvedServer`'s
+            // docs for why this can't just be a CLI flag.
+            let initialization_options = from_katamari_managed
+                .then(install::managed_tsserver_path)
+                .filter(|p| p.is_file())
+                .map(|tsserver| {
+                    serde_json::json!({ "tsserver": { "path": tsserver.display().to_string() } })
+                });
+            ResolvedServer {
+                command: ts_language_server_command(path),
+                initialization_options,
+            }
+        }
+        Language::Python => ResolvedServer {
+            command: pyright_command(path),
+            initialization_options: None,
+        },
+        _ => ResolvedServer {
+            command: Command::new(path),
+            initialization_options: None,
+        },
     }
-    if let Some(path) = which_on_path("typescript-language-server") {
-        return Ok(ts_language_server_command(path));
-    }
-    Err(unavailable(
-        "typescript",
-        "typescript-language-server not found — install it with `npm i -g typescript-language-server typescript`",
-    ))
 }
 
 fn ts_language_server_command(path: PathBuf) -> Command {
@@ -159,52 +290,155 @@ fn ts_language_server_command(path: PathBuf) -> Command {
     command
 }
 
-/// Tries the project-local virtualenv first (`.venv/bin/pyright-langserver`
-/// — the common convention for a Python project's own interpreter and
-/// dependencies), then falls back to `PATH`.
-fn resolve_pyright(workspace_root: &Path) -> Result<Command, Unavailable> {
-    let local = workspace_root
-        .join(".venv")
-        .join("bin")
-        .join("pyright-langserver");
-    if local.is_file() {
-        return Ok(pyright_command(local));
-    }
-    if let Some(path) = which_on_path("pyright-langserver") {
-        return Ok(pyright_command(path));
-    }
-    Err(unavailable(
-        "python",
-        "pyright-langserver not found — install it with `npm i -g pyright`",
-    ))
-}
-
 fn pyright_command(path: PathBuf) -> Command {
     let mut command = Command::new(path);
     command.arg("--stdio");
     command
 }
 
+/// Which tier of [`lookup_in_order`] produced a hit, paired with the path
+/// it found. [`ResolvedFrom`] without the `ConfigOverride` variant, which
+/// never reaches this far — checked directly in `resolve_server`/`diagnose`
+/// before any of this runs.
+enum LookupHit {
+    ProjectLocal(PathBuf),
+    Path(PathBuf),
+    ToolchainWhich(PathBuf),
+    Mise(PathBuf),
+    KatamariManaged(PathBuf),
+}
+
+impl LookupHit {
+    fn into_path(self) -> PathBuf {
+        match self {
+            LookupHit::ProjectLocal(p)
+            | LookupHit::Path(p)
+            | LookupHit::ToolchainWhich(p)
+            | LookupHit::Mise(p)
+            | LookupHit::KatamariManaged(p) => p,
+        }
+    }
+
+    fn source(&self) -> ResolvedFrom {
+        match self {
+            LookupHit::ProjectLocal(_) => ResolvedFrom::ProjectLocal,
+            LookupHit::Path(_) => ResolvedFrom::Path,
+            LookupHit::ToolchainWhich(_) => ResolvedFrom::ToolchainWhich,
+            LookupHit::Mise(_) => ResolvedFrom::Mise,
+            LookupHit::KatamariManaged(_) => ResolvedFrom::KatamariManaged,
+        }
+    }
+}
+
+/// The order every `lookup_*` function below checks in, common to all four
+/// languages: a language-specific project-local convention (if any) beats
+/// everything, then `PATH`, then a toolchain-specific fallback (`rustup
+/// which` for rust-analyzer; nothing for the other three), then `mise
+/// which` (cheap even when katamari itself wasn't invoked through mise —
+/// see [`mise_which`]), and finally whatever [`crate::lsp::install`] has
+/// already installed into katamari's own prefix. Factored as one function
+/// over lookup closures — rather than each `lookup_*` duplicating the order
+/// — so the order itself is unit-testable (see this module's tests) without
+/// a real `PATH`, `mise`, or prefix directory in the picture, and so a
+/// language-specific tier (like TypeScript/Python's project-local check)
+/// can never accidentally skip one of the shared ones.
+fn lookup_in_order(
+    project_local: Option<PathBuf>,
+    path_lookup: impl FnOnce() -> Option<PathBuf>,
+    toolchain_lookup: impl FnOnce() -> Option<PathBuf>,
+    mise_lookup: impl FnOnce() -> Option<PathBuf>,
+    prefix_lookup: impl FnOnce() -> Option<PathBuf>,
+) -> Option<LookupHit> {
+    if let Some(path) = project_local.filter(|p| p.is_file()) {
+        return Some(LookupHit::ProjectLocal(path));
+    }
+    path_lookup()
+        .map(LookupHit::Path)
+        .or_else(|| toolchain_lookup().map(LookupHit::ToolchainWhich))
+        .or_else(|| mise_lookup().map(LookupHit::Mise))
+        .or_else(|| prefix_lookup().map(LookupHit::KatamariManaged))
+}
+
+/// Tries `rust-analyzer` on `PATH` first (the common case: it's a rustup
+/// component and rustup's shims put it on `PATH` directly), then falls back
+/// to `rustup which rust-analyzer` — the form that works when katamari
+/// itself is invoked through `mise exec --`, whose sandboxed `PATH` doesn't
+/// always include rustup's shim directory even though `rustup` itself is
+/// reachable.
+fn lookup_rust_analyzer() -> Option<LookupHit> {
+    lookup_in_order(
+        None,
+        || which_on_path("rust-analyzer"),
+        || rustup_which("rust-analyzer"),
+        || mise_which("rust-analyzer"),
+        || install::installed_binary_path(&install::prefix_dir(), Language::Rust),
+    )
+}
+
+/// Tries the project-local install first (`node_modules/.bin/...`, the
+/// common case for a JS/TS project that lists it as a devDependency — a
+/// project-pinned server version is more likely to agree with the project's
+/// own `tsconfig.json` than whatever happens to be globally installed).
+fn lookup_typescript_language_server(workspace_root: &Path) -> Option<LookupHit> {
+    let local = workspace_root
+        .join("node_modules")
+        .join(".bin")
+        .join("typescript-language-server");
+    lookup_in_order(
+        Some(local),
+        || which_on_path("typescript-language-server"),
+        || None,
+        || mise_which("typescript-language-server"),
+        || install::installed_binary_path(&install::prefix_dir(), Language::TypeScript),
+    )
+}
+
+/// Tries the project-local virtualenv first (`.venv/bin/pyright-langserver`
+/// — the common convention for a Python project's own interpreter and
+/// dependencies).
+fn lookup_pyright(workspace_root: &Path) -> Option<LookupHit> {
+    let local = workspace_root
+        .join(".venv")
+        .join("bin")
+        .join("pyright-langserver");
+    lookup_in_order(
+        Some(local),
+        || which_on_path("pyright-langserver"),
+        || None,
+        || mise_which("pyright-langserver"),
+        || install::installed_binary_path(&install::prefix_dir(), Language::Python),
+    )
+}
+
 /// `gopls` has no meaningful project-local install location (it's a single
 /// Go-toolchain binary, not a per-project dependency the way node/python
-/// servers are) — `PATH` is the only place to look.
-fn resolve_gopls() -> Result<Command, Unavailable> {
-    if let Some(path) = which_on_path("gopls") {
-        return Ok(Command::new(path));
-    }
-    Err(unavailable(
-        "go",
-        "gopls not found on PATH — install it with `go install golang.org/x/tools/gopls@latest`",
-    ))
+/// servers are), so its lookup order starts at `PATH`.
+fn lookup_gopls() -> Option<LookupHit> {
+    lookup_in_order(
+        None,
+        || which_on_path("gopls"),
+        || None,
+        || mise_which("gopls"),
+        || install::installed_binary_path(&install::prefix_dir(), Language::Go),
+    )
 }
 
-fn unavailable(language_name: &str, hint: &str) -> Unavailable {
+/// Whether a go toolchain (needed to `go install golang.org/x/tools/gopls`)
+/// is reachable at all — checked only to decide [`Unavailable::installable`]
+/// for gopls specifically; see [`diagnose_language`]'s docs on why Go is the
+/// one language this question matters for.
+fn go_toolchain_available() -> bool {
+    which_on_path("go").is_some() || mise_which("go").is_some()
+}
+
+fn unavailable(language_name: &str, hint: &str, installable: bool) -> Unavailable {
     Unavailable {
         reason: format!("LSP: {language_name} \u{2715} \u{2014} {hint}"),
+        installable,
     }
 }
 
-fn which_on_path(bin: &str) -> Option<PathBuf> {
+pub(crate) fn which_on_path(bin: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     std::env::split_paths(&path_var).find_map(|dir| {
         let candidate = dir.join(bin);
@@ -214,6 +448,26 @@ fn which_on_path(bin: &str) -> Option<PathBuf> {
 
 fn rustup_which(bin: &str) -> Option<PathBuf> {
     let output = Command::new("rustup").args(["which", bin]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(output.stdout).ok()?;
+    let path = path.trim();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// `mise which <bin>` — the form that finds a mise-managed tool even when
+/// its shim directory isn't on `PATH` (the same reasoning
+/// [`lookup_rust_analyzer`]'s docs give for `rustup which`, generalized:
+/// katamari itself is commonly invoked through `mise exec --`, whose
+/// sandboxed `PATH` doesn't necessarily include every tool mise knows
+/// about). A missing `mise` binary, or `mise` not knowing about `bin`, are
+/// both just "not found" here — this is a cheap best-effort probe, not a
+/// hard dependency on mise being installed at all. `pub(crate)` so
+/// [`crate::lsp::install`]'s own `npm`/`go` toolchain lookups can share it
+/// rather than re-implementing the same subprocess call.
+pub(crate) fn mise_which(bin: &str) -> Option<PathBuf> {
+    let output = Command::new("mise").args(["which", bin]).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -702,7 +956,8 @@ mod tests {
         // this workspace's PATH by default in CI — if resolution *does*
         // succeed (a developer happens to have it installed globally),
         // that's fine too; only the failure message's shape is asserted.
-        if let Err(unavailable) = resolve_gopls() {
+        let overrides = HashMap::new();
+        if let Err(unavailable) = resolve_server(Language::Go, Path::new("/repo"), &overrides) {
             assert!(unavailable.reason.contains("gopls"));
             assert!(unavailable.reason.starts_with("LSP: go"));
         }
@@ -717,20 +972,89 @@ mod tests {
                 args: vec!["--stdio".to_owned()],
             },
         )]);
-        let command = resolve_server(Language::Go, Path::new("/repo"), &overrides).unwrap();
-        assert_eq!(command.get_program(), "/opt/bin/my-gopls");
-        assert_eq!(command.get_args().collect::<Vec<_>>(), vec!["--stdio"]);
+        let resolved = resolve_server(Language::Go, Path::new("/repo"), &overrides).unwrap();
+        assert_eq!(resolved.command.get_program(), "/opt/bin/my-gopls");
+        assert_eq!(
+            resolved.command.get_args().collect::<Vec<_>>(),
+            vec!["--stdio"]
+        );
+        assert_eq!(resolved.initialization_options, None);
     }
 
     #[test]
     fn no_override_falls_through_to_the_built_in_lookup() {
-        // No "go" entry in `overrides` — resolution falls through to
-        // `resolve_gopls`, matching `resolve_server_reports_a_hint_when_a_binary_is_missing`'s
-        // own caveat about this workspace's PATH.
+        // No "go" entry in `overrides` — resolution falls through to the
+        // built-in gopls lookup, matching
+        // `resolve_server_reports_a_hint_when_a_binary_is_missing`'s own
+        // caveat about this workspace's PATH.
         let overrides = HashMap::new();
         let result = resolve_server(Language::Go, Path::new("/repo"), &overrides);
         if let Err(unavailable) = result {
             assert!(unavailable.reason.starts_with("LSP: go"));
         }
+    }
+
+    // --- lookup_in_order: the shared resolution-order primitive ----------
+
+    #[test]
+    fn lookup_in_order_prefers_path_over_katamari_managed() {
+        let hit = lookup_in_order(
+            None,
+            || Some(PathBuf::from("/usr/bin/somebin")),
+            || None,
+            || None,
+            || Some(PathBuf::from("/prefix/somebin")),
+        );
+        assert!(matches!(hit, Some(LookupHit::Path(p)) if p == PathBuf::from("/usr/bin/somebin")));
+    }
+
+    #[test]
+    fn lookup_in_order_falls_back_to_katamari_managed_when_nothing_else_matches() {
+        // Nothing on PATH, no toolchain-specific fallback, no mise — a
+        // binary katamari already installed into its own prefix still gets
+        // used, without anything having to trigger a fresh install (that
+        // trigger only ever fires when this whole chain returns `None`).
+        let hit = lookup_in_order(
+            None,
+            || None,
+            || None,
+            || None,
+            || Some(PathBuf::from("/prefix/somebin")),
+        );
+        assert!(
+            matches!(hit, Some(LookupHit::KatamariManaged(p)) if p == PathBuf::from("/prefix/somebin"))
+        );
+    }
+
+    #[test]
+    fn lookup_in_order_prefers_project_local_over_everything() {
+        let hit = lookup_in_order(
+            Some(PathBuf::from(file!())), // any real file this test binary can see
+            || Some(PathBuf::from("/usr/bin/somebin")),
+            || None,
+            || None,
+            || Some(PathBuf::from("/prefix/somebin")),
+        );
+        assert!(matches!(hit, Some(LookupHit::ProjectLocal(_))));
+    }
+
+    #[test]
+    fn lookup_in_order_is_none_when_every_tier_misses() {
+        let hit = lookup_in_order(None, || None, || None, || None, || None);
+        assert!(hit.is_none());
+    }
+
+    #[test]
+    fn mise_lookup_beats_katamari_managed_but_loses_to_path() {
+        let hit = lookup_in_order(
+            None,
+            || None,
+            || None,
+            || Some(PathBuf::from("/mise/shims/somebin")),
+            || Some(PathBuf::from("/prefix/somebin")),
+        );
+        assert!(
+            matches!(hit, Some(LookupHit::Mise(p)) if p == PathBuf::from("/mise/shims/somebin"))
+        );
     }
 }
