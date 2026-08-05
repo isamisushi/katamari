@@ -12,20 +12,22 @@
 
 use crate::highlight::{FileHighlighter, Language};
 use crate::keymap::Action;
+use crate::lsp::DiagnosticsStore;
 use crate::ui::hover_popup::HoverQuery;
 use crate::ui::scroll;
 use crate::ui::symbols;
 use crate::ui::text::{display_width, highlight_color, mark_range, truncate_spans_to_width};
+use lsp_types::DiagnosticSeverity;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const LINE_NUMBER_WIDTH: usize = 5;
 const STATUS_BAR_HEIGHT: u16 = 1;
-const HINTS: &str = "j/k move  C-d/C-u half-page  gg/G top/bottom  K hover  Tab symbol  q quit";
+const HINTS: &str = "j/k move  C-d/C-u half-page  gg/G top/bottom  ]d/[d diag  K hover  gd def  gr refs  C-o/C-t jump  Tab symbol  q quit";
 
 /// State for one open file. Construction does the (comparatively) expensive
 /// work — reading line boundaries and running the whole-file highlight pass
@@ -81,7 +83,25 @@ impl FileView {
         }
     }
 
-    fn cursor_line_text(&self) -> String {
+    /// The absolute path this view is showing, if it has a hover target —
+    /// `None` for a view constructed with [`Self::with_hover_target`]'s
+    /// `target: None` (a preview over content with nowhere on disk to point
+    /// at). Used by [`crate::ui::navigation`] to recognize "the jump target
+    /// is the file already open in this view" and by the diagnostics gutter
+    /// to look up this file's entries.
+    pub fn file_path(&self) -> Option<&Path> {
+        self.file_path.as_deref()
+    }
+
+    pub fn git_root(&self) -> &Path {
+        &self.git_root
+    }
+
+    /// The plain text of the line the cursor currently sits on — used for
+    /// symbol scanning within this module and, via
+    /// [`crate::ui::navigation`], to resolve the display column of the
+    /// active symbol when recording this position on the jump stack.
+    pub fn cursor_line_text(&self) -> String {
         self.highlighter
             .line(self.cursor)
             .iter()
@@ -152,9 +172,17 @@ impl FileView {
             Action::NextSymbol => self.cycle_symbol(1),
             Action::PrevSymbol => self.cycle_symbol(-1),
             Action::Quit => self.should_quit = true,
-            // `ui::mod` intercepts `Hover`/`Cancel` before they reach here,
+            // `ui::mod` intercepts all of these before they reach here,
             // same as in `App::update` — see that method's comment.
-            Action::Hover | Action::Cancel => {}
+            Action::Hover
+            | Action::Cancel
+            | Action::GotoDefinition
+            | Action::FindReferences
+            | Action::NextDiagnostic
+            | Action::PrevDiagnostic
+            | Action::JumpBack
+            | Action::JumpForward
+            | Action::Confirm => {}
             // A single file has no hunks, no other files, no sidebar, and
             // only one column — these diff-view actions are no-ops here
             // rather than unreachable, so the shared keymap doesn't need a
@@ -176,6 +204,52 @@ impl FileView {
         self.scroll_offset =
             scroll::clamp_scroll(self.cursor, self.viewport_height, self.scroll_offset);
     }
+
+    /// Moves the cursor to `line` and, if the active symbol there covers
+    /// `display_col`, selects it — mirrors [`crate::ui::app::App::jump_cursor_to`];
+    /// see that method's docs for why centering rather than clamping.
+    pub fn jump_cursor_to(&mut self, line: usize, display_col: usize) {
+        self.cursor = line.min(self.line_count().saturating_sub(1));
+        let text = self.cursor_line_text();
+        self.active_symbol = symbols::scan(&text)
+            .iter()
+            .position(|s| s.display_start <= display_col && display_col < s.display_end)
+            .unwrap_or(0);
+        self.scroll_offset = scroll::center(self.cursor, self.viewport_height);
+        self.clamp_scroll();
+    }
+
+    /// As [`crate::ui::app::App::jump_to_diagnostic`], for this single-file
+    /// view: here a "row" already *is* a 0-based line number, so no
+    /// `lsp_target`-style translation is needed first.
+    pub fn jump_to_diagnostic(&mut self, diagnostics: &DiagnosticsStore, forward: bool) {
+        let Some(file) = self.file_path.as_deref() else {
+            return;
+        };
+        let lines = diagnostics.lines_with_diagnostics(file);
+        if lines.is_empty() {
+            return;
+        }
+        let current = self.cursor as u32;
+        let target = if forward {
+            lines
+                .iter()
+                .find(|&&l| l > current)
+                .or_else(|| lines.first())
+        } else {
+            lines
+                .iter()
+                .rev()
+                .find(|&&l| l < current)
+                .or_else(|| lines.last())
+        };
+        if let Some(&line) = target {
+            self.cursor = (line as usize).min(self.line_count().saturating_sub(1));
+            self.active_symbol = 0;
+            self.scroll_offset = scroll::center(self.cursor, self.viewport_height);
+            self.clamp_scroll();
+        }
+    }
 }
 
 pub struct Areas {
@@ -194,7 +268,7 @@ pub fn layout(area: Rect) -> Areas {
     }
 }
 
-pub fn render(frame: &mut Frame, area: Rect, view: &FileView) {
+pub fn render(frame: &mut Frame, area: Rect, view: &FileView, diagnostics: &DiagnosticsStore) {
     let block = Block::default().borders(Borders::LEFT).title(" file ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -203,15 +277,42 @@ pub fn render(frame: &mut Frame, area: Rect, view: &FileView) {
     let visible = (view.scroll_offset..view.line_count()).take(inner.height as usize);
 
     let lines: Vec<Line> = visible
-        .map(|idx| content_line(view, idx, idx == view.cursor, width))
+        .map(|idx| content_line(view, idx, idx == view.cursor, width, diagnostics))
         .collect();
 
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn content_line(view: &FileView, idx: usize, is_cursor: bool, width: usize) -> Line<'static> {
+/// As `diff_view`'s glyph of the same name — see that module's docs. Kept
+/// as a separate small copy rather than a shared helper because the two
+/// views build their gutter strings differently enough (add/del marker and
+/// dual line numbers here vs. a single line number there) that threading a
+/// shared function through both would need as many parameters as it saved
+/// lines.
+fn diagnostic_glyph_span(severity: Option<DiagnosticSeverity>) -> Span<'static> {
+    let (glyph, color) = match severity {
+        Some(DiagnosticSeverity::ERROR) => ("\u{25CF}", Color::Red),
+        Some(DiagnosticSeverity::WARNING) => ("\u{25B2}", Color::Yellow),
+        Some(_) => ("\u{00B7}", Color::Blue),
+        None => (" ", Color::Reset),
+    };
+    Span::styled(format!("{glyph} "), Style::default().fg(color))
+}
+
+fn content_line(
+    view: &FileView,
+    idx: usize,
+    is_cursor: bool,
+    width: usize,
+    diagnostics: &DiagnosticsStore,
+) -> Line<'static> {
+    let severity = view
+        .file_path()
+        .and_then(|file| diagnostics.severity_at(file, idx as u32));
+    let diagnostic_span = diagnostic_glyph_span(severity);
+
     let gutter = format!("{:>LINE_NUMBER_WIDTH$} \u{2502} ", idx + 1);
-    let gutter_width = display_width(&gutter);
+    let gutter_width = display_width(&gutter) + display_width(diagnostic_span.content.as_ref());
     let content_width = width.saturating_sub(gutter_width);
 
     let spans = truncate_spans_to_width(view.highlighter.line(idx), content_width);
@@ -231,7 +332,10 @@ fn content_line(view: &FileView, idx: usize, is_cursor: bool, width: usize) -> L
         );
     }
 
-    let mut line_spans = vec![Span::styled(gutter, Style::default().fg(Color::DarkGray))];
+    let mut line_spans = vec![
+        diagnostic_span,
+        Span::styled(gutter, Style::default().fg(Color::DarkGray)),
+    ];
     line_spans.extend(content_spans);
 
     let rendered_width: usize = line_spans.iter().map(ratatui::text::Span::width).sum();

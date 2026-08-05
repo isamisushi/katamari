@@ -24,6 +24,15 @@ pub fn clamp_scroll(cursor: usize, viewport_height: usize, scroll_offset: usize)
     }
 }
 
+/// The scroll offset that centers `cursor` within `viewport_height` rows —
+/// used when a jump (go-to-definition/references, `]d`/`[d`) lands the
+/// cursor somewhere off-screen, so the destination appears with context on
+/// both sides rather than pinned to whichever edge ordinary movement's
+/// [`clamp_scroll`] would leave it at.
+pub fn center(cursor: usize, viewport_height: usize) -> usize {
+    cursor.saturating_sub(viewport_height / 2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,5 +57,15 @@ mod tests {
     #[test]
     fn clamp_scroll_pushes_offset_forward_when_cursor_moved_past_viewport_bottom() {
         assert_eq!(clamp_scroll(12, 5, 0), 8);
+    }
+
+    #[test]
+    fn center_puts_the_cursor_at_the_viewport_midpoint() {
+        assert_eq!(center(20, 10), 15);
+    }
+
+    #[test]
+    fn center_clamps_to_zero_near_the_top_of_the_file() {
+        assert_eq!(center(2, 10), 0);
     }
 }

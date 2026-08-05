@@ -11,7 +11,9 @@
 use crate::highlight::{Language, LineHighlighter};
 use crate::lsp::{HoverResult, LspError};
 use crate::ui::text::highlight_color;
-use lsp_types::{HoverContents, MarkedString, MarkupContent, MarkupKind};
+use lsp_types::{
+    Diagnostic, DiagnosticSeverity, HoverContents, MarkedString, MarkupContent, MarkupKind,
+};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -65,6 +67,16 @@ struct RenderedHover {
 pub struct HoverState {
     generation: u64,
     status: Status,
+    /// Rendered lines for diagnostics overlapping the row a pending hover
+    /// request was issued for, computed synchronously (before the request
+    /// is even sent — see [`Self::set_diagnostics_prefix`]) and prepended
+    /// once the request resolves, in [`Self::apply`]. Kept separate from
+    /// `status` rather than folded into `Status::Pending` because it's set
+    /// once per request and *read* by `apply` regardless of how that
+    /// request resolves (content, nothing, or an error) — a `match` on
+    /// `Status` isn't the right shape for "always available, consumed
+    /// exactly once."
+    diagnostics_prefix: Vec<Line<'static>>,
 }
 
 impl HoverState {
@@ -90,10 +102,22 @@ impl HoverState {
     pub fn invalidate(&mut self) {
         self.generation += 1;
         self.status = Status::Idle;
+        self.diagnostics_prefix.clear();
     }
 
     pub fn set_pending(&mut self) {
         self.status = Status::Pending;
+    }
+
+    /// Records the "Diagnostics" section [`Self::apply`] should prepend to
+    /// whatever hover content arrives — computed by `ui::mod` from
+    /// whichever diagnostics overlap the row `Action::Hover` was issued on,
+    /// *before* the (asynchronous) hover request is even sent, since the
+    /// diagnostics themselves are already known synchronously. Empty when
+    /// nothing overlaps, which is the common case and makes [`Self::apply`]
+    /// behave exactly as it did before diagnostics existed.
+    pub fn set_diagnostics_prefix(&mut self, diagnostics: &[&Diagnostic]) {
+        self.diagnostics_prefix = diagnostics_section(diagnostics);
     }
 
     pub fn set_message(&mut self, message: impl Into<String>) {
@@ -112,12 +136,28 @@ impl HoverState {
         if generation != self.generation {
             return;
         }
+        let mut lines = std::mem::take(&mut self.diagnostics_prefix);
+        let has_diagnostics = !lines.is_empty();
+
         self.status = match result {
-            Ok(Some(hover)) => Status::Shown(RenderedHover {
-                lines: render_hover_contents(&hover.contents, highlighter),
-                scroll: 0,
-            }),
+            Ok(Some(hover)) => {
+                if has_diagnostics {
+                    lines.push(Line::default());
+                }
+                lines.extend(render_hover_contents(&hover.contents, highlighter));
+                Status::Shown(RenderedHover { lines, scroll: 0 })
+            }
+            // With nothing to show but diagnostics that overlap this
+            // position, the diagnostics themselves are still worth a
+            // popup — "no hover information" would otherwise silently
+            // swallow them into a status-bar-only message no different
+            // from the ordinary "nothing under the cursor" case.
+            Ok(None) if has_diagnostics => Status::Shown(RenderedHover { lines, scroll: 0 }),
             Ok(None) => Status::Message("no hover information".to_owned()),
+            Err(e) if has_diagnostics => {
+                lines.push(Line::from(format!("(hover error: {e})")));
+                Status::Shown(RenderedHover { lines, scroll: 0 })
+            }
             Err(e) => Status::Message(e.to_string()),
         };
     }
@@ -214,6 +254,43 @@ pub fn plain_text(contents: &HoverContents) -> String {
             .collect::<Vec<_>>()
             .join("\n---\n"),
         HoverContents::Markup(markup) => markup.value.clone(),
+    }
+}
+
+/// Renders a "Diagnostics" section: a bold header followed by one line per
+/// diagnostic (`[severity] message (source)`), in the order given. Empty
+/// input renders as no lines at all, not an empty header — a caller with
+/// nothing to show shouldn't have to check that itself.
+fn diagnostics_section(diagnostics: &[&Diagnostic]) -> Vec<Line<'static>> {
+    if diagnostics.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![Line::from(Span::styled(
+        "Diagnostics",
+        Style::default().add_modifier(Modifier::BOLD),
+    ))];
+    for diagnostic in diagnostics {
+        let (label, color) = severity_label(diagnostic.severity);
+        let source = diagnostic
+            .source
+            .as_deref()
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(format!("[{label}] "), Style::default().fg(color)),
+            Span::raw(format!("{}{source}", diagnostic.message)),
+        ]));
+    }
+    lines
+}
+
+fn severity_label(severity: Option<DiagnosticSeverity>) -> (&'static str, ratatui::style::Color) {
+    use ratatui::style::Color;
+    match severity {
+        Some(DiagnosticSeverity::ERROR) => ("error", Color::Red),
+        Some(DiagnosticSeverity::WARNING) => ("warning", Color::Yellow),
+        Some(DiagnosticSeverity::HINT) => ("hint", Color::Blue),
+        _ => ("info", Color::Blue),
     }
 }
 
@@ -433,6 +510,49 @@ mod tests {
 
         let hover = lsp_types::Hover {
             contents: HoverContents::Scalar(MarkedString::String("hello".to_owned())),
+            range: None,
+        };
+        state.apply(generation, Ok(Some(hover)), &mut hl);
+        assert!(state.is_open());
+    }
+
+    #[test]
+    fn diagnostics_prefix_is_shown_even_when_hover_has_nothing() {
+        let mut hl = LineHighlighter::new();
+        let mut state = HoverState::default();
+        state.invalidate();
+        let generation = state.generation();
+        let diagnostic = lsp_types::Diagnostic {
+            range: lsp_types::Range::default(),
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            message: "mismatched types".to_owned(),
+            ..Default::default()
+        };
+        state.set_diagnostics_prefix(&[&diagnostic]);
+        state.set_pending();
+        state.apply(generation, Ok(None), &mut hl);
+        assert!(
+            state.is_open(),
+            "a diagnostic overlapping the hover position must show a popup even with no hover content"
+        );
+    }
+
+    #[test]
+    fn diagnostics_prefix_is_prepended_above_hover_content() {
+        let mut hl = LineHighlighter::new();
+        let mut state = HoverState::default();
+        state.invalidate();
+        let generation = state.generation();
+        let diagnostic = lsp_types::Diagnostic {
+            range: lsp_types::Range::default(),
+            severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+            message: "unused variable".to_owned(),
+            ..Default::default()
+        };
+        state.set_diagnostics_prefix(&[&diagnostic]);
+        state.set_pending();
+        let hover = lsp_types::Hover {
+            contents: HoverContents::Scalar(MarkedString::String("some type info".to_owned())),
             range: None,
         };
         state.apply(generation, Ok(Some(hover)), &mut hl);

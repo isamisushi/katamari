@@ -3,13 +3,18 @@
 //! goes through `ui::text`'s display-width helpers so CJK content lines
 //! neither misalign the gutter nor wrap.
 
-use crate::diff::{DiffLineKind, RenderRow, SideBySideRow, SideCell, side_by_side_scroll_start};
+use crate::diff::{
+    DiffFile, DiffLineKind, DiffRow, RenderRow, SideBySideRow, SideCell, lsp_target,
+    side_by_side_scroll_start,
+};
 use crate::highlight::{Language, LineHighlighter};
+use crate::lsp::DiagnosticsStore;
 use crate::ui::app::{App, Layout};
 use crate::ui::symbols;
 use crate::ui::text::{
     display_width, highlight_color, mark_range, truncate_spans_to_width, truncate_to_width,
 };
+use lsp_types::DiagnosticSeverity;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -45,18 +50,25 @@ pub fn render(
     app: &App,
     highlighter: &mut LineHighlighter,
     layout: Layout,
+    diagnostics: &DiagnosticsStore,
 ) {
     let block = Block::default().borders(Borders::LEFT).title(" diff ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     match layout {
-        Layout::Unified => render_unified(frame, inner, app, highlighter),
-        Layout::SideBySide => render_side_by_side(frame, inner, app, highlighter),
+        Layout::Unified => render_unified(frame, inner, app, highlighter, diagnostics),
+        Layout::SideBySide => render_side_by_side(frame, inner, app, highlighter, diagnostics),
     }
 }
 
-fn render_unified(frame: &mut Frame, inner: Rect, app: &App, highlighter: &mut LineHighlighter) {
+fn render_unified(
+    frame: &mut Frame,
+    inner: Rect,
+    app: &App,
+    highlighter: &mut LineHighlighter,
+    diagnostics: &DiagnosticsStore,
+) {
     let content_width = inner.width as usize;
     let visible = app
         .rows
@@ -66,7 +78,16 @@ fn render_unified(frame: &mut Frame, inner: Rect, app: &App, highlighter: &mut L
         .take(inner.height as usize);
 
     let lines: Vec<Line> = visible
-        .map(|(idx, row)| render_row(app, *row, idx == app.cursor, content_width, highlighter))
+        .map(|(idx, row)| {
+            render_row(
+                app,
+                *row,
+                idx == app.cursor,
+                content_width,
+                highlighter,
+                diagnostics,
+            )
+        })
         .collect();
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -82,6 +103,7 @@ fn render_side_by_side(
     inner: Rect,
     app: &App,
     highlighter: &mut LineHighlighter,
+    diagnostics: &DiagnosticsStore,
 ) {
     let width = inner.width as usize;
     let divider_width = 1;
@@ -96,7 +118,9 @@ fn render_side_by_side(
         .take(inner.height as usize);
 
     let lines: Vec<Line> = visible
-        .map(|row| side_by_side_row_line(app, *row, left_width, right_width, highlighter))
+        .map(|row| {
+            side_by_side_row_line(app, *row, left_width, right_width, highlighter, diagnostics)
+        })
         .collect();
 
     frame.render_widget(Paragraph::new(lines), inner);
@@ -108,6 +132,7 @@ fn side_by_side_row_line(
     left_width: usize,
     right_width: usize,
     highlighter: &mut LineHighlighter,
+    diagnostics: &DiagnosticsStore,
 ) -> Line<'static> {
     match row {
         SideBySideRow::Full { flat_idx } => render_row(
@@ -116,14 +141,15 @@ fn side_by_side_row_line(
             flat_idx == app.cursor,
             left_width + 1 + right_width,
             highlighter,
+            diagnostics,
         ),
         SideBySideRow::Paired { old, new } => {
-            let mut spans = side_cell_spans(app, old, left_width, highlighter).spans;
+            let mut spans = side_cell_spans(app, old, left_width, highlighter, diagnostics).spans;
             spans.push(Span::styled(
                 "\u{2502}",
                 Style::default().fg(Color::DarkGray),
             ));
-            spans.extend(side_cell_spans(app, new, right_width, highlighter).spans);
+            spans.extend(side_cell_spans(app, new, right_width, highlighter, diagnostics).spans);
             Line::from(spans)
         }
     }
@@ -138,6 +164,7 @@ fn side_cell_spans(
     cell: SideCell,
     width: usize,
     highlighter: &mut LineHighlighter,
+    diagnostics: &DiagnosticsStore,
 ) -> Line<'static> {
     match cell {
         SideCell::Line { flat_idx } => render_row(
@@ -146,6 +173,7 @@ fn side_cell_spans(
             flat_idx == app.cursor,
             width,
             highlighter,
+            diagnostics,
         ),
         SideCell::Empty => Line::from(Span::raw(" ".repeat(width))),
     }
@@ -157,6 +185,7 @@ fn render_row(
     is_cursor: bool,
     width: usize,
     highlighter: &mut LineHighlighter,
+    diagnostics: &DiagnosticsStore,
 ) -> Line<'static> {
     match row {
         RenderRow::FileHeader { file_idx } => file_header_line(app, file_idx, width, is_cursor),
@@ -176,8 +205,38 @@ fn render_row(
             width,
             is_cursor,
             highlighter,
+            diagnostics,
         ),
     }
+}
+
+/// The most severe diagnostic touching `row`'s current-file line, if any —
+/// `None` for a `Del` row (no `new_line` to look up) or a row whose file
+/// has no diagnostics loaded at all.
+fn row_diagnostic_severity(
+    app: &App,
+    file: &DiffFile,
+    row: &DiffRow,
+    diagnostics: &DiagnosticsStore,
+) -> Option<DiagnosticSeverity> {
+    let (relative, line) = lsp_target(row, file)?;
+    diagnostics.severity_at(&app.repo_root.join(relative), line)
+}
+
+/// The single-character (plus trailing space) gutter glyph for a
+/// diagnostic severity: `●` red for an error, `▲` yellow for a warning,
+/// `·` blue for anything less — a space when there's nothing to show, so
+/// every content row's gutter is the same width whether or not it has a
+/// diagnostic. `bg` matches the add/del tint the rest of that row's gutter
+/// uses, so the glyph doesn't sit in a visibly different-colored cell.
+fn diagnostic_glyph_span(severity: Option<DiagnosticSeverity>, bg: Option<Color>) -> Span<'static> {
+    let (glyph, color) = match severity {
+        Some(DiagnosticSeverity::ERROR) => ("\u{25CF}", Color::Red),
+        Some(DiagnosticSeverity::WARNING) => ("\u{25B2}", Color::Yellow),
+        Some(_) => ("\u{00B7}", Color::Blue),
+        None => (" ", Color::Reset),
+    };
+    Span::styled(format!("{glyph} "), base_style(bg).fg(color))
 }
 
 fn cursor_style(base: Style, is_cursor: bool) -> Style {
@@ -242,6 +301,12 @@ fn binary_notice_line(
     ))
 }
 
+#[allow(clippy::too_many_arguments)] // every parameter is a distinct piece
+// of what one content row needs to render (which row, whether it's under
+// the cursor, how wide it can be, and the three lookaside tables —
+// highlighter, diagnostics, active-symbol state via `app` — it draws from);
+// bundling them into a struct would just move the same fields one level
+// down.
 fn content_line(
     app: &App,
     file_idx: usize,
@@ -250,6 +315,7 @@ fn content_line(
     width: usize,
     is_cursor: bool,
     highlighter: &mut LineHighlighter,
+    diagnostics: &DiagnosticsStore,
 ) -> Line<'static> {
     let file = &app.files[file_idx];
     let row = &file.hunks[hunk_idx].rows[row_idx];
@@ -260,12 +326,14 @@ fn content_line(
         DiffLineKind::Context => (' ', Color::Reset, None),
     };
 
+    let severity = row_diagnostic_severity(app, file, row, diagnostics);
+    let diagnostic_span = diagnostic_glyph_span(severity, bg);
     let gutter = format!(
         "{marker} {} {} \u{2502} ",
         format_line_number(row.old_line),
         format_line_number(row.new_line),
     );
-    let gutter_width = display_width(&gutter);
+    let gutter_width = display_width(&gutter) + display_width(diagnostic_span.content.as_ref());
     let content_width = width.saturating_sub(gutter_width);
 
     let language = Language::detect(file.display_path());
@@ -285,10 +353,13 @@ fn content_line(
         );
     }
 
-    let mut line_spans = vec![Span::styled(
-        gutter,
-        base_style(bg).fg(marker_color).add_modifier(Modifier::BOLD),
-    )];
+    let mut line_spans = vec![
+        diagnostic_span,
+        Span::styled(
+            gutter,
+            base_style(bg).fg(marker_color).add_modifier(Modifier::BOLD),
+        ),
+    ];
     line_spans.extend(content_spans);
 
     let rendered_width: usize = line_spans.iter().map(ratatui::text::Span::width).sum();

@@ -6,14 +6,15 @@
 
 use crate::lsp::transport::{LspError, Transport};
 use lsp_types::{
-    ClientCapabilities, ClientInfo, DidOpenTextDocumentParams, GeneralClientCapabilities, Hover,
-    HoverClientCapabilities, HoverParams, InitializeParams, InitializeResult, InitializedParams,
-    MarkupKind, Position, PositionEncodingKind, ServerCapabilities, TextDocumentClientCapabilities,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Uri, WindowClientCapabilities,
-    WorkspaceFolder,
+    ClientCapabilities, ClientInfo, DidOpenTextDocumentParams, GeneralClientCapabilities,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverClientCapabilities, HoverParams,
+    InitializeParams, InitializeResult, InitializedParams, Location, MarkupKind,
+    PartialResultParams, Position, PositionEncodingKind, ReferenceContext, ReferenceParams,
+    ServerCapabilities, TextDocumentClientCapabilities, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    WindowClientCapabilities, WorkspaceFolder,
 };
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
@@ -22,6 +23,22 @@ use std::time::{Duration, Instant};
 /// position (a valid, common outcome — whitespace, punctuation, an unknown
 /// symbol — not an error).
 pub type HoverResult = Option<Hover>;
+
+/// A `textDocument/definition` response: `None` when the server has no
+/// definition to offer (the cursor isn't on a resolvable symbol) — as
+/// unremarkable an outcome as an empty hover. The three shapes a server may
+/// reply with (a single location, several, or richer `LocationLink`s with
+/// separate "origin selection" and "target" ranges) are normalized to a flat
+/// list of locations by [`crate::ui::navigation::definition_locations`],
+/// which is where callers should look, not here.
+pub type DefinitionResult = Option<GotoDefinitionResponse>;
+
+/// A `textDocument/references` response: `None` and `Some(vec![])` are both
+/// "found nothing" in practice, but kept distinct because a server
+/// returning `None` (no support/no answer) vs. an explicit empty array (0
+/// references) are different enough facts that flattening them early would
+/// lose information a future caller might want.
+pub type ReferencesResult = Option<Vec<Location>>;
 
 /// How long [`Client::start`] waits for the `initialize` response before
 /// giving up. Generous because a server can be slow to *answer*
@@ -39,11 +56,6 @@ const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 
 pub struct Client {
     transport: Transport,
-    // Stored for M3b's diagnostics/go-to-definition, which need to check
-    // e.g. `definition_provider`/`references_provider` before issuing a
-    // request a server never advertised it supports. M3a only ever calls
-    // `textDocument/hover` unconditionally.
-    #[allow(dead_code)]
     capabilities: ServerCapabilities,
     position_encoding: PositionEncodingKind,
 }
@@ -97,9 +109,19 @@ impl Client {
         })
     }
 
-    #[allow(dead_code)] // see the field's comment
-    pub fn capabilities(&self) -> &ServerCapabilities {
-        &self.capabilities
+    /// Whether this server advertised `textDocument/definition` support in
+    /// its `initialize` response. Checked before issuing the request rather
+    /// than just trying it and handling a `MethodNotFound` error, so a
+    /// server that never implemented go-to-definition reports "not
+    /// supported" immediately instead of after a round trip that was always
+    /// going to fail.
+    pub fn supports_definition(&self) -> bool {
+        self.capabilities.definition_provider.is_some()
+    }
+
+    /// As [`Self::supports_definition`], for `textDocument/references`.
+    pub fn supports_references(&self) -> bool {
+        self.capabilities.references_provider.is_some()
     }
 
     /// The encoding the server picked for `Position::character` (from the
@@ -145,6 +167,50 @@ impl Client {
             work_done_progress_params: Default::default(),
         };
         self.transport.request("textDocument/hover", params)
+    }
+
+    /// Requests go-to-definition at `position`. Callers should check
+    /// [`Self::supports_definition`] first — this method itself doesn't,
+    /// since a caller occasionally has a reason to ask anyway (`ktmr
+    /// lsp-check`'s smoke test, most notably, which wants to see the
+    /// server's actual answer or error rather than a client-side guess).
+    pub fn definition(
+        &self,
+        uri: Uri,
+        position: Position,
+    ) -> Receiver<Result<DefinitionResult, LspError>> {
+        let params = GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        self.transport.request("textDocument/definition", params)
+    }
+
+    /// Requests every reference to the symbol at `position`, including its
+    /// declaration (`includeDeclaration: true` — a reviewer asking "where
+    /// else is this used" wants the declaration listed alongside the uses,
+    /// not filtered out).
+    pub fn references(
+        &self,
+        uri: Uri,
+        position: Position,
+    ) -> Receiver<Result<ReferencesResult, LspError>> {
+        let params = ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: PartialResultParams::default(),
+            context: ReferenceContext {
+                include_declaration: true,
+            },
+        };
+        self.transport.request("textDocument/references", params)
     }
 
     /// `shutdown` request, then `exit` notification, then a bounded wait for
@@ -253,6 +319,32 @@ pub fn file_uri(path: &Path) -> Result<Uri, LspError> {
         .map_err(|e| LspError::Io(format!("invalid file uri for {}: {e}", path.display())))
 }
 
+/// The inverse of [`file_uri`]: a `file://` URI (as returned in a
+/// `Location`/`LocationLink` from a go-to-definition or references
+/// response) back to a filesystem path, percent-decoding every `%XX`
+/// escape. Returns `None` for anything not a `file://` URI (a server could
+/// in principle point at some other scheme, though none `katamari` talks to
+/// does) or that doesn't decode to valid UTF-8.
+pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
+    let s = uri.as_str();
+    let path_part = s.strip_prefix("file://")?;
+    let mut bytes = Vec::with_capacity(path_part.len());
+    let mut chars = path_part.bytes();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let hi = chars.next()?;
+            let lo = chars.next()?;
+            let hex = [hi, lo];
+            let hex_str = std::str::from_utf8(&hex).ok()?;
+            bytes.push(u8::from_str_radix(hex_str, 16).ok()?);
+        } else {
+            bytes.push(b);
+        }
+    }
+    let decoded = String::from_utf8(bytes).ok()?;
+    Some(PathBuf::from(decoded))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,5 +364,25 @@ mod tests {
             uri.as_str()
                 .starts_with("file:///tmp/%E6%97%A5%E6%9C%AC%E8%AA%9E%20dir/main.rs")
         );
+    }
+
+    #[test]
+    fn uri_to_path_round_trips_file_uri() {
+        let path = Path::new("/tmp/src/main.rs");
+        let uri = file_uri(path).unwrap();
+        assert_eq!(uri_to_path(&uri).unwrap(), path);
+    }
+
+    #[test]
+    fn uri_to_path_decodes_percent_escapes() {
+        let path = Path::new("/tmp/日本語 dir/main.rs");
+        let uri = file_uri(path).unwrap();
+        assert_eq!(uri_to_path(&uri).unwrap(), path);
+    }
+
+    #[test]
+    fn uri_to_path_rejects_non_file_schemes() {
+        let uri: Uri = "https://example.com/foo".parse().unwrap();
+        assert_eq!(uri_to_path(&uri), None);
     }
 }

@@ -12,11 +12,13 @@
 
 pub mod adapter;
 pub mod client;
+pub mod diagnostics;
 pub mod manager;
 pub mod transport;
 
-pub use client::HoverResult;
-pub use manager::LspManager;
+pub use client::{DefinitionResult, HoverResult, ReferencesResult};
+pub use diagnostics::{DiagnosticsStore, parse_publish_diagnostics};
+pub use manager::{LspManager, ServerEvent};
 pub use transport::{LspError, LspEvent};
 
 /// A short human-readable summary of a `$/progress` notification's payload

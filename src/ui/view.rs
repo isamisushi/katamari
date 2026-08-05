@@ -6,6 +6,7 @@
 //! `ui::run`'s event loop changing shape.
 
 use crate::keymap::Action;
+use crate::lsp::DiagnosticsStore;
 use crate::ui::app::App;
 use crate::ui::file_view::FileView;
 use crate::ui::hover_popup::HoverQuery;
@@ -86,6 +87,17 @@ impl View {
         };
         u16::try_from(cursor.checked_sub(scroll_offset)?).ok()
     }
+
+    /// Moves the cursor to the next/previous row bearing a diagnostic —
+    /// `Action::NextDiagnostic`/`PrevDiagnostic`, intercepted by
+    /// `ui::mod`'s event loop the same way `Action::Hover` is (needs data
+    /// `App`/`FileView::update` don't own).
+    pub fn jump_to_diagnostic(&mut self, diagnostics: &DiagnosticsStore, forward: bool) {
+        match self {
+            View::Diff(app) => app.jump_to_diagnostic(diagnostics, forward),
+            View::File(file) => file.jump_to_diagnostic(diagnostics, forward),
+        }
+    }
 }
 
 /// A non-empty stack of [`View`]s; the top one is what's on screen. Popping
@@ -100,7 +112,6 @@ impl ViewStack {
         Self { views: vec![root] }
     }
 
-    #[allow(dead_code)] // pushed onto from M3's go-to-definition, not yet from M2.
     pub fn push(&mut self, view: View) {
         self.views.push(view);
     }
@@ -117,11 +128,29 @@ impl ViewStack {
         }
     }
 
+    /// Pops every view above the root, restoring the stack to exactly the
+    /// one it started the session with. Go-to-definition/references uses
+    /// this when a jump lands inside the diff being reviewed: any
+    /// `FileView`s pushed by earlier jumps are no longer relevant once the
+    /// user has navigated back to content the root diff itself shows.
+    pub fn pop_to_root(&mut self) {
+        self.views.truncate(1);
+    }
+
     pub fn top(&self) -> &View {
         self.views.last().expect("view stack is never empty")
     }
 
     pub fn top_mut(&mut self) -> &mut View {
         self.views.last_mut().expect("view stack is never empty")
+    }
+
+    /// The bottom of the stack — the diff (or single file) the session
+    /// started with. Go-to-definition/references checks *this* view, not
+    /// whichever one is currently on top, when deciding whether a jump
+    /// target already appears in the diff under review — see
+    /// [`crate::ui::navigation::navigate_to`].
+    pub fn root_mut(&mut self) -> &mut View {
+        self.views.first_mut().expect("view stack is never empty")
     }
 }

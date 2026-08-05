@@ -5,10 +5,11 @@
 
 use crate::diff::{DiffFile, RenderRow, SideBySideRow, flatten, flatten_side_by_side, lsp_target};
 use crate::keymap::Action;
+use crate::lsp::DiagnosticsStore;
 use crate::ui::hover_popup::HoverQuery;
 use crate::ui::scroll;
 use crate::ui::symbols;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Which of the two diff layouts the diff pane renders. Toggled by
 /// [`Action::ToggleLayout`]; [`crate::ui::diff_view`] may still render
@@ -191,11 +192,19 @@ impl App {
             Action::ToggleLayout => self.layout = self.layout.toggled(),
             Action::NextSymbol => self.cycle_symbol(1),
             Action::PrevSymbol => self.cycle_symbol(-1),
-            // `ui::mod`'s event loop intercepts `Hover` before it reaches
-            // here (issuing it needs the LSP manager, not just `App`
-            // state) and `Cancel` (closing a popup `App` doesn't know
-            // about) — both are no-ops from `App`'s own point of view.
-            Action::Hover | Action::Cancel => {}
+            // `ui::mod`'s event loop intercepts all of these before they
+            // reach here — each needs either the LSP manager, the
+            // diagnostics store, or the jump stack, none of which `App`
+            // owns — so they're no-ops from `App`'s own point of view.
+            Action::Hover
+            | Action::Cancel
+            | Action::GotoDefinition
+            | Action::FindReferences
+            | Action::NextDiagnostic
+            | Action::PrevDiagnostic
+            | Action::JumpBack
+            | Action::JumpForward
+            | Action::Confirm => {}
             Action::Quit => self.should_quit = true,
         }
         if self.cursor != cursor_before {
@@ -206,6 +215,102 @@ impl App {
 
     fn half_page(&self) -> usize {
         scroll::half_page(self.viewport_height)
+    }
+
+    /// The row index whose `(file, new_line)` matches `target_file`/
+    /// `target_line` (0-based), if this diff has one — how a
+    /// go-to-definition/references jump decides to move the cursor within
+    /// the diff already being reviewed instead of pushing a new `FileView`
+    /// on top of it. `target_file` is compared as an absolute path, the
+    /// same coordinate space [`Self::hover_query`] reports.
+    pub fn row_for_target(&self, target_file: &Path, target_line: u32) -> Option<usize> {
+        self.rows.iter().position(|row| {
+            let RenderRow::Line {
+                file_idx,
+                hunk_idx,
+                row_idx,
+            } = row
+            else {
+                return false;
+            };
+            let file = &self.files[*file_idx];
+            let line_row = &file.hunks[*hunk_idx].rows[*row_idx];
+            match lsp_target(line_row, file) {
+                Some((relative, line)) => {
+                    line == target_line && self.repo_root.join(&relative) == target_file
+                }
+                None => false,
+            }
+        })
+    }
+
+    /// Moves the cursor to `row_idx` and, if the active symbol at that row
+    /// covers `display_col`, selects it — the destination of a
+    /// go-to-definition/references jump, or of `]d`/`[d`. Centers the
+    /// scroll offset (rather than the minimal nudge ordinary cursor
+    /// movement uses) so a jump's destination lands with surrounding
+    /// context visible, not pinned to the viewport's edge.
+    pub fn jump_cursor_to(&mut self, row_idx: usize, display_col: usize) {
+        self.cursor = row_idx.min(self.rows.len().saturating_sub(1));
+        self.active_symbol = self
+            .cursor_row_text()
+            .map(symbols::scan)
+            .and_then(|syms| {
+                syms.iter()
+                    .position(|s| s.display_start <= display_col && display_col < s.display_end)
+            })
+            .unwrap_or(0);
+        self.scroll_offset = scroll::center(self.cursor, self.viewport_height);
+        self.clamp_scroll();
+    }
+
+    /// Moves the cursor to the next (`forward`) or previous row whose
+    /// `(file, new_line)` carries a diagnostic, wrapping around the end of
+    /// the row list — `Action::NextDiagnostic`/`PrevDiagnostic`. A no-op
+    /// when no row in the diff has one.
+    pub fn jump_to_diagnostic(&mut self, diagnostics: &DiagnosticsStore, forward: bool) {
+        let Some(target) = self.find_diagnostic_row(diagnostics, forward) else {
+            return;
+        };
+        self.cursor = target;
+        self.active_symbol = 0;
+        self.scroll_offset = scroll::center(self.cursor, self.viewport_height);
+        self.clamp_scroll();
+    }
+
+    fn find_diagnostic_row(&self, diagnostics: &DiagnosticsStore, forward: bool) -> Option<usize> {
+        if self.rows.is_empty() {
+            return None;
+        }
+        let has_diagnostic = |idx: usize| -> bool {
+            let RenderRow::Line {
+                file_idx,
+                hunk_idx,
+                row_idx,
+            } = self.rows[idx]
+            else {
+                return false;
+            };
+            let file = &self.files[file_idx];
+            let row = &file.hunks[hunk_idx].rows[row_idx];
+            let Some((relative, line)) = lsp_target(row, file) else {
+                return false;
+            };
+            diagnostics
+                .severity_at(&self.repo_root.join(relative), line)
+                .is_some()
+        };
+
+        let len = self.rows.len();
+        (1..len)
+            .map(|step| {
+                if forward {
+                    (self.cursor + step) % len
+                } else {
+                    (self.cursor + len - step) % len
+                }
+            })
+            .find(|idx| has_diagnostic(*idx))
     }
 
     fn jump_to(&mut self, is_target: impl Fn(&RenderRow) -> bool) {

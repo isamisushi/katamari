@@ -56,18 +56,31 @@ enum Command {
         /// Path to the file to open.
         file: PathBuf,
     },
-    /// Spawns a language server, requests hover at one position, prints the
+    /// Spawns a language server, requests hover (or, with a mode flag,
+    /// go-to-definition/references/diagnostics) at one position, prints the
     /// result, and exits — an E2E smoke test for the `lsp` module runnable
     /// without a terminal. Not part of the reviewing workflow the rest of
     /// this CLI supports, so it's hidden from `--help`.
     #[command(hide = true)]
     LspCheck {
-        /// Path to the file to hover in.
+        /// Path to the file to check.
         file: PathBuf,
         /// 1-based line number, as an editor would show it.
         line: u32,
         /// 1-based display column within that line.
         col: usize,
+        /// `textDocument/definition` instead of hover.
+        #[arg(long)]
+        definition: bool,
+        /// `textDocument/references` instead of hover.
+        #[arg(long)]
+        references: bool,
+        /// Opens the file and waits for a `textDocument/publishDiagnostics`
+        /// notification instead of requesting anything at `line`/`col` —
+        /// `line`/`col` are still required by the command's shape but
+        /// unused in this mode.
+        #[arg(long)]
+        diagnostics: bool,
     },
 }
 
@@ -105,7 +118,14 @@ fn main() -> Result<()> {
             range,
         } => run_diff(dump, layout, staged, range),
         Command::Open { file } => run_open(file),
-        Command::LspCheck { file, line, col } => run_lsp_check(file, line, col),
+        Command::LspCheck {
+            file,
+            line,
+            col,
+            definition,
+            references,
+            diagnostics,
+        } => run_lsp_check(file, line, col, definition, references, diagnostics),
     }
 }
 
@@ -170,15 +190,32 @@ fn run_open(file: PathBuf) -> Result<()> {
     ui::run(&mut stack)
 }
 
-/// `ktmr lsp-check <file> <line> <col>` — an E2E smoke test for the whole
-/// `lsp` module without a terminal: spawns a server through the same
-/// [`lsp::LspManager`] the TUI uses, waits for it to become `Ready`
-/// (printing `$/progress` notifications and state transitions along the
-/// way, since a cold `rust-analyzer` can take real time to index), requests
-/// hover at the given position, prints the result, and shuts the server
-/// down before exiting — see [`lsp::LspManager::shutdown_all`]'s docs for
-/// why that last step isn't optional.
-fn run_lsp_check(file: PathBuf, line: u32, col: usize) -> Result<()> {
+/// `ktmr lsp-check <file> <line> <col> [--definition|--references|--diagnostics]`
+/// — an E2E smoke test for the whole `lsp` module without a terminal: spawns
+/// a server through the same [`lsp::LspManager`] the TUI uses, waits for it
+/// to become `Ready` (printing `$/progress` notifications and state
+/// transitions along the way, since a cold `rust-analyzer` can take real
+/// time to index), performs the requested check, prints the result, and
+/// shuts the server down before exiting — see
+/// [`lsp::LspManager::shutdown_all`]'s docs for why that last step isn't
+/// optional. Defaults to hover when none of the mode flags are set.
+fn run_lsp_check(
+    file: PathBuf,
+    line: u32,
+    col: usize,
+    definition: bool,
+    references: bool,
+    diagnostics: bool,
+) -> Result<()> {
+    if [definition, references, diagnostics]
+        .iter()
+        .filter(|set| **set)
+        .count()
+        > 1
+    {
+        bail!("--definition, --references, and --diagnostics are mutually exclusive");
+    }
+
     let absolute_file = std::env::current_dir()?.join(&file);
     let content = std::fs::read_to_string(&absolute_file)
         .with_context(|| format!("failed to read {}", absolute_file.display()))?;
@@ -208,72 +245,143 @@ fn run_lsp_check(file: PathBuf, line: u32, col: usize) -> Result<()> {
     let line0 = line.saturating_sub(1);
     let col0 = col.saturating_sub(1);
 
-    // The very first hover call is also what makes `LspManager` spawn the
-    // server at all (it's lazy — nothing starts until something asks for
-    // it). That request reaches the server the instant the `initialize`
-    // handshake finishes, which is well before rust-analyzer's background
-    // workspace indexing catches up, so an immediate `Ok(None)` here isn't
-    // necessarily "no hover info" — it can just as easily mean "asked too
-    // early." Rather than trust the first answer, this re-issues the
-    // request every `RETRY_INTERVAL` (printing state/progress in between)
-    // until either a real result arrives or the overall deadline passes,
-    // keeping only the most recent answer.
-    const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    if diagnostics {
+        run_diagnostics_check(&manager, &events_rx, &absolute_file, &git_root);
+    } else if definition {
+        run_definition_check(
+            &manager,
+            &events_rx,
+            &absolute_file,
+            &git_root,
+            &line_text,
+            line0,
+            col0,
+        );
+    } else if references {
+        run_references_check(
+            &manager,
+            &events_rx,
+            &absolute_file,
+            &git_root,
+            &line_text,
+            line0,
+            col0,
+        );
+    } else {
+        run_hover_check(
+            &manager,
+            &events_rx,
+            &absolute_file,
+            &git_root,
+            &line_text,
+            line0,
+            col0,
+        );
+    }
 
-    let mut pending = Some(manager.hover(&absolute_file, &git_root, &line_text, line0, col0));
+    manager.shutdown_all();
+    Ok(())
+}
+
+/// The very first request against a freshly resolved key is also what makes
+/// `LspManager` spawn the server at all (it's lazy — nothing starts until
+/// something asks for it). That request reaches the server the instant the
+/// `initialize` handshake finishes, which is well before rust-analyzer's
+/// background workspace indexing catches up, so an immediate empty answer
+/// isn't necessarily "nothing there" — it can just as easily mean "asked
+/// too early." Rather than trust the first answer, every `run_*_check`
+/// function below re-issues its request every `RETRY_INTERVAL` (printing
+/// state/progress in between, via `events_rx`) until either `is_final`
+/// judges an answer real or the overall deadline passes — the one piece of
+/// polling/retry machinery every mode built on a request/response (i.e.
+/// everything but `--diagnostics`, which waits on a notification instead)
+/// shares.
+const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+const CHECK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn poll_request<T>(
+    manager: &lsp::LspManager,
+    events_rx: &std::sync::mpsc::Receiver<lsp::ServerEvent>,
+    file: &std::path::Path,
+    git_root: &std::path::Path,
+    mut issue: impl FnMut() -> std::sync::mpsc::Receiver<Result<T, lsp::LspError>>,
+    is_final: impl Fn(&T) -> bool,
+) -> Result<T, lsp::LspError> {
+    let deadline = std::time::Instant::now() + CHECK_DEADLINE;
+    let mut pending = Some(issue());
     let mut last_attempt = std::time::Instant::now();
     let mut last_state = None;
     let mut best = None;
 
-    let result = loop {
+    loop {
         if let Some(rx) = &pending
             && let Ok(result) = rx.try_recv()
         {
-            let is_final = matches!(result, Ok(Some(_)));
+            let final_now = matches!(&result, Ok(v) if is_final(v));
             best = Some(result);
             pending = None;
-            if is_final {
-                break best.expect("just assigned");
+            if final_now {
+                return best.expect("just assigned");
             }
         }
 
         if pending.is_none() && last_attempt.elapsed() >= RETRY_INTERVAL {
-            println!("[retry] requesting hover again");
-            pending = Some(manager.hover(&absolute_file, &git_root, &line_text, line0, col0));
+            println!("[retry] requesting again");
+            pending = Some(issue());
             last_attempt = std::time::Instant::now();
         }
 
         if let Ok(event) = events_rx.recv_timeout(std::time::Duration::from_millis(200)) {
-            match event {
-                lsp::LspEvent::Notification { method, params } if method == "$/progress" => {
-                    if let Some(text) = lsp::progress_status_text(&params) {
-                        println!("[progress] {text}");
-                    }
-                }
-                lsp::LspEvent::Closed { reason } => {
-                    println!("[lsp] transport closed: {reason:?}");
-                }
-                _ => {}
-            }
+            print_progress_or_close(&event);
         }
 
-        let state = manager.state(&absolute_file, &git_root);
+        let state = manager.state(file, git_root);
         if last_state.as_ref() != Some(&state) {
             println!("[state] {state:?}");
             last_state = Some(state);
         }
 
         if std::time::Instant::now() > deadline {
-            manager.shutdown_all();
-            break best.unwrap_or_else(|| {
+            return best.unwrap_or_else(|| {
                 Err(lsp::LspError::Io(
-                    "timed out waiting for a hover response after 60s".to_owned(),
+                    "timed out waiting for a response after 60s".to_owned(),
                 ))
             });
         }
-    };
+    }
+}
 
+fn print_progress_or_close(event: &lsp::ServerEvent) {
+    match &event.event {
+        lsp::LspEvent::Notification { method, params } if method == "$/progress" => {
+            if let Some(text) = lsp::progress_status_text(params) {
+                println!("[progress] {text}");
+            }
+        }
+        lsp::LspEvent::Closed { reason } => {
+            println!("[lsp] transport closed: {reason:?}");
+        }
+        _ => {}
+    }
+}
+
+fn run_hover_check(
+    manager: &lsp::LspManager,
+    events_rx: &std::sync::mpsc::Receiver<lsp::ServerEvent>,
+    file: &std::path::Path,
+    git_root: &std::path::Path,
+    line_text: &str,
+    line0: u32,
+    col0: usize,
+) {
+    let result = poll_request(
+        manager,
+        events_rx,
+        file,
+        git_root,
+        || manager.hover(file, git_root, line_text, line0, col0),
+        Option::is_some,
+    );
     println!();
     match result {
         Ok(Some(hover)) => {
@@ -283,9 +391,215 @@ fn run_lsp_check(file: PathBuf, line: u32, col: usize) -> Result<()> {
         Ok(None) => println!("--- hover ---\n(no hover information at this position)"),
         Err(e) => println!("--- hover error ---\n{e}"),
     }
+}
 
-    manager.shutdown_all();
-    Ok(())
+fn run_definition_check(
+    manager: &lsp::LspManager,
+    events_rx: &std::sync::mpsc::Receiver<lsp::ServerEvent>,
+    file: &std::path::Path,
+    git_root: &std::path::Path,
+    line_text: &str,
+    line0: u32,
+    col0: usize,
+) {
+    let result = poll_request(
+        manager,
+        events_rx,
+        file,
+        git_root,
+        || manager.definition(file, git_root, line_text, line0, col0),
+        definition_is_final,
+    );
+    println!();
+    match result {
+        Ok(Some(response)) => {
+            let locations = ui::navigation::definition_locations(response);
+            println!("--- definition ({} location(s)) ---", locations.len());
+            for location in &locations {
+                print_location(location);
+            }
+        }
+        Ok(None) => println!("--- definition ---\n(no definition found at this position)"),
+        Err(e) => println!("--- definition error ---\n{e}"),
+    }
+}
+
+/// A plain `Option::is_some` check (good enough for hover, where any
+/// `Some(Hover)` is a meaningful answer) isn't quite right for
+/// go-to-definition: a still-indexing rust-analyzer can answer an early
+/// request with `Some(GotoDefinitionResponse::Array(vec![]))` — a
+/// definite-looking "no results" that's actually just "not ready yet,"
+/// indistinguishable from a real empty answer by shape alone. Treating only
+/// a non-empty `Array` (or the `Scalar`/`Link` shapes, which can't be
+/// "empty" the same way) as final, and retrying through `None`/empty-`Array`
+/// until [`poll_request`]'s deadline, matches what hover already does for
+/// its own "answered too early" case — see `run_lsp_check`'s doc comment.
+fn definition_is_final(result: &lsp::DefinitionResult) -> bool {
+    match result {
+        Some(lsp_types::GotoDefinitionResponse::Array(locations)) => !locations.is_empty(),
+        Some(_) => true,
+        None => false,
+    }
+}
+
+fn run_references_check(
+    manager: &lsp::LspManager,
+    events_rx: &std::sync::mpsc::Receiver<lsp::ServerEvent>,
+    file: &std::path::Path,
+    git_root: &std::path::Path,
+    line_text: &str,
+    line0: u32,
+    col0: usize,
+) {
+    let result = poll_request(
+        manager,
+        events_rx,
+        file,
+        git_root,
+        || manager.references(file, git_root, line_text, line0, col0),
+        |result: &lsp::ReferencesResult| result.as_ref().is_some_and(|locs| !locs.is_empty()),
+    );
+    println!();
+    match result {
+        Ok(Some(locations)) => {
+            println!("--- references ({} location(s)) ---", locations.len());
+            for location in &locations {
+                print_location(location);
+            }
+        }
+        Ok(None) => println!("--- references ---\n(no references found at this position)"),
+        Err(e) => println!("--- references error ---\n{e}"),
+    }
+}
+
+fn print_location(location: &lsp_types::Location) {
+    let path = lsp::client::uri_to_path(&location.uri)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| location.uri.as_str().to_owned());
+    println!(
+        "  {path}:{}:{} - {}:{}",
+        location.range.start.line + 1,
+        location.range.start.character + 1,
+        location.range.end.line + 1,
+        location.range.end.character + 1,
+    );
+}
+
+/// `--diagnostics` doesn't request anything at `line`/`col` — it opens the
+/// file (via [`lsp::LspManager::warm_up`], the same mechanism the TUI uses
+/// to make diagnostics appear without a hover) and waits for the server to
+/// push a `textDocument/publishDiagnostics` notification for it, which is
+/// how `katamari`'s core value proposition ("did the AI's edit introduce
+/// errors") actually surfaces — there is no request/response form of this
+/// in LSP.
+fn run_diagnostics_check(
+    manager: &lsp::LspManager,
+    events_rx: &std::sync::mpsc::Receiver<lsp::ServerEvent>,
+    file: &std::path::Path,
+    git_root: &std::path::Path,
+) {
+    let target_uri = match lsp::client::file_uri(file) {
+        Ok(uri) => uri,
+        Err(e) => {
+            println!("--- diagnostics error ---\n{e}");
+            return;
+        }
+    };
+
+    let summary = manager.warm_up(std::slice::from_ref(&file.to_path_buf()), git_root);
+    println!(
+        "[warm-up] opened {} of {} eligible file(s)",
+        summary.opened, summary.total_eligible
+    );
+
+    // rust-analyzer (and most servers) publish diagnostics in (at least)
+    // two waves: a fast one from its own semantic analysis, often empty for
+    // an error only `rustc`/`cargo check` itself would catch, followed by a
+    // slower one once its background `cargo check` ("flycheck") finishes
+    // compiling the crate. Breaking on the *first* notification for this
+    // URI would report a false "zero diagnostics" for exactly the errors
+    // this mode most wants to catch — so this keeps listening past an empty
+    // notification, updating `received` each time, and only stops early on
+    // a non-empty one. A longer deadline than the request-based checks'
+    // `CHECK_DEADLINE`, since a cold flycheck run compiles the whole crate
+    // graph rather than answering from an already-parsed AST.
+    const DIAGNOSTICS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
+    let deadline = std::time::Instant::now() + DIAGNOSTICS_DEADLINE;
+    let mut last_state = None;
+    let mut received: Option<Vec<lsp_types::Diagnostic>> = None;
+
+    while std::time::Instant::now() < deadline {
+        if let Ok(event) = events_rx.recv_timeout(std::time::Duration::from_millis(200)) {
+            match &event.event {
+                lsp::LspEvent::Notification { method, params } if method == "$/progress" => {
+                    if let Some(text) = lsp::progress_status_text(params) {
+                        println!("[progress] {text}");
+                    }
+                }
+                lsp::LspEvent::Notification { method, params }
+                    if method == "textDocument/publishDiagnostics" =>
+                {
+                    if let Some(parsed) = lsp::parse_publish_diagnostics(params) {
+                        if parsed.uri.as_str() == target_uri.as_str() {
+                            let is_final = !parsed.diagnostics.is_empty();
+                            received = Some(parsed.diagnostics);
+                            if is_final {
+                                break;
+                            }
+                            println!("[diagnostics] (empty wave received; still waiting)");
+                        } else {
+                            println!(
+                                "[diagnostics] (ignoring notification for a different file) {}",
+                                parsed.uri.as_str()
+                            );
+                        }
+                    }
+                }
+                lsp::LspEvent::Closed { reason } => {
+                    println!("[lsp] transport closed: {reason:?}");
+                }
+                _ => {}
+            }
+        }
+
+        let state = manager.state(file, git_root);
+        if last_state.as_ref() != Some(&state) {
+            println!("[state] {state:?}");
+            last_state = Some(state);
+        }
+    }
+
+    println!();
+    match received {
+        Some(diagnostics) if diagnostics.is_empty() => {
+            println!("--- diagnostics ---\n(server published zero diagnostics for this file)");
+        }
+        Some(diagnostics) => {
+            println!("--- diagnostics ({}) ---", diagnostics.len());
+            for d in &diagnostics {
+                let severity = d
+                    .severity
+                    .map(|s| format!("{s:?}"))
+                    .unwrap_or_else(|| "?".to_owned());
+                println!(
+                    "  [{severity}] {}:{}-{}:{}  {}{}",
+                    d.range.start.line + 1,
+                    d.range.start.character + 1,
+                    d.range.end.line + 1,
+                    d.range.end.character + 1,
+                    d.message,
+                    d.source
+                        .as_deref()
+                        .map(|s| format!("  ({s})"))
+                        .unwrap_or_default(),
+                );
+            }
+        }
+        None => println!(
+            "--- diagnostics ---\n(no publishDiagnostics notification arrived within {}s)",
+            DIAGNOSTICS_DEADLINE.as_secs()
+        ),
+    }
 }
 
 /// Plain-text rendering of one flattened row, shared by [`format_dump`] and

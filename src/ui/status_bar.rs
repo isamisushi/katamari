@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-const HINTS: &str = "j/k move  C-d/C-u half-page  gg/G top/bottom  ]c/[c hunk  ]f/[f file  b sidebar  s layout  K hover  Tab symbol  q quit";
+const HINTS: &str = "j/k move  C-d/C-u half-page  gg/G top/bottom  ]c/[c hunk  ]f/[f file  ]d/[d diag  b sidebar  s layout  K hover  gd def  gr refs  C-o/C-t jump  Tab symbol  q quit";
 
 /// `effective_layout` is `diff_view::effective_layout(app.layout, pane_width)`
 /// — the layout actually being drawn this frame, which may differ from

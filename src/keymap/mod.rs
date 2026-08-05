@@ -45,6 +45,33 @@ pub enum Action {
     /// popup happens to be open, which is not what a user pressing Esc to
     /// dismiss something expects.
     Cancel,
+    /// Requests go-to-definition for the row's active symbol — like
+    /// `Hover`, intercepted by `ui::mod`'s event loop rather than reaching
+    /// `App`/`FileView::update`, since issuing the LSP request and then
+    /// navigating on its response are not pure state transitions.
+    GotoDefinition,
+    /// Requests every reference to the row's active symbol, including its
+    /// declaration. Always opens the references panel, even for a single
+    /// result — unlike `GotoDefinition`, which jumps straight there when
+    /// there's exactly one candidate.
+    FindReferences,
+    /// Moves the cursor to the next/previous row bearing a diagnostic,
+    /// wrapping around. Intercepted the same way `Hover`/`GotoDefinition`
+    /// are, since it needs the diagnostics store `App`/`FileView` don't
+    /// own.
+    NextDiagnostic,
+    PrevDiagnostic,
+    /// Retraces the jump history one step back/forward — `Ctrl-o`/`Ctrl-i`'s
+    /// vim-familiar direction, bound here to `C-o`/`C-t` since this
+    /// terminal's key reporting can't distinguish a literal Tab from
+    /// `Ctrl-i` (they're the same ASCII control code); see
+    /// [`crate::ui::navigation::JumpStack`].
+    JumpBack,
+    JumpForward,
+    /// Selects the highlighted entry in an open references panel and
+    /// navigates to it. A no-op with nothing open — the panel is the only
+    /// place this milestone binds Enter to anything.
+    Confirm,
     Quit,
 }
 
@@ -259,6 +286,13 @@ pub fn vim_preset() -> Vec<(KeySeq, Action)> {
         ("b", Action::ToggleSidebar),
         ("s", Action::ToggleLayout),
         ("K", Action::Hover),
+        ("g d", Action::GotoDefinition),
+        ("g r", Action::FindReferences),
+        ("] d", Action::NextDiagnostic),
+        ("[ d", Action::PrevDiagnostic),
+        ("C-o", Action::JumpBack),
+        ("C-t", Action::JumpForward),
+        ("Enter", Action::Confirm),
         ("Tab", Action::NextSymbol),
         ("BackTab", Action::PrevSymbol),
         ("Esc", Action::Cancel),
