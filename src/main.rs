@@ -1565,6 +1565,11 @@ fn total_stat(files: &[DiffFile]) -> (u32, u32) {
 /// anchored (after relocation — see `comments::build_index`) to that row.
 /// Exists so parsing correctness — and, since M6, comment placement — can
 /// be checked against `git diff` output without a terminal.
+///
+/// Deliberately ignores `[ui] wrap`: this writes each row's raw text
+/// straight to stdout, one row per line, with no notion of a terminal
+/// width to wrap against in the first place — no pane, no gutter, no
+/// continuation rows, and no `App::row_visual_height` to consult.
 fn format_dump(files: &[DiffFile], comments: &CommentIndex) -> String {
     let (total_added, total_deleted) = total_stat(files);
     let mut out = format!(

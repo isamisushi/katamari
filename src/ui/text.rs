@@ -5,6 +5,7 @@
 //! East Asian wide characters occupy two terminal columns, and
 //! `unicode-width` is the only thing that knows that.
 
+use crate::diff::coords::ColumnMap;
 use crate::highlight::{HighlightKind, Span as HlSpan};
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
@@ -130,6 +131,94 @@ pub fn truncate_spans_to_width(spans: &[HlSpan], max_width: usize) -> Vec<HlSpan
         }
     }
     out
+}
+
+/// Soft-wraps highlighted `spans` into however many rows of at most
+/// `width` display columns each are needed to show every grapheme cluster,
+/// splitting only at grapheme boundaries — a double-width (e.g. CJK)
+/// character that doesn't fit in what's left of a row moves whole to the
+/// next one, never half on each. A span that straddles a wrap point is
+/// split into two, one per row, each keeping the original span's `kind` so
+/// syntax highlighting carries across the wrap exactly as it was before
+/// wrapping.
+///
+/// Grapheme boundaries and widths come from [`ColumnMap`] — the same
+/// segmentation `diff::coords` and [`mark_range`] above already treat as
+/// the source of truth — rather than a second `graphemes(true)`-plus-
+/// `.width()` walk that could drift out of step with it. `spans` must
+/// already have had any tabs expanded to literal spaces (see
+/// [`expand_tabs_in_spans`]); a raw tab reaching here would be measured as
+/// an ordinary zero-column-context grapheme, not a tab stop.
+///
+/// Always returns at least one row, even for empty/whitespace-only `spans`
+/// (so a blank diff line still occupies exactly one visual row). `width ==
+/// 0` degenerately returns `spans` unwrapped as that single row, matching
+/// [`wrap_text`]'s same convention, rather than looping forever trying to
+/// fit graphemes into no space at all. A single grapheme wider than `width`
+/// on its own (an extremely narrow pane) is placed on its own row and
+/// allowed to overflow rather than dropped or split.
+pub fn wrap_spans_to_width(spans: &[HlSpan], width: usize) -> Vec<Vec<HlSpan>> {
+    if width == 0 {
+        return vec![spans.to_vec()];
+    }
+    let mut rows: Vec<Vec<HlSpan>> = Vec::new();
+    let mut row: Vec<HlSpan> = Vec::new();
+    let mut pending: Option<(String, HighlightKind)> = None;
+    let mut col = 0usize;
+
+    for span in spans {
+        // No raw tabs are expected in `span.text` (see this function's
+        // docs) so the tab-stop width `ColumnMap` computes never actually
+        // triggers here — a tab width of 1 is passed purely because *some*
+        // value is required, not because it means anything.
+        let map = ColumnMap::with_tab_width(&span.text, 1);
+        for (utf8_start, utf8_len, _display_start, display_width) in map.graphemes() {
+            if col > 0 && col + display_width > width {
+                if let Some((text, kind)) = pending.take() {
+                    row.push(HlSpan { text, kind });
+                }
+                rows.push(std::mem::take(&mut row));
+                col = 0;
+            }
+            let grapheme = &span.text[utf8_start..utf8_start + utf8_len];
+            match &mut pending {
+                Some((text, kind)) if *kind == span.kind => text.push_str(grapheme),
+                _ => {
+                    if let Some((text, kind)) = pending.take() {
+                        row.push(HlSpan { text, kind });
+                    }
+                    pending = Some((grapheme.to_owned(), span.kind));
+                }
+            }
+            col += display_width;
+        }
+    }
+    if let Some((text, kind)) = pending.take() {
+        row.push(HlSpan { text, kind });
+    }
+    rows.push(row);
+    rows
+}
+
+/// The plain-text analogue of [`wrap_spans_to_width`]'s row *count*: how
+/// many visual rows `text` wraps into at `width` display columns, after
+/// expanding tabs to `tab_width`-column stops the same way a highlighted
+/// row's spans are before wrapping (see [`expand_tabs_in_spans`]). Used for
+/// scroll math (`ui::app::App::row_visual_height`,
+/// `ui::file_view::FileView::row_visual_height`), which needs a row's
+/// visual *height* well before it's actually rendered and has no reason to
+/// run the syntax highlighter or rebuild real span rows just to count them
+/// — [`wrap_spans_to_width`] on the highlighted spans is still what
+/// actually renders a wrapped row.
+pub fn wrapped_row_count(text: &str, tab_width: usize, width: usize) -> usize {
+    let expanded = expand_tabs_in_spans(
+        vec![HlSpan {
+            text: text.to_owned(),
+            kind: HighlightKind::Plain,
+        }],
+        tab_width,
+    );
+    wrap_spans_to_width(&expanded, width).len()
 }
 
 /// Patches an extra [`Style`] (e.g. underline) onto whichever part of
@@ -288,6 +377,110 @@ mod tests {
     #[test]
     fn truncate_leaves_short_strings_unchanged() {
         assert_eq!(truncate_to_width("hi", 10), "hi");
+    }
+
+    fn plain_hl_kind(text: &str, kind: HighlightKind) -> HlSpan {
+        HlSpan {
+            text: text.to_owned(),
+            kind,
+        }
+    }
+
+    fn rows_text(rows: &[Vec<HlSpan>]) -> Vec<String> {
+        rows.iter()
+            .map(|row| row.iter().map(|s| s.text.as_str()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn wrap_spans_ascii_exact_fit_needs_no_wrapping() {
+        let spans = vec![plain_hl("hello")];
+        let wrapped = wrap_spans_to_width(&spans, 5);
+        assert_eq!(rows_text(&wrapped), vec!["hello"]);
+    }
+
+    #[test]
+    fn wrap_spans_ascii_off_by_one_wraps_the_last_character_alone() {
+        let spans = vec![plain_hl("hello!")];
+        let wrapped = wrap_spans_to_width(&spans, 5);
+        assert_eq!(rows_text(&wrapped), vec!["hello", "!"]);
+    }
+
+    #[test]
+    fn wrap_spans_moves_a_double_width_character_whole_to_the_next_row() {
+        // Width 5: "abcd" (4) leaves only 1 column, not enough for a 2-wide
+        // 日 — it must move entirely to the next row, not split across the
+        // boundary and not squeeze in with only half showing.
+        let spans = vec![plain_hl("abcd日")];
+        let wrapped = wrap_spans_to_width(&spans, 5);
+        assert_eq!(rows_text(&wrapped), vec!["abcd", "日"]);
+        for row in &wrapped {
+            let width: usize = row.iter().map(|s| display_width(&s.text)).sum();
+            assert!(width <= 5);
+        }
+    }
+
+    #[test]
+    fn wrap_spans_preserves_each_kind_across_a_wrap_point() {
+        let spans = vec![
+            plain_hl_kind("keyword ", HighlightKind::Keyword),
+            plain_hl_kind("restofthetoken", HighlightKind::Variable),
+        ];
+        let wrapped = wrap_spans_to_width(&spans, 10);
+        // Reassembling every row's spans, in order, must reproduce the
+        // original text with no character lost or duplicated.
+        let joined: String = wrapped
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(joined, "keyword restofthetoken");
+        // The keyword's styling never bleeds into the variable's, even
+        // though the wrap point falls in the middle of the second span.
+        for row in &wrapped {
+            for span in row {
+                if span.kind == HighlightKind::Keyword {
+                    assert!("keyword ".starts_with(span.text.as_str()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_spans_on_an_empty_line_yields_exactly_one_empty_row() {
+        let wrapped = wrap_spans_to_width(&[], 10);
+        assert_eq!(wrapped.len(), 1);
+        assert!(wrapped[0].is_empty());
+    }
+
+    #[test]
+    fn wrap_spans_with_zero_width_returns_the_input_unwrapped_as_one_row() {
+        let spans = vec![plain_hl("hello world")];
+        let wrapped = wrap_spans_to_width(&spans, 0);
+        assert_eq!(wrapped.len(), 1);
+        assert_eq!(wrapped[0][0].text, "hello world");
+    }
+
+    #[test]
+    fn wrap_spans_places_an_overlong_grapheme_alone_rather_than_dropping_it() {
+        // A pane narrower than a single wide character (width 1) still
+        // shows it — on its own, overflowing row — rather than losing it.
+        let spans = vec![plain_hl("日")];
+        let wrapped = wrap_spans_to_width(&spans, 1);
+        assert_eq!(rows_text(&wrapped), vec!["日"]);
+    }
+
+    #[test]
+    fn wrapped_row_count_matches_wrap_spans_to_width_row_count() {
+        assert_eq!(wrapped_row_count("hello world", 4, 5), 3); // "hello", " worl", "d"
+        assert_eq!(wrapped_row_count("short", 4, 80), 1);
+    }
+
+    #[test]
+    fn wrapped_row_count_accounts_for_post_expansion_tab_width() {
+        // A leading tab (width 4) plus "abcdefgh" (8) is 12 columns total;
+        // at a wrap width of 6 that's exactly two rows.
+        assert_eq!(wrapped_row_count("\tabcdefgh", 4, 6), 2);
     }
 
     use ratatui::style::Modifier;

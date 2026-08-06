@@ -247,6 +247,11 @@ tab_width = 4
 # lockfiles (*.lock, package-lock.json, *.min.js) always skip regardless
 # of size. Default 5000.
 highlight_max_lines = 5000
+# Soft-wrap a content line wider than its pane onto continuation rows
+# (marked with ↪) instead of truncating it at the pane edge. Default true;
+# set false to restore truncation, e.g. if you rely on it for
+# alignment-heavy code.
+wrap = true
 
 [watch]
 # Debounce window for `--watch`: how long a burst of filesystem changes

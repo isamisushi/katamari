@@ -10,7 +10,7 @@
 //! beyond what a frame needs to draw — `update` is a pure state transition,
 //! testable without a real terminal.
 
-use crate::highlight::{FileHighlighter, Language};
+use crate::highlight::{FileHighlighter, Language, Span as HlSpan};
 use crate::keymap::Action;
 use crate::lsp::DiagnosticsStore;
 use crate::ui::hints::{self, HintItem};
@@ -19,6 +19,7 @@ use crate::ui::scroll;
 use crate::ui::symbols;
 use crate::ui::text::{
     display_width, expand_tabs_in_spans, highlight_color, mark_range, truncate_spans_to_width,
+    wrap_spans_to_width, wrapped_row_count,
 };
 use lsp_types::DiagnosticSeverity;
 use ratatui::Frame;
@@ -61,6 +62,11 @@ pub struct FileView {
     pub pending_keys: String,
     pub should_quit: bool,
     viewport_height: usize,
+    /// This pane's per-row wrap width — see [`crate::ui::app::App`]'s field
+    /// of the same purpose for why it's refreshed every frame rather than
+    /// computed once, and [`content_width_for_pane`] for how a pane width
+    /// becomes this.
+    content_width: usize,
 }
 
 impl FileView {
@@ -97,6 +103,7 @@ impl FileView {
             pending_keys: String::new(),
             should_quit: false,
             viewport_height: 1,
+            content_width: usize::MAX, // see `App::content_width`'s docs
         }
     }
 
@@ -166,6 +173,30 @@ impl FileView {
         self.clamp_scroll();
     }
 
+    /// As [`crate::ui::app::App::set_content_width`] — refreshed every
+    /// frame alongside [`Self::set_viewport_height`] so [`Self::row_visual_height`]'s
+    /// wrap width stays current with the pane's actual size.
+    pub fn set_content_width(&mut self, width: usize) {
+        self.content_width = width.max(1);
+        self.clamp_scroll();
+    }
+
+    /// As [`crate::ui::app::App::row_visual_height`]: `1` when `[ui] wrap`
+    /// is off, otherwise however many visual rows line `idx`'s highlighted
+    /// text soft-wraps into at [`Self::content_width`].
+    fn row_visual_height(&self, idx: usize) -> usize {
+        if !crate::config::wrap_enabled() {
+            return 1;
+        }
+        let text: String = self
+            .highlighter
+            .line(idx)
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect();
+        wrapped_row_count(&text, crate::config::tab_width(), self.content_width)
+    }
+
     pub fn update(&mut self, action: Action) {
         if self.line_count() == 0 {
             self.should_quit |= action == Action::Quit;
@@ -177,12 +208,15 @@ impl FileView {
             Action::CursorDown => self.cursor = (self.cursor + 1).min(last),
             Action::CursorUp => self.cursor = self.cursor.saturating_sub(1),
             Action::HalfPageDown => {
-                self.cursor = (self.cursor + scroll::half_page(self.viewport_height)).min(last);
+                self.cursor =
+                    scroll::half_page_down(self.cursor, last, self.viewport_height, |i| {
+                        self.row_visual_height(i)
+                    });
             }
             Action::HalfPageUp => {
-                self.cursor = self
-                    .cursor
-                    .saturating_sub(scroll::half_page(self.viewport_height));
+                self.cursor = scroll::half_page_up(self.cursor, self.viewport_height, |i| {
+                    self.row_visual_height(i)
+                });
             }
             Action::Top => self.cursor = 0,
             Action::Bottom => self.cursor = last,
@@ -230,7 +264,9 @@ impl FileView {
 
     fn clamp_scroll(&mut self) {
         self.scroll_offset =
-            scroll::clamp_scroll(self.cursor, self.viewport_height, self.scroll_offset);
+            scroll::clamp_scroll(self.cursor, self.viewport_height, self.scroll_offset, |i| {
+                self.row_visual_height(i)
+            });
     }
 
     /// Moves the cursor to `line` and, if the active symbol there covers
@@ -243,7 +279,9 @@ impl FileView {
             .iter()
             .position(|s| s.display_start <= display_col && display_col < s.display_end)
             .unwrap_or(0);
-        self.scroll_offset = scroll::center(self.cursor, self.viewport_height);
+        self.scroll_offset = scroll::center(self.cursor, self.viewport_height, |i| {
+            self.row_visual_height(i)
+        });
         self.clamp_scroll();
     }
 
@@ -274,7 +312,9 @@ impl FileView {
         if let Some(&line) = target {
             self.cursor = (line as usize).min(self.line_count().saturating_sub(1));
             self.active_symbol = 0;
-            self.scroll_offset = scroll::center(self.cursor, self.viewport_height);
+            self.scroll_offset = scroll::center(self.cursor, self.viewport_height, |i| {
+                self.row_visual_height(i)
+            });
             self.clamp_scroll();
         }
     }
@@ -307,11 +347,20 @@ pub fn render(frame: &mut Frame, area: Rect, view: &FileView, diagnostics: &Diag
     frame.render_widget(block, area);
 
     let width = inner.width as usize;
-    let visible = (view.scroll_offset..view.line_count()).take(inner.height as usize);
+    let viewport_height = inner.height as usize;
+    let wrap = crate::config::wrap_enabled();
 
-    let lines: Vec<Line> = visible
-        .map(|idx| content_line(view, idx, idx == view.cursor, width, diagnostics))
-        .collect();
+    let mut lines: Vec<Line> = Vec::with_capacity(viewport_height);
+    let mut idx = view.scroll_offset;
+    while lines.len() < viewport_height && idx < view.line_count() {
+        for line in content_line(view, idx, idx == view.cursor, width, diagnostics, wrap) {
+            if lines.len() >= viewport_height {
+                break;
+            }
+            lines.push(line);
+        }
+        idx += 1;
+    }
 
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -332,59 +381,125 @@ fn diagnostic_glyph_span(severity: Option<DiagnosticSeverity>) -> Span<'static> 
     Span::styled(format!("{glyph} "), Style::default().fg(color))
 }
 
+/// The exact display-column width every content row's gutter (diagnostic
+/// glyph + line number + separator) occupies, regardless of that row's
+/// actual line number or diagnostic state — see `diff_view::gutter_width`'s
+/// identical "always reserve the width" rationale, which this mirrors for
+/// the file view's simpler (single line-number, no add/del marker) gutter.
+fn gutter_width() -> usize {
+    const DIAG_WIDTH: usize = 2; // glyph + trailing space, see `diagnostic_glyph_span`
+    LINE_NUMBER_WIDTH + 1 + 1 + 1 + DIAG_WIDTH // number + space + │ + space
+}
+
+/// The display-column budget available to a content row's highlighted text
+/// at a pane of `pane_width` columns: the pane's border (1 column, see
+/// `render`'s `Borders::LEFT`) and [`gutter_width`] subtracted out. The
+/// single source both [`content_line`]'s own wrap and
+/// [`FileView::row_visual_height`]'s scroll-math lookups derive a line's
+/// wrap width from, so they never disagree about how wide a line is
+/// allowed to be before it needs a continuation row.
+pub fn content_width_for_pane(pane_width: u16) -> usize {
+    (pane_width.saturating_sub(1) as usize).saturating_sub(gutter_width())
+}
+
+/// The gutter for a wrapped line's second-and-later visual rows: blank
+/// where the diagnostic glyph and line number would be (so a continuation
+/// row is never mistaken for a diagnostic-bearing line of its own or a
+/// separate numbered line), with a `↪` marking it as a continuation of the
+/// row above — the same width as [`gutter_width`] so the highlighted text
+/// after it lines up in the same column regardless of which visual row of
+/// its logical line it belongs to.
+fn continuation_gutter() -> Vec<Span<'static>> {
+    vec![
+        Span::raw(" ".repeat(2)), // diagnostic glyph's reserved width
+        Span::styled(
+            format!("{:>LINE_NUMBER_WIDTH$} \u{21aa} ", ""),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]
+}
+
 fn content_line(
     view: &FileView,
     idx: usize,
     is_cursor: bool,
     width: usize,
     diagnostics: &DiagnosticsStore,
-) -> Line<'static> {
+    wrap: bool,
+) -> Vec<Line<'static>> {
     let severity = view
         .file_path()
         .and_then(|file| diagnostics.severity_at(file, idx as u32));
-    let diagnostic_span = diagnostic_glyph_span(severity);
-
     let gutter = format!("{:>LINE_NUMBER_WIDTH$} \u{2502} ", idx + 1);
-    let gutter_width = display_width(&gutter) + display_width(diagnostic_span.content.as_ref());
-    let content_width = width.saturating_sub(gutter_width);
+    let content_width = width.saturating_sub(gutter_width());
 
     let spans = expand_tabs_in_spans(
         view.highlighter.line(idx).to_vec(),
         crate::config::tab_width(),
     );
-    let spans = truncate_spans_to_width(&spans, content_width);
+    let visual_rows: Vec<Vec<HlSpan>> = if wrap {
+        wrap_spans_to_width(&spans, content_width)
+    } else {
+        vec![truncate_spans_to_width(&spans, content_width)]
+    };
 
-    let mut content_spans: Vec<Span<'static>> = spans
-        .into_iter()
-        .map(|span| Span::styled(span.text, Style::default().fg(highlight_color(span.kind))))
-        .collect();
-    if is_cursor
-        && let Some(active) = symbols::scan(&view.cursor_line_text()).get(view.active_symbol)
-    {
-        content_spans = mark_range(
-            content_spans,
-            active.display_start,
-            active.display_end,
-            Style::default().add_modifier(Modifier::UNDERLINED),
-        );
+    // Resolved once per logical line (not per visual row): the active
+    // symbol's display-column range is in terms of the whole logical
+    // line, and gets clipped down to whichever visual row(s) it actually
+    // falls within below.
+    let active_symbol = is_cursor
+        .then(|| {
+            symbols::scan(&view.cursor_line_text())
+                .get(view.active_symbol)
+                .copied()
+        })
+        .flatten();
+
+    let mut out = Vec::with_capacity(visual_rows.len());
+    let mut col_offset = 0usize;
+    for (i, row_spans) in visual_rows.into_iter().enumerate() {
+        let row_width: usize = row_spans.iter().map(|s| display_width(&s.text)).sum();
+        let mut content_spans: Vec<Span<'static>> = row_spans
+            .into_iter()
+            .map(|span| Span::styled(span.text, Style::default().fg(highlight_color(span.kind))))
+            .collect();
+        if let Some(active) = active_symbol {
+            let (start, end) = (active.display_start, active.display_end);
+            if end > col_offset && start < col_offset + row_width {
+                let local_start = start.saturating_sub(col_offset);
+                let local_end = (end - col_offset).min(row_width);
+                content_spans = mark_range(
+                    content_spans,
+                    local_start,
+                    local_end,
+                    Style::default().add_modifier(Modifier::UNDERLINED),
+                );
+            }
+        }
+
+        let mut line_spans = if i == 0 {
+            vec![
+                diagnostic_glyph_span(severity),
+                Span::styled(gutter.clone(), Style::default().fg(Color::DarkGray)),
+            ]
+        } else {
+            continuation_gutter()
+        };
+        line_spans.extend(content_spans);
+
+        let rendered_width: usize = line_spans.iter().map(ratatui::text::Span::width).sum();
+        if rendered_width < width {
+            line_spans.push(Span::raw(" ".repeat(width - rendered_width)));
+        }
+
+        let mut line = Line::from(line_spans);
+        if is_cursor {
+            line = line.patch_style(Style::default().add_modifier(Modifier::REVERSED));
+        }
+        out.push(line);
+        col_offset += row_width;
     }
-
-    let mut line_spans = vec![
-        diagnostic_span,
-        Span::styled(gutter, Style::default().fg(Color::DarkGray)),
-    ];
-    line_spans.extend(content_spans);
-
-    let rendered_width: usize = line_spans.iter().map(ratatui::text::Span::width).sum();
-    if rendered_width < width {
-        line_spans.push(Span::raw(" ".repeat(width - rendered_width)));
-    }
-
-    let mut line = Line::from(line_spans);
-    if is_cursor {
-        line = line.patch_style(Style::default().add_modifier(Modifier::REVERSED));
-    }
-    line
+    out
 }
 
 /// `hint_items` is [`hints::file_view_items`] read off the session's active

@@ -96,6 +96,24 @@ pub struct App {
     /// revision(s) are being compared.
     pub scope_label: Option<String>,
     viewport_height: usize,
+    /// The unified layout's per-row wrap width — display columns left for a
+    /// content row's highlighted text after the pane border and gutter are
+    /// subtracted (see [`crate::ui::diff_view::unified_content_width`]),
+    /// refreshed every frame by [`Self::set_content_width`] alongside
+    /// [`Self::set_viewport_height`]. Drives [`Self::row_visual_height`],
+    /// which every wrap-aware scroll computation in [`Self::update`]/
+    /// [`Self::jump_cursor_to`]/[`Self::jump_to_diagnostic`] reads.
+    ///
+    /// Deliberately *not* layout-aware: side-by-side's columns are each
+    /// narrower than the unified pane and wrap independently per side (see
+    /// `diff_view::render_side_by_side`), so a row's true visual height
+    /// there can differ from what this field implies. Scroll math uses this
+    /// single, unified-width-based estimate regardless of which layout is
+    /// actually on screen — an intentional scope simplification (see the
+    /// M13 milestone notes): side-by-side's own rendering still wraps and
+    /// pairs correctly, it just isn't what `ensure-cursor-visible`/
+    /// half-page math measures against.
+    content_width: usize,
 }
 
 impl App {
@@ -120,6 +138,11 @@ impl App {
             interactive: true,
             scope_label: None,
             viewport_height: 1,
+            // Unbounded until the first frame reports a real pane width
+            // (see `set_content_width`) — `row_visual_height` then treats
+            // every row as exactly one visual row, matching `wrap = false`
+            // behavior, rather than wrapping against a width of `0`.
+            content_width: usize::MAX,
         }
     }
 
@@ -217,6 +240,41 @@ impl App {
         self.clamp_scroll();
     }
 
+    /// The diff pane's content width changes on resize the same way its
+    /// height does — reported every frame alongside [`Self::set_viewport_height`]
+    /// so [`Self::row_visual_height`]'s wrap-width stays current. See
+    /// [`Self::content_width`]'s docs for exactly what width this expects
+    /// (the unified layout's, regardless of which layout is actually
+    /// showing) and [`crate::ui::diff_view::unified_content_width`], which
+    /// every caller derives it through.
+    pub fn set_content_width(&mut self, width: usize) {
+        self.content_width = width.max(1);
+        self.clamp_scroll();
+    }
+
+    /// How many visual rows `self.rows[idx]` occupies on screen right now —
+    /// `1` for every header/binary-notice row (headers never wrap, see
+    /// `diff_view::render_row`), `1` for a content row when `[ui] wrap` is
+    /// off, and otherwise however many rows [`crate::ui::text::wrapped_row_count`]
+    /// says its text soft-wraps into at [`Self::content_width`]. The single
+    /// row-height oracle every wrap-aware call into `ui::scroll` in this
+    /// module reads.
+    fn row_visual_height(&self, idx: usize) -> usize {
+        if !crate::config::wrap_enabled() {
+            return 1;
+        }
+        let Some(RenderRow::Line {
+            file_idx,
+            hunk_idx,
+            row_idx,
+        }) = self.rows.get(idx)
+        else {
+            return 1;
+        };
+        let text = &self.files[*file_idx].hunks[*hunk_idx].rows[*row_idx].text;
+        crate::ui::text::wrapped_row_count(text, crate::config::tab_width(), self.content_width)
+    }
+
     /// Swaps in a freshly re-parsed diff — watch mode's refresh pipeline
     /// calls this after every debounced batch of filesystem changes (see
     /// `ui::mod`'s `handle_watch_refresh`). Preserves the cursor's logical
@@ -307,10 +365,15 @@ impl App {
             Action::CursorDown => self.cursor = (self.cursor + 1).min(last),
             Action::CursorUp => self.cursor = self.cursor.saturating_sub(1),
             Action::HalfPageDown => {
-                self.cursor = (self.cursor + self.half_page()).min(last);
+                self.cursor =
+                    scroll::half_page_down(self.cursor, last, self.viewport_height, |i| {
+                        self.row_visual_height(i)
+                    });
             }
             Action::HalfPageUp => {
-                self.cursor = self.cursor.saturating_sub(self.half_page());
+                self.cursor = scroll::half_page_up(self.cursor, self.viewport_height, |i| {
+                    self.row_visual_height(i)
+                });
             }
             Action::Top => self.cursor = 0,
             Action::Bottom => self.cursor = last,
@@ -359,10 +422,6 @@ impl App {
         self.clamp_scroll();
     }
 
-    fn half_page(&self) -> usize {
-        scroll::half_page(self.viewport_height)
-    }
-
     /// The row index whose `(file, new_line)` matches `target_file`/
     /// `target_line` (0-based), if this diff has one — how a
     /// go-to-definition/references jump decides to move the cursor within
@@ -406,7 +465,9 @@ impl App {
                     .position(|s| s.display_start <= display_col && display_col < s.display_end)
             })
             .unwrap_or(0);
-        self.scroll_offset = scroll::center(self.cursor, self.viewport_height);
+        self.scroll_offset = scroll::center(self.cursor, self.viewport_height, |i| {
+            self.row_visual_height(i)
+        });
         self.clamp_scroll();
     }
 
@@ -420,7 +481,9 @@ impl App {
         };
         self.cursor = target;
         self.active_symbol = 0;
-        self.scroll_offset = scroll::center(self.cursor, self.viewport_height);
+        self.scroll_offset = scroll::center(self.cursor, self.viewport_height, |i| {
+            self.row_visual_height(i)
+        });
         self.clamp_scroll();
     }
 
@@ -486,7 +549,9 @@ impl App {
 
     fn clamp_scroll(&mut self) {
         self.scroll_offset =
-            scroll::clamp_scroll(self.cursor, self.viewport_height, self.scroll_offset);
+            scroll::clamp_scroll(self.cursor, self.viewport_height, self.scroll_offset, |i| {
+                self.row_visual_height(i)
+            });
     }
 }
 
@@ -647,6 +712,94 @@ mod tests {
         app.update(Action::Bottom);
         assert!(app.cursor >= app.scroll_offset);
         assert!(app.cursor < app.scroll_offset + 3);
+    }
+
+    /// A one-hunk file whose middle line is much longer than the others —
+    /// the fixture the wrap-aware scroll tests below build an `App` from,
+    /// since [`FIXTURE`] has no line wide enough to ever wrap.
+    fn app_with_a_wrapping_line(long_line_len: usize) -> App {
+        use crate::diff::{DiffFile, DiffHunk, DiffLineKind, DiffRow};
+
+        let row = |text: &str, n: u32| DiffRow {
+            kind: DiffLineKind::Context,
+            text: text.to_owned(),
+            old_line: Some(n),
+            new_line: Some(n),
+        };
+        let file = DiffFile {
+            old_path: Some("f.rs".to_owned()),
+            new_path: Some("f.rs".to_owned()),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 3,
+                new_start: 1,
+                new_lines: 3,
+                header: String::new(),
+                rows: vec![
+                    row("short one", 1),
+                    row(&"x".repeat(long_line_len), 2),
+                    row("short two", 3),
+                ],
+            }],
+            ..Default::default()
+        };
+        App::new("repo".to_owned(), PathBuf::from("/repo"), vec![file])
+    }
+
+    #[test]
+    fn row_visual_height_reflects_wrapping_at_the_current_content_width() {
+        let mut app = app_with_a_wrapping_line(100);
+        app.set_viewport_height(10);
+        app.set_content_width(40);
+
+        // Row 0 is the file header, row 1 the hunk header, row 2 "short
+        // one", row 3 the 100-column line, row 4 "short two".
+        assert_eq!(app.row_visual_height(0), 1, "headers never wrap");
+        assert_eq!(app.row_visual_height(2), 1);
+        assert_eq!(
+            app.row_visual_height(3),
+            3,
+            "100 columns at a width of 40 wraps into 3 visual rows"
+        );
+        assert_eq!(app.row_visual_height(4), 1);
+    }
+
+    #[test]
+    fn row_visual_height_is_always_one_when_content_width_was_never_set() {
+        // Before the first frame reports a real pane width, `content_width`
+        // defaults to effectively unbounded — matching plain, unwrapped
+        // rendering rather than wrapping against a width of 0.
+        let app = app_with_a_wrapping_line(500);
+        assert_eq!(app.row_visual_height(3), 1);
+    }
+
+    #[test]
+    fn clamp_scroll_pulls_the_offset_forward_to_keep_a_wrapped_cursor_row_visible() {
+        let mut app = app_with_a_wrapping_line(100);
+        app.set_viewport_height(3);
+        app.set_content_width(40); // the long row wraps into 3 visual rows
+        app.update(Action::Top);
+
+        // Rows 0-2 (file header, hunk header, "short one") are 1 visual row
+        // each — the offset has no reason to move while the cursor is
+        // still among them, even in a 3-row viewport.
+        app.update(Action::CursorDown);
+        app.update(Action::CursorDown);
+        assert_eq!(app.cursor, 2);
+        assert_eq!(
+            app.scroll_offset, 0,
+            "three ordinary 1-row lines fit a 3-row viewport with no scrolling"
+        );
+
+        // Row 3 (the 100-column line) wraps into exactly 3 visual rows —
+        // as wide as the whole viewport on its own. A uniform-height
+        // `clamp_scroll` would have left the offset at 0 (only 3 *logical*
+        // rows precede the cursor); the wrap-aware version must instead
+        // scroll all the way to the cursor's own row, since rows 0-2 no
+        // longer fit alongside it.
+        app.update(Action::CursorDown);
+        assert_eq!(app.cursor, 3);
+        assert_eq!(app.scroll_offset, 3);
     }
 
     #[test]

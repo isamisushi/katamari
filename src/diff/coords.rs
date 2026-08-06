@@ -170,6 +170,20 @@ impl ColumnMap {
             .map_or(self.display_len, |seg| seg.display_start)
     }
 
+    /// This line's grapheme clusters in display order, as `(utf8_start,
+    /// utf8_len, display_start, display_width)` tuples — the same
+    /// segmentation [`Self::display_to_utf8`] and friends query internally,
+    /// exposed so a caller that needs to walk every grapheme in order (e.g.
+    /// [`crate::ui::text::wrap_spans_to_width`], soft-wrapping a line into
+    /// fixed-width visual rows) reuses this module's grapheme boundaries and
+    /// widths instead of re-deriving them with a second `graphemes(true)` +
+    /// width-crate walk that could drift out of step with this one.
+    pub fn graphemes(&self) -> impl Iterator<Item = (usize, usize, usize, usize)> + '_ {
+        self.segments
+            .iter()
+            .map(|s| (s.utf8_start, s.utf8_len, s.display_start, s.display_width))
+    }
+
     fn find_by_display(&self, display_col: usize) -> Option<&Segment> {
         if display_col >= self.display_len {
             return None;

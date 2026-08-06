@@ -73,6 +73,15 @@ pub struct Config {
     pub auto_install: bool,
     pub tab_width: usize,
     pub highlight_max_lines: usize,
+    /// `[ui] wrap` — whether a diff/file-view content line wider than its
+    /// pane soft-wraps onto continuation rows (`true`, the default) or is
+    /// truncated at the pane edge the way every line was before this
+    /// setting existed (`false`, for reviewers who rely on truncation to
+    /// keep unrelated lines column-aligned). Read alongside `tab_width`/
+    /// `highlight_max_lines` via [`wrap_enabled`] — see this module's docs
+    /// on why these process-wide rendering knobs go through a `OnceLock`
+    /// instead of being threaded as parameters.
+    pub wrap: bool,
     pub debounce_ms: u64,
 }
 
@@ -85,6 +94,7 @@ impl Default for Config {
             auto_install: true,
             tab_width: DEFAULT_TAB_WIDTH,
             highlight_max_lines: DEFAULT_HIGHLIGHT_MAX_LINES,
+            wrap: true,
             debounce_ms: DEFAULT_DEBOUNCE_MS,
         }
     }
@@ -122,6 +132,7 @@ struct RawLsp {
 struct RawUi {
     tab_width: Option<usize>,
     highlight_max_lines: Option<usize>,
+    wrap: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -133,7 +144,7 @@ struct RawWatch {
 const TOP_LEVEL_KEYS: &[&str] = &["keymap", "keys", "lsp", "ui", "watch"];
 const LSP_KEYS: &[&str] = &["servers", "auto_install"];
 const SERVER_KEYS: &[&str] = &["command", "args"];
-const UI_KEYS: &[&str] = &["tab_width", "highlight_max_lines"];
+const UI_KEYS: &[&str] = &["tab_width", "highlight_max_lines", "wrap"];
 const WATCH_KEYS: &[&str] = &["debounce_ms"];
 
 /// Merges `overlay`'s present fields onto `base`, in place — the field-level
@@ -165,6 +176,9 @@ fn merge_raw(base: &mut RawFile, overlay: RawFile) {
         }
         if overlay_ui.highlight_max_lines.is_some() {
             base_ui.highlight_max_lines = overlay_ui.highlight_max_lines;
+        }
+        if overlay_ui.wrap.is_some() {
+            base_ui.wrap = overlay_ui.wrap;
         }
     }
     if let Some(overlay_watch) = overlay.watch {
@@ -311,6 +325,7 @@ fn finalize(raw: RawFile) -> Config {
         highlight_max_lines: ui
             .highlight_max_lines
             .unwrap_or(DEFAULT_HIGHLIGHT_MAX_LINES),
+        wrap: ui.wrap.unwrap_or(true),
         debounce_ms: watch.debounce_ms.unwrap_or(DEFAULT_DEBOUNCE_MS),
     }
 }
@@ -348,18 +363,20 @@ pub fn apply_key_overrides(
 
 static TAB_WIDTH: OnceLock<usize> = OnceLock::new();
 static HIGHLIGHT_MAX_LINES: OnceLock<usize> = OnceLock::new();
+static WRAP: OnceLock<bool> = OnceLock::new();
 
 /// Installs `config`'s rendering knobs for [`tab_width`]/
-/// [`highlight_max_lines`] to read — called exactly once per process, by
-/// every entry point that launches the TUI, before the first frame renders.
-/// A second call is a no-op (each `OnceLock` keeps its first value): nothing
-/// in this program loads more than one `Config` per run, so this should
-/// never happen outside of tests, several of which install their own values
-/// to exercise a specific tab width — see this module's test-only
-/// `install_for_test`.
+/// [`highlight_max_lines`]/[`wrap_enabled`] to read — called exactly once
+/// per process, by every entry point that launches the TUI, before the
+/// first frame renders. A second call is a no-op (each `OnceLock` keeps its
+/// first value): nothing in this program loads more than one `Config` per
+/// run, so this should never happen outside of tests, several of which
+/// install their own values to exercise a specific tab width — see this
+/// module's test-only `install_for_test`.
 pub fn install(config: &Config) {
     let _ = TAB_WIDTH.set(config.tab_width);
     let _ = HIGHLIGHT_MAX_LINES.set(config.highlight_max_lines);
+    let _ = WRAP.set(config.wrap);
 }
 
 /// The configured tab-stop width columns of raw text advance to when a
@@ -381,6 +398,19 @@ pub fn highlight_max_lines() -> usize {
     *HIGHLIGHT_MAX_LINES
         .get()
         .unwrap_or(&DEFAULT_HIGHLIGHT_MAX_LINES)
+}
+
+/// Whether a diff/file-view content line wider than its pane should
+/// soft-wrap (`true`, the default and what runs whenever nothing installed
+/// a [`Config`] yet — every non-TUI code path) or truncate at the pane edge
+/// — see [`Config::wrap`]'s docs. Read from deep inside
+/// `ui::app::App::row_visual_height`/`ui::file_view::FileView::row_visual_height`
+/// and the `ui::diff_view`/`ui::file_view` render paths, none of which have
+/// a natural path back to the session's `Config`, for the same reason
+/// [`tab_width`] and [`highlight_max_lines`] are read this way rather than
+/// threaded as a parameter — see the module docs.
+pub fn wrap_enabled() -> bool {
+    *WRAP.get().unwrap_or(&true)
 }
 
 #[cfg(test)]
@@ -426,6 +456,19 @@ mod tests {
     }
 
     #[test]
+    fn wrap_defaults_to_true_and_can_be_disabled() {
+        let repo = fixture_repo();
+        assert!(load_merged(&repo).wrap, "on by default");
+
+        write_repo_config(&repo, "[ui]\nwrap = false\n");
+        let config = load_merged(&repo);
+        assert!(!config.wrap);
+        // Disabling wrap doesn't reset a sibling `[ui]` field back to its
+        // default — same field-level merge guarantee `tab_width` gets.
+        assert_eq!(config.tab_width, DEFAULT_TAB_WIDTH);
+    }
+
+    #[test]
     fn repo_config_takes_precedence_over_home_config_field_by_field() {
         // Simulate the merge directly rather than mutating the real $HOME,
         // which every test in this binary shares: `merge_raw` is exactly
@@ -436,6 +479,7 @@ mod tests {
             ui: Some(RawUi {
                 tab_width: Some(8),
                 highlight_max_lines: Some(1000),
+                wrap: None,
             }),
             watch: Some(RawWatch {
                 debounce_ms: Some(500),
@@ -446,6 +490,7 @@ mod tests {
             ui: Some(RawUi {
                 tab_width: Some(2),
                 highlight_max_lines: None,
+                wrap: None,
             }),
             ..RawFile::default()
         };

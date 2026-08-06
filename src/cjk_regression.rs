@@ -295,6 +295,79 @@ mod tests {
         );
     }
 
+    /// M13: a line long enough to soft-wrap, with a CJK comment prefix
+    /// sitting before the identifier under the cursor —
+    /// `App::hover_query`'s display-column pipeline
+    /// (`ui::symbols::scan` + eventual `ColumnMap` conversion) reads only a
+    /// row's raw, un-wrapped text and never consults pane width or
+    /// `App::content_width` at all, so wrapping a line for display must
+    /// never perturb the display column (and therefore the UTF-8/UTF-16
+    /// offset a real LSP request would carry) it reports for an identifier
+    /// that ends up on a wrapped continuation row — the cursor→LSP position
+    /// path this milestone's spec calls out as needing a regression test.
+    #[test]
+    fn hover_query_display_column_is_unaffected_by_wrapping_a_line_with_a_cjk_prefix() {
+        use crate::diff::{DiffFile, DiffHunk, DiffLineKind, DiffRow};
+        use crate::keymap::Action;
+        use crate::ui::app::App;
+        use std::path::PathBuf;
+
+        // "日本語のコメントです" is 10 characters, 20 display columns —
+        // combined with "xxx...x" padding this line comfortably exceeds
+        // 100 display columns, wrapping into several visual rows at any
+        // pane narrower than that.
+        let cjk_prefix = "日本語のコメントです";
+        let padding = "x".repeat(90);
+        let line = format!("// {cjk_prefix} {padding} target_symbol();");
+
+        let file = DiffFile {
+            old_path: Some("f.rs".to_owned()),
+            new_path: Some("f.rs".to_owned()),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                rows: vec![DiffRow {
+                    kind: DiffLineKind::Context,
+                    text: line.clone(),
+                    old_line: Some(1),
+                    new_line: Some(1),
+                }],
+            }],
+            ..Default::default()
+        };
+        let mut app = App::new("repo".to_owned(), PathBuf::from("/repo"), vec![file]);
+        app.set_viewport_height(10);
+        app.update(Action::Top);
+        app.update(Action::CursorDown); // hunk header
+        app.update(Action::CursorDown); // the content row
+        assert_eq!(app.cursor, 2, "sanity: cursor is on the content row");
+
+        // Symbols on this line, in order: the CJK comment run, the 90-`x`
+        // padding run, then `target_symbol` — the third.
+        app.active_symbol = 2;
+
+        // Unwrapped (an effectively unbounded pane) and wrapped (a pane
+        // narrow enough that this line splits across several continuation
+        // rows) must report the exact same `HoverQuery` — wrapping is pure
+        // presentation, never a second source of truth for where the
+        // cursor's identifier sits.
+        app.set_content_width(usize::MAX);
+        let unwrapped = app.hover_query().expect("target_symbol is hover-eligible");
+        app.set_content_width(20); // forces the line to wrap several times over
+        let wrapped = app
+            .hover_query()
+            .expect("still hover-eligible once wrapped");
+
+        assert_eq!(unwrapped, wrapped);
+        assert_eq!(wrapped.line_text, line);
+        assert_eq!(wrapped.line, 0); // new_line 1, 0-based
+        // "// " (3) + the CJK run (20) + " " (1) + 90 `x`s + " " (1).
+        assert_eq!(wrapped.display_col, 3 + 20 + 1 + 90 + 1);
+    }
+
     /// A tab followed by wide Japanese characters — the M7.3 tab-stop work
     /// (`ColumnMap`'s tab-aware width rule) and CJK wide-character width
     /// must compose correctly, not just each work in isolation: the tab

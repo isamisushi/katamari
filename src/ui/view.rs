@@ -53,6 +53,20 @@ impl View {
         }
     }
 
+    /// The pane's content width changes on resize the same way its height
+    /// does — reported every frame alongside [`Self::set_viewport_height`]
+    /// so a wrap-aware view's scroll math (`App::row_visual_height`,
+    /// `FileView::row_visual_height`) always measures against the current
+    /// pane size. [`View::Timeline`]/[`View::Log`] don't soft-wrap their
+    /// rows at all, so this is a no-op for them rather than a real width.
+    pub fn set_content_width(&mut self, width: usize) {
+        match self {
+            View::Diff(app) => app.set_content_width(width),
+            View::File(file) => file.set_content_width(width),
+            View::Timeline(_) | View::Log(_) => {}
+        }
+    }
+
     pub fn set_pending_keys(&mut self, keys: String) {
         match self {
             View::Diff(app) => app.pending_keys = keys,

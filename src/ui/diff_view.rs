@@ -1,7 +1,17 @@
 //! Renders the diff pane: file/hunk headers and gutter-numbered, syntax
-//! highlighted content lines. All layout math (gutter width, truncation)
-//! goes through `ui::text`'s display-width helpers so CJK content lines
-//! neither misalign the gutter nor wrap.
+//! highlighted content lines. All layout math (gutter width, truncation,
+//! soft-wrapping) goes through `ui::text`'s display-width helpers so CJK
+//! content lines never misalign the gutter or split a character in half.
+//!
+//! A content line wider than its pane either soft-wraps onto continuation
+//! rows (`[ui] wrap = true`, the default — see [`content_line`] and
+//! [`unified_content_width`]) or truncates at the pane edge exactly as
+//! every line did before wrapping existed (`wrap = false`). Continuation
+//! rows stay logically part of the same [`crate::diff::RenderRow::Line`]
+//! they wrapped from: `App::cursor`/`scroll_offset` are indexed by logical
+//! row, never by visual row, and [`crate::ui::scroll`]'s functions account
+//! for a row's variable visual height rather than assuming one row is
+//! always one terminal line — see that module's docs.
 
 use crate::comments::{CommentAnnotation, CommentIndex, Status as CommentStatus};
 use crate::diff::{
@@ -14,7 +24,7 @@ use crate::ui::app::{App, Layout};
 use crate::ui::symbols;
 use crate::ui::text::{
     display_width, expand_tabs_in_spans, highlight_color, mark_range, truncate_spans_to_width,
-    truncate_to_width, wrap_text,
+    truncate_to_width, wrap_spans_to_width, wrap_text,
 };
 use lsp_types::DiagnosticSeverity;
 use ratatui::Frame;
@@ -116,12 +126,13 @@ fn render_unified(
 ) {
     let content_width = inner.width as usize;
     let viewport_height = inner.height as usize;
+    let wrap = crate::config::wrap_enabled();
     let mut lines: Vec<Line> = Vec::with_capacity(viewport_height);
 
     let mut idx = app.scroll_offset;
     while lines.len() < viewport_height && idx < app.rows.len() {
         let row = app.rows[idx];
-        lines.push(render_row(
+        for line in render_row(
             app,
             row,
             idx == app.cursor,
@@ -129,7 +140,13 @@ fn render_unified(
             highlighter,
             diagnostics,
             comments,
-        ));
+            wrap,
+        ) {
+            if lines.len() >= viewport_height {
+                break;
+            }
+            lines.push(line);
+        }
         if app.comments_visible {
             for block_line in
                 comment_block_lines(comments_for_row(app, row, comments), content_width)
@@ -166,12 +183,13 @@ fn render_side_by_side(
     let viewport_height = inner.height as usize;
 
     let start = side_by_side_scroll_start(&app.side_by_side_rows, app.scroll_offset);
+    let wrap = crate::config::wrap_enabled();
     let mut lines: Vec<Line> = Vec::with_capacity(viewport_height);
 
     let mut idx = start;
     while lines.len() < viewport_height && idx < app.side_by_side_rows.len() {
         let row = app.side_by_side_rows[idx];
-        lines.push(side_by_side_row_line(
+        for line in side_by_side_row_line(
             app,
             row,
             left_width,
@@ -179,7 +197,13 @@ fn render_side_by_side(
             highlighter,
             diagnostics,
             comments,
-        ));
+            wrap,
+        ) {
+            if lines.len() >= viewport_height {
+                break;
+            }
+            lines.push(line);
+        }
         if app.comments_visible {
             let annotations = side_by_side_row_comments(app, row, comments);
             for block_line in comment_block_lines(annotations, width) {
@@ -221,6 +245,14 @@ fn side_by_side_row_comments<'a>(
     }
 }
 
+/// One [`SideBySideRow`]'s visual rows: a `Full` header spans both columns
+/// exactly as [`render_row`] already draws it, unwrapped (headers never
+/// wrap — see [`render_row`]'s docs); a `Paired` old/new row wraps each
+/// side independently within its own width and pairs them back up
+/// row-by-row, with whichever side wrapped to fewer visual rows padded out
+/// with blank filler so the `│` divider stays a straight vertical line down
+/// the pane regardless of which side (if either) actually grew — the pair's
+/// visual height is `max(old's rows, new's rows)`.
 #[allow(clippy::too_many_arguments)] // mirrors `content_line`'s: every
 // parameter is a distinct piece of what one paired row needs — see that
 // function's comment for why bundling into a struct wouldn't help.
@@ -232,7 +264,8 @@ fn side_by_side_row_line(
     highlighter: &mut LineHighlighter,
     diagnostics: &DiagnosticsStore,
     comments: &CommentIndex,
-) -> Line<'static> {
+    wrap: bool,
+) -> Vec<Line<'static>> {
     match row {
         SideBySideRow::Full { flat_idx } => render_row(
             app,
@@ -242,35 +275,61 @@ fn side_by_side_row_line(
             highlighter,
             diagnostics,
             comments,
+            wrap,
         ),
         SideBySideRow::Paired { old, new } => {
-            let mut spans =
-                side_cell_spans(app, old, left_width, highlighter, diagnostics, comments).spans;
-            spans.push(Span::styled(
-                "\u{2502}",
-                Style::default().fg(Color::DarkGray),
-            ));
-            spans.extend(
-                side_cell_spans(app, new, right_width, highlighter, diagnostics, comments).spans,
+            let left_lines = side_cell_lines(
+                app,
+                old,
+                left_width,
+                highlighter,
+                diagnostics,
+                comments,
+                wrap,
             );
-            Line::from(spans)
+            let right_lines = side_cell_lines(
+                app,
+                new,
+                right_width,
+                highlighter,
+                diagnostics,
+                comments,
+                wrap,
+            );
+            let pair_height = left_lines.len().max(right_lines.len());
+            let blank_left = Line::from(Span::raw(" ".repeat(left_width)));
+            let blank_right = Line::from(Span::raw(" ".repeat(right_width)));
+            (0..pair_height)
+                .map(|i| {
+                    let mut spans = left_lines.get(i).unwrap_or(&blank_left).spans.clone();
+                    spans.push(Span::styled(
+                        "\u{2502}",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                    spans.extend(right_lines.get(i).unwrap_or(&blank_right).spans.clone());
+                    Line::from(spans)
+                })
+                .collect()
         }
     }
 }
 
-/// One column's worth of spans for a [`SideCell`]: the same rendering
-/// `render_row` already produces for that flat row when populated, or a
-/// blank filler line at `width` when the other side has no counterpart
-/// here.
+/// One column's worth of visual rows for a [`SideCell`]: the same
+/// rendering [`render_row`] already produces for that flat row when
+/// populated (one row, or more if it wrapped), or a single blank filler
+/// line at `width` when the other side has no counterpart here — pairing
+/// this up against the other side's row count is [`side_by_side_row_line`]'s
+/// job, not this function's.
 #[allow(clippy::too_many_arguments)] // see `content_line`'s comment
-fn side_cell_spans(
+fn side_cell_lines(
     app: &App,
     cell: SideCell,
     width: usize,
     highlighter: &mut LineHighlighter,
     diagnostics: &DiagnosticsStore,
     comments: &CommentIndex,
-) -> Line<'static> {
+    wrap: bool,
+) -> Vec<Line<'static>> {
     match cell {
         SideCell::Line { flat_idx } => render_row(
             app,
@@ -280,11 +339,19 @@ fn side_cell_spans(
             highlighter,
             diagnostics,
             comments,
+            wrap,
         ),
-        SideCell::Empty => Line::from(Span::raw(" ".repeat(width))),
+        SideCell::Empty => vec![Line::from(Span::raw(" ".repeat(width)))],
     }
 }
 
+/// One [`RenderRow`]'s visual rows at `width` columns: always exactly one
+/// for a file/hunk header or binary notice (none of those ever wrap — a
+/// path or hunk range is short enough that truncating, as
+/// [`file_header_line`]/[`hunk_header_line`] already do, reads better than
+/// spending a second terminal row on it), or [`content_line`]'s wrapped
+/// output for an actual diff line.
+#[allow(clippy::too_many_arguments)] // see `content_line`'s comment
 fn render_row(
     app: &App,
     row: RenderRow,
@@ -293,12 +360,17 @@ fn render_row(
     highlighter: &mut LineHighlighter,
     diagnostics: &DiagnosticsStore,
     comments: &CommentIndex,
-) -> Line<'static> {
+    wrap: bool,
+) -> Vec<Line<'static>> {
     match row {
-        RenderRow::FileHeader { file_idx } => file_header_line(app, file_idx, width, is_cursor),
-        RenderRow::BinaryNotice { file_idx } => binary_notice_line(app, file_idx, width, is_cursor),
+        RenderRow::FileHeader { file_idx } => {
+            vec![file_header_line(app, file_idx, width, is_cursor)]
+        }
+        RenderRow::BinaryNotice { file_idx } => {
+            vec![binary_notice_line(app, file_idx, width, is_cursor)]
+        }
         RenderRow::HunkHeader { file_idx, hunk_idx } => {
-            hunk_header_line(app, file_idx, hunk_idx, width, is_cursor)
+            vec![hunk_header_line(app, file_idx, hunk_idx, width, is_cursor)]
         }
         RenderRow::Line {
             file_idx,
@@ -314,6 +386,7 @@ fn render_row(
             highlighter,
             diagnostics,
             comments_for_row(app, row, comments),
+            wrap,
         ),
     }
 }
@@ -486,6 +559,57 @@ fn binary_notice_line(
     ))
 }
 
+/// The exact display-column width every content row's gutter (diagnostic
+/// glyph + comment marker + add/del marker + old/new line numbers +
+/// separator) occupies, regardless of that row's actual marker, line
+/// numbers, diagnostic severity, or comment state — every piece of it
+/// renders at a fixed width (see [`diagnostic_glyph_span`]'s and
+/// [`comment_marker_span`]'s "always reserve the width" convention).
+/// [`content_line`] derives its highlighted-text budget from this, and
+/// [`unified_content_width`] reuses it so scroll math's wrap-height lookups
+/// (`App::row_visual_height`) agree with what actually renders.
+fn gutter_width() -> usize {
+    const DIAG_WIDTH: usize = 2; // glyph + trailing space, see `diagnostic_glyph_span`
+    const COMMENT_WIDTH: usize = 1; // see `comment_marker_span`
+    // marker + space + old# + space + new# + space + │ + space
+    1 + 1 + LINE_NUMBER_WIDTH + 1 + LINE_NUMBER_WIDTH + 1 + 1 + 1 + DIAG_WIDTH + COMMENT_WIDTH
+}
+
+/// The display-column budget available to a *unified*-layout content row's
+/// highlighted text at a pane of `pane_width` columns: the pane's border (1
+/// column, see [`render`]'s `Borders::LEFT`) and [`gutter_width`] subtracted
+/// out. Exposed so `App::row_visual_height` derives the same wrap width
+/// [`render_unified`]'s own [`content_line`] call uses, keeping
+/// cursor-visibility and half-page scroll math in agreement with what's
+/// actually on screen in the unified layout — see `App::content_width`'s
+/// docs for why side-by-side, whose two columns are each narrower still, is
+/// a deliberately separate concern from this.
+pub fn unified_content_width(pane_width: u16) -> usize {
+    (pane_width.saturating_sub(1) as usize).saturating_sub(gutter_width())
+}
+
+/// The gutter for a wrapped content row's second-and-later visual rows:
+/// blank where the diagnostic glyph, comment marker, add/del marker, and
+/// line numbers would be (so a continuation row is never mistaken for a
+/// diagnostic-bearing, commented, or separately-numbered diff row of its
+/// own), with a `↪` marking it as a continuation of the row above — the
+/// same total width as [`gutter_width`] so the highlighted text after it
+/// lines up in the same column regardless of which visual row of its
+/// logical line it belongs to. `bg` matches the add/del tint the row's
+/// first visual row uses, so a wrapped +/- line stays visibly tinted all
+/// the way down.
+fn continuation_gutter(bg: Option<Color>) -> Vec<Span<'static>> {
+    let marker_field = " ".repeat(1 + 1 + LINE_NUMBER_WIDTH + 1 + LINE_NUMBER_WIDTH + 1);
+    vec![
+        Span::styled(" ".repeat(2), base_style(bg)), // diagnostic glyph's reserved width
+        Span::styled(" ", base_style(bg)),           // comment marker's reserved width
+        Span::styled(
+            format!("{marker_field}\u{21aa} "),
+            base_style(bg).fg(Color::DarkGray),
+        ),
+    ]
+}
+
 #[allow(clippy::too_many_arguments)] // every parameter is a distinct piece
 // of what one content row needs to render (which row, whether it's under
 // the cursor, how wide it can be, and the lookaside tables — highlighter,
@@ -502,7 +626,8 @@ fn content_line(
     highlighter: &mut LineHighlighter,
     diagnostics: &DiagnosticsStore,
     comments: &[CommentAnnotation],
-) -> Line<'static> {
+    wrap: bool,
+) -> Vec<Line<'static>> {
     let file = &app.files[file_idx];
     let row = &file.hunks[hunk_idx].rows[row_idx];
 
@@ -513,17 +638,12 @@ fn content_line(
     };
 
     let severity = row_diagnostic_severity(app, file, row, diagnostics);
-    let diagnostic_span = diagnostic_glyph_span(severity, bg);
-    let comment_span = comment_marker_span(comments, bg);
     let gutter = format!(
         "{marker} {} {} \u{2502} ",
         format_line_number(row.old_line),
         format_line_number(row.new_line),
     );
-    let gutter_width = display_width(&gutter)
-        + display_width(diagnostic_span.content.as_ref())
-        + display_width(comment_span.content.as_ref());
-    let content_width = width.saturating_sub(gutter_width);
+    let content_width = width.saturating_sub(gutter_width());
 
     let spans = if file.skip_highlighting(crate::config::highlight_max_lines()) {
         // Large/lockfile-ish files skip tree-sitter entirely (see
@@ -542,44 +662,72 @@ fn content_line(
         highlighter.highlight_line(language, &row.text)
     };
     let spans = expand_tabs_in_spans(spans, crate::config::tab_width());
-    let spans = truncate_spans_to_width(&spans, content_width);
+    let visual_rows: Vec<Vec<HlSpan>> = if wrap {
+        wrap_spans_to_width(&spans, content_width)
+    } else {
+        vec![truncate_spans_to_width(&spans, content_width)]
+    };
 
-    let mut content_spans: Vec<Span<'static>> = spans
-        .into_iter()
-        .map(|span| Span::styled(span.text, base_style(bg).fg(highlight_color(span.kind))))
-        .collect();
-    if is_cursor && let Some(active) = symbols::scan(&row.text).get(app.active_symbol) {
-        content_spans = mark_range(
-            content_spans,
-            active.display_start,
-            active.display_end,
-            Style::default().add_modifier(Modifier::UNDERLINED),
-        );
+    // Resolved once per logical line, in the line's own display-column
+    // space — not per visual row — then clipped down below to whichever
+    // visual row(s) it actually falls within, since a long enough active
+    // symbol can itself straddle a wrap point.
+    let active_symbol = is_cursor
+        .then(|| symbols::scan(&row.text).get(app.active_symbol).copied())
+        .flatten();
+
+    let mut out = Vec::with_capacity(visual_rows.len());
+    let mut col_offset = 0usize;
+    for (i, row_spans) in visual_rows.into_iter().enumerate() {
+        let row_width: usize = row_spans.iter().map(|s| display_width(&s.text)).sum();
+        let mut content_spans: Vec<Span<'static>> = row_spans
+            .into_iter()
+            .map(|span| Span::styled(span.text, base_style(bg).fg(highlight_color(span.kind))))
+            .collect();
+        if let Some(active) = active_symbol {
+            let (start, end) = (active.display_start, active.display_end);
+            if end > col_offset && start < col_offset + row_width {
+                let local_start = start.saturating_sub(col_offset);
+                let local_end = (end - col_offset).min(row_width);
+                content_spans = mark_range(
+                    content_spans,
+                    local_start,
+                    local_end,
+                    Style::default().add_modifier(Modifier::UNDERLINED),
+                );
+            }
+        }
+
+        let mut line_spans = if i == 0 {
+            vec![
+                diagnostic_glyph_span(severity, bg),
+                comment_marker_span(comments, bg),
+                Span::styled(
+                    gutter.clone(),
+                    base_style(bg).fg(marker_color).add_modifier(Modifier::BOLD),
+                ),
+            ]
+        } else {
+            continuation_gutter(bg)
+        };
+        line_spans.extend(content_spans);
+
+        let rendered_width: usize = line_spans.iter().map(ratatui::text::Span::width).sum();
+        if rendered_width < width {
+            line_spans.push(Span::styled(
+                " ".repeat(width - rendered_width),
+                base_style(bg),
+            ));
+        }
+
+        let mut line = Line::from(line_spans);
+        if is_cursor {
+            line = line.patch_style(Style::default().add_modifier(Modifier::REVERSED));
+        }
+        out.push(line);
+        col_offset += row_width;
     }
-
-    let mut line_spans = vec![
-        diagnostic_span,
-        comment_span,
-        Span::styled(
-            gutter,
-            base_style(bg).fg(marker_color).add_modifier(Modifier::BOLD),
-        ),
-    ];
-    line_spans.extend(content_spans);
-
-    let rendered_width: usize = line_spans.iter().map(ratatui::text::Span::width).sum();
-    if rendered_width < width {
-        line_spans.push(Span::styled(
-            " ".repeat(width - rendered_width),
-            base_style(bg),
-        ));
-    }
-
-    let mut line = Line::from(line_spans);
-    if is_cursor {
-        line = line.patch_style(Style::default().add_modifier(Modifier::REVERSED));
-    }
-    line
+    out
 }
 
 fn base_style(bg: Option<Color>) -> Style {
@@ -600,4 +748,257 @@ fn pad_or_truncate(s: &str, width: usize) -> String {
     let truncated = truncate_to_width(s, width);
     let pad = width.saturating_sub(display_width(&truncated));
     truncated + &" ".repeat(pad)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::comments::CommentIndex;
+    use crate::diff::{DiffFile, DiffHunk, DiffLineKind, DiffRow, SideBySideRow, SideCell};
+    use crate::lsp::DiagnosticsStore;
+    use std::path::PathBuf;
+
+    fn row(kind: DiffLineKind, text: &str, old: Option<u32>, new: Option<u32>) -> DiffRow {
+        DiffRow {
+            kind,
+            text: text.to_owned(),
+            old_line: old,
+            new_line: new,
+        }
+    }
+
+    fn app_with_rows(rows: Vec<DiffRow>) -> App {
+        let file = DiffFile {
+            old_path: Some("f.rs".to_owned()),
+            new_path: Some("f.rs".to_owned()),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: rows.len() as u32,
+                new_start: 1,
+                new_lines: rows.len() as u32,
+                header: String::new(),
+                rows,
+            }],
+            ..Default::default()
+        };
+        App::new("repo".to_owned(), PathBuf::from("/repo"), vec![file])
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn unified_content_width_subtracts_the_border_and_the_gutter() {
+        assert_eq!(unified_content_width(100), 100 - 1 - gutter_width());
+    }
+
+    #[test]
+    fn unified_content_width_saturates_rather_than_underflowing_on_a_tiny_pane() {
+        assert_eq!(unified_content_width(3), 0);
+    }
+
+    #[test]
+    fn content_line_with_wrap_off_truncates_exactly_as_before_this_milestone() {
+        let app = app_with_rows(vec![row(
+            DiffLineKind::Context,
+            &"x".repeat(50),
+            Some(1),
+            Some(1),
+        )]);
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let lines = content_line(
+            &app,
+            0,
+            0,
+            0,
+            30,
+            false,
+            &mut highlighter,
+            &diagnostics,
+            &[],
+            false, // wrap = false
+        );
+        assert_eq!(
+            lines.len(),
+            1,
+            "wrap off must never produce a continuation row"
+        );
+    }
+
+    #[test]
+    fn content_line_wraps_a_long_line_into_multiple_rows_preserving_every_character() {
+        let app = app_with_rows(vec![row(
+            DiffLineKind::Context,
+            &"x".repeat(50),
+            Some(1),
+            Some(1),
+        )]);
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let lines = content_line(
+            &app,
+            0,
+            0,
+            0,
+            30,
+            false,
+            &mut highlighter,
+            &diagnostics,
+            &[],
+            true,
+        );
+        assert!(
+            lines.len() > 1,
+            "50 columns of content at a much narrower pane must wrap onto continuation rows"
+        );
+        // Every character makes it onto some visual row — none dropped.
+        let total_x: usize = lines
+            .iter()
+            .map(|l| line_text(l).chars().filter(|&c| c == 'x').count())
+            .sum();
+        assert_eq!(total_x, 50);
+        // Every row after the first carries the continuation marker; the
+        // first does not (it has the real gutter instead).
+        assert!(!line_text(&lines[0]).contains('\u{21aa}'));
+        for continuation in &lines[1..] {
+            assert!(line_text(continuation).contains('\u{21aa}'));
+        }
+        // Every visual row is padded to exactly the requested pane width.
+        for line in &lines {
+            assert_eq!(display_width(&line_text(line)), 30);
+        }
+    }
+
+    #[test]
+    fn content_line_under_cursor_reverses_every_one_of_its_wrapped_visual_rows() {
+        let app = app_with_rows(vec![row(
+            DiffLineKind::Context,
+            &"x".repeat(50),
+            Some(1),
+            Some(1),
+        )]);
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let lines = content_line(
+            &app,
+            0,
+            0,
+            0,
+            30,
+            true, // is_cursor
+            &mut highlighter,
+            &diagnostics,
+            &[],
+            true,
+        );
+        assert!(lines.len() > 1);
+        for line in &lines {
+            assert!(
+                line.style.add_modifier.contains(Modifier::REVERSED),
+                "a selected logical row highlights every one of its visual rows"
+            );
+        }
+    }
+
+    #[test]
+    fn side_by_side_paired_row_visual_height_is_the_max_of_both_sides() {
+        // The old side is a short, unwrapped line; the new side is long
+        // enough to wrap at a narrow column width — the pair's visual
+        // height must be driven by whichever side is taller.
+        let app = app_with_rows(vec![
+            row(DiffLineKind::Del, "short", Some(1), None),
+            row(DiffLineKind::Add, &"y".repeat(40), None, Some(1)),
+        ]);
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let comments = CommentIndex::default();
+
+        // app.rows: 0 = FileHeader, 1 = HunkHeader, 2 = the Del row,
+        // 3 = the Add row.
+        let pair = SideBySideRow::Paired {
+            old: SideCell::Line { flat_idx: 2 },
+            new: SideCell::Line { flat_idx: 3 },
+        };
+        // Both comfortably wider than `gutter_width()` — each side's cell
+        // still renders a full `content_line` gutter (old *and* new line
+        // number fields) even in side-by-side, so a column narrower than
+        // that has no content budget left at all, which isn't a
+        // configuration `MIN_SIDE_BY_SIDE_WIDTH` ever actually allows.
+        let (left_width, right_width) = (30, 25);
+        let lines = side_by_side_row_line(
+            &app,
+            pair,
+            left_width,
+            right_width,
+            &mut highlighter,
+            &diagnostics,
+            &comments,
+            true,
+        );
+
+        assert!(
+            lines.len() > 1,
+            "the wrapped new-side cell must make the whole pair more than one visual row tall"
+        );
+
+        let mut total_y = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            let divider_idx = line
+                .spans
+                .iter()
+                .position(|s| s.content.as_ref() == "\u{2502}")
+                .expect("every pair row carries the old/new divider");
+            let left_text: String = line.spans[..divider_idx]
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            let right_text: String = line.spans[divider_idx + 1..]
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            // Both columns stay exactly their requested width on every
+            // visual row, so the divider is a straight vertical line down
+            // the pane regardless of which side (if either) wrapped.
+            assert_eq!(display_width(&left_text), left_width);
+            assert_eq!(display_width(&right_text), right_width);
+            if i > 0 {
+                assert!(
+                    left_text.trim().is_empty(),
+                    "the old side's single row is exhausted, so later rows are blank filler"
+                );
+            }
+            total_y += right_text.chars().filter(|&c| c == 'y').count();
+        }
+        assert_eq!(
+            total_y, 40,
+            "every character of the wrapped new side survives"
+        );
+    }
+
+    #[test]
+    fn side_by_side_full_row_never_wraps_a_file_header() {
+        let app = app_with_rows(vec![row(
+            DiffLineKind::Context,
+            "unrelated",
+            Some(1),
+            Some(1),
+        )]);
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let comments = CommentIndex::default();
+
+        let lines = side_by_side_row_line(
+            &app,
+            SideBySideRow::Full { flat_idx: 0 }, // the file header row
+            20,
+            20,
+            &mut highlighter,
+            &diagnostics,
+            &comments,
+            true,
+        );
+        assert_eq!(lines.len(), 1);
+    }
 }

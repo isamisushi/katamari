@@ -532,31 +532,43 @@ fn event_loop(
     loop {
         let size = terminal.size()?;
         let area = Rect::new(0, 0, size.width, size.height);
-        let content_height = match stack.top() {
+        // `content_width` feeds `App`/`FileView`'s wrap-aware scroll math
+        // (see `View::set_content_width`'s docs) — always the *unified*
+        // layout's content width for a `View::Diff`, regardless of which
+        // layout is actually showing (see `App::content_width`'s docs on
+        // why side-by-side is a deliberately separate concern from this).
+        let (content_height, content_width) = match stack.top() {
             View::Diff(app) => {
                 let status_height =
                     hints::required_height(&hints::diff_view_items(keymap), area.width);
-                diff_layout(area, app.sidebar_visible, status_height)
-                    .diff
-                    .height
+                let diff_area = diff_layout(area, app.sidebar_visible, status_height).diff;
+                (
+                    diff_area.height,
+                    diff_view::unified_content_width(diff_area.width),
+                )
             }
             View::File(_) => {
                 let status_height =
                     hints::required_height(&hints::file_view_items(keymap), area.width);
-                file_view::layout(area, status_height).content.height
+                let content_area = file_view::layout(area, status_height).content;
+                (
+                    content_area.height,
+                    file_view::content_width_for_pane(content_area.width),
+                )
             }
             View::Timeline(_) => {
                 let status_height =
                     hints::required_height(&hints::timeline_view_items(keymap), area.width);
-                timeline_view::layout(area, status_height).diff.height
+                (timeline_view::layout(area, status_height).diff.height, 0)
             }
             View::Log(_) => {
                 let status_height =
                     hints::required_height(&hints::log_view_items(keymap), area.width);
-                log_view::layout(area, status_height).list.height
+                (log_view::layout(area, status_height).list.height, 0)
             }
         };
         stack.top_mut().set_viewport_height(content_height as usize);
+        stack.top_mut().set_content_width(content_width);
 
         if let Some((generation, rx)) = &pending_hover
             && let Ok(result) = rx.try_recv()

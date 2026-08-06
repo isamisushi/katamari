@@ -137,3 +137,39 @@ pub fn japanese_repo() -> FixtureRepo {
 
     FixtureRepo { dir }
 }
+
+/// A repo whose working-tree edit adds a single, very long content line —
+/// the M13 wrap E2E fixture. The line is built to an exact, known shape:
+/// 100 display columns of prefix (70 ASCII dashes then 15 double-width
+/// Japanese characters, mixing both the way a real diff line would), then a
+/// `TAILMARKER` word found nowhere else in the fixture. At a 100-column
+/// terminal with the sidebar showing, `[ui] wrap`'s rendered content width
+/// works out to 50 columns (`100 - 30 sidebar - 1 border - 19 gutter` — see
+/// `diff_view::unified_content_width`/`gutter_width`), so `TAILMARKER`
+/// (starting at column 100) lands intact on a continuation row when
+/// wrapped, or never renders at all when truncated — an unambiguous,
+/// deterministic witness either way. `wrap` is always written into
+/// `.katamari/config.toml` explicitly (never left to the built-in default),
+/// so the fixture's behavior doesn't silently depend on what that default
+/// happens to be.
+pub fn long_line_repo(wrap: bool) -> FixtureRepo {
+    let dir = init_repo();
+    let root = dir.path();
+
+    std::fs::write(root.join("long.txt"), "one\ntwo\nthree\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "initial commit"]);
+
+    let prefix = format!("{}{}", "-".repeat(70), "日本語のテキストで幅を確認する");
+    let long_line = format!("{prefix}TAILMARKER");
+    std::fs::write(root.join("long.txt"), format!("one\n{long_line}\nthree\n")).unwrap();
+
+    std::fs::create_dir_all(root.join(".katamari")).unwrap();
+    std::fs::write(
+        root.join(".katamari").join("config.toml"),
+        format!("[ui]\nwrap = {wrap}\n"),
+    )
+    .unwrap();
+
+    FixtureRepo { dir }
+}
