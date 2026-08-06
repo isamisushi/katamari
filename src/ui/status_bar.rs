@@ -1,14 +1,16 @@
-//! Renders the single-line mode bar: repo name, position within the diff,
-//! any in-progress key sequence, and a hint of the available bindings.
+//! Renders the mode bar: repo name, position within the diff, any
+//! in-progress key sequence, and a hint of the available bindings — wrapped
+//! onto as many rows as [`hints::required_height`] says this frame needs
+//! (see that function's docs), rather than a single row that used to
+//! silently truncate on a narrow terminal.
 
 use crate::ui::app::{App, Layout};
+use crate::ui::hints::{self, HintItem};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-
-const HINTS: &str = "j/k move  C-d/C-u half-page  gg/G top/bottom  ]c/[c hunk  ]f/[f file  ]d/[d diag  b sidebar  s layout  K hover  gd def  gr refs  C-o/C-t jump  Tab symbol  c comment  C toggle  q quit";
 
 /// `effective_layout` is `diff_view::effective_layout(app.layout, pane_width)`
 /// — the layout actually being drawn this frame, which may differ from
@@ -22,12 +24,19 @@ const HINTS: &str = "j/k move  C-d/C-u half-page  gg/G top/bottom  ]c/[c hunk  ]
 /// same way the pending-key indicator is. It lives outside `App` because
 /// issuing and tracking it isn't a pure state transition; see
 /// `hover_popup`'s module docs for why.
+///
+/// `hint_items` is [`hints::diff_view_items`] read off the session's active
+/// [`crate::keymap::Keymap`] — built once per frame by the caller (which
+/// also uses it to size `area` via [`hints::required_height`] before the
+/// frame was even split into panes) rather than rebuilt here, so the exact
+/// same list that sized the area is the one wrapped into it.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     app: &App,
     effective_layout: Layout,
     status_note: Option<&str>,
+    hint_items: &[HintItem],
 ) {
     let position = format!("{}/{}", app.cursor + 1, app.rows.len().max(1));
     let mut spans = vec![
@@ -74,11 +83,8 @@ pub fn render(
         ));
     }
 
-    spans.push(Span::styled(
-        format!("· {HINTS}"),
-        Style::default().fg(Color::DarkGray),
-    ));
-
-    let line = Line::from(spans);
-    frame.render_widget(Paragraph::new(line), area);
+    let wrapped = hints::wrap_for_area(hint_items, area.width);
+    let mut lines = vec![Line::from(spans)];
+    lines.extend(hints::render_lines(&wrapped));
+    frame.render_widget(Paragraph::new(lines), area);
 }

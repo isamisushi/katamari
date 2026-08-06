@@ -15,9 +15,10 @@
 //! against it would be misleading rather than merely unavailable.
 
 use crate::diff::{DiffFile, parse_unified_diff};
-use crate::keymap::Action;
+use crate::keymap::{Action, Keymap};
 use crate::lsp::DiagnosticsStore;
 use crate::ui::app::{App, Layout};
+use crate::ui::hints;
 use crate::ui::hover_popup::HoverQuery;
 use crate::vcs::jj::{JjRepo, SnapshotOp};
 use ratatui::Frame;
@@ -45,9 +46,7 @@ enum Focus {
 /// the two never drift apart.
 pub const DEFAULT_OP_LOG_LIMIT: usize = 100;
 
-const STATUS_BAR_HEIGHT: u16 = 1;
 const LIST_WIDTH: u16 = 40;
-const HINTS: &str = "j/k select  Tab focus  v range  Enter back to diff  q/Esc/t close";
 
 /// State for one open timeline. Construction fetches the op log once;
 /// afterward, only the selected diff is (re)fetched — never the whole list
@@ -349,10 +348,14 @@ pub struct Areas {
     pub status: Rect,
 }
 
-pub fn layout(area: Rect) -> Areas {
+/// `status_height` is [`hints::required_height`] applied to
+/// [`hints::timeline_view_items`] and `area`'s width — see
+/// `file_view::layout`'s docs for why the caller computes this rather than
+/// a fixed constant.
+pub fn layout(area: Rect, status_height: u16) -> Areas {
     let rows = RatLayout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(STATUS_BAR_HEIGHT)])
+        .constraints([Constraint::Min(0), Constraint::Length(status_height)])
         .split(area);
     let cols = RatLayout::default()
         .direction(Direction::Horizontal)
@@ -370,8 +373,11 @@ pub fn render(
     area: Rect,
     view: &TimelineView,
     highlighter: &mut crate::highlight::LineHighlighter,
+    keymap: &Keymap,
 ) {
-    let areas = layout(area);
+    let hint_items = hints::timeline_view_items(keymap);
+    let status_height = hints::required_height(&hint_items, area.width);
+    let areas = layout(area, status_height);
     render_list(frame, areas.list, view);
     let diagnostics = DiagnosticsStore::new();
     // A past snapshot's diff has nothing in `.katamari/comments.jsonl` to
@@ -388,7 +394,7 @@ pub fn render(
         &diagnostics,
         &comments,
     );
-    render_status(frame, areas.status, view);
+    render_status(frame, areas.status, view, &hint_items);
 }
 
 fn render_list(frame: &mut Frame, area: Rect, view: &TimelineView) {
@@ -450,7 +456,12 @@ fn view_focus_is_list(view: &TimelineView) -> bool {
     view.focus == Focus::List
 }
 
-fn render_status(frame: &mut Frame, area: Rect, view: &TimelineView) {
+fn render_status(
+    frame: &mut Frame,
+    area: Rect,
+    view: &TimelineView,
+    hint_items: &[hints::HintItem],
+) {
     let mut spans = vec![Span::styled(
         " timeline ",
         Style::default().add_modifier(Modifier::BOLD),
@@ -483,12 +494,10 @@ fn render_status(frame: &mut Frame, area: Rect, view: &TimelineView) {
         ));
     }
 
-    spans.push(Span::styled(
-        format!("· {HINTS}"),
-        Style::default().fg(Color::DarkGray),
-    ));
-
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    let wrapped = hints::wrap_for_area(hint_items, area.width);
+    let mut lines = vec![Line::from(spans)];
+    lines.extend(hints::render_lines(&wrapped));
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 #[cfg(test)]

@@ -17,6 +17,7 @@ pub mod app;
 pub mod compose;
 pub mod diff_view;
 pub mod file_view;
+pub mod hints;
 pub mod hover_popup;
 pub mod navigation;
 pub mod refresh;
@@ -73,7 +74,6 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 const SIDEBAR_WIDTH: u16 = 30;
-const STATUS_BAR_HEIGHT: u16 = 1;
 
 /// How long the render loop's channel wait blocks before looping anyway.
 /// Short enough that a hover response or a `$/progress` tick shows up
@@ -252,6 +252,7 @@ pub fn run(
         &mut terminal,
         stack,
         &mut resolver,
+        &keymap,
         &mut highlighter,
         &app_rx,
         &lsp_manager,
@@ -485,6 +486,7 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     stack: &mut ViewStack,
     resolver: &mut Resolver<'_>,
+    keymap: &Keymap,
     highlighter: &mut LineHighlighter,
     app_rx: &Receiver<AppEvent>,
     lsp_manager: &LspManager,
@@ -516,9 +518,23 @@ fn event_loop(
         let size = terminal.size()?;
         let area = Rect::new(0, 0, size.width, size.height);
         let content_height = match stack.top() {
-            View::Diff(app) => diff_layout(area, app.sidebar_visible).diff.height,
-            View::File(_) => file_view::layout(area).content.height,
-            View::Timeline(_) => timeline_view::layout(area).diff.height,
+            View::Diff(app) => {
+                let status_height =
+                    hints::required_height(&hints::diff_view_items(keymap), area.width);
+                diff_layout(area, app.sidebar_visible, status_height)
+                    .diff
+                    .height
+            }
+            View::File(_) => {
+                let status_height =
+                    hints::required_height(&hints::file_view_items(keymap), area.width);
+                file_view::layout(area, status_height).content.height
+            }
+            View::Timeline(_) => {
+                let status_height =
+                    hints::required_height(&hints::timeline_view_items(keymap), area.width);
+                timeline_view::layout(area, status_height).diff.height
+            }
         };
         stack.top_mut().set_viewport_height(content_height as usize);
 
@@ -600,6 +616,7 @@ fn event_loop(
             draw(
                 frame,
                 stack.top(),
+                keymap,
                 highlighter,
                 &hover_state,
                 &diagnostics,
@@ -1192,6 +1209,7 @@ fn apply_references_result(
 fn draw(
     frame: &mut Frame,
     view: &View,
+    keymap: &Keymap,
     highlighter: &mut LineHighlighter,
     hover_state: &hover_popup::HoverState,
     diagnostics: &DiagnosticsStore,
@@ -1202,7 +1220,9 @@ fn draw(
 ) {
     match view {
         View::Diff(app) => {
-            let areas = diff_layout(frame.area(), app.sidebar_visible);
+            let hint_items = hints::diff_view_items(keymap);
+            let status_height = hints::required_height(&hint_items, frame.area().width);
+            let areas = diff_layout(frame.area(), app.sidebar_visible, status_height);
             if let Some(sidebar_area) = areas.sidebar {
                 sidebar::render(frame, sidebar_area, app);
             }
@@ -1216,7 +1236,14 @@ fn draw(
                 diagnostics,
                 comments,
             );
-            status_bar::render(frame, areas.status, app, effective_layout, status_note);
+            status_bar::render(
+                frame,
+                areas.status,
+                app,
+                effective_layout,
+                status_note,
+                &hint_items,
+            );
             if let Some(row) = view.cursor_screen_row() {
                 hover_popup::render(frame, areas.diff, row, hover_state);
             }
@@ -1230,9 +1257,11 @@ fn draw(
             }
         }
         View::File(file) => {
-            let areas = file_view::layout(frame.area());
+            let hint_items = hints::file_view_items(keymap);
+            let status_height = hints::required_height(&hint_items, frame.area().width);
+            let areas = file_view::layout(frame.area(), status_height);
             file_view::render(frame, areas.content, file, diagnostics);
-            file_view::render_status(frame, areas.status, file, status_note);
+            file_view::render_status(frame, areas.status, file, status_note, &hint_items);
             if let Some(row) = view.cursor_screen_row() {
                 hover_popup::render(frame, areas.content, row, hover_state);
             }
@@ -1242,7 +1271,7 @@ fn draw(
         }
         View::Timeline(timeline) => {
             let area = frame.area();
-            timeline_view::render(frame, area, timeline, highlighter);
+            timeline_view::render(frame, area, timeline, highlighter, keymap);
         }
     }
 }
@@ -1253,10 +1282,14 @@ struct DiffAreas {
     status: Rect,
 }
 
-fn diff_layout(area: Rect, sidebar_visible: bool) -> DiffAreas {
+/// `status_height` is [`hints::required_height`] applied to
+/// [`hints::diff_view_items`] and `area`'s width — see
+/// `file_view::layout`'s docs for why the caller computes this rather than
+/// a fixed constant.
+fn diff_layout(area: Rect, sidebar_visible: bool, status_height: u16) -> DiffAreas {
     let rows = RatatuiLayout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(STATUS_BAR_HEIGHT)])
+        .constraints([Constraint::Min(0), Constraint::Length(status_height)])
         .split(area);
     let (main, status) = (rows[0], rows[1]);
 

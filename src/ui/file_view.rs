@@ -13,6 +13,7 @@
 use crate::highlight::{FileHighlighter, Language};
 use crate::keymap::Action;
 use crate::lsp::DiagnosticsStore;
+use crate::ui::hints::{self, HintItem};
 use crate::ui::hover_popup::HoverQuery;
 use crate::ui::scroll;
 use crate::ui::symbols;
@@ -28,8 +29,6 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use std::path::{Path, PathBuf};
 
 const LINE_NUMBER_WIDTH: usize = 5;
-const STATUS_BAR_HEIGHT: u16 = 1;
-const HINTS: &str = "j/k move  C-d/C-u half-page  gg/G top/bottom  ]d/[d diag  K hover  gd def  gr refs  C-o/C-t jump  Tab symbol  q quit";
 
 /// State for one open file. Construction does the (comparatively) expensive
 /// work — reading line boundaries and running the whole-file highlight pass
@@ -282,10 +281,15 @@ pub struct Areas {
     pub status: Rect,
 }
 
-pub fn layout(area: Rect) -> Areas {
+/// `status_height` is [`hints::required_height`] applied to
+/// [`hints::file_view_items`] and `area`'s width — computed by the caller
+/// (see `ui::mod`'s draw/event-loop functions) so the same value both sizes
+/// this split and, later, the number of rows `render_status` actually
+/// renders into it.
+pub fn layout(area: Rect, status_height: u16) -> Areas {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(0), Constraint::Length(STATUS_BAR_HEIGHT)])
+        .constraints([Constraint::Min(0), Constraint::Length(status_height)])
         .split(area);
     Areas {
         content: rows[0],
@@ -379,7 +383,16 @@ fn content_line(
     line
 }
 
-pub fn render_status(frame: &mut Frame, area: Rect, view: &FileView, status_note: Option<&str>) {
+/// `hint_items` is [`hints::file_view_items`] read off the session's active
+/// keymap — see `status_bar::render`'s docs on why it's built by the caller
+/// rather than here.
+pub fn render_status(
+    frame: &mut Frame,
+    area: Rect,
+    view: &FileView,
+    status_note: Option<&str>,
+    hint_items: &[HintItem],
+) {
     let position = format!("{}/{}", view.cursor + 1, view.line_count().max(1));
     let mut spans = vec![
         Span::styled(
@@ -414,12 +427,10 @@ pub fn render_status(frame: &mut Frame, area: Rect, view: &FileView, status_note
         ));
     }
 
-    spans.push(Span::styled(
-        format!("· {HINTS}"),
-        Style::default().fg(Color::DarkGray),
-    ));
-
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    let wrapped = hints::wrap_for_area(hint_items, area.width);
+    let mut lines = vec![Line::from(spans)];
+    lines.extend(hints::render_lines(&wrapped));
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 #[cfg(test)]

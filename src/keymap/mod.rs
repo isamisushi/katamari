@@ -229,6 +229,29 @@ impl KeySeq {
             .collect::<Result<Vec<_>, _>>()
             .map(Self)
     }
+
+    /// Compact display notation for status-bar hints (see
+    /// `ui::hints::HintItem`): consecutive *bare* chords — a single
+    /// character, no modifier, like the `g`/`d` in `g d` or the `]`/`c` in
+    /// `] c` — render with no separator (`gd`, `]c`), matching vim's own
+    /// convention for a two-key sequence. A sequence with any modified or
+    /// multi-character chord (`M-g M-n`, `C-x n`) keeps a separating space
+    /// instead, since jamming `C-x` and `n` together as `C-xn` would misread
+    /// as a single token. Distinct from [`Resolver::pending_display`], which
+    /// always space-joins — that renders keys the user has *already
+    /// pressed*, one at a time, not a single compact reference notation.
+    pub fn compact_notation(&self) -> String {
+        let is_bare = |chord: &KeyChord| chord.notation().chars().count() == 1;
+        if self.0.iter().all(is_bare) {
+            self.0.iter().map(|c| c.notation()).collect()
+        } else {
+            self.0
+                .iter()
+                .map(|c| c.notation())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
 }
 
 #[derive(Default)]
@@ -242,6 +265,14 @@ struct TrieNode {
 /// one at a time.
 pub struct Keymap {
     root: TrieNode,
+    /// The bindings this trie was built from, kept alongside it for
+    /// [`Self::binding_for`]'s reverse lookup — the trie itself is indexed
+    /// key-sequence-first (exactly what `Resolver::feed` needs) and has no
+    /// efficient way to ask "what maps to this action" without walking every
+    /// path, whereas the original list already answers that in one scan and
+    /// preserves the preset's insertion order (see that method's docs on why
+    /// order matters here).
+    bindings: Vec<(KeySeq, Action)>,
 }
 
 impl Keymap {
@@ -254,7 +285,10 @@ impl Keymap {
             }
             node.action = Some(*action);
         }
-        Self { root }
+        Self {
+            root,
+            bindings: bindings.to_vec(),
+        }
     }
 
     pub fn resolver(&self) -> Resolver<'_> {
@@ -263,6 +297,28 @@ impl Keymap {
             current: &self.root,
             pending: Vec::new(),
         }
+    }
+
+    /// The key sequence bound to `action` in this keymap, if any — the
+    /// single source of truth `ui::hints` reads to render status-bar hints,
+    /// so a `[keys]` rebind or switching to the emacs preset changes hint
+    /// text automatically instead of a hardcoded string drifting out of
+    /// sync with it (the bug this method exists to fix).
+    ///
+    /// When `bindings` holds more than one entry for `action`, the first one
+    /// wins — preset insertion order, which every built-in preset also
+    /// happens to list in "primary binding first" order. In practice this
+    /// tie only matters for a pathological `[keys]` config that adds an
+    /// alias without touching the original (`apply_key_overrides` rebinds
+    /// the *existing* slot in place, so a normal override never creates a
+    /// second entry); `None` only if `action` has no binding at all, which
+    /// neither built-in preset ever produces (see this module's
+    /// `every_vim_and_emacs_binding_covers_every_action_exactly_once` test).
+    pub fn binding_for(&self, action: Action) -> Option<&KeySeq> {
+        self.bindings
+            .iter()
+            .find(|(_, a)| *a == action)
+            .map(|(seq, _)| seq)
     }
 }
 
@@ -736,6 +792,79 @@ mod tests {
     fn try_parse_reports_an_error_instead_of_panicking_on_a_bad_token() {
         assert!(KeySeq::try_parse("C-d NotAKey g").is_err());
         assert!(KeySeq::try_parse("g g").is_ok());
+    }
+
+    #[test]
+    fn binding_for_finds_a_vim_preset_binding() {
+        let keymap = Keymap::from_bindings(&vim_preset());
+        let seq = keymap.binding_for(Action::GotoDefinition).unwrap();
+        assert_eq!(seq.compact_notation(), "gd");
+    }
+
+    #[test]
+    fn binding_for_finds_an_emacs_preset_binding() {
+        let keymap = Keymap::from_bindings(&emacs_preset());
+        let seq = keymap.binding_for(Action::GotoDefinition).unwrap();
+        assert_eq!(seq.compact_notation(), "M-.");
+    }
+
+    #[test]
+    fn binding_for_returns_none_for_an_action_with_no_binding() {
+        let keymap = Keymap::from_bindings(&[(KeySeq::parse("j"), Action::CursorDown)]);
+        assert!(keymap.binding_for(Action::Quit).is_none());
+    }
+
+    #[test]
+    fn binding_for_reflects_a_keys_override_automatically() {
+        // The whole point of driving hints off `binding_for` rather than a
+        // hardcoded string: rebind an action, and the "key" a hint would
+        // show changes with it, with no separate hint-text update needed.
+        let mut bindings = vim_preset();
+        let slot = bindings
+            .iter_mut()
+            .find(|(_, a)| *a == Action::Quit)
+            .unwrap();
+        slot.0 = KeySeq::parse("C-q");
+        let keymap = Keymap::from_bindings(&bindings);
+        assert_eq!(
+            keymap.binding_for(Action::Quit).unwrap().compact_notation(),
+            "C-q"
+        );
+    }
+
+    #[test]
+    fn binding_for_prefers_the_first_matching_entry_when_more_than_one_exists() {
+        let bindings = vec![
+            (KeySeq::parse("x"), Action::Quit),
+            (KeySeq::parse("y"), Action::Quit),
+        ];
+        let keymap = Keymap::from_bindings(&bindings);
+        assert_eq!(
+            keymap.binding_for(Action::Quit).unwrap().compact_notation(),
+            "x"
+        );
+    }
+
+    #[test]
+    fn compact_notation_joins_bare_multi_key_sequences_without_a_separator() {
+        assert_eq!(KeySeq::parse("g g").compact_notation(), "gg");
+        assert_eq!(KeySeq::parse("] c").compact_notation(), "]c");
+    }
+
+    #[test]
+    fn compact_notation_keeps_a_space_around_any_modified_or_named_chord() {
+        // `C-x` and `n` would misread as one token ("C-xn") jammed together
+        // — unlike two bare chords, at least one side here needs the space
+        // to stay legible.
+        assert_eq!(KeySeq::parse("C-x n").compact_notation(), "C-x n");
+        assert_eq!(KeySeq::parse("M-g M-n").compact_notation(), "M-g M-n");
+        assert_eq!(KeySeq::parse("C-c C-c").compact_notation(), "C-c C-c");
+    }
+
+    #[test]
+    fn compact_notation_for_a_single_chord_matches_its_own_notation() {
+        assert_eq!(KeySeq::parse("C-o").compact_notation(), "C-o");
+        assert_eq!(KeySeq::parse("q").compact_notation(), "q");
     }
 
     #[test]
