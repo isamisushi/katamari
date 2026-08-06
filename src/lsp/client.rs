@@ -10,10 +10,10 @@ use lsp_types::{
     DidOpenTextDocumentParams, FileEvent, GeneralClientCapabilities, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverClientCapabilities, HoverParams, InitializeParams,
     InitializeResult, InitializedParams, Location, MarkupKind, PartialResultParams, Position,
-    PositionEncodingKind, ReferenceContext, ReferenceParams, ServerCapabilities,
-    TextDocumentClientCapabilities, TextDocumentContentChangeEvent, TextDocumentIdentifier,
-    TextDocumentItem, TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier,
-    WindowClientCapabilities, WorkspaceFolder,
+    PositionEncodingKind, PublishDiagnosticsClientCapabilities, ReferenceContext, ReferenceParams,
+    ServerCapabilities, TextDocumentClientCapabilities, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri,
+    VersionedTextDocumentIdentifier, WindowClientCapabilities, WorkspaceFolder,
 };
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -310,6 +310,16 @@ fn client_capabilities() -> ClientCapabilities {
                 dynamic_registration: Some(false),
                 content_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
             }),
+            // Some servers (typescript-language-server confirmed; others
+            // may follow suit) treat this capability as permission to push
+            // `textDocument/publishDiagnostics` at all, silently withholding
+            // every diagnostic — not just extra detail — when it's absent,
+            // even after a normal `didOpen`. rust-analyzer pushes
+            // diagnostics unconditionally so this went unnoticed there, but
+            // declaring it (with no sub-fields needed; we don't use
+            // `relatedInformation`/tag/version support) is required for
+            // `]d`/`[d` and the diagnostic gutter to work on TypeScript.
+            publish_diagnostics: Some(PublishDiagnosticsClientCapabilities::default()),
             ..Default::default()
         }),
         general: Some(GeneralClientCapabilities {
@@ -391,6 +401,21 @@ pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initialize_capabilities_declare_publish_diagnostics() {
+        // Regression guard for a silent-failure class of bug: spec-compliant
+        // servers (typescript-language-server confirmed) withhold every
+        // `textDocument/publishDiagnostics` notification when the client
+        // doesn't declare this capability, so dropping it doesn't fail any
+        // request — diagnostics just never arrive. Asserting on the
+        // serialized JSON pins the wire shape a server actually sees.
+        let caps = serde_json::to_value(client_capabilities()).unwrap();
+        assert!(
+            caps.pointer("/textDocument/publishDiagnostics").is_some(),
+            "initialize must declare textDocument.publishDiagnostics: {caps}"
+        );
+    }
 
     #[test]
     fn file_uri_encodes_an_absolute_ascii_path() {
