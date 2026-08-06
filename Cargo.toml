@@ -5,6 +5,7 @@ edition = "2024"
 description = "Terminal diff-review tool with LSP — hover, go-to-definition, references and diagnostics inside a git/jj diff"
 license = "MIT"
 repository = "https://github.com/isamisushi/katamari"
+homepage = "https://github.com/isamisushi/katamari"
 
 [[bin]]
 name = "katamari"
@@ -46,3 +47,8 @@ vt100 = "0.16"
 opt-level = 3
 lto = "thin"
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

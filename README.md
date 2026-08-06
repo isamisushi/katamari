@@ -43,6 +43,20 @@ an agent's session passed through, not just the version currently on disk.
 
 ## Install
 
+### Homebrew
+
+```
+brew install isamisushi/tap/katamari
+```
+
+Installs two identical binaries, `katamari` and `ktmr` (the short name is
+what the rest of this document uses). Prebuilt for macOS (Apple Silicon
+and Intel) and Linux (x86_64 and aarch64); each [release](https://github.com/isamisushi/katamari/releases)
+also has raw binary archives for those targets if you'd rather skip
+Homebrew.
+
+### From source
+
 Needs a Rust toolchain (any recent stable):
 
 ```
@@ -51,12 +65,10 @@ cd katamari
 cargo install --path .
 ```
 
-Installs two identical binaries, `katamari` and `ktmr` (the short name is
-what the rest of this document uses). If this repository itself is
-managed with [mise](https://mise.jdx.dev/), `mise.toml` already pins a
-Rust toolchain and defines `mise run build`/`test`/`lint`/`fmt` tasks for
-working on katamari's own source; none of that is required to build or
-run it.
+If this repository itself is managed with [mise](https://mise.jdx.dev/),
+`mise.toml` already pins a Rust toolchain and defines `mise run
+build`/`test`/`lint`/`fmt` tasks for working on katamari's own source;
+none of that is required to build or run it.
 
 ## Quickstart
 
