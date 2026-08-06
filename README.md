@@ -5,6 +5,8 @@ highlighting, hover/go-to-definition/find-references/diagnostics from real
 language servers, and inline review comments an AI coding agent can read
 back and address — all without leaving the terminal.
 
+![demo](docs/demo.gif)
+
 - **LSP inside the diff** — hover, go-to-definition, find-references, and
   live diagnostics on changed lines (Rust / TypeScript / Python / Go /
   Kotlin; servers auto-install on first use)
