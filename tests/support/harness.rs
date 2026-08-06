@@ -1,0 +1,329 @@
+//! Drives the real compiled `ktmr` binary through a PTY, the same way a
+//! human terminal would, and parses what it prints via `vt100::Parser` — no
+//! real terminal is ever involved, so the whole suite runs under plain
+//! `cargo test`. See [`Harness::spawn`]'s docs for the one ordering
+//! guarantee every test in the suite leans on without having to think about
+//! it: keys are never sent before the kitty-protocol probe exchange has
+//! definitely finished.
+
+use super::key::Key;
+use pty_process::Size;
+use pty_process::blocking::{Command, Pty, open};
+use std::io::{Read, Write};
+use std::path::Path;
+use std::process::Child;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+use vt100::Parser;
+
+/// Whether the fake terminal answers crossterm's kitty-keyboard-protocol
+/// probe (`\x1b[?u\x1b[c`) as though it supports the protocol. See
+/// [`spawn_reader_thread`] for where the reply is actually sent, and
+/// [`Key::encode`](super::key::Key::encode) for how a [`Key`] is encoded
+/// differently depending on this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KittyMode {
+    Supported,
+    Unsupported,
+}
+
+impl KittyMode {
+    /// The bytes a terminal answering `\x1b[?u\x1b[c` (kitty flags query +
+    /// DA1) sends back. Per the M10 task's verified research: a `Supported`
+    /// terminal answers both halves; an `Unsupported` one answers only DA1
+    /// — which is what makes `supports_keyboard_enhancement` return
+    /// `Ok(false)` rather than block for its full 2s timeout.
+    fn probe_reply(self) -> &'static [u8] {
+        match self {
+            KittyMode::Supported => b"\x1b[?1u\x1b[?1c",
+            KittyMode::Unsupported => b"\x1b[?1c",
+        }
+    }
+}
+
+/// The exact bytes crossterm 0.29's `supports_keyboard_enhancement` writes
+/// to probe for kitty keyboard protocol support. Watched for in the raw
+/// byte stream (not the parsed screen — it's a query the child sends, never
+/// something it displays) so the reader thread knows the instant to answer.
+const PROBE_QUERY: &[u8] = b"\x1b[?u\x1b[c";
+
+/// [`Harness::spawn`]'s configuration. Defaults to a generously-sized
+/// terminal and no extra args — plain `ktmr` in a git repo defaults to `ktmr
+/// diff`, which is all this suite ever needs to spawn.
+pub struct SpawnOptions {
+    pub cols: u16,
+    pub rows: u16,
+    pub kitty_mode: KittyMode,
+    pub args: Vec<&'static str>,
+}
+
+impl Default for SpawnOptions {
+    fn default() -> Self {
+        Self {
+            cols: 100,
+            rows: 30,
+            kitty_mode: KittyMode::Supported,
+            args: Vec::new(),
+        }
+    }
+}
+
+/// How long [`Harness::spawn`] waits for the first rendered frame before
+/// giving up — generous, since a debug build's startup (run `git diff`,
+/// parse it, load config; never a language server for this suite's
+/// plain-text fixtures) is the only thing racing this.
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default timeout for [`Harness::wait_for_text`] and any [`Harness::wait_until`]
+/// call that doesn't need a tighter one.
+pub const DEFAULT_WAIT: Duration = Duration::from_secs(3);
+
+/// Drives one `ktmr` session through a PTY. Owns the child process, the PTY
+/// master, a background thread that continuously drains it into a
+/// [`vt100::Parser`], and a per-test `$HOME` (plus `$XDG_CONFIG_HOME`/
+/// `$XDG_DATA_HOME`) tempdir the child's environment points at, so the real
+/// `~/.config/katamari` and the katamari-managed LSP install prefix are
+/// never touched by a test run.
+pub struct Harness {
+    pty: Arc<Pty>,
+    write_lock: Arc<Mutex<()>>,
+    screen: Arc<Mutex<Parser>>,
+    bytes_read: Arc<AtomicUsize>,
+    kitty_mode: KittyMode,
+    child: Child,
+    reader: Option<JoinHandle<()>>,
+    // Held only for its `Drop`: `ktmr` reads `$HOME`/`$XDG_*` at startup, so
+    // this tempdir must outlive the child process, not just the `spawn`
+    // call that set the env vars pointing at it.
+    _env_home: tempfile::TempDir,
+}
+
+impl Harness {
+    /// Spawns `ktmr` (via `env!("CARGO_BIN_EXE_ktmr")`) in `cwd` inside a
+    /// PTY sized `opts.cols`x`opts.rows`, answers the kitty-keyboard-protocol
+    /// probe as `opts.kitty_mode` dictates, and blocks until the first
+    /// rendered frame has real content on screen before returning.
+    ///
+    /// That wait is load-bearing, not a convenience. `ktmr` answers the
+    /// probe via a synchronous blocking read that runs *before* it spawns
+    /// its own input-reading thread (see `ui::mod::run`'s ordering) — any
+    /// key bytes a test sent before that exchange finished could be
+    /// consumed and silently dropped by it, an easy way for a test to look
+    /// flaky for a reason that has nothing to do with the feature it's
+    /// testing. Blocking here until content appears means every [`Key`] a
+    /// test sends via [`Harness::send`] is sent only once that window has
+    /// definitely closed — test bodies never have to think about the race
+    /// themselves.
+    pub fn spawn(cwd: &Path, opts: SpawnOptions) -> Harness {
+        let env_home = tempfile::Builder::new()
+            .prefix("katamari-e2e-home-")
+            .tempdir()
+            .expect("failed to create per-test $HOME tempdir");
+
+        let (pty, pts) = open().expect("failed to allocate a pty");
+        pty.resize(Size::new(opts.rows, opts.cols))
+            .expect("failed to size the pty");
+
+        let bin = env!("CARGO_BIN_EXE_ktmr");
+        let child = Command::new(bin)
+            .args(&opts.args)
+            .current_dir(cwd)
+            .env("TERM", "xterm-256color")
+            .env("HOME", env_home.path())
+            .env("XDG_CONFIG_HOME", env_home.path().join("config"))
+            .env("XDG_DATA_HOME", env_home.path().join("data"))
+            .spawn(pts)
+            .expect("failed to spawn ktmr in a pty");
+
+        let pty = Arc::new(pty);
+        let write_lock = Arc::new(Mutex::new(()));
+        let screen = Arc::new(Mutex::new(Parser::new(opts.rows, opts.cols, 0)));
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+
+        let reader = spawn_reader_thread(
+            Arc::clone(&pty),
+            Arc::clone(&write_lock),
+            Arc::clone(&screen),
+            Arc::clone(&bytes_read),
+            opts.kitty_mode,
+        );
+
+        let harness = Harness {
+            pty,
+            write_lock,
+            screen,
+            bytes_read,
+            kitty_mode: opts.kitty_mode,
+            child,
+            reader: Some(reader),
+            _env_home: env_home,
+        };
+
+        harness.wait_until(READY_TIMEOUT, |screen| !screen.contents().trim().is_empty());
+        harness
+    }
+
+    /// Sends one logical keypress, encoded for this harness's
+    /// [`KittyMode`]. Always safe to call any time after `spawn` returns —
+    /// see [`Harness::spawn`]'s docs on the ordering this relies on.
+    pub fn send(&self, key: Key) {
+        write_locked(&self.pty, &self.write_lock, &key.encode(self.kitty_mode));
+    }
+
+    /// Polls the parsed screen every 10ms until `predicate` is true, or
+    /// panics once `timeout` elapses. The panic dumps the full screen
+    /// contents (via [`vt100::Screen::contents`]) and how many raw bytes
+    /// have been read from the pty so far — diagnosability first, per the
+    /// M10 task: a bare "timed out" tells a future debugger nothing.
+    pub fn wait_until(&self, timeout: Duration, mut predicate: impl FnMut(&vt100::Screen) -> bool) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            {
+                let parser = self.screen.lock().expect("screen mutex poisoned");
+                if predicate(parser.screen()) {
+                    return;
+                }
+            }
+            if Instant::now() >= deadline {
+                let dump = self.screen_contents();
+                panic!(
+                    "wait_until timed out after {timeout:?}\n\
+                     bytes read from pty so far: {}\n\
+                     --- screen contents ---\n{dump}\n--- end screen contents ---",
+                    self.bytes_read.load(Ordering::SeqCst),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Convenience for the common case: wait until `text` appears anywhere
+    /// on screen, with [`DEFAULT_WAIT`].
+    pub fn wait_for_text(&self, text: &str) {
+        self.wait_until(DEFAULT_WAIT, |screen| screen.contents().contains(text));
+    }
+
+    /// A snapshot of the current screen contents, for ad hoc assertions
+    /// that don't fit `wait_for_text`'s "just wait for a substring" shape.
+    pub fn screen_contents(&self) -> String {
+        self.screen
+            .lock()
+            .expect("screen mutex poisoned")
+            .screen()
+            .contents()
+    }
+
+    /// Runs `f` against the current parsed screen — for assertions that
+    /// need [`vt100::Screen`]'s cell-level API (`cell`, `is_wide`,
+    /// `underline`, ...), which a plain string snapshot can't answer. See
+    /// `support::screen` for ready-made readers built on this.
+    pub fn with_screen<T>(&self, f: impl FnOnce(&vt100::Screen) -> T) -> T {
+        let parser = self.screen.lock().expect("screen mutex poisoned");
+        f(parser.screen())
+    }
+
+    /// Waits for the child to exit (typically after sending `q`) and
+    /// returns its [`std::process::ExitStatus`]. Panics with the current
+    /// screen contents if it hasn't exited within `timeout` — a session
+    /// that doesn't quit on `q` is exactly the kind of hang this harness
+    /// exists to catch, not something to wait out silently.
+    pub fn wait_exit(&mut self, timeout: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait failed") {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let dump = self.screen_contents();
+                panic!(
+                    "ktmr did not exit within {timeout:?}\n--- screen contents ---\n{dump}\n--- end screen contents ---"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// The one place any byte ever gets written to the pty master — both the
+/// reader thread's reactive probe reply and every [`Harness::send`] call
+/// funnel through this, serialized by `lock`, so two writers can never
+/// interleave their bytes on the wire.
+fn write_locked(pty: &Pty, lock: &Mutex<()>, bytes: &[u8]) {
+    let _guard = lock.lock().expect("pty write lock poisoned");
+    let mut writer: &Pty = pty;
+    writer
+        .write_all(bytes)
+        .expect("failed to write to pty master");
+    writer.flush().expect("failed to flush pty master");
+}
+
+/// Drains the pty master into `screen` for the harness's whole lifetime,
+/// watching the raw byte stream for the kitty-keyboard-protocol probe and
+/// answering it inline the moment it appears (see [`PROBE_QUERY`] and
+/// [`KittyMode::probe_reply`]) — reactively, never preemptively, so a
+/// terminal that never asked never gets an unsolicited reply sitting in its
+/// input buffer ahead of whatever a test sends next.
+fn spawn_reader_thread(
+    pty: Arc<Pty>,
+    write_lock: Arc<Mutex<()>>,
+    screen: Arc<Mutex<Parser>>,
+    bytes_read: Arc<AtomicUsize>,
+    kitty_mode: KittyMode,
+) -> JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        // Bytes seen so far that might be the start of `PROBE_QUERY` split
+        // across two reads — bounded to the query's own length, since a
+        // genuine split can never leave more than that unmatched.
+        let mut tail: Vec<u8> = Vec::with_capacity(PROBE_QUERY.len());
+        let mut probe_answered = false;
+
+        loop {
+            let mut reader: &Pty = &pty;
+            let n = match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break, // child's pts side closed: session over
+                Ok(n) => n,
+            };
+            let chunk = &buf[..n];
+
+            screen.lock().expect("screen mutex poisoned").process(chunk);
+            bytes_read.fetch_add(n, Ordering::SeqCst);
+
+            if !probe_answered {
+                tail.extend_from_slice(chunk);
+                if find_subslice(&tail, PROBE_QUERY).is_some() {
+                    write_locked(&pty, &write_lock, kitty_mode.probe_reply());
+                    probe_answered = true;
+                    tail.clear();
+                } else if tail.len() > PROBE_QUERY.len() {
+                    let drop = tail.len() - PROBE_QUERY.len();
+                    tail.drain(0..drop);
+                }
+            }
+        }
+    })
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+impl Drop for Harness {
+    /// Guarantees no zombie `ktmr` process and no stuck reader thread
+    /// survives a test, whether it finished cleanly or panicked partway
+    /// through: kill (a no-op if it already exited via `q`), reap, then join
+    /// the reader thread — which unblocks on its own the moment the child's
+    /// pts side closes (see the loop in [`spawn_reader_thread`]), so this
+    /// never hangs waiting for it.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}

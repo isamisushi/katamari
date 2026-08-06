@@ -11,8 +11,8 @@ run = "cargo test"
 description = "Run unit and integration tests"
 
 [tasks.lint]
-run = "cargo clippy -- -D warnings"
-description = "Lint with clippy"
+run = "cargo clippy --all-targets -- -D warnings"
+description = "Lint with clippy (including tests/)"
 
 [tasks.fmt]
 run = "cargo fmt"
@@ -21,3 +21,11 @@ description = "Format code"
 [tasks.run]
 run = "cargo run --bin katamari --"
 description = "Run katamari"
+
+[tasks.e2e]
+run = "cargo test --test e2e"
+description = "Run the PTY-driven E2E suite (tests/e2e.rs) against the real ktmr binary"
+
+[tasks."e2e-tmux"]
+run = ["cargo build --bin ktmr", "scripts/e2e-tmux.sh"]
+description = "Real-terminal (tmux) smoke test of the kitty-protocol fallback"
