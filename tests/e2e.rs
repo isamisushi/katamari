@@ -27,5 +27,7 @@ mod navigation;
 mod rendering;
 #[path = "e2e/scope_menu.rs"]
 mod scope_menu;
+#[path = "e2e/update_check.rs"]
+mod update_check;
 #[path = "e2e/wrap.rs"]
 mod wrap;

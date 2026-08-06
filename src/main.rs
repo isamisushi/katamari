@@ -7,6 +7,7 @@ mod highlight;
 mod keymap;
 mod lsp;
 mod ui;
+mod update;
 mod vcs;
 mod watch;
 

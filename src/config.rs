@@ -83,6 +83,14 @@ pub struct Config {
     /// instead of being threaded as parameters.
     pub wrap: bool,
     pub debounce_ms: u64,
+    /// `[update] check` — whether a TUI session ever looks for a newer
+    /// katamari release: both the once-a-day background GitHub check
+    /// ([`crate::update::on_startup`]) and the notices sourced from its
+    /// cache (the startup status-bar note, the on-quit stderr line).
+    /// `false` disables both entirely — no request is ever made, no cache
+    /// file is ever read or written. Defaults to `true`, matching gh CLI's
+    /// own opt-out-not-opt-in default.
+    pub update_check: bool,
 }
 
 impl Default for Config {
@@ -96,6 +104,7 @@ impl Default for Config {
             highlight_max_lines: DEFAULT_HIGHLIGHT_MAX_LINES,
             wrap: true,
             debounce_ms: DEFAULT_DEBOUNCE_MS,
+            update_check: true,
         }
     }
 }
@@ -118,6 +127,7 @@ struct RawFile {
     lsp: Option<RawLsp>,
     ui: Option<RawUi>,
     watch: Option<RawWatch>,
+    update: Option<RawUpdate>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -141,11 +151,18 @@ struct RawWatch {
     debounce_ms: Option<u64>,
 }
 
-const TOP_LEVEL_KEYS: &[&str] = &["keymap", "keys", "lsp", "ui", "watch"];
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawUpdate {
+    check: Option<bool>,
+}
+
+const TOP_LEVEL_KEYS: &[&str] = &["keymap", "keys", "lsp", "ui", "watch", "update"];
 const LSP_KEYS: &[&str] = &["servers", "auto_install"];
 const SERVER_KEYS: &[&str] = &["command", "args"];
 const UI_KEYS: &[&str] = &["tab_width", "highlight_max_lines", "wrap"];
 const WATCH_KEYS: &[&str] = &["debounce_ms"];
+const UPDATE_KEYS: &[&str] = &["check"];
 
 /// Merges `overlay`'s present fields onto `base`, in place — the field-level
 /// (not whole-file) precedence rule the module docs describe: a file that
@@ -185,6 +202,12 @@ fn merge_raw(base: &mut RawFile, overlay: RawFile) {
         let base_watch = base.watch.get_or_insert_with(RawWatch::default);
         if overlay_watch.debounce_ms.is_some() {
             base_watch.debounce_ms = overlay_watch.debounce_ms;
+        }
+    }
+    if let Some(overlay_update) = overlay.update {
+        let base_update = base.update.get_or_insert_with(RawUpdate::default);
+        if overlay_update.check.is_some() {
+            base_update.check = overlay_update.check;
         }
     }
 }
@@ -284,6 +307,9 @@ fn warn_unknown_keys(path: &Path, table: &toml::Table) {
     if let Some(watch) = table.get("watch").and_then(toml::Value::as_table) {
         warn_extra(path, "watch.", watch, WATCH_KEYS);
     }
+    if let Some(update) = table.get("update").and_then(toml::Value::as_table) {
+        warn_extra(path, "update.", update, UPDATE_KEYS);
+    }
 }
 
 fn warn_extra(
@@ -316,6 +342,7 @@ fn finalize(raw: RawFile) -> Config {
     let ui = raw.ui.unwrap_or_default();
     let watch = raw.watch.unwrap_or_default();
     let lsp = raw.lsp.unwrap_or_default();
+    let update = raw.update.unwrap_or_default();
     Config {
         keymap,
         key_overrides: raw.keys.unwrap_or_default(),
@@ -327,6 +354,7 @@ fn finalize(raw: RawFile) -> Config {
             .unwrap_or(DEFAULT_HIGHLIGHT_MAX_LINES),
         wrap: ui.wrap.unwrap_or(true),
         debounce_ms: watch.debounce_ms.unwrap_or(DEFAULT_DEBOUNCE_MS),
+        update_check: update.check.unwrap_or(true),
     }
 }
 
@@ -602,6 +630,24 @@ mod tests {
         // set elsewhere — same field-level merge guarantee every other
         // section gets.
         assert!(config.lsp_servers.is_empty());
+    }
+
+    #[test]
+    fn update_check_defaults_to_true() {
+        let repo = fixture_repo();
+        assert!(load_merged(&repo).update_check);
+    }
+
+    #[test]
+    fn update_check_can_be_disabled_explicitly() {
+        let repo = fixture_repo();
+        write_repo_config(&repo, "[update]\ncheck = false\n");
+        let config = load_merged(&repo);
+        assert!(!config.update_check);
+        // Disabling the update check doesn't reset an unrelated section
+        // back to its default — same field-level merge guarantee every
+        // other section gets.
+        assert_eq!(config.tab_width, DEFAULT_TAB_WIDTH);
     }
 
     #[test]

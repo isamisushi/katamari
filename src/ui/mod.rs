@@ -57,6 +57,7 @@ use crate::ui::scope_menu::{
     RevisionInputOutcome, ScopeMenuEntry, ScopeMenuState, handle_revision_key,
 };
 use crate::ui::timeline_view::TimelineView;
+use crate::update;
 use crate::vcs::DiffSource;
 use crate::vcs::LogBackend;
 use crate::vcs::git::GitSource;
@@ -196,6 +197,19 @@ pub fn run(
     config: &Config,
 ) -> Result<()> {
     install_panic_hook();
+
+    // Every TUI session (this function, called only from `run_diff`/
+    // `run_open`/`run_timeline`/`run_log` — never from `--dump`, a hidden
+    // plumbing subcommand, or `ktmr comments`) is where a background update
+    // check belongs: cheap (a small file read, and a detached background
+    // thread if the cache is stale — see `update::on_startup`'s docs), so
+    // it runs before the terminal is even touched. `available_update` is
+    // sourced entirely from whatever was already cached before this call;
+    // it's read once here and reused for both the startup status note below
+    // and the on-quit stderr line, so the two agree within one session even
+    // if a background refresh completes in between.
+    let available_update = update::on_startup(config.update_check);
+
     let mut terminal = init_terminal()?;
 
     // Must happen before `spawn_input_thread` below starts its own
@@ -263,7 +277,13 @@ pub fn run(
     // `watch::spawn_comments_watcher`.
     let (comments_repo_root, initial_comments, comments_startup_status) =
         start_comments(stack.top(), app_tx);
-    let startup_status = startup_status.or(comments_startup_status);
+    // Lowest priority of the three: an available-update notice is
+    // informational, never a problem report the way a failed watcher or a
+    // capped warm-up is, so it only shows when nothing more actionable
+    // claimed this session's one startup status slot.
+    let startup_status = startup_status
+        .or(comments_startup_status)
+        .or(available_update.as_ref().map(update::status_bar_notice));
 
     let result = event_loop(
         &mut terminal,
@@ -291,6 +311,15 @@ pub fn run(
     // this). Runs after the terminal is already restored so this brief,
     // bounded wait doesn't leave the user staring at a frozen screen.
     lsp_manager.shutdown_all();
+
+    // A normal quit only — a session that exited via an `Err` already has
+    // something more important to report (and `main` prints that), and
+    // isn't the "you're about to walk away, here's a heads-up" moment this
+    // line is for. Silent unless stderr is a real terminal — see
+    // `update::print_exit_notice`'s docs.
+    if result.is_ok() {
+        update::print_exit_notice(available_update.as_ref());
+    }
 
     result
 }

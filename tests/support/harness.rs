@@ -57,6 +57,17 @@ pub struct SpawnOptions {
     pub rows: u16,
     pub kitty_mode: KittyMode,
     pub args: Vec<&'static str>,
+    /// Pre-seeds `$XDG_STATE_HOME/katamari/update-check.json` with this
+    /// exact JSON text before the child ever starts, overriding
+    /// [`spawn`](Harness::spawn)'s own default seed — for a test that needs
+    /// a specific fabricated cache (e.g. a newer `latest_version`, to make
+    /// the status-bar notice appear). `None` (the default) leaves `spawn`'s
+    /// own seeding in place: a cache stamped "just checked, nothing newer,"
+    /// so `update::on_startup`'s staleness check never spawns a real
+    /// background request against the actual GitHub API — see
+    /// [`spawn`](Harness::spawn)'s docs on why that matters for every test
+    /// in this suite, not just the ones about the update check itself.
+    pub update_state_json: Option<String>,
 }
 
 impl Default for SpawnOptions {
@@ -66,6 +77,7 @@ impl Default for SpawnOptions {
             rows: 30,
             kitty_mode: KittyMode::Supported,
             args: Vec::new(),
+            update_state_json: None,
         }
     }
 }
@@ -83,9 +95,10 @@ pub const DEFAULT_WAIT: Duration = Duration::from_secs(3);
 /// Drives one `ktmr` session through a PTY. Owns the child process, the PTY
 /// master, a background thread that continuously drains it into a
 /// [`vt100::Parser`], and a per-test `$HOME` (plus `$XDG_CONFIG_HOME`/
-/// `$XDG_DATA_HOME`) tempdir the child's environment points at, so the real
-/// `~/.config/katamari` and the katamari-managed LSP install prefix are
-/// never touched by a test run.
+/// `$XDG_DATA_HOME`/`$XDG_STATE_HOME`) tempdir the child's environment
+/// points at, so the real `~/.config/katamari`, the katamari-managed LSP
+/// install prefix, and the update-check state file are never touched by a
+/// test run.
 pub struct Harness {
     pty: Arc<Pty>,
     write_lock: Arc<Mutex<()>>,
@@ -116,11 +129,41 @@ impl Harness {
     /// test sends via [`Harness::send`] is sent only once that window has
     /// definitely closed — test bodies never have to think about the race
     /// themselves.
+    ///
+    /// Also always seeds `$XDG_STATE_HOME/katamari/update-check.json` before
+    /// the child starts — with `opts.update_state_json` if a test supplied
+    /// one, otherwise with a cache stamped "checked right now, nothing
+    /// newer than this build." Without that default seed, `update::on_startup`
+    /// would see no cache at all in a fresh per-test `$HOME` and treat that
+    /// exactly like a stale one: spawning a real background thread that
+    /// hits the actual GitHub API from every single test in this suite,
+    /// however unrelated to the update check, which is both a real network
+    /// dependency this suite must never have (see `support::fixture`'s
+    /// module docs) and — even fire-and-forget — enough concurrent
+    /// DNS/TLS work under `cargo test`'s default parallelism to make
+    /// timing-sensitive assertions elsewhere in the suite flaky.
     pub fn spawn(cwd: &Path, opts: SpawnOptions) -> Harness {
         let env_home = tempfile::Builder::new()
             .prefix("katamari-e2e-home-")
             .tempdir()
             .expect("failed to create per-test $HOME tempdir");
+
+        let state_home = env_home.path().join("state");
+        let update_state_json = opts.update_state_json.clone().unwrap_or_else(|| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before the epoch")
+                .as_secs();
+            format!(
+                r#"{{"last_checked":{now},"latest_version":"{}"}}"#,
+                env!("CARGO_PKG_VERSION")
+            )
+        });
+        let state_dir = state_home.join("katamari");
+        std::fs::create_dir_all(&state_dir)
+            .expect("failed to create fixture $XDG_STATE_HOME/katamari dir");
+        std::fs::write(state_dir.join("update-check.json"), update_state_json)
+            .expect("failed to write fixture update-check.json");
 
         let (pty, pts) = open().expect("failed to allocate a pty");
         pty.resize(Size::new(opts.rows, opts.cols))
@@ -134,6 +177,7 @@ impl Harness {
             .env("HOME", env_home.path())
             .env("XDG_CONFIG_HOME", env_home.path().join("config"))
             .env("XDG_DATA_HOME", env_home.path().join("data"))
+            .env("XDG_STATE_HOME", state_home)
             .spawn(pts)
             .expect("failed to spawn ktmr in a pty");
 

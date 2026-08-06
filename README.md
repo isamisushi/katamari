@@ -257,6 +257,16 @@ wrap = true
 # Debounce window for `--watch`: how long a burst of filesystem changes
 # must go quiet before the diff refreshes. Milliseconds, default 200.
 debounce_ms = 200
+
+[update]
+# Whether ktmr looks for a newer release: a once-a-day background check
+# (never on the critical path — it can't slow a session down or block on a
+# flaky network) against GitHub, plus the notices sourced from its cached
+# result — a status-bar note at startup and a one-line "vX.Y.Z is
+# available — <upgrade command>" hint on stderr when you quit, printed only
+# if stderr is a real terminal. Default true; false disables both the
+# request and the notices entirely.
+check = true
 ```
 
 ## Language servers
