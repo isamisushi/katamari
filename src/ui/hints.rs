@@ -283,6 +283,26 @@ pub fn timeline_view_items(keymap: &Keymap) -> Vec<HintItem> {
     .collect()
 }
 
+/// [`View::Log`](crate::ui::View::Log)'s curated hints. No jump item, the
+/// same reason [`timeline_view_items`] has none — a read-only history list
+/// has nowhere for `Ctrl-o`/`Ctrl-i` to retrace from (see
+/// `View::jump_entry`'s docs).
+pub fn log_view_items(keymap: &Keymap) -> Vec<HintItem> {
+    [
+        HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "select"),
+        HintItem::for_actions(keymap, &[Action::Confirm], "open diff"),
+        HintItem::for_actions(keymap, &[Action::ToggleRangeSelect], "range"),
+        HintItem::for_actions(
+            keymap,
+            &[Action::Quit, Action::Cancel, Action::ToggleLogView],
+            "close",
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

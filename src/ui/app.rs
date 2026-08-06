@@ -72,6 +72,29 @@ pub struct App {
     /// turning inline bodies off is purely about screen real estate on a
     /// heavily annotated diff, not about hiding that comments exist at all.
     pub comments_visible: bool,
+    /// Whether this diff's content is trusted to match what's live on disk
+    /// right now — `true` for everything M1 through M10 ever produced (the
+    /// working tree, staged changes, a git range/single-revision diff), and
+    /// the default. `false` for M11's revision diffs opened via `ktmr diff
+    /// -r`/`--from`/`--to` or from [`crate::ui::log_view::LogView`] (every
+    /// row except its git-only "local changes" one): an arbitrary jj
+    /// revset or historical commit can point at content from long before
+    /// the file's current on-disk state, so a hover/goto-definition/
+    /// find-references request against it would be asking a language
+    /// server about a position that may no longer mean anything — the same
+    /// reasoning [`crate::ui::timeline_view::TimelineView::hover_query`]
+    /// already applies to every snapshot in the jj op-log timeline,
+    /// generalized here into a per-`App` flag so a revision diff can reuse
+    /// it without also reusing `TimelineView`'s nested-pane shape (see
+    /// [`Self::hover_query`]).
+    pub interactive: bool,
+    /// A short, human-readable description of what's being diffed, shown in
+    /// the status bar next to the repo name — `None` for the ordinary
+    /// working-tree/staged/range diffs that need no explanation beyond the
+    /// repo they're in, `Some("r: <id>")`/`Some("<from>..<to>")` for a
+    /// revision diff, where it's the only thing on screen that says which
+    /// revision(s) are being compared.
+    pub scope_label: Option<String>,
     viewport_height: usize,
 }
 
@@ -94,6 +117,8 @@ impl App {
             should_quit: false,
             watch_mode: false,
             comments_visible: true,
+            interactive: true,
+            scope_label: None,
             viewport_height: 1,
         }
     }
@@ -137,6 +162,9 @@ impl App {
     /// header, a `Del` line, a deleted/binary file) or the row has no
     /// identifier-like token to target.
     pub fn hover_query(&self) -> Option<HoverQuery> {
+        if !self.interactive {
+            return None;
+        }
         let RenderRow::Line {
             file_idx,
             hunk_idx,
@@ -286,11 +314,12 @@ impl App {
             | Action::JumpForward
             | Action::AddComment
             | Action::Confirm => {}
-            // `ui::mod` intercepts `ToggleTimeline` before it reaches here
-            // (constructing/tearing down a `TimelineView` isn't a pure state
-            // transition); `ToggleRangeSelect` only means something inside
-            // `TimelineView` itself.
-            Action::ToggleTimeline | Action::ToggleRangeSelect => {}
+            // `ui::mod` intercepts `ToggleTimeline`/`ToggleLogView` before
+            // they reach here (constructing/tearing down a `TimelineView`/
+            // `LogView` isn't a pure state transition); `ToggleRangeSelect`
+            // only means something inside `TimelineView`/`LogView`
+            // themselves.
+            Action::ToggleTimeline | Action::ToggleLogView | Action::ToggleRangeSelect => {}
             Action::Quit => self.should_quit = true,
         }
         if self.cursor != cursor_before {
@@ -563,6 +592,20 @@ mod tests {
             app.update(Action::CursorDown);
         }
         // Row 3 is the "-fn old_name() {}" del line — nothing to hover.
+        assert_eq!(app.hover_query(), None);
+    }
+
+    #[test]
+    fn hover_query_is_none_on_a_non_interactive_app_even_on_an_eligible_row() {
+        let mut app = test_app();
+        app.interactive = false;
+        app.update(Action::Top);
+        for _ in 0..4 {
+            app.update(Action::CursorDown);
+        }
+        // Same otherwise-hover-eligible add row as
+        // `hover_query_targets_the_active_symbol_on_an_add_row` — only
+        // `interactive` differs.
         assert_eq!(app.hover_query(), None);
     }
 

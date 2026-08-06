@@ -52,6 +52,32 @@ ktmr diff <a>..<b>     # a revision range
 ktmr diff --watch      # refresh automatically as files change on disk
 ```
 
+In a colocated jj repository (see [jj colocated setup](#jj-colocated-setup)),
+`ktmr diff` also takes jj revsets, matching `jj diff`'s own flags so jj
+muscle memory transfers directly:
+
+```
+ktmr diff -r <revset>          # one change's own diff, e.g. -r @ or -r @-
+ktmr diff --from <a> --to <b>  # diff between two revisions
+ktmr diff --from <a>           # --to defaults to @, like `jj diff` itself
+```
+
+`-r`/`--from`/`--to` are mutually exclusive with each other, with the plain
+git revision/range argument, and with `--staged`/`--watch` — a revision diff
+shows historical content, not necessarily what's on disk right now, so
+hover/go-to-definition/find-references are unavailable on it (the status bar
+names the scope being shown, e.g. `r: <id>` or `<from>..<to>`, so this is
+never ambiguous on screen).
+
+`ktmr log` opens a browsable revision history instead of a single diff: jj
+changes (including the working copy, `@`, as a real entry) in a colocated jj
+repo, or `git log` commits — plus a synthetic "local changes" row while the
+working tree is dirty — otherwise. `j`/`k` select, `Enter` opens the
+selected revision's diff (the local-changes row opens the same interactive
+working-tree diff a plain `ktmr diff` would), `v` starts a 2-point range
+selection (a second `Enter` diffs between the two), `q`/`Esc` closes. Also
+reachable mid-session from `ktmr diff` with `L`.
+
 Inside the diff: `K` hovers the identifier under the cursor, `gd`/`gr` go
 to its definition/references, `]d`/`[d` jump between diagnostics. Language
 servers spawn lazily, the first time something asks, and auto-install
@@ -102,7 +128,8 @@ below) for the emacs column. `q` quits either way.
 | Toggle sidebar | `b` | `b` |
 | Toggle unified/side-by-side | `s` | `s` |
 | Toggle timeline | `t` | `t` |
-| Toggle range-select (timeline) | `v` | `C-Space` |
+| Toggle log view | `L` | `L` |
+| Toggle range-select (timeline/log) | `v` | `C-Space` |
 | Add comment | `c` | `C-c C-c` |
 | Toggle inline comment bodies | `C` | `C` |
 | Quit | `q` | `q` |
@@ -230,7 +257,11 @@ jj git init --colocate
 That's it: jj now tracks the same working copy as git (a `.jj` directory
 appears alongside `.git`), and every save creates a new jj operation
 katamari's timeline can show. Nothing about `ktmr diff` changes if jj
-isn't set up — the timeline (`t`) simply reports it's unavailable.
+isn't set up — the timeline (`t`) simply reports it's unavailable. `ktmr
+diff -r`/`--from`/`--to` and `ktmr log`'s jj-backed history need this same
+colocated setup; `ktmr log` still works without it (falling back to plain
+`git log`), just without jj's revsets or the working copy as a browsable
+entry.
 
 ## Development
 

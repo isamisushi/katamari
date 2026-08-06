@@ -29,6 +29,11 @@ pub enum Key {
     /// as legacy `Ctrl-i` in [`KittyMode::Unsupported`] — that collision is
     /// the exact thing under test there.
     Tab,
+    /// Enter / `Action::Confirm` — `0x0D` (carriage return), the byte a
+    /// real terminal sends for the Enter key and what crossterm's legacy
+    /// parser recognizes as `KeyCode::Enter` in both kitty modes, so this
+    /// has a single encoding regardless of `KittyMode`.
+    Enter,
     /// A plain character, sent as its raw UTF-8 bytes.
     Char(char),
 }
@@ -51,6 +56,7 @@ impl Key {
             Key::CtrlT => vec![0x14],
             Key::CtrlO => vec![0x0f],
             Key::Tab => vec![0x09],
+            Key::Enter => vec![0x0d],
             Key::Char(c) => {
                 let mut buf = [0u8; 4];
                 c.encode_utf8(&mut buf).as_bytes().to_vec()

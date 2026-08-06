@@ -19,6 +19,7 @@ pub mod diff_view;
 pub mod file_view;
 pub mod hints;
 pub mod hover_popup;
+pub mod log_view;
 pub mod navigation;
 pub mod refresh;
 pub mod refs_panel;
@@ -48,10 +49,12 @@ use crate::lsp::{
     ServerEvent, parse_publish_diagnostics, progress_status_text,
 };
 use crate::ui::compose::{ComposeOutcome, ComposeState};
+use crate::ui::log_view::LogView;
 use crate::ui::navigation::{JumpEntry, JumpStack, navigate_to};
 use crate::ui::refs_panel::RefsPanel;
 use crate::ui::timeline_view::TimelineView;
 use crate::vcs::DiffSource;
+use crate::vcs::LogBackend;
 use crate::vcs::git::GitSource;
 use crate::vcs::jj::{self, JjRepo};
 use crate::watch::{self, WatchSignal};
@@ -390,10 +393,10 @@ fn warm_up_root(view: &View, lsp_manager: &LspManager) -> Option<String> {
             None
         }
         // Read-only and LSP-free by design (see `TimelineView::hover_query`'s
-        // docs) — a timeline session, whether reached via `ktmr timeline` or
-        // by toggling from the root diff, has nothing for `LspManager` to
-        // warm up.
-        View::Timeline(_) => None,
+        // / `LogView::hover_query`'s docs) — a timeline or log session,
+        // whether reached via `ktmr timeline`/`ktmr log` or by toggling from
+        // the root diff, has nothing for `LspManager` to warm up.
+        View::Timeline(_) | View::Log(_) => None,
     }
 }
 
@@ -544,6 +547,11 @@ fn event_loop(
                 let status_height =
                     hints::required_height(&hints::timeline_view_items(keymap), area.width);
                 timeline_view::layout(area, status_height).diff.height
+            }
+            View::Log(_) => {
+                let status_height =
+                    hints::required_height(&hints::log_view_items(keymap), area.width);
+                log_view::layout(area, status_height).list.height
             }
         };
         stack.top_mut().set_viewport_height(content_height as usize);
@@ -948,7 +956,7 @@ fn handle_action(
                 Some((file, line)) => *compose = Some(ComposeState::new(file, line)),
                 None => *goto_status = Some("comment: nothing to annotate on this row".to_owned()),
             },
-            View::File(_) | View::Timeline(_) => {
+            View::File(_) | View::Timeline(_) | View::Log(_) => {
                 *goto_status = Some("comment: only available in the diff view".to_owned());
             }
         },
@@ -994,10 +1002,44 @@ fn handle_action(
                     *goto_status = Some("jj not detected — timeline unavailable".to_owned());
                 }
             },
-            // The timeline only relates to the root diff; a `FileView`
-            // pushed on top of it (via goto-definition) has nothing for
-            // `t` to open.
-            View::File(_) => {}
+            // The timeline only relates to the root diff; a `FileView`/
+            // `LogView` pushed on top of it (via goto-definition or `L`)
+            // has nothing for `t` to open.
+            View::File(_) | View::Log(_) => {}
+        },
+        // Unlike `ToggleTimeline`, there's no "jj not detected" failure
+        // mode: `LogBackend::detect` always has *something* to open (jj
+        // history if colocated, plain `git log` otherwise), since every
+        // repository `ktmr` runs in is a git repository first.
+        Action::ToggleLogView => match stack.top_mut() {
+            View::Log(log) => log.should_quit = true, // closes back to the diff
+            View::Diff(app) => {
+                let backend = LogBackend::detect(&app.repo_root);
+                match LogView::new(backend, log_view::DEFAULT_LOG_LIMIT) {
+                    Ok(log) => stack.push(View::Log(log)),
+                    Err(e) => *goto_status = Some(format!("log: {e}")),
+                }
+            }
+            View::File(_) | View::Timeline(_) => {}
+        },
+        Action::Confirm => match stack.top_mut() {
+            // Computing the diff is a real backend call that can fail, so
+            // `LogView::confirm` is called directly here rather than
+            // forwarded through `View::update` — see `log_view`'s module
+            // docs on why `Action::Confirm` is deliberately absent from
+            // `LogView::update`'s own match.
+            View::Log(log) => match log.confirm() {
+                Ok(Some(app)) => stack.push(View::Diff(app)),
+                Ok(None) => {} // empty list, or a blocked range — see `LogView::confirm`
+                Err(e) => *goto_status = Some(format!("log: {e}")),
+            },
+            _ => {
+                let before = stack.top().hover_cursor_key();
+                stack.top_mut().update(action);
+                if stack.top().hover_cursor_key() != before {
+                    hover_state.invalidate();
+                }
+            }
         },
         other => {
             let before = stack.top().hover_cursor_key();
@@ -1282,6 +1324,10 @@ fn draw(
         View::Timeline(timeline) => {
             let area = frame.area();
             timeline_view::render(frame, area, timeline, highlighter, keymap);
+        }
+        View::Log(log) => {
+            let area = frame.area();
+            log_view::render(frame, area, log, keymap);
         }
     }
 }

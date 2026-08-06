@@ -1,4 +1,4 @@
-use super::DiffSource;
+use super::{DiffSource, LogEntry, RevisionEntry};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15,7 +15,10 @@ const EMPTY_TREE_OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /// A [`DiffSource`] backed by an installed `git` binary invoked as a
 /// subprocess. Holds nothing but the resolved repository root, so it stays
-/// cheap to construct and safe to recreate per command.
+/// cheap to construct and safe to recreate per command — [`Clone`] for the
+/// same reason [`super::jj::JjRepo`] is: [`super::LogBackend`] and any
+/// [`crate::ui::log_view::LogView`] it hands to need their own owned copy.
+#[derive(Clone)]
 pub struct GitSource {
     repo_root: PathBuf,
 }
@@ -47,6 +50,24 @@ impl GitSource {
         Ok(Self {
             repo_root: PathBuf::from(root),
         })
+    }
+
+    /// Builds a [`GitSource`] directly from an already-known repository
+    /// root, bypassing [`Self::discover`]'s own `git rev-parse` call — for
+    /// callers (like [`super::LogBackend::detect`]) that already resolved
+    /// the root some other way and would otherwise pay for the same lookup
+    /// twice. `repo_root` is trusted as-is; an invalid one surfaces the same
+    /// way it always would, the first time a command actually runs against
+    /// it.
+    pub fn at(repo_root: PathBuf) -> Self {
+        Self { repo_root }
+    }
+
+    /// The repository root this instance was resolved against — infallible,
+    /// unlike [`DiffSource::repo_root`] (which exists to satisfy that
+    /// trait's signature and just clones this).
+    pub fn repo_root_path(&self) -> &Path {
+        &self.repo_root
     }
 
     /// A `git` invocation rooted at this repository, with path quoting
@@ -171,6 +192,123 @@ impl GitSource {
         String::from_utf8(output.stdout)
             .with_context(|| format!("git diff produced non-UTF-8 output for {}", path.display()))
     }
+
+    /// How many files the working tree touches versus the review baseline —
+    /// tracked changes plus untracked files, the same two-part definition
+    /// [`Self::working_tree_diff`] uses, but computed via `git diff
+    /// --name-only` (a path listing, not full patch text) instead of that
+    /// method's per-file diffing — cheap enough to run just to decide
+    /// whether [`Self::log`]'s synthetic "local changes" row exists at all,
+    /// and to label it with a count, without paying for the patches
+    /// themselves until a reviewer actually opens it.
+    fn working_tree_change_count(&self) -> Result<usize> {
+        let baseline = self.baseline()?;
+        let output = self
+            .git_command()
+            .args(["diff", "--name-only", &baseline])
+            .output()
+            .context("failed to run `git diff --name-only`")?;
+        if !output.status.success() {
+            bail!(
+                "git diff --name-only failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let text = String::from_utf8(output.stdout)
+            .context("git diff --name-only produced non-UTF-8 output")?;
+        let tracked = text.lines().filter(|l| !l.is_empty()).count();
+        Ok(tracked + self.untracked_files()?.len())
+    }
+
+    /// Field separator for [`Self::log`]'s `git log --format` template —
+    /// ASCII Unit Separator, the same choice [`super::jj::JjRepo`]'s op-log
+    /// template makes and for the same reason: it can't appear in a commit
+    /// subject typed as ordinary text.
+    const LOG_FIELD_SEP: &'static str = "\u{1f}";
+
+    /// `ktmr log`'s git-backed history: the synthetic
+    /// [`LogEntry::LocalChanges`] row first (only when the working tree is
+    /// actually dirty — see [`Self::working_tree_change_count`]), then up to
+    /// `limit` commits reachable from `HEAD`, newest first. A repository
+    /// with no commits yet reports an empty commit list rather than letting
+    /// `git log` fail outright (it errors on a branch with no history) —
+    /// still combined with a local-changes row if there's untracked/staged
+    /// content to show even before the first commit.
+    pub fn log(&self, limit: usize) -> Result<Vec<LogEntry>> {
+        let mut entries = Vec::new();
+        let changed = self.working_tree_change_count()?;
+        if changed > 0 {
+            entries.push(LogEntry::LocalChanges {
+                changed_files: changed,
+            });
+        }
+
+        if !self.rev_exists("HEAD")? {
+            return Ok(entries);
+        }
+
+        let template = format!(
+            "%H{sep}%h{sep}%an{sep}%at{sep}%D{sep}%s",
+            sep = Self::LOG_FIELD_SEP
+        );
+        let output = self
+            .git_command()
+            .args(["log", "--no-color", "-n", &limit.to_string()])
+            .arg(format!("--format={template}"))
+            .output()
+            .context("failed to run `git log`")?;
+        if !output.status.success() {
+            bail!(
+                "git log failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let text = String::from_utf8(output.stdout).context("git log produced non-UTF-8 output")?;
+        entries.extend(parse_git_log(&text).into_iter().map(LogEntry::Revision));
+        Ok(entries)
+    }
+}
+
+/// Parses [`GitSource::log`]'s raw, `\x1f`-field-separated `git log --format`
+/// output into [`RevisionEntry`]s — a pure function so the format string and
+/// its parsing stay verifiably in sync without a real git process (see this
+/// module's tests).
+fn parse_git_log(text: &str) -> Vec<RevisionEntry> {
+    text.lines().filter_map(parse_git_log_line).collect()
+}
+
+fn parse_git_log_line(line: &str) -> Option<RevisionEntry> {
+    let mut fields = line.splitn(6, GitSource::LOG_FIELD_SEP);
+    let id = fields.next()?.to_owned();
+    let short_id = fields.next()?.to_owned();
+    let author = fields.next()?.to_owned();
+    let time_unix = fields.next()?.parse().ok()?;
+    let refs = parse_git_decoration(fields.next().unwrap_or_default());
+    let summary = fields.next().unwrap_or_default().to_owned();
+    Some(RevisionEntry {
+        id,
+        short_id,
+        summary,
+        author,
+        time_unix,
+        refs,
+        // A git commit is never itself the working copy — see
+        // `RevisionEntry::is_working_copy`'s docs.
+        is_working_copy: false,
+    })
+}
+
+/// Splits `git log --format=%D`'s decoration string (e.g. `"HEAD -> main,
+/// tag: v1, origin/main"`) into individual ref names, in the order git
+/// printed them. Kept exactly as git names them (`"HEAD -> main"` rather
+/// than just `"main"`, `"tag: v1"` rather than just `"v1"`) — display-only
+/// data, not something any call site parses back apart, so there's nothing
+/// to gain by stripping git's own labels.
+fn parse_git_decoration(raw: &str) -> Vec<String> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    raw.split(", ").map(|s| s.to_owned()).collect()
 }
 
 /// Where a [`GitSource::range_diff`] revspec sends the underlying `git
@@ -399,5 +537,100 @@ mod tests {
         let diff = source.range_diff("HEAD~1..HEAD").unwrap();
 
         assert!(diff.contains("+two"), "diff:\n{diff}");
+    }
+
+    // ---- parse_git_log / parse_git_decoration --------------------------
+
+    #[test]
+    fn parses_a_log_line_with_no_decoration() {
+        let sep = GitSource::LOG_FIELD_SEP;
+        let line = format!("aaaa111{sep}aaaa{sep}Test{sep}1780000000{sep}{sep}first commit");
+        let entries = parse_git_log(&line);
+        assert_eq!(
+            entries,
+            vec![RevisionEntry {
+                id: "aaaa111".to_owned(),
+                short_id: "aaaa".to_owned(),
+                summary: "first commit".to_owned(),
+                author: "Test".to_owned(),
+                time_unix: 1780000000,
+                refs: Vec::new(),
+                is_working_copy: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_a_log_line_with_bookmarks_and_a_tag() {
+        let sep = GitSource::LOG_FIELD_SEP;
+        let line = format!(
+            "bbbb222{sep}bbbb{sep}Test{sep}1780000001{sep}HEAD -> main, tag: v1{sep}second commit"
+        );
+        let entries = parse_git_log(&line);
+        assert_eq!(
+            entries[0].refs,
+            vec!["HEAD -> main".to_owned(), "tag: v1".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_line_missing_fields_is_skipped_rather_than_panicking() {
+        assert_eq!(parse_git_log("onlyonefield"), Vec::new());
+    }
+
+    #[test]
+    fn empty_log_text_parses_to_no_entries() {
+        assert_eq!(parse_git_log(""), Vec::new());
+    }
+
+    // ---- GitSource::log ---------------------------------------------------
+
+    #[test]
+    fn log_has_no_local_changes_row_when_the_working_tree_is_clean() {
+        let dir = init_repo();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        git(dir.path(), &["add", "a.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "first"]);
+
+        let source = GitSource::discover(dir.path()).unwrap();
+        let entries = source.log(10).unwrap();
+
+        assert_eq!(entries.len(), 1, "entries: {entries:?}");
+        assert!(matches!(&entries[0], LogEntry::Revision(r) if r.summary == "first"));
+    }
+
+    #[test]
+    fn log_prepends_a_local_changes_row_when_the_working_tree_is_dirty() {
+        let dir = init_repo();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        git(dir.path(), &["add", "a.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "first"]);
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\n").unwrap();
+        std::fs::write(dir.path().join("untracked.txt"), "new\n").unwrap();
+
+        let source = GitSource::discover(dir.path()).unwrap();
+        let entries = source.log(10).unwrap();
+
+        assert_eq!(entries.len(), 2, "entries: {entries:?}");
+        assert_eq!(entries[0], LogEntry::LocalChanges { changed_files: 2 });
+        assert!(matches!(&entries[1], LogEntry::Revision(r) if r.summary == "first"));
+    }
+
+    #[test]
+    fn log_on_a_repo_with_no_commits_yet_reports_no_revisions() {
+        let dir = init_repo();
+        let source = GitSource::discover(dir.path()).unwrap();
+        assert_eq!(source.log(10).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn log_on_a_repo_with_no_commits_yet_still_reports_local_changes() {
+        let dir = init_repo();
+        std::fs::write(dir.path().join("untracked.txt"), "new\n").unwrap();
+
+        let source = GitSource::discover(dir.path()).unwrap();
+        let entries = source.log(10).unwrap();
+
+        assert_eq!(entries, vec![LogEntry::LocalChanges { changed_files: 1 }]);
     }
 }

@@ -199,11 +199,11 @@ pub fn navigate_to(
 
     let root_row = match stack.root_mut() {
         View::Diff(app) => app.row_for_target(&target.file, target.line),
-        // The root view is never `Timeline` in practice — `ktmr timeline`'s
-        // root is a `Timeline`, but that entry point never calls
-        // `navigate_to` (no LSP, no jumps) — and `File` has no diff rows to
-        // target either way.
-        View::File(_) | View::Timeline(_) => None,
+        // The root view is never `Timeline`/`Log` in practice — `ktmr
+        // timeline`/`ktmr log`'s root is one of those, but neither entry
+        // point ever calls `navigate_to` (no LSP, no jumps) — and `File`
+        // has no diff rows to target either way.
+        View::File(_) | View::Timeline(_) | View::Log(_) => None,
     };
     if let Some(row_idx) = root_row {
         stack.pop_to_root();
@@ -309,9 +309,10 @@ impl View {
                         col,
                     })
             }
-            // Read-only, LSP-free — see `TimelineView::hover_query`'s docs
-            // — so there's nowhere a jump could return to.
-            View::Timeline(_) => None,
+            // Read-only, LSP-free — see `TimelineView::hover_query`'s /
+            // `LogView::hover_query`'s docs — so there's nowhere a jump
+            // could return to.
+            View::Timeline(_) | View::Log(_) => None,
         }
     }
 }

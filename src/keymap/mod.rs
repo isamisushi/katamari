@@ -90,6 +90,14 @@ pub enum Action {
     /// diff instead of one snapshot's diff against its immediate
     /// predecessor. A no-op in every other view.
     ToggleRangeSelect,
+    /// Opens [`crate::ui::log_view::LogView`] on top of the root diff, or
+    /// closes it back if it's already open — `ui::mod`'s event loop
+    /// intercepts this the same way it intercepts `ToggleTimeline`, since
+    /// picking a backend (jj vs git) and constructing the view aren't pure
+    /// state transitions. Unlike `ToggleTimeline`, this never fails to have
+    /// something to open: every repository `ktmr diff` can start in has
+    /// git history, jj or not.
+    ToggleLogView,
     /// Opens the M6 comment-compose overlay, anchored to the cursor's
     /// current row — `ui::mod`'s event loop intercepts this rather than
     /// forwarding it through `App::update`, since it needs the repo root
@@ -431,6 +439,7 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("BackTab", Action::PrevSymbol),
         ("Esc", Action::Cancel),
         ("t", Action::ToggleTimeline),
+        ("L", Action::ToggleLogView),
         ("v", Action::ToggleRangeSelect),
         ("c", Action::AddComment),
         ("C", Action::ToggleComments),
@@ -495,6 +504,7 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("BackTab", Action::PrevSymbol),
         ("Esc", Action::Cancel),
         ("t", Action::ToggleTimeline),
+        ("L", Action::ToggleLogView),
         ("C-Space", Action::ToggleRangeSelect),
         ("C-c C-c", Action::AddComment),
         ("C", Action::ToggleComments),
@@ -547,6 +557,7 @@ pub fn action_name(action: Action) -> &'static str {
         Action::Confirm => "confirm",
         Action::ToggleTimeline => "toggle-timeline",
         Action::ToggleRangeSelect => "toggle-range-select",
+        Action::ToggleLogView => "toggle-log-view",
         Action::AddComment => "add-comment",
         Action::ToggleComments => "toggle-comments",
         Action::Quit => "quit",
@@ -584,6 +595,7 @@ pub fn action_by_name(name: &str) -> Option<Action> {
         "confirm" => Action::Confirm,
         "toggle-timeline" => Action::ToggleTimeline,
         "toggle-range-select" => Action::ToggleRangeSelect,
+        "toggle-log-view" => Action::ToggleLogView,
         "add-comment" => Action::AddComment,
         "toggle-comments" => Action::ToggleComments,
         "quit" => Action::Quit,
@@ -686,6 +698,23 @@ mod tests {
         assert_eq!(
             resolver.feed(chord('v')),
             StepResult::Matched(Action::ToggleRangeSelect)
+        );
+    }
+
+    #[test]
+    fn shifted_l_resolves_to_toggle_log_view_in_both_presets() {
+        let shifted_l = KeyChord::new(KeyCode::Char('L'), KeyModifiers::SHIFT);
+        let vim_keymap = Keymap::from_bindings(&vim_preset(false));
+        let mut vim = vim_keymap.resolver();
+        assert_eq!(
+            vim.feed(shifted_l),
+            StepResult::Matched(Action::ToggleLogView)
+        );
+        let emacs_keymap = Keymap::from_bindings(&emacs_preset(false));
+        let mut emacs = emacs_keymap.resolver();
+        assert_eq!(
+            emacs.feed(shifted_l),
+            StepResult::Matched(Action::ToggleLogView)
         );
     }
 
@@ -802,6 +831,7 @@ mod tests {
             Action::Confirm,
             Action::ToggleTimeline,
             Action::ToggleRangeSelect,
+            Action::ToggleLogView,
             Action::AddComment,
             Action::ToggleComments,
             Action::Quit,
@@ -910,7 +940,7 @@ mod tests {
     /// present, exactly equal otherwise.
     #[test]
     fn every_vim_and_emacs_binding_covers_every_action_exactly_once() {
-        const ACTION_COUNT: usize = 28;
+        const ACTION_COUNT: usize = 29;
         for ci_distinguishable in [false, true] {
             for preset in [
                 vim_preset(ci_distinguishable),

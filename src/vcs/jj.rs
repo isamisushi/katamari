@@ -14,6 +14,7 @@
 //! where jj's actual (as opposed to documented-and-hoped-for) 0.43 behavior
 //! mattered enough to write down.
 
+use super::{LogEntry, RevisionEntry};
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -238,6 +239,111 @@ impl JjRepo {
             String::from_utf8(output.stdout).context("jj op diff produced non-UTF-8 output")?;
         Ok(strip_op_diff_wrapper(&text).to_owned())
     }
+
+    /// One change's own diff — its tree against its parent(s) — via `jj
+    /// diff -r <revset> --git`. Unlike [`Self::op_diff`], `jj diff` doesn't
+    /// accept `--no-graph` at all (confirmed empirically against jj 0.43:
+    /// `jj diff --no-graph` fails with "unexpected argument"; `--no-graph`
+    /// is an op-log/log-only flag), so this — and [`Self::revision_range_diff`]
+    /// — omit it; there's no per-line graph gutter in `jj diff`'s output to
+    /// suppress in the first place. `revset` is passed through to jj
+    /// unvalidated — an unresolvable one surfaces jj's own clear error
+    /// (e.g. `` Revision `nonsense` doesn't exist ``) via this method's
+    /// `Err`, which is already actionable enough not to need rewording.
+    pub fn revision_diff(&self, revset: &str) -> Result<String> {
+        let output = self
+            .readonly_command()
+            .args(["diff", "-r", revset, "--git"])
+            .output()
+            .context("failed to run `jj diff`")?;
+        if !output.status.success() {
+            bail!(
+                "jj diff -r {revset} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        String::from_utf8(output.stdout).context("jj diff produced non-UTF-8 output")
+    }
+
+    /// The diff between two revisions — `jj diff --from <from> --to <to>
+    /// --git`. Either side left `None` is simply omitted from the command
+    /// line, which jj itself then defaults to `@` (confirmed empirically
+    /// and documented in `jj diff --help`: "If either is left out, it
+    /// defaults to the working-copy commit") — katamari doesn't
+    /// reimplement that defaulting, just lets jj apply its own.
+    pub fn revision_range_diff(&self, from: Option<&str>, to: Option<&str>) -> Result<String> {
+        let mut cmd = self.readonly_command();
+        cmd.arg("diff");
+        if let Some(from) = from {
+            cmd.args(["--from", from]);
+        }
+        if let Some(to) = to {
+            cmd.args(["--to", to]);
+        }
+        cmd.arg("--git");
+        let output = cmd.output().context("failed to run `jj diff`")?;
+        if !output.status.success() {
+            bail!(
+                "jj diff --from {}--to {} failed: {}",
+                from.map(|f| format!("{f} ")).unwrap_or_default(),
+                to.unwrap_or("@"),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        String::from_utf8(output.stdout).context("jj diff produced non-UTF-8 output")
+    }
+
+    /// Change ids are never abbreviated (see [`RevisionEntry::id`]'s docs on
+    /// why); the visible `zzzzzzzz...` root commit — jj's fixed sentinel
+    /// change id, 32 `z`s, always present as the ultimate ancestor of every
+    /// change — is the one entry [`Self::log`] filters out, the same way
+    /// [`parse_op_log`] filters non-snapshot operations: it's real data jj
+    /// reports, but not a change any reviewer would want in a browsable
+    /// history (it has no author, no description, and nothing to diff).
+    const ROOT_CHANGE_ID: &'static str = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+
+    /// Field separator for [`Self::log`]'s template — see
+    /// [`Self::OP_LOG_FIELD_SEP`]'s docs (same rationale, same character).
+    const LOG_FIELD_SEP: &'static str = "\u{1f}";
+
+    /// `ktmr log`'s jj-backed history: up to `limit` changes from jj's own
+    /// default log revset (ancestors of `@`, immutable heads, and `trunk()`
+    /// — whatever a plain `jj log` would show), newest first, with the
+    /// working copy (`@`) included as a real, ordinary entry rather than a
+    /// synthetic row — unlike [`super::git::GitSource::log`], which has to
+    /// invent a "local changes" row because a plain git commit can't
+    /// represent an in-progress edit. jj's working-copy commit already can:
+    /// every `jj` invocation snapshots it, so `@` is just the newest change
+    /// in the log, distinguished only by [`RevisionEntry::is_working_copy`]
+    /// (carried as an explicit template field — `current_working_copy` —
+    /// rather than parsed back out of jj's own `@`/`○` graph glyphs, which
+    /// `--no-graph` suppresses anyway).
+    pub fn log(&self, limit: usize) -> Result<Vec<LogEntry>> {
+        let template = format!(
+            "change_id ++ \"{sep}\" ++ description.first_line() ++ \"{sep}\" \
+             ++ author.name() ++ \"{sep}\" ++ author.timestamp().format(\"%s\") \
+             ++ \"{sep}\" ++ bookmarks.join(\",\") ++ \"{sep}\" \
+             ++ if(current_working_copy, \"1\", \"0\") ++ \"\\n\"",
+            sep = Self::LOG_FIELD_SEP
+        );
+        let output = self
+            .readonly_command()
+            .args(["log", "-n", &limit.to_string(), "--no-graph", "-T"])
+            .arg(&template)
+            .output()
+            .context("failed to run `jj log`")?;
+        if !output.status.success() {
+            bail!(
+                "jj log failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let text = String::from_utf8(output.stdout).context("jj log produced non-UTF-8 output")?;
+        Ok(parse_jj_log(&text)
+            .into_iter()
+            .map(LogEntry::Revision)
+            .collect())
+    }
 }
 
 /// Candidate subcommands to trigger a working-copy snapshot, most to least
@@ -345,6 +451,47 @@ fn parse_op_log_line(line: &str) -> Option<SnapshotOp> {
         op_id,
         time_unix,
         description,
+    })
+}
+
+/// Parses [`JjRepo::log`]'s raw, `\x1f`-field-separated `jj log` output into
+/// [`RevisionEntry`]s, dropping the sentinel root change (see
+/// [`JjRepo::ROOT_CHANGE_ID`]'s docs) — a pure function so the template
+/// string and its parsing stay verifiably in sync without a real jj process
+/// (see this module's tests).
+fn parse_jj_log(text: &str) -> Vec<RevisionEntry> {
+    text.lines()
+        .filter_map(parse_jj_log_line)
+        .filter(|entry| entry.id != JjRepo::ROOT_CHANGE_ID)
+        .collect()
+}
+
+fn parse_jj_log_line(line: &str) -> Option<RevisionEntry> {
+    let mut fields = line.splitn(6, JjRepo::LOG_FIELD_SEP);
+    let id = fields.next()?.to_owned();
+    let summary = fields.next()?.to_owned();
+    let author = fields.next()?.to_owned();
+    let time_unix = fields.next()?.parse().ok()?;
+    let refs = fields
+        .next()
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_owned())
+        .collect();
+    let is_working_copy = fields.next().unwrap_or_default() == "1";
+    // Truncated the same way `ui::timeline_view::short_op_id` truncates a
+    // full operation id — display-only, never a lookup key (every jj
+    // invocation this module makes uses `id`, the full change id).
+    let short_id = id[..id.len().min(12)].to_owned();
+    Some(RevisionEntry {
+        short_id,
+        id,
+        summary,
+        author,
+        time_unix,
+        refs,
+        is_working_copy,
     })
 }
 
@@ -590,5 +737,266 @@ mod tests {
         let repo = JjRepo::detect(dir.path(), PathBuf::from("/usr/bin/jj"));
         assert!(repo.is_some());
         assert_eq!(repo.unwrap().repo_root(), dir.path());
+    }
+
+    // ---- parse_jj_log ---------------------------------------------------
+
+    #[test]
+    fn parses_log_lines_and_drops_the_sentinel_root_change() {
+        let sep = JjRepo::LOG_FIELD_SEP;
+        let text = format!(
+            "qrlotxzlnnttqlwvzsuyroxsmqlnvror{sep}wip third{sep}Test{sep}1780000002{sep}{sep}1\n\
+             pvkuylmxwmuqnxmvqpxyrqtrpzxkvnum{sep}second{sep}Test{sep}1780000001{sep}mybookmark{sep}0\n\
+             {root}{sep}{sep}{sep}0{sep}{sep}0\n",
+            root = JjRepo::ROOT_CHANGE_ID,
+        );
+        let entries = parse_jj_log(&text);
+        assert_eq!(entries.len(), 2, "entries: {entries:?}");
+        assert_eq!(entries[0].id, "qrlotxzlnnttqlwvzsuyroxsmqlnvror");
+        assert_eq!(entries[0].short_id, "qrlotxzlnntt");
+        assert_eq!(entries[0].summary, "wip third");
+        assert!(entries[0].is_working_copy);
+        assert_eq!(entries[1].id, "pvkuylmxwmuqnxmvqpxyrqtrpzxkvnum");
+        assert_eq!(entries[1].refs, vec!["mybookmark".to_owned()]);
+        assert!(!entries[1].is_working_copy);
+    }
+
+    #[test]
+    fn multiple_bookmarks_split_on_comma() {
+        let sep = JjRepo::LOG_FIELD_SEP;
+        let line =
+            format!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa{sep}m{sep}Test{sep}1{sep}main,release{sep}0");
+        let entries = parse_jj_log(&line);
+        assert_eq!(
+            entries[0].refs,
+            vec!["main".to_owned(), "release".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_jj_log_line_missing_fields_is_skipped_rather_than_panicking() {
+        assert_eq!(parse_jj_log("onlyonefield"), Vec::new());
+    }
+
+    #[test]
+    fn empty_jj_log_text_parses_to_no_entries() {
+        assert_eq!(parse_jj_log(""), Vec::new());
+    }
+
+    // ---- real-jj integration tests --------------------------------------
+    //
+    // Build a throwaway colocated repo and shell out to a real `jj` binary
+    // — the same thing `select_snapshot_command`'s unit tests deliberately
+    // avoid (canned outcomes instead), but appropriate here since
+    // `revision_diff`/`revision_range_diff`/`log` are themselves nothing
+    // but "build the right `jj` invocation and parse its output," which a
+    // canned-outcome test can't verify. Every test below skips (rather than
+    // failing) when `jj` isn't resolvable on `PATH`, so the suite still
+    // passes in an environment without it — `mise exec -- cargo test` (this
+    // project's documented way to run tests) does have it.
+
+    struct JjFixture {
+        _dir: tempfile::TempDir,
+        repo: JjRepo,
+    }
+
+    fn jj_cmd(jj_bin: &Path, dir: &Path, args: &[&str]) -> String {
+        let output = Command::new(jj_bin)
+            .arg("-R")
+            .arg(dir)
+            .args(["--color", "never", "--no-pager"])
+            .args(args)
+            .output()
+            .expect("failed to spawn jj");
+        assert!(
+            output.status.success(),
+            "jj {args:?} failed in {dir:?}:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// `jj git init --colocate` is the one command in this fixture that
+    /// can't go through [`jj_cmd`]'s `-R <dir>` wrapper: `-R` tells jj to
+    /// operate on a repo that already exists at that path, but this call is
+    /// what *creates* it — run with `dir` as the current directory instead,
+    /// the same way this module's own doc comment's empirical exploration
+    /// did (`cd <dir> && jj git init --colocate`).
+    fn jj_git_init_colocate(jj_bin: &Path, dir: &Path) {
+        let output = Command::new(jj_bin)
+            .args([
+                "--color",
+                "never",
+                "--no-pager",
+                "git",
+                "init",
+                "--colocate",
+            ])
+            .current_dir(dir)
+            .output()
+            .expect("failed to spawn jj");
+        assert!(
+            output.status.success(),
+            "jj git init --colocate failed in {dir:?}:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// A colocated repo with two committed changes ("first", "second") and
+    /// a third left as the uncommitted working copy (`@`) — the same shape
+    /// this module's docs' empirical exploration used, exercising both
+    /// "diff a historical change" and "diff the working copy" in one
+    /// fixture.
+    fn jj_fixture() -> Option<JjFixture> {
+        let jj_bin = resolve_jj_bin()?;
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path();
+
+        let status = Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg(path)
+            .status()
+            .expect("git must be on PATH");
+        assert!(status.success());
+        jj_git_init_colocate(&jj_bin, path);
+        jj_cmd(
+            &jj_bin,
+            path,
+            &["config", "set", "--repo", "user.name", "Test"],
+        );
+        jj_cmd(
+            &jj_bin,
+            path,
+            &["config", "set", "--repo", "user.email", "test@example.com"],
+        );
+
+        std::fs::write(path.join("a.txt"), "one\n").unwrap();
+        jj_cmd(&jj_bin, path, &["commit", "-m", "first"]);
+        std::fs::write(path.join("a.txt"), "one\ntwo\n").unwrap();
+        jj_cmd(&jj_bin, path, &["commit", "-m", "second"]);
+        std::fs::write(path.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        // Every `JjRepo` query in this module deliberately runs with
+        // `--ignore-working-copy` (see `readonly_command`'s docs), so it
+        // never itself triggers the auto-snapshot a live `jj` invocation
+        // normally would — this fixture needs one real command to actually
+        // record the "three" edit into `@`'s tree before any test below
+        // reads it back.
+        jj_cmd(&jj_bin, path, &["status"]);
+
+        let repo = JjRepo::detect(path, jj_bin).expect("jj git init --colocate makes a .jj dir");
+        Some(JjFixture { _dir: dir, repo })
+    }
+
+    #[test]
+    fn revision_diff_of_the_working_copy_shows_its_own_change() {
+        let Some(fx) = jj_fixture() else {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        };
+        let diff = fx.repo.revision_diff("@").unwrap();
+        assert!(diff.contains("+three"), "diff:\n{diff}");
+        assert!(!diff.contains("+two"), "diff:\n{diff}");
+    }
+
+    #[test]
+    fn revision_diff_of_a_historical_change_shows_only_that_changes_content() {
+        let Some(fx) = jj_fixture() else {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        };
+        let diff = fx.repo.revision_diff("@-").unwrap();
+        assert!(diff.contains("+two"), "diff:\n{diff}");
+        assert!(!diff.contains("+three"), "diff:\n{diff}");
+    }
+
+    #[test]
+    fn revision_diff_of_an_unresolvable_revset_is_a_clear_error() {
+        let Some(fx) = jj_fixture() else {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        };
+        let err = fx.repo.revision_diff("nonexistent-change").unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("doesn't exist")
+                || err.to_string().to_lowercase().contains("failed"),
+            "err: {err}"
+        );
+    }
+
+    /// Empirically confirmed jj default: leaving `--to` unset defaults it
+    /// to `@`, so `--from @--` (two parents back) alone reproduces the same
+    /// diff as `-r @-` combined with the working copy's own edit — this
+    /// pins that defaulting down against a real `jj` binary rather than
+    /// only trusting `jj diff --help`'s prose.
+    #[test]
+    fn from_without_to_defaults_to_the_working_copy() {
+        let Some(fx) = jj_fixture() else {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        };
+        let via_from = fx.repo.revision_range_diff(Some("@-"), None).unwrap();
+        let via_explicit = fx.repo.revision_range_diff(Some("@-"), Some("@")).unwrap();
+        assert_eq!(via_from, via_explicit);
+        // "two" is already present on both sides (it was `@-`'s own
+        // change), so only "three" (the working copy's uncommitted edit)
+        // shows up as added.
+        assert!(via_from.contains("+three"), "diff:\n{via_from}");
+        assert!(!via_from.contains("+two"), "diff:\n{via_from}");
+    }
+
+    #[test]
+    fn to_without_from_defaults_to_the_working_copy() {
+        let Some(fx) = jj_fixture() else {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        };
+        let via_to = fx.repo.revision_range_diff(None, Some("@-")).unwrap();
+        let via_explicit = fx.repo.revision_range_diff(Some("@"), Some("@-")).unwrap();
+        assert_eq!(via_to, via_explicit);
+        // Reversed direction from the `from`-only case: this removes
+        // "three" (going from the working copy back to "@-").
+        assert!(via_to.contains("-three"), "diff:\n{via_to}");
+    }
+
+    #[test]
+    fn log_marks_the_working_copy_and_excludes_the_root_change() {
+        let Some(fx) = jj_fixture() else {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        };
+        let entries: Vec<RevisionEntry> = fx
+            .repo
+            .log(50)
+            .unwrap()
+            .into_iter()
+            .map(|e| match e {
+                LogEntry::Revision(r) => r,
+                LogEntry::LocalChanges { .. } => {
+                    panic!("jj's log never produces a LocalChanges row")
+                }
+            })
+            .collect();
+        assert!(
+            !entries.iter().any(|e| e.id == JjRepo::ROOT_CHANGE_ID),
+            "entries: {entries:?}"
+        );
+        let working_copy = entries
+            .iter()
+            .find(|e| e.is_working_copy)
+            .expect("the working copy is always a real entry in jj's log");
+        assert_eq!(
+            working_copy.summary, "",
+            "an uncommitted change is undescribed"
+        );
+
+        let named: Vec<&str> = entries
+            .iter()
+            .filter(|e| !e.is_working_copy)
+            .map(|e| e.summary.as_str())
+            .collect();
+        assert_eq!(named, vec!["second", "first"], "entries: {entries:?}");
     }
 }

@@ -58,13 +58,29 @@ enum Command {
         /// A single revision (that commit's own changes against its
         /// parent) or a `<rev>..<rev>` / `<rev>...<rev>` range, passed to
         /// git. Defaults to the working tree.
+        #[arg(conflicts_with_all = ["revision", "from", "to"])]
         range: Option<String>,
+        /// Diff a single jj change against its parent(s) — `jj diff -r
+        /// <revset>`'s equivalent. Requires a colocated jj repository (see
+        /// `ktmr timeline`'s docs on what "colocated" means here).
+        #[arg(short = 'r', long, value_name = "REVSET", conflicts_with_all = ["from", "to", "range", "staged", "watch"])]
+        revision: Option<String>,
+        /// Diff between two jj revisions — `jj diff --from/--to`'s
+        /// equivalent. Either side left unset defaults to `@` (the working
+        /// copy), matching jj's own `jj diff --help` documented behavior.
+        /// Requires a colocated jj repository.
+        #[arg(long, value_name = "REVSET", conflicts_with_all = ["revision", "range", "staged", "watch"])]
+        from: Option<String>,
+        /// See `--from`.
+        #[arg(long, value_name = "REVSET", conflicts_with_all = ["revision", "range", "staged", "watch"])]
+        to: Option<String>,
         /// Watch the repository for filesystem changes and refresh the
         /// diff automatically. Working-tree scope only — combining this
-        /// with `--staged` or a revision range is rejected, since neither
-        /// has a stable "current" version for a filesystem watcher to
-        /// refresh against the way the working tree does.
-        #[arg(long)]
+        /// with `--staged`, a revision range, or `-r`/`--from`/`--to` is
+        /// rejected, since none of those has a stable "current" version for
+        /// a filesystem watcher to refresh against the way the working tree
+        /// does.
+        #[arg(long, conflicts_with_all = ["revision", "from", "to"])]
         watch: bool,
         /// Renders this many frames of the diff pane offscreen (a
         /// `ratatui::backend::TestBackend`, no real terminal involved) and
@@ -106,6 +122,18 @@ enum Command {
         /// without a live `--watch` session.
         #[arg(long, hide = true, conflicts_with = "dump")]
         snapshot: bool,
+    },
+    /// Opens directly into a browsable revision history (see `L` from
+    /// `ktmr diff`): jj changes — including the working copy, `@`, as a
+    /// real entry — in a colocated jj repository, or `git log` commits plus
+    /// a synthetic "local changes" row for the dirty working tree
+    /// otherwise. Unlike `ktmr timeline`, this never requires jj: every
+    /// repository `ktmr` runs in has git history to show even without it.
+    Log {
+        /// Print the parsed history list as plain text and exit, instead of
+        /// launching the TUI — for headless verification.
+        #[arg(long, hide = true)]
+        dump: bool,
     },
     /// Spawns a language server, requests hover (or, with a mode flag,
     /// go-to-definition/references/diagnostics) at one position, prints the
@@ -309,6 +337,9 @@ fn main() -> Result<()> {
         layout: LayoutArg::Unified,
         staged: false,
         range: None,
+        revision: None,
+        from: None,
+        to: None,
         watch: false,
         bench_render: None,
     }) {
@@ -317,11 +348,25 @@ fn main() -> Result<()> {
             layout,
             staged,
             range,
+            revision,
+            from,
+            to,
             watch,
             bench_render,
-        } => run_diff(dump, layout, staged, range, watch, bench_render),
+        } => run_diff(
+            dump,
+            layout,
+            staged,
+            range,
+            revision,
+            from,
+            to,
+            watch,
+            bench_render,
+        ),
         Command::Open { file } => run_open(file),
         Command::Timeline { dump, op, snapshot } => run_timeline(dump, op, snapshot),
+        Command::Log { dump } => run_log(dump),
         Command::LspCheck {
             file,
             line,
@@ -341,11 +386,18 @@ fn main() -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // one flag per `Command::Diff` field;
+// see `ui::mod::handle_action`'s identical justification for its own
+// too-many-arguments allow — bundling into a struct wouldn't reduce how
+// many independent scope choices this function has to resolve.
 fn run_diff(
     dump: bool,
     layout: LayoutArg,
     staged: bool,
     range: Option<String>,
+    revision: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
     watch: bool,
     bench_render: Option<usize>,
 ) -> Result<()> {
@@ -361,11 +413,38 @@ fn run_diff(
     let config = config::load_merged(&repo_root);
     config::install(&config);
 
-    let diff_text = match (staged, range.as_deref()) {
-        (true, Some(_)) => bail!("--staged cannot be combined with a revision range"),
-        (true, None) => source.staged_diff()?,
-        (false, Some(range)) => source.range_diff(range)?,
-        (false, None) => source.working_tree_diff()?,
+    // `revision`/`from`/`to` are jj-only and mutually exclusive with
+    // `staged`/`range`/`watch` (see `Command::Diff`'s `conflicts_with_all`
+    // attributes) — resolving them first means the `(staged, range)` match
+    // below only ever has to handle the git-only scopes it always has.
+    // `interactive = false` for every jj revision diff, matching
+    // `crate::ui::timeline_view::TimelineView`'s "historical content isn't
+    // trustworthy enough to ask a language server about" rule — see
+    // `App::interactive`'s docs.
+    let (diff_text, scope_label, interactive) = if let Some(revset) = revision.as_deref() {
+        let jj_repo = discover_jj_repo_at(&repo_root)?;
+        (
+            jj_repo.revision_diff(revset)?,
+            Some(format!("r: {revset}")),
+            false,
+        )
+    } else if from.is_some() || to.is_some() {
+        let jj_repo = discover_jj_repo_at(&repo_root)?;
+        let text = jj_repo.revision_range_diff(from.as_deref(), to.as_deref())?;
+        let label = format!(
+            "{}..{}",
+            from.as_deref().unwrap_or("@"),
+            to.as_deref().unwrap_or("@")
+        );
+        (text, Some(label), false)
+    } else {
+        let text = match (staged, range.as_deref()) {
+            (true, Some(_)) => bail!("--staged cannot be combined with a revision range"),
+            (true, None) => source.staged_diff()?,
+            (false, Some(range)) => source.range_diff(range)?,
+            (false, None) => source.working_tree_diff()?,
+        };
+        (text, None, true)
     };
     let files = parse_unified_diff(&diff_text);
 
@@ -394,6 +473,8 @@ fn run_diff(
 
     let mut app = App::new(repo_name, repo_root, files);
     app.layout = layout.into();
+    app.interactive = interactive;
+    app.scope_label = scope_label;
 
     if let Some(frames) = bench_render {
         return run_bench_render(app, frames);
@@ -517,9 +598,17 @@ fn run_open(file: PathBuf) -> Result<()> {
 fn discover_jj_repo() -> Result<jj::JjRepo> {
     let cwd = std::env::current_dir()?;
     let repo_root = GitSource::discover(&cwd)?.repo_root()?;
-    let jj_bin = jj::resolve_jj_bin()
-        .context("jj not found on PATH; `ktmr timeline` needs a `jj` binary to read")?;
-    jj::JjRepo::detect(&repo_root, jj_bin).with_context(|| {
+    discover_jj_repo_at(&repo_root)
+}
+
+/// The repo-root-already-known half of [`discover_jj_repo`] — shared with
+/// [`run_diff`]'s `-r`/`--from`/`--to` handling, which has already resolved
+/// `repo_root` via its own `GitSource::discover` and would otherwise pay
+/// for that `git rev-parse` a second time just to reach this check.
+fn discover_jj_repo_at(repo_root: &Path) -> Result<jj::JjRepo> {
+    let jj_bin =
+        jj::resolve_jj_bin().context("jj not found on PATH; this needs a `jj` binary to read")?;
+    jj::JjRepo::detect(repo_root, jj_bin).with_context(|| {
         format!(
             "no colocated jj repository at {} (expected a `.jj` directory alongside `.git`)",
             repo_root.display()
@@ -598,6 +687,32 @@ fn run_timeline_dump(jj_repo: &jj::JjRepo, op: Option<String>) -> Result<()> {
     let diff = jj_repo.op_diff(&previous.op_id, &ops[idx].op_id)?;
     print!("{diff}");
     Ok(())
+}
+
+/// `ktmr log [--dump]` — opens directly into [`ui::log_view::LogView`], or
+/// (hidden, for headless E2E verification) dumps the parsed history list as
+/// plain text via [`ui::log_view::format_dump`]. Unlike [`run_timeline`],
+/// never requires jj: [`vcs::LogBackend::detect`] falls back to plain git
+/// history when no colocated jj repository is found, so this only ever
+/// fails the way [`run_diff`]'s plain working-tree case can (not a git
+/// repository at all, or `git` missing from `PATH`).
+fn run_log(dump: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let repo_root = GitSource::discover(&cwd)?.repo_root()?;
+    let backend = vcs::LogBackend::detect(&repo_root);
+
+    if dump {
+        let entries = backend.log(ui::log_view::DEFAULT_LOG_LIMIT)?;
+        print!("{}", ui::log_view::format_dump(&entries));
+        return Ok(());
+    }
+
+    let config = config::load_merged(&repo_root);
+    config::install(&config);
+
+    let log_view = ui::log_view::LogView::new(backend, ui::log_view::DEFAULT_LOG_LIMIT)?;
+    let mut stack = ViewStack::new(View::Log(log_view));
+    ui::run(&mut stack, None, &config)
 }
 
 /// `ktmr lsp-check <file> <line> <col> [--definition|--references|--diagnostics]`

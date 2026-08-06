@@ -56,6 +56,15 @@ pub fn render(
         ));
     }
 
+    if let Some(label) = &app.scope_label {
+        spans.push(Span::styled(
+            format!("· {label} "),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     if app.watch_mode {
         spans.push(Span::styled(
             "· \u{29BF} watch ", // ⦿ — BULLSEYE

@@ -320,7 +320,11 @@ fn diff_stat(files: &[DiffFile]) -> (usize, u32, u32) {
 /// now" rather than shown as a negative duration), rendered the way a
 /// commit timeline usually is: coarsening from seconds up through days as
 /// the gap grows, rather than an exact timestamp nobody needs at a glance.
-fn relative_time(time_unix: i64) -> String {
+///
+/// `pub(crate)`, not private: [`crate::ui::log_view::LogView`] renders the
+/// same "Ns/m/h/d ago" shape for `git log`/`jj log` timestamps and has no
+/// reason to duplicate this rather than share it.
+pub(crate) fn relative_time(time_unix: i64) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
