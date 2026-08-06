@@ -62,10 +62,16 @@ pub enum Action {
     NextDiagnostic,
     PrevDiagnostic,
     /// Retraces the jump history one step back/forward — `Ctrl-o`/`Ctrl-i`'s
-    /// vim-familiar direction, bound here to `C-o`/`C-t` since this
-    /// terminal's key reporting can't distinguish a literal Tab from
-    /// `Ctrl-i` (they're the same ASCII control code); see
-    /// [`crate::ui::navigation::JumpStack`].
+    /// vim-familiar direction. Forward's *canonical* binding depends on
+    /// whether the terminal can tell a literal Tab from `Ctrl-i` apart: with
+    /// the kitty keyboard protocol's `DISAMBIGUATE_ESCAPE_CODES` flag active
+    /// they arrive as different [`crate::keymap::KeyChord`]s, so
+    /// [`vim_preset`]/[`emacs_preset`] bind `C-i` (matching neovim) with
+    /// `C-t` kept as a still-working alias; without it, both share the same
+    /// byte on the wire, so only `C-t` is bound at all — binding `C-i`
+    /// there would silently steal every Tab press meant for
+    /// [`NextSymbol`](Action::NextSymbol). See `ui::mod`'s kitty-protocol
+    /// startup probe and [`crate::ui::navigation::JumpStack`].
     JumpBack,
     JumpForward,
     /// Selects the highlighted entry in an open references panel and
@@ -383,8 +389,19 @@ impl<'a> Resolver<'a> {
 /// The default keymap: vim-style bindings, expressed as data rather than
 /// hardcoded into the event loop, so an emacs preset can later live
 /// alongside it as another function of the same shape.
-pub fn vim_preset() -> Vec<(KeySeq, Action)> {
-    [
+///
+/// `ci_distinguishable` is `ui::run`'s kitty-protocol startup probe result
+/// (see [`Action::JumpBack`]'s docs): when `true`, `C-i` is inserted ahead
+/// of `C-t` in the list below so [`Keymap::binding_for`]'s first-match rule
+/// picks it as `JumpForward`'s canonical, hinted binding, while `C-t` stays
+/// bound as a working alias (both entries resolve to the same action; the
+/// trie has no trouble with two distinct key sequences mapping to one
+/// action, only with one sequence mapping to two). When `false`, `C-i` is
+/// left unbound entirely — the terminal delivers the identical byte for a
+/// literal Tab and `Ctrl-i` in that case, and Tab already means
+/// [`Action::NextSymbol`].
+pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
+    let mut bindings = vec![
         ("j", Action::CursorDown),
         ("k", Action::CursorUp),
         ("C-d", Action::HalfPageDown),
@@ -403,7 +420,12 @@ pub fn vim_preset() -> Vec<(KeySeq, Action)> {
         ("] d", Action::NextDiagnostic),
         ("[ d", Action::PrevDiagnostic),
         ("C-o", Action::JumpBack),
-        ("C-t", Action::JumpForward),
+    ];
+    if ci_distinguishable {
+        bindings.push(("C-i", Action::JumpForward));
+    }
+    bindings.push(("C-t", Action::JumpForward));
+    bindings.extend([
         ("Enter", Action::Confirm),
         ("Tab", Action::NextSymbol),
         ("BackTab", Action::PrevSymbol),
@@ -413,10 +435,11 @@ pub fn vim_preset() -> Vec<(KeySeq, Action)> {
         ("c", Action::AddComment),
         ("C", Action::ToggleComments),
         ("q", Action::Quit),
-    ]
-    .into_iter()
-    .map(|(notation, action)| (KeySeq::parse(notation), action))
-    .collect()
+    ]);
+    bindings
+        .into_iter()
+        .map(|(notation, action)| (KeySeq::parse(notation), action))
+        .collect()
 }
 
 /// An emacs-style keymap, the same shape as [`vim_preset`] so both flow
@@ -437,8 +460,12 @@ pub fn vim_preset() -> Vec<(KeySeq, Action)> {
 /// vim's keys rather than invent an arbitrary emacs-flavored alternative —
 /// `q` for quit most of all, kept identical across both presets by design
 /// (documented here rather than duplicated in each preset's own bindings).
-pub fn emacs_preset() -> Vec<(KeySeq, Action)> {
-    [
+///
+/// `ci_distinguishable` has the same effect as in [`vim_preset`] — this
+/// isn't a vim-specific concern, it's a terminal-capability one, so both
+/// presets take and act on it identically.
+pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
+    let mut bindings = vec![
         ("C-n", Action::CursorDown),
         ("C-p", Action::CursorUp),
         ("C-v", Action::HalfPageDown),
@@ -457,7 +484,12 @@ pub fn emacs_preset() -> Vec<(KeySeq, Action)> {
         ("M-g M-n", Action::NextDiagnostic),
         ("M-g M-p", Action::PrevDiagnostic),
         ("C-o", Action::JumpBack),
-        ("C-t", Action::JumpForward),
+    ];
+    if ci_distinguishable {
+        bindings.push(("C-i", Action::JumpForward));
+    }
+    bindings.push(("C-t", Action::JumpForward));
+    bindings.extend([
         ("Enter", Action::Confirm),
         ("Tab", Action::NextSymbol),
         ("BackTab", Action::PrevSymbol),
@@ -467,10 +499,11 @@ pub fn emacs_preset() -> Vec<(KeySeq, Action)> {
         ("C-c C-c", Action::AddComment),
         ("C", Action::ToggleComments),
         ("q", Action::Quit),
-    ]
-    .into_iter()
-    .map(|(notation, action)| (KeySeq::parse(notation), action))
-    .collect()
+    ]);
+    bindings
+        .into_iter()
+        .map(|(notation, action)| (KeySeq::parse(notation), action))
+        .collect()
 }
 
 /// `action`'s kebab-case name in config's `[keys]` table — e.g.
@@ -572,7 +605,7 @@ mod tests {
 
     #[test]
     fn double_g_resolves_to_top_through_pending_state() {
-        let keymap = Keymap::from_bindings(&vim_preset());
+        let keymap = Keymap::from_bindings(&vim_preset(false));
         let mut resolver = keymap.resolver();
         assert_eq!(resolver.feed(chord('g')), StepResult::Pending);
         assert_eq!(resolver.pending_display(), "g");
@@ -582,7 +615,7 @@ mod tests {
 
     #[test]
     fn bracket_c_resolves_to_next_hunk() {
-        let keymap = Keymap::from_bindings(&vim_preset());
+        let keymap = Keymap::from_bindings(&vim_preset(false));
         let mut resolver = keymap.resolver();
         assert_eq!(resolver.feed(chord(']')), StepResult::Pending);
         assert_eq!(
@@ -593,7 +626,7 @@ mod tests {
 
     #[test]
     fn invalid_continuation_cancels_pending_sequence() {
-        let keymap = Keymap::from_bindings(&vim_preset());
+        let keymap = Keymap::from_bindings(&vim_preset(false));
         let mut resolver = keymap.resolver();
         assert_eq!(resolver.feed(chord('g')), StepResult::Pending);
         assert_eq!(resolver.feed(chord('x')), StepResult::Cancelled);
@@ -604,7 +637,7 @@ mod tests {
 
     #[test]
     fn single_key_control_d_matches_immediately() {
-        let keymap = Keymap::from_bindings(&vim_preset());
+        let keymap = Keymap::from_bindings(&vim_preset(false));
         let mut resolver = keymap.resolver();
         assert_eq!(
             resolver.feed(ctrl('d')),
@@ -614,7 +647,7 @@ mod tests {
 
     #[test]
     fn hover_and_symbol_cycling_keys_resolve() {
-        let keymap = Keymap::from_bindings(&vim_preset());
+        let keymap = Keymap::from_bindings(&vim_preset(false));
         let mut resolver = keymap.resolver();
         assert_eq!(
             resolver.feed(chord('K')),
@@ -636,7 +669,7 @@ mod tests {
 
     #[test]
     fn shifted_uppercase_char_matches_bottom() {
-        let keymap = Keymap::from_bindings(&vim_preset());
+        let keymap = Keymap::from_bindings(&vim_preset(false));
         let mut resolver = keymap.resolver();
         let shifted = KeyChord::new(KeyCode::Char('G'), KeyModifiers::SHIFT);
         assert_eq!(resolver.feed(shifted), StepResult::Matched(Action::Bottom));
@@ -644,7 +677,7 @@ mod tests {
 
     #[test]
     fn t_resolves_to_toggle_timeline_and_v_to_toggle_range_select() {
-        let keymap = Keymap::from_bindings(&vim_preset());
+        let keymap = Keymap::from_bindings(&vim_preset(false));
         let mut resolver = keymap.resolver();
         assert_eq!(
             resolver.feed(chord('t')),
@@ -662,7 +695,7 @@ mod tests {
 
     #[test]
     fn emacs_preset_single_key_control_n_matches_cursor_down() {
-        let keymap = Keymap::from_bindings(&emacs_preset());
+        let keymap = Keymap::from_bindings(&emacs_preset(false));
         let mut resolver = keymap.resolver();
         assert_eq!(
             resolver.feed(ctrl('n')),
@@ -672,7 +705,7 @@ mod tests {
 
     #[test]
     fn emacs_preset_meta_dot_matches_goto_definition() {
-        let keymap = Keymap::from_bindings(&emacs_preset());
+        let keymap = Keymap::from_bindings(&emacs_preset(false));
         let mut resolver = keymap.resolver();
         assert_eq!(
             resolver.feed(alt('.')),
@@ -682,7 +715,7 @@ mod tests {
 
     #[test]
     fn emacs_preset_c_x_n_two_chord_sequence_resolves_to_next_file() {
-        let keymap = Keymap::from_bindings(&emacs_preset());
+        let keymap = Keymap::from_bindings(&emacs_preset(false));
         let mut resolver = keymap.resolver();
         assert_eq!(resolver.feed(ctrl('x')), StepResult::Pending);
         assert_eq!(resolver.pending_display(), "C-x");
@@ -703,7 +736,7 @@ mod tests {
 
     #[test]
     fn emacs_preset_m_g_m_n_two_chord_sequence_resolves_to_next_diagnostic() {
-        let keymap = Keymap::from_bindings(&emacs_preset());
+        let keymap = Keymap::from_bindings(&emacs_preset(false));
         let mut resolver = keymap.resolver();
         assert_eq!(resolver.feed(alt('g')), StepResult::Pending);
         assert_eq!(
@@ -714,7 +747,7 @@ mod tests {
 
     #[test]
     fn emacs_preset_c_c_c_c_resolves_to_add_comment() {
-        let keymap = Keymap::from_bindings(&emacs_preset());
+        let keymap = Keymap::from_bindings(&emacs_preset(false));
         let mut resolver = keymap.resolver();
         assert_eq!(resolver.feed(ctrl('c')), StepResult::Pending);
         assert_eq!(
@@ -725,7 +758,7 @@ mod tests {
 
     #[test]
     fn emacs_preset_control_space_resolves_to_toggle_range_select() {
-        let keymap = Keymap::from_bindings(&emacs_preset());
+        let keymap = Keymap::from_bindings(&emacs_preset(false));
         let mut resolver = keymap.resolver();
         let control_space = KeyChord::new(KeyCode::Char(' '), KeyModifiers::CONTROL);
         assert_eq!(
@@ -736,7 +769,7 @@ mod tests {
 
     #[test]
     fn emacs_preset_q_quits_same_as_vim() {
-        let keymap = Keymap::from_bindings(&emacs_preset());
+        let keymap = Keymap::from_bindings(&emacs_preset(false));
         let mut resolver = keymap.resolver();
         assert_eq!(resolver.feed(chord('q')), StepResult::Matched(Action::Quit));
     }
@@ -796,14 +829,14 @@ mod tests {
 
     #[test]
     fn binding_for_finds_a_vim_preset_binding() {
-        let keymap = Keymap::from_bindings(&vim_preset());
+        let keymap = Keymap::from_bindings(&vim_preset(false));
         let seq = keymap.binding_for(Action::GotoDefinition).unwrap();
         assert_eq!(seq.compact_notation(), "gd");
     }
 
     #[test]
     fn binding_for_finds_an_emacs_preset_binding() {
-        let keymap = Keymap::from_bindings(&emacs_preset());
+        let keymap = Keymap::from_bindings(&emacs_preset(false));
         let seq = keymap.binding_for(Action::GotoDefinition).unwrap();
         assert_eq!(seq.compact_notation(), "M-.");
     }
@@ -819,7 +852,7 @@ mod tests {
         // The whole point of driving hints off `binding_for` rather than a
         // hardcoded string: rebind an action, and the "key" a hint would
         // show changes with it, with no separate hint-text update needed.
-        let mut bindings = vim_preset();
+        let mut bindings = vim_preset(false);
         let slot = bindings
             .iter_mut()
             .find(|(_, a)| *a == Action::Quit)
@@ -867,17 +900,115 @@ mod tests {
         assert_eq!(KeySeq::parse("q").compact_notation(), "q");
     }
 
+    /// The 28 actions (see the `action_name_and_action_by_name_round_trip…`
+    /// test's `all` list) each get exactly one binding — except
+    /// `JumpForward`, which gets a *second* one (`C-i`) precisely when
+    /// `ci_distinguishable` is set, per [`vim_preset`]/[`emacs_preset`]'s
+    /// docs. So this checks two things per preset: every action is still
+    /// reachable (`actions.len() == 28` after dedup), and the raw entry
+    /// count is exactly one more than that when the extra `C-i` alias is
+    /// present, exactly equal otherwise.
     #[test]
     fn every_vim_and_emacs_binding_covers_every_action_exactly_once() {
-        for preset in [vim_preset(), emacs_preset()] {
-            let mut actions: Vec<Action> = preset.iter().map(|(_, a)| *a).collect();
-            actions.sort_by_key(|a| action_name(*a));
-            actions.dedup();
+        const ACTION_COUNT: usize = 28;
+        for ci_distinguishable in [false, true] {
+            for preset in [
+                vim_preset(ci_distinguishable),
+                emacs_preset(ci_distinguishable),
+            ] {
+                let mut actions: Vec<Action> = preset.iter().map(|(_, a)| *a).collect();
+                actions.sort_by_key(|a| action_name(*a));
+                actions.dedup();
+                assert_eq!(
+                    actions.len(),
+                    ACTION_COUNT,
+                    "every action should be reachable regardless of ci_distinguishable"
+                );
+                let expected_len = ACTION_COUNT + usize::from(ci_distinguishable);
+                assert_eq!(
+                    preset.len(),
+                    expected_len,
+                    "ci_distinguishable={ci_distinguishable} should add exactly the C-i alias"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ci_distinguishable_binds_c_i_first_so_binding_for_hints_it() {
+        for preset_fn in [vim_preset, emacs_preset] {
+            let keymap = Keymap::from_bindings(&preset_fn(true));
             assert_eq!(
-                actions.len(),
-                preset.len(),
-                "every action should be bound exactly once per preset"
+                keymap
+                    .binding_for(Action::JumpForward)
+                    .unwrap()
+                    .compact_notation(),
+                "C-i"
             );
         }
+    }
+
+    #[test]
+    fn ci_distinguishable_keeps_c_t_working_as_an_alias_via_the_trie() {
+        for preset_fn in [vim_preset, emacs_preset] {
+            let keymap = Keymap::from_bindings(&preset_fn(true));
+            let mut resolver = keymap.resolver();
+            assert_eq!(
+                resolver.feed(ctrl('t')),
+                StepResult::Matched(Action::JumpForward)
+            );
+            let mut resolver = keymap.resolver();
+            assert_eq!(
+                resolver.feed(ctrl('i')),
+                StepResult::Matched(Action::JumpForward)
+            );
+        }
+    }
+
+    #[test]
+    fn not_ci_distinguishable_binds_only_c_t_and_leaves_c_i_unbound() {
+        for preset_fn in [vim_preset, emacs_preset] {
+            let keymap = Keymap::from_bindings(&preset_fn(false));
+            assert_eq!(
+                keymap
+                    .binding_for(Action::JumpForward)
+                    .unwrap()
+                    .compact_notation(),
+                "C-t"
+            );
+            // `C-i` was never inserted into the trie in this mode — feeding
+            // it cancels like any other unbound key, rather than resolving
+            // to whatever it happened to fall through to.
+            let mut resolver = keymap.resolver();
+            assert_eq!(resolver.feed(ctrl('i')), StepResult::Cancelled);
+        }
+    }
+
+    /// Tab must keep meaning `NextSymbol` in both modes — the whole reason
+    /// `ci_distinguishable=false` refuses to bind `C-i` at all is that an
+    /// undisambiguating terminal reports a literal Tab keypress with the
+    /// exact same byte, so binding `C-i` there would silently reroute every
+    /// Tab press meant for symbol-cycling. Checking it explicitly under
+    /// both modes pins that down rather than trusting it by omission.
+    #[test]
+    fn tab_still_resolves_to_next_symbol_in_both_ci_distinguishable_modes() {
+        for ci_distinguishable in [false, true] {
+            for preset_fn in [vim_preset, emacs_preset] {
+                let keymap = Keymap::from_bindings(&preset_fn(ci_distinguishable));
+                let mut resolver = keymap.resolver();
+                assert_eq!(
+                    resolver.feed(KeyChord::new(KeyCode::Tab, KeyModifiers::NONE)),
+                    StepResult::Matched(Action::NextSymbol)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn key_seq_c_i_parses_and_round_trips_through_compact_notation() {
+        let seq = KeySeq::parse("C-i");
+        assert_eq!(seq.compact_notation(), "C-i");
+        let ctrl_i = ctrl('i');
+        assert_eq!(seq.0, vec![ctrl_i]);
     }
 }

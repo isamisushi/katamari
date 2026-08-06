@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn apply_key_overrides_rebinds_an_existing_action() {
-        let bindings = keymap::vim_preset();
+        let bindings = keymap::vim_preset(false);
         let overrides = HashMap::from([("quit".to_owned(), "Z Z".to_owned())]);
         let rebound = apply_key_overrides(bindings, &overrides).unwrap();
         let quit_seq = rebound
@@ -506,14 +506,14 @@ mod tests {
     #[test]
     fn apply_key_overrides_reports_an_unknown_action_name() {
         let overrides = HashMap::from([("not-a-real-action".to_owned(), "q".to_owned())]);
-        let err = apply_key_overrides(keymap::vim_preset(), &overrides).unwrap_err();
+        let err = apply_key_overrides(keymap::vim_preset(false), &overrides).unwrap_err();
         assert!(err.contains("not-a-real-action"), "error was: {err}");
     }
 
     #[test]
     fn apply_key_overrides_reports_a_bad_key_sequence_naming_the_entry() {
         let overrides = HashMap::from([("quit".to_owned(), "NotAKey".to_owned())]);
-        let err = apply_key_overrides(keymap::vim_preset(), &overrides).unwrap_err();
+        let err = apply_key_overrides(keymap::vim_preset(false), &overrides).unwrap_err();
         assert!(err.contains("quit"), "error should name the entry: {err}");
         assert!(
             err.contains("NotAKey"),

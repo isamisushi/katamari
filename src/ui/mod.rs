@@ -56,10 +56,14 @@ use crate::vcs::git::GitSource;
 use crate::vcs::jj::{self, JjRepo};
 use crate::watch::{self, WatchSignal};
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{
+    self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use lsp_types::{FileChangeType, PositionEncodingKind};
 use ratatui::Frame;
@@ -187,9 +191,15 @@ pub fn run(
     install_panic_hook();
     let mut terminal = init_terminal()?;
 
+    // Must happen before `spawn_input_thread` below starts its own
+    // blocking `event::read()` loop — see `enable_kitty_keyboard_protocol`'s
+    // docs on why the two would otherwise contend for crossterm's internal
+    // event-reader lock.
+    let ci_distinguishable = enable_kitty_keyboard_protocol();
+
     let preset = match config.keymap {
-        config::KeymapPreset::Vim => vim_preset(),
-        config::KeymapPreset::Emacs => emacs_preset(),
+        config::KeymapPreset::Vim => vim_preset(ci_distinguishable),
+        config::KeymapPreset::Emacs => emacs_preset(ci_distinguishable),
     };
     let bindings = config::apply_key_overrides(preset, &config.key_overrides)
         .map_err(|e| anyhow::anyhow!("config: {e}"))?;
@@ -1319,19 +1329,76 @@ fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
+/// Probes for the kitty keyboard protocol and, if the terminal answers
+/// that it supports it, enables its escape-code disambiguation — the
+/// mechanism this session needs to tell a literal Tab from `Ctrl-i` apart
+/// on the wire (see [`Action::JumpBack`](crate::keymap::Action::JumpBack)'s
+/// docs for why that distinction decides `JumpForward`'s canonical
+/// binding). Returns whether it ended up active; `run` threads that
+/// straight into [`vim_preset`]/[`emacs_preset`].
+///
+/// Requests only [`KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES`] —
+/// not `REPORT_EVENT_TYPES` (this app has no use for key-release/repeat
+/// events; every [`Action`] fires on a plain press, matched by
+/// `KeyEventKind::Press` in the event loop) and not `REPORT_ALTERNATE_KEYS`
+/// (nothing here reads a keyboard-layout alternate keycode) — so the
+/// contract this session asks the terminal for is exactly as wide as what
+/// it actually acts on.
+///
+/// Must run after [`enable_raw_mode`] (crossterm's probe blocks on a real
+/// synchronous read from the tty — it doesn't work otherwise) and before
+/// [`spawn_input_thread`] starts its own blocking `event::read()` loop on a
+/// background thread; both read from the same underlying tty through
+/// crossterm's internal event-reader lock, so overlapping them risks the
+/// probe's response bytes being stolen by the input thread instead (or a
+/// deadlock, depending on timing) rather than a hang or a crash, which is
+/// worse to debug. `supports_keyboard_enhancement` already bounds its own
+/// wait (2s) and turns "no response," "not a tty" (e.g. output piped in a
+/// test harness), or any other I/O hiccup into `Ok(false)`/`Err` — both
+/// treated identically here as "not supported," so a plain terminal or a
+/// pipe never makes startup fail or hang, it just keeps `C-t` as the sole
+/// working binding.
+fn enable_kitty_keyboard_protocol() -> bool {
+    let Ok(true) = supports_keyboard_enhancement() else {
+        return false;
+    };
+    execute!(
+        io::stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )
+    .is_ok()
+}
+
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    // Popping unconditionally — not gated on whether `enable_kitty_keyboard_protocol`
+    // actually pushed anything — mirrors `disable_raw_mode`/`LeaveAlternateScreen`
+    // right alongside it: both run every time regardless of what this
+    // particular session did on the way in. It's safe to do: a terminal
+    // that never understood the push in the first place ignores this CSI
+    // sequence the same way it ignored that one (unrecognized CSI final
+    // bytes are conventionally no-ops per ECMA-48), and the kitty protocol
+    // itself specifies popping an empty flag stack as a no-op too.
+    execute!(
+        terminal.backend_mut(),
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
 
 /// Ensures a panicking render doesn't leave the user's terminal stuck in
-/// raw mode / the alternate screen. Installed once, before the terminal is
-/// touched, so it's active for the whole session.
+/// raw mode / the alternate screen / the kitty keyboard protocol's escape
+/// mode. Installed once, before the terminal is touched, so it's active
+/// for the whole session — including the window between
+/// `enable_kitty_keyboard_protocol` pushing the flag and `restore_terminal`
+/// popping it on a clean exit, which a panic mid-session would otherwise
+/// skip entirely.
 fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
         original(info);

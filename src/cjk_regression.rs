@@ -281,7 +281,7 @@ mod tests {
     /// pins down.
     #[test]
     fn keymap_resolver_treats_an_unbound_cjk_character_as_an_ordinary_cancelled_key() {
-        let keymap = Keymap::from_bindings(&vim_preset());
+        let keymap = Keymap::from_bindings(&vim_preset(false));
         let mut resolver = keymap.resolver();
         let cjk_key = KeyChord::new(KeyCode::Char('日'), KeyModifiers::NONE);
         assert_eq!(resolver.feed(cjk_key), StepResult::Cancelled);

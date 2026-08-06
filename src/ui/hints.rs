@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn for_actions_reads_the_live_vim_binding() {
-        let keymap = Keymap::from_bindings(&vim_preset());
+        let keymap = Keymap::from_bindings(&vim_preset(false));
         let item = HintItem::for_actions(&keymap, &[Action::GotoDefinition], "def").unwrap();
         assert_eq!(item.display(), "gd def");
     }
@@ -300,14 +300,14 @@ mod tests {
         // The M9 bug fix, pinned down directly: switching presets changes
         // hint text with no separate update, because this reads the active
         // `Keymap` rather than a hardcoded vim string.
-        let keymap = Keymap::from_bindings(&emacs_preset());
+        let keymap = Keymap::from_bindings(&emacs_preset(false));
         let item = HintItem::for_actions(&keymap, &[Action::GotoDefinition], "def").unwrap();
         assert_eq!(item.display(), "M-. def");
     }
 
     #[test]
     fn for_actions_joins_a_pair_with_a_slash() {
-        let keymap = Keymap::from_bindings(&vim_preset());
+        let keymap = Keymap::from_bindings(&vim_preset(false));
         let item = HintItem::for_actions(&keymap, &[Action::CursorDown, Action::CursorUp], "move")
             .unwrap();
         assert_eq!(item.display(), "j/k move");
@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn for_actions_follows_a_keys_override() {
-        let mut bindings = vim_preset();
+        let mut bindings = vim_preset(false);
         bindings
             .iter_mut()
             .find(|(_, a)| *a == Action::GotoDefinition)
@@ -447,7 +447,7 @@ mod tests {
 
     #[test]
     fn diff_view_items_lists_jump_back_forward_second() {
-        let keymap = Keymap::from_bindings(&vim_preset());
+        let keymap = Keymap::from_bindings(&vim_preset(false));
         let items = diff_view_items(&keymap);
         assert_eq!(items[0].display(), "j/k move");
         assert_eq!(items[1].display(), "C-o/C-t jump");
@@ -455,7 +455,7 @@ mod tests {
 
     #[test]
     fn file_view_items_lists_jump_back_forward_second() {
-        let keymap = Keymap::from_bindings(&vim_preset());
+        let keymap = Keymap::from_bindings(&vim_preset(false));
         let items = file_view_items(&keymap);
         assert_eq!(items[0].display(), "j/k move");
         assert_eq!(items[1].display(), "C-o/C-t jump");
@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn diff_view_items_show_emacs_notation_under_the_emacs_preset() {
-        let keymap = Keymap::from_bindings(&emacs_preset());
+        let keymap = Keymap::from_bindings(&emacs_preset(false));
         let items = diff_view_items(&keymap);
         let def = items.iter().find(|i| i.label == "def").unwrap();
         assert_eq!(def.display(), "M-. def");
@@ -473,7 +473,7 @@ mod tests {
 
     #[test]
     fn timeline_view_items_has_no_jump_item() {
-        let keymap = Keymap::from_bindings(&vim_preset());
+        let keymap = Keymap::from_bindings(&vim_preset(false));
         let items = timeline_view_items(&keymap);
         assert!(items.iter().all(|i| i.label != "jump"));
     }
@@ -483,5 +483,34 @@ mod tests {
         let wrapped = vec!["j/k move".to_owned(), "gd def".to_owned()];
         let lines = render_lines(&wrapped);
         assert_eq!(lines.len(), 2);
+    }
+
+    /// The M9b payoff: the jump hint's forward key follows whatever
+    /// `binding_for(JumpForward)` resolves to (see that method's
+    /// first-match-wins docs), with zero hint-side special-casing — a
+    /// kitty-protocol-capable session's hint reads `C-o/C-i`, matching
+    /// neovim, purely because `vim_preset(true)` lists `C-i` ahead of
+    /// `C-t` for that action.
+    #[test]
+    fn diff_view_items_jump_hint_shows_c_i_when_ci_distinguishable() {
+        let keymap = Keymap::from_bindings(&vim_preset(true));
+        let items = diff_view_items(&keymap);
+        assert_eq!(items[1].display(), "C-o/C-i jump");
+    }
+
+    #[test]
+    fn diff_view_items_jump_hint_shows_c_t_when_not_ci_distinguishable() {
+        let keymap = Keymap::from_bindings(&vim_preset(false));
+        let items = diff_view_items(&keymap);
+        assert_eq!(items[1].display(), "C-o/C-t jump");
+    }
+
+    #[test]
+    fn file_view_items_jump_hint_follows_ci_distinguishable_too() {
+        // Not diff-view-specific: `file_view_items` builds its jump hint the
+        // same way, off the same live keymap.
+        let keymap = Keymap::from_bindings(&emacs_preset(true));
+        let items = file_view_items(&keymap);
+        assert_eq!(items[1].display(), "C-o/C-i jump");
     }
 }

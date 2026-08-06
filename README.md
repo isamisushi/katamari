@@ -96,7 +96,7 @@ below) for the emacs column. `q` quits either way.
 | Hover | `K` | `C-h` |
 | Go to definition | `gd` | `M-.` |
 | Find references | `gr` | `M-?` |
-| Jump back / forward | `C-o` / `C-t` | `C-o` / `C-t` |
+| Jump back / forward | `C-o` / `C-i`\* | `C-o` / `C-i`\* |
 | Next / prev symbol on line | `Tab` / `BackTab` | `Tab` / `BackTab` |
 | Confirm / cancel | `Enter` / `Esc` | `Enter` / `Esc` |
 | Toggle sidebar | `b` | `b` |
@@ -106,6 +106,15 @@ below) for the emacs column. `q` quits either way.
 | Add comment | `c` | `C-c C-c` |
 | Toggle inline comment bodies | `C` | `C` |
 | Quit | `q` | `q` |
+
+\* Jump-forward matches neovim: it's `C-i` in terminals that implement the
+[kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
+(Ghostty, kitty, WezTerm, iTerm2 3.5+, Alacritty), which lets katamari tell a
+literal Tab keypress apart from `Ctrl-i` on the wire — without it they arrive
+as the same byte, and Tab already means next-symbol-on-line, so katamari
+falls back to `C-t` there instead (notably Terminal.app, which doesn't
+implement the protocol). Detected once at startup; `C-t` also keeps working
+as an alias in terminals where `C-i` is active.
 
 Any binding can be overridden per action; see `[keys]` below.
 
