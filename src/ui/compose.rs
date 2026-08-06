@@ -130,7 +130,12 @@ impl ComposeBuffer {
     }
 }
 
-fn char_byte_index(s: &str, char_idx: usize) -> usize {
+/// `pub(super)`: [`crate::ui::scope_menu`]'s single-line revision input
+/// reuses this exact char-index-to-byte-index conversion rather than
+/// re-deriving it — see [`ComposeBuffer`]'s docs on why char indexing
+/// (never byte indexing) is the right coordinate space for a text buffer a
+/// user is actively typing into.
+pub(super) fn char_byte_index(s: &str, char_idx: usize) -> usize {
     s.char_indices()
         .nth(char_idx)
         .map_or(s.len(), |(byte_idx, _)| byte_idx)
@@ -269,8 +274,11 @@ pub fn render(frame: &mut Frame, area: Rect, cursor_screen_row: u16, state: &Com
 /// Renders one line of the buffer with its `char`-column cursor position
 /// underlined, so the compose overlay shows where typing will land the same
 /// way a real cursor would — `ratatui::Frame` has no text-input widget of
-/// its own to delegate this to.
-fn cursor_marked_line(text: &str, cursor_col: usize) -> Line<'static> {
+/// its own to delegate this to. `pub(super)` rather than private:
+/// [`crate::ui::scope_menu`]'s one-line revision input reuses this exact
+/// rendering rather than re-deriving the same cursor math for a second kind
+/// of text field.
+pub(super) fn cursor_marked_line(text: &str, cursor_col: usize) -> Line<'static> {
     let chars: Vec<char> = text.chars().collect();
     let before: String = chars[..cursor_col.min(chars.len())].iter().collect();
     let at = chars.get(cursor_col).copied();

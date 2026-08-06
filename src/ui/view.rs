@@ -159,6 +159,16 @@ impl ViewStack {
         self.views.truncate(1);
     }
 
+    /// Whether the top view is also the root — nothing has been pushed on
+    /// top of it. The scope-menu popup's watch-mode pause/resume (see
+    /// [`crate::ui::apply_scope_swap`]) only applies when this is true:
+    /// watch mode only ever refreshes [`Self::root_mut`], so a scope swap
+    /// on a *pushed* diff (opened via `L`/`t`/goto-definition) has nothing
+    /// to do with whatever watch mode is refreshing underneath it.
+    pub fn is_at_root(&self) -> bool {
+        self.views.len() == 1
+    }
+
     pub fn top(&self) -> &View {
         self.views.last().expect("view stack is never empty")
     }

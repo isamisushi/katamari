@@ -23,6 +23,7 @@ pub mod log_view;
 pub mod navigation;
 pub mod refresh;
 pub mod refs_panel;
+pub mod scope_menu;
 pub mod scroll;
 pub mod sidebar;
 pub mod status_bar;
@@ -52,6 +53,9 @@ use crate::ui::compose::{ComposeOutcome, ComposeState};
 use crate::ui::log_view::LogView;
 use crate::ui::navigation::{JumpEntry, JumpStack, navigate_to};
 use crate::ui::refs_panel::RefsPanel;
+use crate::ui::scope_menu::{
+    RevisionInputOutcome, ScopeMenuEntry, ScopeMenuState, handle_revision_key,
+};
 use crate::ui::timeline_view::TimelineView;
 use crate::vcs::DiffSource;
 use crate::vcs::LogBackend;
@@ -368,15 +372,7 @@ fn spawn_comments_forwarder(rx: Receiver<()>, tx: Sender<AppEvent>) {
 fn warm_up_root(view: &View, lsp_manager: &LspManager) -> Option<String> {
     match view {
         View::Diff(app) => {
-            let max_lines = crate::config::highlight_max_lines();
-            let files: Vec<PathBuf> = app
-                .files
-                .iter()
-                .filter(|f| !f.is_deleted && !f.is_binary && !f.skip_highlighting(max_lines))
-                .filter_map(|f| f.new_path.as_deref())
-                .map(|relative| app.repo_root.join(relative))
-                .collect();
-            let summary = lsp_manager.warm_up(&files, &app.repo_root);
+            let summary = warm_up_diff(app, lsp_manager);
             summary.capped().then(|| {
                 format!(
                     "LSP: opened {} of {} changed files for diagnostics (first {} by diff order)",
@@ -521,6 +517,12 @@ fn event_loop(
     let mut watch_status: Option<WatchStatus> = initial_watch_status.map(WatchStatus::new);
     let mut warned_languages: HashSet<Language> = HashSet::new();
     let mut compose: Option<ComposeState> = None;
+    let mut scope_menu: Option<ScopeMenuState> = None;
+    // Only meaningful while `pre_refresh_hook.is_some()` (watch mode is
+    // actually running) — see `apply_scope_swap`'s docs and
+    // `handle_watch_refresh`'s early-return on this flag.
+    let mut watch_paused = false;
+    let watch_active = pre_refresh_hook.is_some();
     let mut comment_list: Vec<Comment> = initial_comments;
     let mut comment_index: CommentIndex = comments_repo_root
         .as_deref()
@@ -642,6 +644,8 @@ fn event_loop(
                 status_note.as_deref(),
                 &comment_index,
                 compose.as_ref(),
+                scope_menu.as_ref(),
+                jj_repo.is_some(),
             )
         })?;
 
@@ -669,6 +673,53 @@ fn event_loop(
                             compose = None;
                         }
                     }
+                } else if let Some(ScopeMenuState::Revision(input)) = scope_menu.as_mut() {
+                    // Bypasses the keymap resolver for the same reason
+                    // `compose` does above: a revision string can contain
+                    // characters (`.`, `@`, `-`) that would otherwise
+                    // resolve to unrelated `Action`s.
+                    match handle_revision_key(input, key) {
+                        RevisionInputOutcome::Continue => {}
+                        RevisionInputOutcome::Back => {
+                            scope_menu = Some(ScopeMenuState::new_list(jj_repo.is_some()));
+                        }
+                        RevisionInputOutcome::Submit(text) => {
+                            let at_root = stack.is_at_root();
+                            if let View::Diff(app) = stack.top_mut() {
+                                match apply_scope_swap(
+                                    app,
+                                    &ScopeChoice::Revision(text),
+                                    at_root,
+                                    watch_active,
+                                    jj_repo.as_ref(),
+                                    lsp_manager,
+                                    highlighter,
+                                    &mut hover_state,
+                                    &mut refs_panel,
+                                    &mut watch_paused,
+                                    &mut watch_status,
+                                ) {
+                                    Ok(()) => scope_menu = None,
+                                    Err(e) => {
+                                        goto_status = Some(format!("scope: {e}"));
+                                        // Leave `scope_menu` open (still
+                                        // `Revision`) so the reviewer can
+                                        // fix the input and retry — an
+                                        // invalid revision must never blank
+                                        // the diff already on screen.
+                                    }
+                                }
+                            } else {
+                                // The popup only ever opens from a
+                                // `View::Diff` (see `Action::OpenScopeMenu`'s
+                                // handling below) and nothing else pops the
+                                // stack while it's open, so this shouldn't
+                                // happen in practice — closing defensively
+                                // rather than leaving an orphaned overlay.
+                                scope_menu = None;
+                            }
+                        }
+                    }
                 } else {
                     match resolver.feed(KeyChord::from(key)) {
                         StepResult::Matched(action) => {
@@ -687,6 +738,11 @@ fn event_loop(
                                 lsp_manager,
                                 jj_repo.as_ref(),
                                 &mut compose,
+                                &mut scope_menu,
+                                highlighter,
+                                &mut watch_paused,
+                                watch_active,
+                                &mut watch_status,
                             );
                         }
                         StepResult::Pending => {
@@ -724,7 +780,13 @@ fn event_loop(
                 crate::lsp::LspEvent::Closed { .. } => lsp_status = None,
             },
             Ok(AppEvent::Watch(WatchSignal::Pending)) => {
-                watch_status = Some(WatchStatus::new("watch: pending\u{2026}".to_owned()));
+                // Suppressed while paused: a "pending…" note that never
+                // resolves into "updated" (see `handle_watch_refresh`'s
+                // early return below) would read as a stuck refresh rather
+                // than the deliberate pause it actually is.
+                if !watch_paused {
+                    watch_status = Some(WatchStatus::new("watch: pending\u{2026}".to_owned()));
+                }
             }
             Ok(AppEvent::Watch(WatchSignal::Flushed(batch))) => {
                 handle_watch_refresh(
@@ -736,6 +798,7 @@ fn event_loop(
                     &mut hover_state,
                     &mut refs_panel,
                     &mut watch_status,
+                    watch_paused,
                 );
                 // The working tree just changed, which can shift where
                 // every comment relocates to even though the comment log
@@ -867,7 +930,74 @@ fn handle_action(
     lsp_manager: &LspManager,
     jj_repo: Option<&JjRepo>,
     compose: &mut Option<ComposeState>,
+    scope_menu: &mut Option<ScopeMenuState>,
+    highlighter: &mut LineHighlighter,
+    watch_paused: &mut bool,
+    watch_active: bool,
+    watch_status: &mut Option<WatchStatus>,
 ) {
+    // The scope-menu popup's *list* half intercepts its own navigation
+    // keys the same way `refs_panel`/`hover_state` do below — `Revision`
+    // input never reaches here at all (see `run`'s event loop: it bypasses
+    // the keymap resolver entirely, the same way `compose` does), so only
+    // `ScopeMenuState::List` ever needs handling in this dispatch point.
+    if let Some(ScopeMenuState::List(list)) = scope_menu {
+        match action {
+            Action::CursorDown => return list.move_down(),
+            Action::CursorUp => return list.move_up(),
+            Action::Cancel | Action::OpenScopeMenu => {
+                *scope_menu = None;
+                return;
+            }
+            Action::Confirm => {
+                let entry = list.selected_entry();
+                match entry {
+                    ScopeMenuEntry::Log => {
+                        *scope_menu = None;
+                        open_or_close_log(stack, goto_status);
+                    }
+                    ScopeMenuEntry::Timeline => {
+                        *scope_menu = None;
+                        open_or_close_timeline(stack, jj_repo, goto_status);
+                    }
+                    ScopeMenuEntry::Revision => {
+                        *scope_menu = Some(ScopeMenuState::new_revision_input());
+                    }
+                    ScopeMenuEntry::WorkingTree | ScopeMenuEntry::Staged => {
+                        let choice = if entry == ScopeMenuEntry::WorkingTree {
+                            ScopeChoice::WorkingTree
+                        } else {
+                            ScopeChoice::Staged
+                        };
+                        let at_root = stack.is_at_root();
+                        if let View::Diff(app) = stack.top_mut() {
+                            match apply_scope_swap(
+                                app,
+                                &choice,
+                                at_root,
+                                watch_active,
+                                jj_repo,
+                                lsp_manager,
+                                highlighter,
+                                hover_state,
+                                refs_panel,
+                                watch_paused,
+                                watch_status,
+                            ) {
+                                Ok(()) => *scope_menu = None,
+                                Err(e) => *goto_status = Some(format!("scope: {e}")),
+                            }
+                        } else {
+                            *scope_menu = None; // defensive; see the Revision-input arm's identical comment in `run`
+                        }
+                    }
+                }
+                return;
+            }
+            _ => *scope_menu = None, // any other key closes the menu, then falls through
+        }
+    }
+
     if let Some(state) = refs_panel {
         match action {
             Action::CursorDown => return state.panel.select_next(),
@@ -989,38 +1119,13 @@ fn handle_action(
             }
         }
         Action::Cancel => {} // nothing open; no effect
-        Action::ToggleTimeline => match stack.top_mut() {
-            View::Timeline(timeline) => timeline.should_quit = true, // closes back to the diff
-            View::Diff(_) => match jj_repo {
-                Some(repo) => {
-                    match TimelineView::new(repo.clone(), timeline_view::DEFAULT_OP_LOG_LIMIT) {
-                        Ok(timeline) => stack.push(View::Timeline(timeline)),
-                        Err(e) => *goto_status = Some(format!("timeline: {e}")),
-                    }
-                }
-                None => {
-                    *goto_status = Some("jj not detected — timeline unavailable".to_owned());
-                }
-            },
-            // The timeline only relates to the root diff; a `FileView`/
-            // `LogView` pushed on top of it (via goto-definition or `L`)
-            // has nothing for `t` to open.
-            View::File(_) | View::Log(_) => {}
-        },
-        // Unlike `ToggleTimeline`, there's no "jj not detected" failure
-        // mode: `LogBackend::detect` always has *something* to open (jj
-        // history if colocated, plain `git log` otherwise), since every
-        // repository `ktmr` runs in is a git repository first.
-        Action::ToggleLogView => match stack.top_mut() {
-            View::Log(log) => log.should_quit = true, // closes back to the diff
-            View::Diff(app) => {
-                let backend = LogBackend::detect(&app.repo_root);
-                match LogView::new(backend, log_view::DEFAULT_LOG_LIMIT) {
-                    Ok(log) => stack.push(View::Log(log)),
-                    Err(e) => *goto_status = Some(format!("log: {e}")),
-                }
+        Action::ToggleTimeline => open_or_close_timeline(stack, jj_repo, goto_status),
+        Action::ToggleLogView => open_or_close_log(stack, goto_status),
+        Action::OpenScopeMenu => match stack.top() {
+            View::Diff(_) => *scope_menu = Some(ScopeMenuState::new_list(jj_repo.is_some())),
+            View::File(_) | View::Timeline(_) | View::Log(_) => {
+                *goto_status = Some("scope: only available in the diff view".to_owned());
             }
-            View::File(_) | View::Timeline(_) => {}
         },
         Action::Confirm => match stack.top_mut() {
             // Computing the diff is a real backend call that can fail, so
@@ -1051,6 +1156,183 @@ fn handle_action(
     }
 }
 
+/// `Action::ToggleTimeline`'s handling, factored out so the scope-menu
+/// popup's `Timeline (jj)` entry (see `handle_action`'s scope-menu
+/// interception) triggers exactly the same behavior `t` already does — the
+/// milestone spec calls for the popup entry to be a discoverability alias
+/// for the key, not a second implementation of it.
+fn open_or_close_timeline(
+    stack: &mut ViewStack,
+    jj_repo: Option<&JjRepo>,
+    goto_status: &mut Option<String>,
+) {
+    match stack.top_mut() {
+        View::Timeline(timeline) => timeline.should_quit = true, // closes back to the diff
+        View::Diff(_) => match jj_repo {
+            Some(repo) => {
+                match TimelineView::new(repo.clone(), timeline_view::DEFAULT_OP_LOG_LIMIT) {
+                    Ok(timeline) => stack.push(View::Timeline(timeline)),
+                    Err(e) => *goto_status = Some(format!("timeline: {e}")),
+                }
+            }
+            None => {
+                *goto_status = Some("jj not detected — timeline unavailable".to_owned());
+            }
+        },
+        // The timeline only relates to the root diff; a `FileView`/
+        // `LogView` pushed on top of it (via goto-definition or `L`) has
+        // nothing for `t` to open.
+        View::File(_) | View::Log(_) => {}
+    }
+}
+
+/// `Action::ToggleLogView`'s handling, factored out the same way and for
+/// the same reason as [`open_or_close_timeline`] — the scope-menu popup's
+/// `Log` entry.
+fn open_or_close_log(stack: &mut ViewStack, goto_status: &mut Option<String>) {
+    match stack.top_mut() {
+        View::Log(log) => log.should_quit = true, // closes back to the diff
+        View::Diff(app) => {
+            let backend = LogBackend::detect(&app.repo_root);
+            match LogView::new(backend, log_view::DEFAULT_LOG_LIMIT) {
+                Ok(log) => stack.push(View::Log(log)),
+                Err(e) => *goto_status = Some(format!("log: {e}")),
+            }
+        }
+        View::File(_) | View::Timeline(_) => {}
+    }
+}
+
+/// What the scope-menu popup can swap the current [`View::Diff`]'s content
+/// to *in place* — unlike `Log`/`Timeline` (handled by
+/// [`open_or_close_log`]/[`open_or_close_timeline`] instead), which push a
+/// new view rather than replacing this one's content, so they never become
+/// a `ScopeChoice`.
+enum ScopeChoice {
+    WorkingTree,
+    Staged,
+    /// The free-form text a "Revision…" submission carried, untrimmed —
+    /// [`apply_scope_swap`] trims it once, at the point it's actually used.
+    Revision(String),
+}
+
+/// Whether a scope swap that resolves at the session's root diff should
+/// pause (`Some(true)`) or resume (`Some(false)`) watch mode's refresh loop
+/// — `None` when watch mode isn't running at all, or the swap happened on
+/// a *pushed* diff rather than the root (see [`ViewStack::is_at_root`]'s
+/// docs), in which case nothing about watch mode changes. Split out as its
+/// own pure function — no `App`, no I/O — so this decision is unit
+/// testable without constructing an [`LspManager`] or a real watcher, per
+/// this milestone's convention of factoring state transitions out of the
+/// glue that has to run them.
+fn watch_pause_decision(watch_active: bool, at_root: bool, is_working_tree: bool) -> Option<bool> {
+    (watch_active && at_root).then_some(!is_working_tree)
+}
+
+/// Proactively opens `app`'s current files with the LSP — shared by
+/// [`warm_up_root`]'s [`View::Diff`] handling and [`apply_scope_swap`] (a
+/// mid-session scope swap onto an interactive scope warms up exactly the
+/// same way the session's initial root view does), so both call sites stay
+/// in agreement about which files qualify rather than maintaining the
+/// filter twice.
+fn warm_up_diff(app: &App, lsp_manager: &LspManager) -> crate::lsp::manager::WarmUpSummary {
+    let max_lines = crate::config::highlight_max_lines();
+    let files: Vec<PathBuf> = app
+        .files
+        .iter()
+        .filter(|f| !f.is_deleted && !f.is_binary && !f.skip_highlighting(max_lines))
+        .filter_map(|f| f.new_path.as_deref())
+        .map(|relative| app.repo_root.join(relative))
+        .collect();
+    lsp_manager.warm_up(&files, &app.repo_root)
+}
+
+/// Fetches `choice`'s diff text and, on success, swaps it into `app`
+/// ([`App::apply_scope_swap`]) and runs every side effect a scope change
+/// needs: closing a now-stale hover/references overlay, bounding the
+/// highlight cache the same way a watch refresh already does (see
+/// `handle_watch_refresh`'s docs), warming up the LSP for an interactive
+/// scope (`Working tree`/`Staged` — never `Revision`, matching
+/// [`crate::ui::log_view::LogView`]-opened diffs' existing "historical
+/// content isn't LSP-eligible" precedent, see `App::interactive`'s docs),
+/// and — only when this swap happened on the session's root diff, the one
+/// view watch mode actually refreshes (`at_root`) — pausing or resuming
+/// watch mode to match the new scope via [`watch_pause_decision`].
+///
+/// On failure, `app` is left *completely* untouched: every branch below
+/// only calls [`App::apply_scope_swap`] after its own VCS call already
+/// succeeded, so a bad revision or a transient git/jj failure can never
+/// leave a blank or half-updated diff on screen — the error is returned for
+/// the caller to show as a status-bar note instead, per the milestone spec.
+#[allow(clippy::too_many_arguments)] // one function, every side effect a
+// scope change needs — see `handle_action`'s identical justification for
+// why splitting this into a struct wouldn't reduce how many independent
+// pieces of session state it has to touch.
+fn apply_scope_swap(
+    app: &mut App,
+    choice: &ScopeChoice,
+    at_root: bool,
+    watch_active: bool,
+    jj_repo: Option<&JjRepo>,
+    lsp_manager: &LspManager,
+    highlighter: &mut LineHighlighter,
+    hover_state: &mut hover_popup::HoverState,
+    refs_panel: &mut Option<RefsPanelState>,
+    watch_paused: &mut bool,
+    watch_status: &mut Option<WatchStatus>,
+) -> Result<(), String> {
+    let git = GitSource::at(app.repo_root.clone());
+    let (result, interactive, scope_label): (anyhow::Result<String>, bool, Option<String>) =
+        match choice {
+            ScopeChoice::WorkingTree => (git.working_tree_diff(), true, None),
+            ScopeChoice::Staged => (git.staged_diff(), true, None),
+            ScopeChoice::Revision(input) => {
+                let revset = input.trim();
+                if revset.is_empty() {
+                    return Err("enter a revision first".to_owned());
+                }
+                // jj mode passes the whole string through as one revset to
+                // `jj diff -r` unvalidated, letting jj's own operators
+                // (`a..b`, `@-`, ...) work exactly as they do on the
+                // command line — see `crate::vcs::jj::JjRepo::revision_diff`'s
+                // docs, and this milestone's task notes for the empirical
+                // check that a DAG-range revset like `a..b` resolves to the
+                // combined diff from `a`'s side to `b`'s, not something
+                // unhelpful. git mode reuses `GitSource::range_diff`, which
+                // already accepts a plain rev or an `A..B`/`A...B` range
+                // (see `git::plan_range`) — no second parser needed here.
+                let result = match jj_repo {
+                    Some(repo) => repo.revision_diff(revset),
+                    None => git.range_diff(revset),
+                };
+                (result, false, Some(format!("r: {revset}")))
+            }
+        };
+    let text = result.map_err(|e| e.to_string())?;
+    app.apply_scope_swap(parse_unified_diff(&text), interactive, scope_label);
+
+    hover_state.invalidate();
+    *refs_panel = None;
+    highlighter.clear_cache();
+    if interactive {
+        warm_up_diff(app, lsp_manager);
+    }
+
+    let is_working_tree = matches!(choice, ScopeChoice::WorkingTree);
+    if let Some(should_pause) = watch_pause_decision(watch_active, at_root, is_working_tree) {
+        let was_paused = *watch_paused;
+        *watch_paused = should_pause;
+        if should_pause && !was_paused {
+            *watch_status = Some(WatchStatus::new(
+                "watch paused (historical scope)".to_owned(),
+            ));
+        } else if !should_pause && was_paused {
+            *watch_status = Some(WatchStatus::new("watch resumed".to_owned()));
+        }
+    }
+    Ok(())
+}
+
 /// Applies one flushed watch batch: runs the M5 pre-refresh hook, re-runs
 /// the working-tree diff, re-parses it, and swaps it into the root diff via
 /// [`App::apply_refresh`] (which owns cursor/scroll preservation — see its
@@ -1067,6 +1349,13 @@ fn handle_action(
 /// racing an in-progress `git rebase`) is left as a status note rather than
 /// treated as fatal — the diff already on screen stays put, and the next
 /// flush gets another chance.
+///
+/// M12: a no-op entirely while `watch_paused` (the scope-menu popup swapped
+/// the root diff to something other than the working tree — see
+/// [`apply_scope_swap`]/[`watch_pause_decision`]). Watch mode's own
+/// filesystem watcher thread keeps running regardless — nothing here tears
+/// it down — so the moment the reviewer swaps back to `Working tree`,
+/// refreshes resume on the very next flush with no restart needed.
 #[allow(clippy::too_many_arguments)] // each parameter is a distinct piece
 // of session state one refresh cycle touches — see `handle_action`'s
 // comment for why bundling into a struct wouldn't reduce this.
@@ -1079,7 +1368,12 @@ fn handle_watch_refresh(
     hover_state: &mut hover_popup::HoverState,
     refs_panel: &mut Option<RefsPanelState>,
     watch_status: &mut Option<WatchStatus>,
+    watch_paused: bool,
 ) {
+    if watch_paused {
+        return;
+    }
+
     let View::Diff(app) = stack.root_mut() else {
         return; // watch mode only ever runs against the root diff view
     };
@@ -1269,6 +1563,8 @@ fn draw(
     status_note: Option<&str>,
     comments: &CommentIndex,
     compose: Option<&ComposeState>,
+    scope_menu: Option<&ScopeMenuState>,
+    jj_available: bool,
 ) {
     match view {
         View::Diff(app) => {
@@ -1306,6 +1602,9 @@ fn draw(
                 && let Some(row) = view.cursor_screen_row()
             {
                 compose::render(frame, areas.diff, row, state);
+            }
+            if let Some(state) = scope_menu {
+                scope_menu::render(frame, areas.diff, state, jj_available);
             }
         }
         View::File(file) => {
@@ -1449,4 +1748,41 @@ fn install_panic_hook() {
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
         original(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- watch_pause_decision ---------------------------------------------
+
+    #[test]
+    fn watch_inactive_never_changes_the_pause_flag() {
+        assert_eq!(watch_pause_decision(false, true, true), None);
+        assert_eq!(watch_pause_decision(false, true, false), None);
+    }
+
+    #[test]
+    fn a_swap_on_a_pushed_diff_never_changes_the_pause_flag() {
+        // `at_root == false`: the scope menu was opened on a diff `L`/`t`
+        // (or goto-definition) pushed on top of the root, not the root
+        // itself — watch mode only ever refreshes the root, so this has
+        // nothing to do with it.
+        assert_eq!(watch_pause_decision(true, false, true), None);
+        assert_eq!(watch_pause_decision(true, false, false), None);
+    }
+
+    #[test]
+    fn swapping_the_root_to_working_tree_resumes() {
+        assert_eq!(watch_pause_decision(true, true, true), Some(false));
+    }
+
+    #[test]
+    fn swapping_the_root_to_a_non_working_tree_scope_pauses() {
+        // `is_working_tree = false` covers both `Staged` and `Revision` —
+        // this function only distinguishes "the working tree" from
+        // "anything else," matching the milestone spec's "non-working-tree
+        // scope" wording exactly.
+        assert_eq!(watch_pause_decision(true, true, false), Some(true));
+    }
 }

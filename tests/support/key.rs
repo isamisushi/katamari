@@ -36,6 +36,16 @@ pub enum Key {
     Enter,
     /// A plain character, sent as its raw UTF-8 bytes.
     Char(char),
+    /// Esc. The one key whose *legacy* encoding (a bare `0x1b`) is
+    /// genuinely ambiguous with the start of any other escape sequence —
+    /// which is exactly what `DISAMBIGUATE_ESCAPE_CODES` exists to fix: a
+    /// kitty-protocol terminal sends a real Escape keypress as its CSI-u
+    /// form (`ESC [ 27 u`, codepoint 27 being Escape's own) precisely so a
+    /// lone `0x1b` byte is never emitted standalone once the flag is
+    /// active. `KittyMode::Unsupported` still sends the legacy bare byte —
+    /// crossterm's own escape-timeout heuristic there is what turns "ESC,
+    /// then nothing else arrives" into `KeyCode::Esc`.
+    Esc,
 }
 
 impl Key {
@@ -61,6 +71,10 @@ impl Key {
                 let mut buf = [0u8; 4];
                 c.encode_utf8(&mut buf).as_bytes().to_vec()
             }
+            Key::Esc => match mode {
+                KittyMode::Supported => b"\x1b[27u".to_vec(),
+                KittyMode::Unsupported => vec![0x1b],
+            },
         }
     }
 }

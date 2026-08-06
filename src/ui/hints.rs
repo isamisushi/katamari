@@ -220,6 +220,7 @@ pub fn diff_view_items(keymap: &Keymap) -> Vec<HintItem> {
             &[Action::NextDiagnostic, Action::PrevDiagnostic],
             "diag",
         ),
+        HintItem::for_actions(keymap, &[Action::OpenScopeMenu], "scope"),
         HintItem::for_actions(keymap, &[Action::AddComment], "comment"),
         HintItem::for_actions(keymap, &[Action::ToggleSidebar], "sidebar"),
         HintItem::for_actions(keymap, &[Action::ToggleLayout], "layout"),

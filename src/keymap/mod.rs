@@ -98,6 +98,19 @@ pub enum Action {
     /// something to open: every repository `ktmr diff` can start in has
     /// git history, jj or not.
     ToggleLogView,
+    /// Opens [`crate::ui::scope_menu`]'s popup — a keyboard-driven menu for
+    /// switching what a live [`crate::ui::view::View::Diff`] session is
+    /// reviewing (working tree, staged, a free-form revision, or straight
+    /// to `L`/`t`'s own views) without restarting `ktmr diff` with CLI
+    /// flags. `ui::mod`'s event loop intercepts this the same way it
+    /// intercepts `ToggleTimeline`/`ToggleLogView`: building the menu needs
+    /// to know whether a colocated jj repo was detected, which neither
+    /// `App` nor `FileView` owns. Also closes the popup when it's already
+    /// open, mirroring how `ToggleTimeline`/`ToggleLogView` close their own
+    /// views — see `ui::mod::handle_action`'s scope-menu interception for
+    /// the exact key handling once it's open (`j`/`k`/Enter/Esc, not this
+    /// action again).
+    OpenScopeMenu,
     /// Opens the M6 comment-compose overlay, anchored to the cursor's
     /// current row — `ui::mod`'s event loop intercepts this rather than
     /// forwarding it through `App::update`, since it needs the repo root
@@ -440,6 +453,7 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("Esc", Action::Cancel),
         ("t", Action::ToggleTimeline),
         ("L", Action::ToggleLogView),
+        ("o", Action::OpenScopeMenu),
         ("v", Action::ToggleRangeSelect),
         ("c", Action::AddComment),
         ("C", Action::ToggleComments),
@@ -465,7 +479,8 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
 /// two-chord-with-a-shared-prefix shape `C-x` itself is famous for, without
 /// this app actually needing a `C-x` prefix for anything else. A handful of
 /// bindings that have no strong identity in either editor (the sidebar/
-/// layout/timeline/comments toggles, symbol cycling, confirm/cancel) keep
+/// layout/timeline/comments/scope-menu toggles, symbol cycling,
+/// confirm/cancel) keep
 /// vim's keys rather than invent an arbitrary emacs-flavored alternative —
 /// `q` for quit most of all, kept identical across both presets by design
 /// (documented here rather than duplicated in each preset's own bindings).
@@ -505,6 +520,7 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("Esc", Action::Cancel),
         ("t", Action::ToggleTimeline),
         ("L", Action::ToggleLogView),
+        ("o", Action::OpenScopeMenu),
         ("C-Space", Action::ToggleRangeSelect),
         ("C-c C-c", Action::AddComment),
         ("C", Action::ToggleComments),
@@ -558,6 +574,7 @@ pub fn action_name(action: Action) -> &'static str {
         Action::ToggleTimeline => "toggle-timeline",
         Action::ToggleRangeSelect => "toggle-range-select",
         Action::ToggleLogView => "toggle-log-view",
+        Action::OpenScopeMenu => "open-scope-menu",
         Action::AddComment => "add-comment",
         Action::ToggleComments => "toggle-comments",
         Action::Quit => "quit",
@@ -596,6 +613,7 @@ pub fn action_by_name(name: &str) -> Option<Action> {
         "toggle-timeline" => Action::ToggleTimeline,
         "toggle-range-select" => Action::ToggleRangeSelect,
         "toggle-log-view" => Action::ToggleLogView,
+        "open-scope-menu" => Action::OpenScopeMenu,
         "add-comment" => Action::AddComment,
         "toggle-comments" => Action::ToggleComments,
         "quit" => Action::Quit,
@@ -718,6 +736,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn o_resolves_to_open_scope_menu_in_both_presets() {
+        let vim_keymap = Keymap::from_bindings(&vim_preset(false));
+        let mut vim = vim_keymap.resolver();
+        assert_eq!(
+            vim.feed(chord('o')),
+            StepResult::Matched(Action::OpenScopeMenu)
+        );
+        let emacs_keymap = Keymap::from_bindings(&emacs_preset(false));
+        let mut emacs = emacs_keymap.resolver();
+        assert_eq!(
+            emacs.feed(chord('o')),
+            StepResult::Matched(Action::OpenScopeMenu)
+        );
+    }
+
     fn alt(c: char) -> KeyChord {
         KeyChord::new(KeyCode::Char(c), KeyModifiers::ALT)
     }
@@ -832,6 +866,7 @@ mod tests {
             Action::ToggleTimeline,
             Action::ToggleRangeSelect,
             Action::ToggleLogView,
+            Action::OpenScopeMenu,
             Action::AddComment,
             Action::ToggleComments,
             Action::Quit,
@@ -930,17 +965,17 @@ mod tests {
         assert_eq!(KeySeq::parse("q").compact_notation(), "q");
     }
 
-    /// The 28 actions (see the `action_name_and_action_by_name_round_trip…`
+    /// The 30 actions (see the `action_name_and_action_by_name_round_trip…`
     /// test's `all` list) each get exactly one binding — except
     /// `JumpForward`, which gets a *second* one (`C-i`) precisely when
     /// `ci_distinguishable` is set, per [`vim_preset`]/[`emacs_preset`]'s
     /// docs. So this checks two things per preset: every action is still
-    /// reachable (`actions.len() == 28` after dedup), and the raw entry
+    /// reachable (`actions.len() == 30` after dedup), and the raw entry
     /// count is exactly one more than that when the extra `C-i` alias is
     /// present, exactly equal otherwise.
     #[test]
     fn every_vim_and_emacs_binding_covers_every_action_exactly_once() {
-        const ACTION_COUNT: usize = 29;
+        const ACTION_COUNT: usize = 30;
         for ci_distinguishable in [false, true] {
             for preset in [
                 vim_preset(ci_distinguishable),

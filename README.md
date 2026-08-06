@@ -106,6 +106,27 @@ If the repository has a colocated jj repo (see
 [jj colocated setup](#jj-colocated-setup)), `t` from `ktmr diff` opens the
 snapshot timeline, or jump there directly with `ktmr timeline`.
 
+`o` from `ktmr diff` opens the scope-picker popup — switch what a live
+session is reviewing without restarting `ktmr diff` with new CLI flags.
+`j`/`k` select, `Enter` confirms, `Esc` closes:
+
+- **Working tree** / **Staged** swap the current diff in place (cursor
+  resets to the top; anchor restoration across two unrelated diffs
+  wouldn't mean anything).
+- **Log** / **Timeline (jj)** (the latter only offered in a colocated jj
+  repo) open the same views `L`/`t` do — listed here too, purely for
+  discoverability.
+- **Revision…** opens a one-line input: a git rev or `A..B`/`A...B` range
+  in a git-only repo, or a jj revset in a colocated one — passed straight
+  through to `jj diff -r <input>`, so jj's own operators (`a..b`, `@-`, a
+  bookmark name, ...) work exactly as they do on the command line. An
+  invalid revision reports the VCS's own error in the status bar and
+  leaves whatever was on screen untouched.
+
+Swapping to anything other than the working tree pauses `--watch`'s
+refresh loop (the watcher itself keeps running) until you swap back;
+`.katamari/comments.jsonl`'s own watcher is unaffected either way.
+
 ## Keybindings
 
 Vim bindings are the default; set `keymap = "emacs"` in config (see
@@ -129,6 +150,7 @@ below) for the emacs column. `q` quits either way.
 | Toggle unified/side-by-side | `s` | `s` |
 | Toggle timeline | `t` | `t` |
 | Toggle log view | `L` | `L` |
+| Open scope menu | `o` | `o` |
 | Toggle range-select (timeline/log) | `v` | `C-Space` |
 | Add comment | `c` | `C-c C-c` |
 | Toggle inline comment bodies | `C` | `C` |

@@ -256,6 +256,34 @@ impl App {
         restored.overlay_survives
     }
 
+    /// Swaps in a completely different diff — the M12 scope-menu popup's
+    /// "Working tree" / "Staged" / "Revision…" selections. Unlike
+    /// [`Self::apply_refresh`] (a same-scope re-diff after a watched file
+    /// changed, where preserving the cursor's logical position across a
+    /// small edit is the whole point), a scope swap has nothing meaningful
+    /// to preserve: the new diff isn't a later version of the old one, it's
+    /// an unrelated review surface, so anchor restoration would just land
+    /// the cursor somewhere arbitrary. Always resets to the top instead.
+    /// `interactive`/`scope_label` are set by the caller (see
+    /// `crate::ui::mod::apply_scope_swap`), which is the one place that
+    /// knows which scope this diff came from.
+    pub fn apply_scope_swap(
+        &mut self,
+        files: Vec<DiffFile>,
+        interactive: bool,
+        scope_label: Option<String>,
+    ) {
+        self.files = files;
+        self.rows = flatten(&self.files);
+        self.side_by_side_rows = flatten_side_by_side(&self.files);
+        self.cursor = 0;
+        self.scroll_offset = 0;
+        self.active_symbol = 0;
+        self.interactive = interactive;
+        self.scope_label = scope_label;
+        self.clamp_scroll();
+    }
+
     /// Index into `files`/`rows` for whichever file the cursor currently
     /// sits within, for sidebar highlighting.
     pub fn selected_file(&self) -> usize {
@@ -314,12 +342,15 @@ impl App {
             | Action::JumpForward
             | Action::AddComment
             | Action::Confirm => {}
-            // `ui::mod` intercepts `ToggleTimeline`/`ToggleLogView` before
-            // they reach here (constructing/tearing down a `TimelineView`/
-            // `LogView` isn't a pure state transition); `ToggleRangeSelect`
-            // only means something inside `TimelineView`/`LogView`
-            // themselves.
-            Action::ToggleTimeline | Action::ToggleLogView | Action::ToggleRangeSelect => {}
+            // `ui::mod` intercepts `ToggleTimeline`/`ToggleLogView`/
+            // `OpenScopeMenu` before they reach here (constructing/tearing
+            // down a `TimelineView`/`LogView`/the scope-menu popup isn't a
+            // pure state transition); `ToggleRangeSelect` only means
+            // something inside `TimelineView`/`LogView` themselves.
+            Action::ToggleTimeline
+            | Action::ToggleLogView
+            | Action::OpenScopeMenu
+            | Action::ToggleRangeSelect => {}
             Action::Quit => self.should_quit = true,
         }
         if self.cursor != cursor_before {
@@ -635,6 +666,44 @@ mod tests {
             "identical content at the same position must survive"
         );
         assert_eq!(app.cursor, cursor_before);
+    }
+
+    #[test]
+    fn apply_scope_swap_resets_cursor_to_top_and_sets_interactive_and_label() {
+        let mut app = test_app();
+        app.update(Action::Bottom);
+        assert_ne!(app.cursor, 0, "sanity: cursor moved away from the top");
+
+        let files = parse_unified_diff(FIXTURE);
+        app.apply_scope_swap(files, false, Some("r: deadbeef".to_owned()));
+
+        assert_eq!(app.cursor, 0, "a scope swap always resets to the top");
+        assert_eq!(app.scroll_offset, 0);
+        assert!(!app.interactive);
+        assert_eq!(app.scope_label.as_deref(), Some("r: deadbeef"));
+    }
+
+    #[test]
+    fn apply_scope_swap_to_working_tree_clears_interactive_and_label() {
+        let mut app = test_app();
+        app.interactive = false;
+        app.scope_label = Some("r: old".to_owned());
+
+        let files = parse_unified_diff(FIXTURE);
+        app.apply_scope_swap(files, true, None);
+
+        assert!(app.interactive);
+        assert_eq!(app.scope_label, None);
+    }
+
+    #[test]
+    fn apply_scope_swap_on_an_empty_diff_resets_cursor_and_scroll_without_panicking() {
+        let mut app = test_app();
+        app.update(Action::Bottom);
+        app.apply_scope_swap(Vec::new(), true, None);
+        assert_eq!(app.cursor, 0);
+        assert_eq!(app.scroll_offset, 0);
+        assert!(app.rows.is_empty());
     }
 
     #[test]

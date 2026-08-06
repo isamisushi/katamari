@@ -22,6 +22,30 @@ impl FixtureRepo {
     pub fn path(&self) -> &Path {
         self.dir.path()
     }
+
+    /// `git rev-parse --short <rev>`'s output — for a test that needs a
+    /// deterministic revision to type into the scope-menu popup's
+    /// "Revision…" input. Commit hashes aren't deterministic across runs
+    /// (they hash the commit's author/committer timestamps among other
+    /// things), so a test can never hardcode one; it has to ask the fixture
+    /// for whatever hash it actually produced.
+    pub fn commit_hash(&self, rev: &str) -> String {
+        let output = Command::new("git")
+            .args(["rev-parse", "--short", rev])
+            .current_dir(self.path())
+            .output()
+            .expect("failed to spawn git — is it on PATH?");
+        assert!(
+            output.status.success(),
+            "git rev-parse --short {rev} failed in {}:\nstderr: {}",
+            self.path().display(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        String::from_utf8(output.stdout)
+            .expect("git rev-parse produced non-UTF-8 output")
+            .trim()
+            .to_owned()
+    }
 }
 
 /// Runs `git <args>` in `dir` with a fixed, throwaway identity (`-c

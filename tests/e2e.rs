@@ -25,3 +25,5 @@ mod log;
 mod navigation;
 #[path = "e2e/rendering.rs"]
 mod rendering;
+#[path = "e2e/scope_menu.rs"]
+mod scope_menu;
