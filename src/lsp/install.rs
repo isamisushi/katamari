@@ -22,17 +22,19 @@
 //! neither one ever populates `node_modules/.bin`/`$GOBIN` without
 //! succeeding first).
 //!
-//! HTTPS to three kinds of host only, enforced by [`assert_allowed_host`]:
+//! HTTPS to four kinds of host only, enforced by [`assert_allowed_host`]:
 //! `github.com` (rust-analyzer releases — note the initial request's
 //! redirect to a signed, time-limited `githubusercontent.com` asset URL is
 //! trusted implicitly, since it's `github.com` itself issuing that
-//! redirect, not a third party), `nodejs.org` (the Node.js bootstrap), and
-//! the npm registry (reached through `npm` itself, which this module treats
-//! as a trusted subprocess rather than an HTTP endpoint it talks to
+//! redirect, not a third party), `nodejs.org` (the Node.js bootstrap),
+//! `download-cdn.jetbrains.com` (kotlin-lsp releases — JetBrains' own CDN,
+//! not fronted through GitHub release assets the way rust-analyzer's are),
+//! and the npm registry (reached through `npm` itself, which this module
+//! treats as a trusted subprocess rather than an HTTP endpoint it talks to
 //! directly).
 
 use crate::lsp::adapter::{Language, mise_which, which_on_path};
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -55,9 +57,16 @@ const TS_LANGUAGE_SERVER_VERSION: &str = "5.3.0";
 const TYPESCRIPT_VERSION: &str = "6.0.3";
 const PYRIGHT_VERSION: &str = "1.1.411";
 const GOPLS_VERSION: &str = "0.23.0";
+/// JetBrains' own version scheme (`<build>.<build-number>.<patch>`, not
+/// semver) — matches both the CDN path segment and every asset filename for
+/// a given release, e.g. `kotlin-server-262.9593.0-aarch64.sit`. The GitHub
+/// release tag (`kotlin-lsp/v262.9593.0`) carries the same number but isn't
+/// used here: releases are hosted on JetBrains' CDN, not as GitHub release
+/// assets — see [`install_kotlin_lsp`].
+const KOTLIN_LSP_VERSION: &str = "262.9593.0";
 /// Node.js LTS used only as a bootstrap runtime for the two npm-based
 /// strategies below, when no `npm` can be found anywhere (not even via
-/// `mise which npm`) — not itself one of the four languages katamari
+/// `mise which npm`) — not itself one of the five languages katamari
 /// reviews.
 const NODE_BOOTSTRAP_VERSION: &str = "24.19.0";
 
@@ -73,7 +82,7 @@ struct ServerSpec {
     version: &'static str,
 }
 
-const REGISTRY: [(Language, ServerSpec); 4] = [
+const REGISTRY: [(Language, ServerSpec); 5] = [
     (
         Language::Rust,
         ServerSpec {
@@ -100,6 +109,13 @@ const REGISTRY: [(Language, ServerSpec); 4] = [
         ServerSpec {
             dir_name: "gopls",
             version: GOPLS_VERSION,
+        },
+    ),
+    (
+        Language::Kotlin,
+        ServerSpec {
+            dir_name: "kotlin-lsp",
+            version: KOTLIN_LSP_VERSION,
         },
     ),
 ];
@@ -129,6 +145,12 @@ fn binary_path(prefix: &Path, language: Language) -> PathBuf {
             .join(".bin")
             .join("pyright-langserver"),
         Language::Go => version_dir.join("gopls"),
+        // The archive's sole top-level directory
+        // (`kotlin-server-<version>[-aarch64]/`) is renamed to `version_dir`
+        // itself on install (mirroring `bootstrap_node`'s approach — see
+        // `install_kotlin_lsp`), so the launcher always lands at the same
+        // path regardless of which per-arch asset produced it.
+        Language::Kotlin => version_dir.join("bin").join("intellij-server"),
     }
 }
 
@@ -259,6 +281,7 @@ fn ensure_in(
             &mut on_progress,
         ),
         Language::Go => install_gopls(prefix, &mut on_progress),
+        Language::Kotlin => install_kotlin_lsp(prefix, &mut on_progress),
     }
 }
 
@@ -453,6 +476,150 @@ fn install_gopls(
     Ok(binary)
 }
 
+// --- kotlin-lsp: self-contained archive from JetBrains' CDN -----------------
+
+/// Maps a target to the exact asset filename kotlin-lsp's release publishes
+/// for it — the same pure-mapping split [`rust_analyzer_asset_name`] gets,
+/// for the same reason (unit-testable target logic, no network). macOS
+/// assets are named `.sit` (a vestige of JetBrains' release tooling) but are
+/// ordinary zip archives in practice — verified by hand against the real
+/// download, not an assumption; see [`install_kotlin_lsp`]'s docs. Linux
+/// assets are real `.tar.gz`. Windows isn't a supported katamari platform at
+/// all yet, so it isn't listed here despite kotlin-lsp itself publishing for
+/// it.
+fn kotlin_lsp_asset_name(os: &str, arch: &str) -> Result<String, String> {
+    let version = KOTLIN_LSP_VERSION;
+    let name = match (os, arch) {
+        ("macos", "aarch64") => format!("kotlin-server-{version}-aarch64.sit"),
+        ("macos", "x86_64") => format!("kotlin-server-{version}.sit"),
+        ("linux", "aarch64") => format!("kotlin-server-{version}-aarch64.tar.gz"),
+        ("linux", "x86_64") => format!("kotlin-server-{version}.tar.gz"),
+        _ => {
+            return Err(format!(
+                "katamari has no prebuilt kotlin-lsp for {os}/{arch} — install it manually \
+                 (see https://github.com/Kotlin/kotlin-lsp)"
+            ));
+        }
+    };
+    Ok(name)
+}
+
+/// Downloads and installs the pinned kotlin-lsp build for the current
+/// platform — JetBrains' "Standalone Kotlin LSP Archive", not the VS
+/// Code-only `.vsix` build. Ships its own JetBrains Runtime (JBR): the
+/// archive's `bin/intellij-server` is a native launcher that finds its
+/// bundled `jbr/` alongside itself, so — unlike gopls, which needs an
+/// external Go toolchain to `go install` against — this needs no JVM probe
+/// and no external Java at all, on this machine or the end user's; verified
+/// by extracting a real release and finding a complete JBR under `jbr/`,
+/// and by running the extracted `bin/intellij-server --help` standalone.
+///
+/// Despite the `.sit` extension (a StuffIt-archive holdover in JetBrains'
+/// own naming, not a StuffIt archive at all), the macOS assets are ordinary
+/// zip files — confirmed by downloading one and inspecting it with `file`
+/// before writing this — so [`extract_archive`] dispatches purely on
+/// filename suffix (`.sit`/`.zip` vs `.tar.gz`) rather than sniffing
+/// content. The archive's sole top-level entry
+/// (`kotlin-server-<version>[-<arch>]/`) is renamed into place exactly the
+/// way [`bootstrap_node`] handles Node's tarball, so [`binary_path`] doesn't
+/// need to know that per-asset directory name.
+fn install_kotlin_lsp(
+    prefix: &Path,
+    on_progress: &mut impl FnMut(String),
+) -> Result<PathBuf, InstallError> {
+    let asset = kotlin_lsp_asset_name(std::env::consts::OS, std::env::consts::ARCH)
+        .map_err(InstallError)?;
+    let spec = spec_for(Language::Kotlin);
+    let version_dir = prefix.join(spec.dir_name).join(spec.version);
+    let parent_dir = prefix.join(spec.dir_name);
+    create_dir_all(&parent_dir)?;
+
+    let url = format!(
+        "https://download-cdn.jetbrains.com/language-server/kotlin-server/{}/{asset}",
+        spec.version
+    );
+    on_progress(format!("downloading kotlin-lsp {}", spec.version));
+    let archive = http_get(&url)?;
+
+    on_progress("extracting kotlin-lsp".to_owned());
+    let tmp_dir = parent_dir.join(format!(".tmp-extract-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    create_dir_all(&tmp_dir)?;
+    extract_archive(&asset, &archive, &tmp_dir)?;
+
+    // The archive's sole top-level entry is `kotlin-server-<version>[-<arch>]/`.
+    let extracted = std::fs::read_dir(&tmp_dir)
+        .map_err(|e| InstallError(format!("reading {}: {e}", tmp_dir.display())))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|p| p.is_dir())
+        .ok_or_else(|| InstallError("kotlin-lsp archive had no top-level directory".to_owned()))?;
+    let _ = std::fs::remove_dir_all(&version_dir);
+    std::fs::rename(&extracted, &version_dir).map_err(|e| {
+        InstallError(format!(
+            "installing kotlin-lsp into {}: {e}",
+            version_dir.display()
+        ))
+    })?;
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    let binary = version_dir.join("bin").join("intellij-server");
+    ensure_executable(&binary)?;
+    if !is_executable(&binary) {
+        return Err(InstallError(format!(
+            "kotlin-lsp archive extracted but {} was not produced",
+            binary.display()
+        )));
+    }
+    Ok(binary)
+}
+
+/// Extracts `bytes` (the full body of `asset`) into `dest_dir`, dispatching
+/// on `asset`'s filename suffix: `.tar.gz` the same gzip+tar path
+/// [`bootstrap_node`] uses, `.sit`/`.zip` via the `zip` crate. Both are
+/// in-memory sources (`Cursor`/[`flate2::read::GzDecoder`]) rather than a
+/// temp file on disk first — neither release asset is large enough (tens to
+/// a few hundred megabytes) to need streaming extraction.
+fn extract_archive(asset: &str, bytes: &[u8], dest_dir: &Path) -> Result<(), InstallError> {
+    if asset.ends_with(".tar.gz") {
+        let decoder = flate2::read::GzDecoder::new(bytes);
+        tar::Archive::new(decoder)
+            .unpack(dest_dir)
+            .map_err(|e| InstallError(format!("extracting {asset}: {e}")))
+    } else {
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+            .map_err(|e| InstallError(format!("reading {asset} as a zip archive: {e}")))?;
+        archive
+            .extract(dest_dir)
+            .map_err(|e| InstallError(format!("extracting {asset}: {e}")))
+    }
+}
+
+/// Sets the executable bit on `path` if it isn't already set — a fallback
+/// for [`extract_archive`]'s zip path, whose unix-permission preservation
+/// depends on the archive actually storing them (it does, for the real
+/// kotlin-lsp release, but this keeps `install_kotlin_lsp` correct even
+/// against a differently-packaged future release rather than failing with
+/// "extracted but not executable" for a reason a user can't fix). A no-op on
+/// non-unix targets, matching [`is_executable`]'s own unix/non-unix split.
+fn ensure_executable(path: &Path) -> Result<(), InstallError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path) {
+            let mut perms = metadata.permissions();
+            if perms.mode() & 0o111 == 0 {
+                perms.set_mode(perms.mode() | 0o755);
+                std::fs::set_permissions(path, perms)
+                    .map_err(|e| InstallError(format!("chmod {}: {e}", path.display())))?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 // --- Node.js bootstrap (last resort for the npm strategies) -----------------
 
 /// Maps a target to Node's official tarball filename — the same
@@ -586,7 +753,8 @@ fn http_get(url: &str) -> Result<Vec<u8>, InstallError> {
 
 /// The allowlist backing this module's "HTTPS, official hosts only"
 /// guarantee (see the module doc comment): `github.com` for rust-analyzer
-/// releases and `nodejs.org` for the Node.js bootstrap are the only hosts
+/// releases, `nodejs.org` for the Node.js bootstrap, and
+/// `download-cdn.jetbrains.com` for kotlin-lsp releases are the only hosts
 /// this module's own HTTP client ever talks to directly — npm's registry is
 /// reached through the `npm` binary instead, never through here.
 fn assert_allowed_host(url: &str) -> Result<(), InstallError> {
@@ -594,7 +762,8 @@ fn assert_allowed_host(url: &str) -> Result<(), InstallError> {
         return Err(InstallError(format!("refusing a non-HTTPS URL: {url}")));
     };
     let host = rest.split('/').next().unwrap_or("");
-    let allowed = host == "github.com" || host == "nodejs.org";
+    let allowed =
+        host == "github.com" || host == "nodejs.org" || host == "download-cdn.jetbrains.com";
     if !allowed {
         return Err(InstallError(format!(
             "refusing a download from an untrusted host: {host}"
@@ -688,12 +857,48 @@ mod tests {
         assert!(node_asset_name("windows", "x86_64").is_err());
     }
 
+    #[test]
+    fn kotlin_lsp_asset_name_maps_every_supported_target() {
+        assert_eq!(
+            kotlin_lsp_asset_name("macos", "aarch64").unwrap(),
+            format!("kotlin-server-{KOTLIN_LSP_VERSION}-aarch64.sit")
+        );
+        assert_eq!(
+            kotlin_lsp_asset_name("macos", "x86_64").unwrap(),
+            format!("kotlin-server-{KOTLIN_LSP_VERSION}.sit")
+        );
+        assert_eq!(
+            kotlin_lsp_asset_name("linux", "aarch64").unwrap(),
+            format!("kotlin-server-{KOTLIN_LSP_VERSION}-aarch64.tar.gz")
+        );
+        assert_eq!(
+            kotlin_lsp_asset_name("linux", "x86_64").unwrap(),
+            format!("kotlin-server-{KOTLIN_LSP_VERSION}.tar.gz")
+        );
+    }
+
+    #[test]
+    fn kotlin_lsp_asset_name_reports_unsupported_targets_clearly() {
+        let err = kotlin_lsp_asset_name("windows", "x86_64").unwrap_err();
+        assert!(err.contains("windows/x86_64"));
+    }
+
     // --- host allowlist ---------------------------------------------------
 
     #[test]
     fn assert_allowed_host_accepts_github_and_nodejs() {
         assert!(assert_allowed_host("https://github.com/foo/bar").is_ok());
         assert!(assert_allowed_host("https://nodejs.org/dist/x").is_ok());
+    }
+
+    #[test]
+    fn assert_allowed_host_accepts_the_jetbrains_cdn() {
+        assert!(
+            assert_allowed_host(
+                "https://download-cdn.jetbrains.com/language-server/kotlin-server/x"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -733,6 +938,26 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn installed_binary_path_finds_kotlin_lsp_at_its_renamed_layout() {
+        // Kotlin's `binary_path` doesn't embed the per-arch asset directory
+        // name (`kotlin-server-<version>-aarch64/`) — `install_kotlin_lsp`
+        // renames that into `<prefix>/kotlin-lsp/<version>/` on install, so
+        // this must resolve regardless of which platform produced it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = binary_path(dir.path(), Language::Kotlin);
+        assert!(path.ends_with("kotlin-lsp/262.9593.0/bin/intellij-server"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"#!/bin/sh\n").unwrap();
+        make_executable(&path);
+
+        assert_eq!(
+            installed_binary_path(dir.path(), Language::Kotlin),
+            Some(path)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn installed_binary_path_ignores_a_non_executable_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = binary_path(dir.path(), Language::Go);
@@ -761,6 +986,100 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ensure_in_returns_an_already_installed_kotlin_lsp_without_any_install_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = binary_path(dir.path(), Language::Kotlin);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"#!/bin/sh\necho fake\n").unwrap();
+        make_executable(&path);
+
+        let mut progress_calls = 0;
+        let result = ensure_in(dir.path(), Language::Kotlin, |_| progress_calls += 1);
+
+        assert_eq!(result.unwrap(), path);
+        assert_eq!(
+            progress_calls, 0,
+            "no progress callback fired means install work (and any network call) was never attempted"
+        );
+    }
+
+    // --- extract_archive ---------------------------------------------------
+
+    /// Builds a minimal in-memory zip containing one file at
+    /// `<top>/bin/intellij-server`, with its unix mode bits set — the same
+    /// shape kotlin-lsp's real macOS `.sit` release has (verified by hand
+    /// against the actual asset; see `install_kotlin_lsp`'s docs).
+    fn build_test_zip(top: &str) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let options = zip::write::SimpleFileOptions::default().unix_permissions(0o755);
+        writer
+            .start_file(format!("{top}/bin/intellij-server"), options)
+            .unwrap();
+        std::io::Write::write_all(&mut writer, b"#!/bin/sh\necho fake\n").unwrap();
+        writer.finish().unwrap();
+        buf
+    }
+
+    #[test]
+    fn extract_archive_dispatches_zip_by_suffix_and_preserves_unix_mode() {
+        let bytes = build_test_zip("kotlin-server-262.9593.0-aarch64");
+        let dir = tempfile::tempdir().unwrap();
+        extract_archive("kotlin-server-262.9593.0-aarch64.sit", &bytes, dir.path()).unwrap();
+
+        let extracted = dir
+            .path()
+            .join("kotlin-server-262.9593.0-aarch64")
+            .join("bin")
+            .join("intellij-server");
+        assert!(extracted.is_file());
+        #[cfg(unix)]
+        assert!(
+            is_executable(&extracted),
+            "unix mode from the zip entry should have been preserved"
+        );
+    }
+
+    #[test]
+    fn extract_archive_dispatches_tar_gz_by_suffix() {
+        let mut tar_bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_bytes);
+            let data = b"#!/bin/sh\necho fake\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(
+                    &mut header,
+                    "kotlin-server-262.9593.0/bin/intellij-server",
+                    &data[..],
+                )
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz_bytes = Vec::new();
+        {
+            let mut encoder =
+                flate2::write::GzEncoder::new(&mut gz_bytes, flate2::Compression::fast());
+            std::io::Write::write_all(&mut encoder, &tar_bytes).unwrap();
+            encoder.finish().unwrap();
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        extract_archive("kotlin-server-262.9593.0.tar.gz", &gz_bytes, dir.path()).unwrap();
+
+        let extracted = dir
+            .path()
+            .join("kotlin-server-262.9593.0")
+            .join("bin")
+            .join("intellij-server");
+        assert!(extracted.is_file());
+    }
+
     // --- real-network smoke test, run manually only -----------------------
 
     /// Exercises the actual rust-analyzer download end to end. Deliberately
@@ -777,6 +1096,29 @@ mod tests {
             "expected progress messages along the way"
         );
         let output = Command::new(&path).arg("--version").output().unwrap();
+        assert!(output.status.success());
+    }
+
+    /// Exercises the actual kotlin-lsp download end to end — verified by
+    /// hand during this language's implementation (downloaded the real
+    /// asset, confirmed it's a zip despite the `.sit` extension, confirmed
+    /// unix permissions survive extraction, ran the extracted launcher's
+    /// `--help`). Deliberately `#[ignore]`d for the same reason as
+    /// `install_rust_analyzer_downloads_and_extracts_a_runnable_binary`:
+    /// `cargo test` must stay hermetic and network-free, and this downloads
+    /// several hundred megabytes. Run it explicitly with `cargo test --
+    /// --ignored install_kotlin_lsp`.
+    #[test]
+    #[ignore = "hits the real network (download-cdn.jetbrains.com); run manually"]
+    fn install_kotlin_lsp_downloads_and_extracts_a_runnable_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut messages = Vec::new();
+        let path = ensure_in(dir.path(), Language::Kotlin, |m| messages.push(m)).unwrap();
+        assert!(
+            !messages.is_empty(),
+            "expected progress messages along the way"
+        );
+        let output = Command::new(&path).arg("--help").output().unwrap();
         assert!(output.status.success());
     }
 }

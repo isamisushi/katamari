@@ -439,6 +439,7 @@ fn language_from_hint(hint: &str) -> Language {
         "tsx" => Language::Tsx,
         "python" | "py" => Language::Python,
         "go" | "golang" => Language::Go,
+        "kotlin" | "kt" => Language::Kotlin,
         _ => Language::Plain,
     }
 }

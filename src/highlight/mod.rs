@@ -24,6 +24,7 @@ pub enum Language {
     Tsx,
     Python,
     Go,
+    Kotlin,
     Plain,
 }
 
@@ -35,6 +36,7 @@ impl Language {
             "tsx" => Language::Tsx,
             "py" | "pyi" => Language::Python,
             "go" => Language::Go,
+            "kt" | "kts" => Language::Kotlin,
             _ => Language::Plain,
         }
     }
@@ -143,6 +145,11 @@ fn build_config(language: Language) -> Option<HighlightConfiguration> {
             tree_sitter_go::HIGHLIGHTS_QUERY,
             "",
         ),
+        Language::Kotlin => (
+            tree_sitter_kotlin_sg::LANGUAGE.into(),
+            tree_sitter_kotlin_sg::HIGHLIGHTS_QUERY,
+            "",
+        ),
         Language::Plain => return None,
     };
 
@@ -165,6 +172,7 @@ fn language_name(language: Language) -> &'static str {
         Language::Tsx => "tsx",
         Language::Python => "python",
         Language::Go => "go",
+        Language::Kotlin => "kotlin",
         Language::Plain => "plain",
     }
 }
@@ -439,6 +447,8 @@ mod tests {
         assert_eq!(Language::detect("src/app.ts"), Language::TypeScript);
         assert_eq!(Language::detect("script.py"), Language::Python);
         assert_eq!(Language::detect("main.go"), Language::Go);
+        assert_eq!(Language::detect("src/Main.kt"), Language::Kotlin);
+        assert_eq!(Language::detect("build.gradle.kts"), Language::Kotlin);
         assert_eq!(Language::detect("README.md"), Language::Plain);
         assert_eq!(Language::detect("no_extension"), Language::Plain);
     }
@@ -513,6 +523,19 @@ mod tests {
         );
         let joined: String = spans.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(joined, "fn main() {}");
+    }
+
+    #[test]
+    fn kotlin_keyword_is_highlighted() {
+        let mut hl = LineHighlighter::new();
+        let spans = hl.highlight_line(Language::Kotlin, "val x = 1");
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.kind == HighlightKind::Keyword && s.text == "val")
+        );
+        let joined: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(joined, "val x = 1");
     }
 
     #[test]
