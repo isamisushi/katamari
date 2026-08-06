@@ -13,9 +13,12 @@
 use crate::diff::ColumnMap;
 use crate::lsp::adapter::{self, Language};
 use crate::lsp::client::{Client, DefinitionResult, HoverResult, ReferencesResult, file_uri};
+use crate::lsp::diagnostics::{PulledDocument, fold_pull_result};
 use crate::lsp::install;
 use crate::lsp::transport::{LspError, LspEvent};
-use lsp_types::{FileChangeType, FileEvent, Position, PositionEncodingKind};
+use lsp_types::{
+    FileChangeType, FileEvent, Position, PositionEncodingKind, PublishDiagnosticsParams, Uri,
+};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -163,6 +166,26 @@ struct ServerEntry {
     /// place that version counter lives, so a resync can never reuse or
     /// skip a number.
     versions: HashMap<PathBuf, i32>,
+    /// The `resultId` this server sent back on each document's last
+    /// successful `textDocument/diagnostic` pull, replayed as
+    /// `previousResultId` on the next one so an unchanged document costs the
+    /// server a cheap "still accurate" answer instead of resending identical
+    /// diagnostics. Populated (and read) only by [`maybe_pull_diagnostics`]
+    /// and [`apply_pulled_diagnostics`]; a document with no entry here has
+    /// either never been pulled or was last pulled with no `resultId` in the
+    /// response — both are indistinguishable from "start fresh," which
+    /// `previous_result_id: None` already means.
+    diagnostic_result_ids: HashMap<PathBuf, String>,
+    /// Latches `true` the first time this server sends a *real*
+    /// `textDocument/publishDiagnostics` notification (checked in
+    /// [`LspManager::spawn_server`]'s event loop, before that notification
+    /// is forwarded onward) — see [`maybe_pull_diagnostics`]'s docs for why
+    /// this is the whole pull-vs-push policy. Never reset: a server that has
+    /// proven it pushes is trusted to keep doing so for the rest of the
+    /// session, the same assumption [`Self::versions`]' open-document
+    /// tracking already makes about a server's behavior staying consistent
+    /// once observed.
+    push_seen: bool,
     /// When this server last had a request dispatched to it (see
     /// [`dispatch`]) — the input to [`evict_lru_if_at_capacity`]'s
     /// least-recently-used eviction policy once [`MAX_LIVE_SERVERS`] is
@@ -179,6 +202,8 @@ impl ServerEntry {
             client: None,
             queue: VecDeque::new(),
             versions: HashMap::new(),
+            diagnostic_result_ids: HashMap::new(),
+            push_seen: false,
             last_touched: Instant::now(),
         }
     }
@@ -389,6 +414,8 @@ impl LspManager {
             };
             let (client, version) = next;
             let file = file.clone();
+            let servers = Arc::clone(&self.servers);
+            let events_tx = self.events_tx.clone();
             std::thread::spawn(move || {
                 // A file a watch batch reported as changed may have been
                 // deleted again (or be mid-write) by the time this thread
@@ -400,7 +427,12 @@ impl LspManager {
                     return;
                 };
                 let Ok(uri) = file_uri(&file) else { return };
-                client.did_change(uri, version, &content);
+                client.did_change(uri.clone(), version, &content);
+                // `sync_changed_files` runs once per debounced watch flush
+                // (see `watch::debounce`), never per raw filesystem event, so
+                // this pull is already naturally rate-limited — no separate
+                // debounce needed here.
+                maybe_pull_diagnostics(&client, &file, uri, version, &servers, &key, &events_tx);
             });
         }
     }
@@ -504,6 +536,7 @@ impl LspManager {
                     },
                     Arc::clone(&self.servers),
                     key,
+                    self.events_tx.clone(),
                 );
             }
             ServerState::Unavailable { reason } | ServerState::Crashed { reason } => {
@@ -595,6 +628,7 @@ impl LspManager {
                     request,
                     Arc::clone(&servers),
                     key.clone(),
+                    events_tx.clone(),
                 );
             }
 
@@ -603,6 +637,31 @@ impl LspManager {
                     LspEvent::Closed { reason } => Some(reason.clone()),
                     LspEvent::Notification { .. } => None,
                 };
+                if let LspEvent::Notification { method, params } = &event {
+                    if method == "textDocument/publishDiagnostics" {
+                        // A *real* push notification, straight off the
+                        // transport — as opposed to the synthetic
+                        // notifications of the same shape
+                        // `apply_pulled_diagnostics` sends through
+                        // `events_tx` directly (bypassing this loop
+                        // entirely) when a pull-model server answers. Seeing
+                        // one here means this server pushes, so
+                        // `maybe_pull_diagnostics` stops pulling it — see
+                        // that function's docs for the full policy.
+                        mark_push_seen(&servers, &key);
+                    } else if method == "$/progress" && progress_is_end(params) {
+                        // kotlin-lsp's project indexing can leave an early
+                        // pull answering empty (or wrong) simply because the
+                        // server hasn't finished building its model yet;
+                        // re-pulling every open document once indexing
+                        // reports done is the cheap way to correct that
+                        // without polling. A no-op for any server this
+                        // manager isn't pulling for (checked first, before
+                        // any lock, since `$/progress end` is routine chatter
+                        // from push-model servers too).
+                        repull_open_documents(&client, &servers, &key, &events_tx);
+                    }
+                }
                 let _ = events_tx.send(ServerEvent {
                     language,
                     root: workspace_root.clone(),
@@ -818,6 +877,7 @@ fn dispatch(
     request: QueuedRequest,
     servers: Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
     key: ServerKey,
+    events_tx: Sender<ServerEvent>,
 ) {
     std::thread::spawn(move || {
         let content = match std::fs::read_to_string(&request.file) {
@@ -847,6 +907,15 @@ fn dispatch(
         if needs_open {
             let language_id = adapter::lsp_language_id(key.0, &request.file);
             client.did_open(uri.clone(), language_id, 1, &content);
+            maybe_pull_diagnostics(
+                &client,
+                &request.file,
+                uri.clone(),
+                1,
+                &servers,
+                &key,
+                &events_tx,
+            );
         }
 
         let Some(display_col) = request.display_col else {
@@ -890,6 +959,216 @@ fn dispatch(
             Op::WarmUp(_) => unreachable!("handled above, before a position was needed"),
         }
     });
+}
+
+/// Pulls `file`'s diagnostics from a server that needs the pull model, if
+/// this one does. The whole push-vs-pull policy lives here, in one place:
+/// pull only when the server (a) advertised `diagnosticProvider` at all, and
+/// (b) has never sent a real `publishDiagnostics` push (tracked by
+/// [`ServerEntry::push_seen`], latched permanently the first time one
+/// arrives — see [`LspManager::spawn_server`]'s event loop). A server that
+/// speaks only one model obviously needs exactly this; a server that
+/// advertises both (some do) gets pulled until its first push proves it
+/// pushes too, at which point pulling for it stops for the rest of the
+/// session. This is the simpler of the two policies the design considered —
+/// the alternative (pull unconditionally, reconcile with push by comparing
+/// document versions in [`crate::lsp::diagnostics::DiagnosticsStore`]
+/// itself) would mean two independent writers racing to publish the same
+/// document, with a store that has no way to know which one is newer.
+/// Latching on the first push instead means at most one of the two models is
+/// ever active for a given server, so there's nothing to reconcile — and
+/// [`crate::lsp::diagnostics::DiagnosticsStore::set`]'s existing
+/// last-write-wins semantics are already exactly right for that one writer.
+///
+/// Fire-and-forget: spawns its own thread, since a pull's round trip
+/// (kotlin-lsp's first one can take tens of seconds while it indexes a
+/// project — see [`repull_open_documents`]) must never delay the
+/// hover/definition/references/warm-up request that's piggybacking a
+/// `didOpen`/`didChange` this call is riding along with. `version` is the
+/// document version just announced via that `didOpen`/`didChange` — stored
+/// so the eventual response can be checked for staleness (see
+/// [`apply_pulled_diagnostics`]) before it's applied.
+fn maybe_pull_diagnostics(
+    client: &Arc<Client>,
+    file: &Path,
+    uri: Uri,
+    version: i32,
+    servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
+    key: &ServerKey,
+    events_tx: &Sender<ServerEvent>,
+) {
+    if !client.supports_diagnostic_pull() {
+        return;
+    }
+    let previous_result_id = {
+        let mut guard = servers.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard.entry(key.clone()).or_insert_with(ServerEntry::new);
+        if entry.push_seen {
+            return;
+        }
+        entry.diagnostic_result_ids.get(file).cloned()
+    };
+
+    let client = Arc::clone(client);
+    let file = file.to_path_buf();
+    let servers = Arc::clone(servers);
+    let key = key.clone();
+    let events_tx = events_tx.clone();
+    std::thread::spawn(move || {
+        let rx = client.pull_diagnostics(uri.clone(), previous_result_id);
+        let Ok(Ok(result)) = rx.recv_timeout(REQUEST_TIMEOUT) else {
+            // Timeout, transport error, or a JSON-RPC error from the
+            // server — nothing to apply. Not worth surfacing as a status
+            // note: the next `didOpen`/`didChange`, or the next
+            // `$/progress end` (see `repull_open_documents`), tries again.
+            return;
+        };
+        apply_pulled_diagnostics(uri, result, version, &file, &servers, &key, &events_tx);
+    });
+}
+
+/// Applies one `textDocument/diagnostic` response: discards it if the
+/// document has moved on since the pull was issued (a burst of edits bumped
+/// the version again before the server answered — applying a superseded
+/// answer now would show diagnostics for content that's no longer on
+/// screen, exactly the staleness `previousResultId` tracking must not
+/// reintroduce), then folds the response (see
+/// [`crate::lsp::diagnostics::fold_pull_result`]) and, for every document it
+/// touched (the primary one plus any `relatedDocuments`), stores that
+/// document's new `resultId` and — for a changed (`Full`) report only —
+/// publishes it through `events_tx` as a *synthetic*
+/// `textDocument/publishDiagnostics` notification, the same shape a real
+/// push sends. That's the whole integration seam with the rest of the
+/// pipeline: [`crate::ui::mod`]'s event loop already folds any
+/// `textDocument/publishDiagnostics`-shaped notification into
+/// [`crate::lsp::diagnostics::DiagnosticsStore`] regardless of where it came
+/// from, so a pull result needs zero UI-side changes to show up in the
+/// gutter or `]d`/`[d` — it only needs to arrive looking like a push did. An
+/// `Unchanged` report updates the stored `resultId` without publishing
+/// anything, since by definition nothing in the store needs to change.
+fn apply_pulled_diagnostics(
+    primary_uri: Uri,
+    result: lsp_types::DocumentDiagnosticReportResult,
+    version: i32,
+    file: &Path,
+    servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
+    key: &ServerKey,
+    events_tx: &Sender<ServerEvent>,
+) {
+    {
+        let guard = servers.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = guard.get(key) else {
+            return;
+        };
+        // Discard if the document moved on since this pull was issued
+        // (`version` no longer matches — a newer `didChange` landed while
+        // the round trip was in flight) or if a real push has since proven
+        // this server pushes (`push_seen` flipped `true` after this pull
+        // was already dispatched, the one race `maybe_pull_diagnostics`'s
+        // own pre-dispatch check can't catch): either way, applying this
+        // response now would risk overwriting newer state with older,
+        // exactly what version-tagging exists to prevent.
+        if entry.push_seen || entry.versions.get(file) != Some(&version) {
+            return;
+        }
+    }
+
+    for (doc_uri, pulled) in fold_pull_result(primary_uri, result) {
+        let Some(path) = crate::lsp::client::uri_to_path(&doc_uri) else {
+            continue;
+        };
+        let result_id = match pulled {
+            PulledDocument::Full { items, result_id } => {
+                let _ = events_tx.send(ServerEvent {
+                    language: key.0,
+                    root: key.1.clone(),
+                    event: LspEvent::Notification {
+                        method: "textDocument/publishDiagnostics".to_owned(),
+                        params: serde_json::to_value(PublishDiagnosticsParams {
+                            uri: doc_uri,
+                            diagnostics: items,
+                            version: None,
+                        })
+                        .unwrap_or(serde_json::Value::Null),
+                    },
+                });
+                result_id
+            }
+            PulledDocument::Unchanged { result_id } => Some(result_id),
+        };
+        let mut guard = servers.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard.entry(key.clone()).or_insert_with(ServerEntry::new);
+        match result_id {
+            Some(id) => {
+                entry.diagnostic_result_ids.insert(path, id);
+            }
+            None => {
+                entry.diagnostic_result_ids.remove(&path);
+            }
+        }
+    }
+}
+
+/// Marks `key`'s server as having proven it pushes diagnostics — see
+/// [`maybe_pull_diagnostics`]'s docs for what this gates.
+fn mark_push_seen(servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>, key: &ServerKey) {
+    let mut guard = servers.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .entry(key.clone())
+        .or_insert_with(ServerEntry::new)
+        .push_seen = true;
+}
+
+/// Whether a `$/progress` notification's params represent the end of a work
+/// cycle (`{"value": {"kind": "end", ...}}`) — kotlin-lsp reports its
+/// project indexing this way, and [`LspManager::spawn_server`]'s event loop
+/// uses this to know when re-pulling might finally get a real answer.
+fn progress_is_end(params: &serde_json::Value) -> bool {
+    params
+        .get("value")
+        .and_then(|v| v.get("kind"))
+        .and_then(serde_json::Value::as_str)
+        == Some("end")
+}
+
+/// Re-pulls diagnostics for every document `key`'s server already has open,
+/// once that server reports finishing a `$/progress` cycle. Exists for
+/// kotlin-lsp specifically: a pull issued right after `didOpen` (before
+/// project indexing completes) can come back empty not because the file is
+/// clean but because the server hasn't built enough of a model to know yet
+/// — indistinguishable from a real "no diagnostics" answer by shape alone.
+/// Re-pulling when the server itself signals it's done with a work cycle
+/// corrects that without polling on a timer. A no-op, checked before any
+/// lock, for the common case of a push-model server's routine progress
+/// chatter (compilation, formatting, anything else it reports through
+/// `$/progress`) triggering this on every tick.
+fn repull_open_documents(
+    client: &Arc<Client>,
+    servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
+    key: &ServerKey,
+    events_tx: &Sender<ServerEvent>,
+) {
+    if !client.supports_diagnostic_pull() {
+        return;
+    }
+    let files: Vec<(PathBuf, i32)> = {
+        let guard = servers.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(entry) = guard.get(key) else {
+            return;
+        };
+        if entry.push_seen {
+            return;
+        }
+        entry
+            .versions
+            .iter()
+            .map(|(file, version)| (file.clone(), *version))
+            .collect()
+    };
+    for (file, version) in files {
+        let Ok(uri) = file_uri(&file) else { continue };
+        maybe_pull_diagnostics(client, &file, uri, version, servers, key, events_tx);
+    }
 }
 
 /// Waits (bounded by [`REQUEST_TIMEOUT`]) for `rx` to resolve and relays the
@@ -981,5 +1260,39 @@ mod tests {
         let candidates = [(&newer, &newer_touched), (&older, &older_touched)];
 
         assert_eq!(select_lru_victim(candidates), Some(&older));
+    }
+
+    #[test]
+    fn progress_is_end_recognizes_a_work_done_progress_end_notification() {
+        let params = serde_json::json!({
+            "token": "indexing",
+            "value": {"kind": "end", "message": "indexing finished"},
+        });
+        assert!(progress_is_end(&params));
+    }
+
+    #[test]
+    fn progress_is_end_rejects_begin_and_report_kinds() {
+        let begin = serde_json::json!({"value": {"kind": "begin", "title": "Indexing"}});
+        let report = serde_json::json!({"value": {"kind": "report", "percentage": 40}});
+        assert!(!progress_is_end(&begin));
+        assert!(!progress_is_end(&report));
+    }
+
+    #[test]
+    fn progress_is_end_rejects_malformed_params() {
+        assert!(!progress_is_end(&serde_json::json!({})));
+        assert!(!progress_is_end(&serde_json::json!("not an object")));
+    }
+
+    #[test]
+    fn a_fresh_server_entry_has_not_seen_a_push_and_has_no_stored_result_ids() {
+        // `maybe_pull_diagnostics`'s whole push-vs-pull policy hinges on
+        // `push_seen` starting `false` (a server is assumed pull-eligible
+        // until it proves otherwise) and `diagnostic_result_ids` starting
+        // empty (a document's first pull has no `previousResultId` to send).
+        let entry = ServerEntry::new();
+        assert!(!entry.push_seen);
+        assert!(entry.diagnostic_result_ids.is_empty());
     }
 }

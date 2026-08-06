@@ -6,8 +6,8 @@ language servers, and inline review comments an AI coding agent can read
 back and address — all without leaving the terminal.
 
 - **LSP inside the diff** — hover, go-to-definition, find-references, and
-  live diagnostics on changed lines (Rust / TypeScript / Python / Go;
-  servers auto-install on first use)
+  live diagnostics on changed lines (Rust / TypeScript / Python / Go /
+  Kotlin; servers auto-install on first use)
 - **Watch mode** — the diff refreshes as an agent's edits land on disk
 - **Any unit of change** — working tree, staged, one commit, a range, a jj
   change or revset; browse and pick from `ktmr log`, or switch mid-session
@@ -291,14 +291,20 @@ VSCode/Zed give you.
 
 kotlin-lsp is JetBrains' own server (the `fwcd/kotlin-language-server`
 community project is unmaintained as of this writing) and is still alpha
-quality: on a project with no Gradle wrapper yet cached, its first hover or
-go-to-definition can take tens of seconds while it resolves the classpath in
-the background — katamari's `ktmr lsp-check` retries handle this the same
-way they do rust-analyzer's own cold-start indexing. Diagnostics are the one
-gap: kotlin-lsp only implements pull-model `textDocument/diagnostic`, not
-the `publishDiagnostics` push notifications katamari's gutter/`--diagnostics`
-flow listens for, so error/warning highlighting doesn't yet surface for
-Kotlin files — hover, go-to-definition, and find-references all work.
+quality: on a project with no Gradle wrapper yet cached, its first hover,
+go-to-definition, or diagnostics pull can take tens of seconds while it
+resolves the classpath and indexes the project in the background —
+katamari's `ktmr lsp-check` retries handle this the same way they do
+rust-analyzer's own cold-start indexing. kotlin-lsp only implements
+LSP 3.17's pull model (`textDocument/diagnostic`), never the unsolicited
+`publishDiagnostics` push notifications every other server here sends;
+katamari's gutter/`]d`/`[d`/`--diagnostics` flow now pulls on Kotlin's
+behalf after every open/change and re-publishes the answer through the same
+path a push would use, so error/warning highlighting works for Kotlin files
+too — the only user-visible difference from a push server is that the very
+first diagnostics for a freshly-opened file can lag behind hover/go-to
+readiness while indexing finishes, since an early pull during that window
+can legitimately come back empty.
 
 Managed installs live under `~/.local/share/katamari/servers/`
 (`$XDG_DATA_HOME/katamari/servers/` if set), one version-stamped

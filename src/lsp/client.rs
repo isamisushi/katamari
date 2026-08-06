@@ -6,8 +6,9 @@
 
 use crate::lsp::transport::{LspError, Transport};
 use lsp_types::{
-    ClientCapabilities, ClientInfo, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
-    DidOpenTextDocumentParams, FileEvent, GeneralClientCapabilities, GotoDefinitionParams,
+    ClientCapabilities, ClientInfo, DiagnosticClientCapabilities, DidChangeTextDocumentParams,
+    DidChangeWatchedFilesParams, DidOpenTextDocumentParams, DocumentDiagnosticParams,
+    DocumentDiagnosticReportResult, FileEvent, GeneralClientCapabilities, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverClientCapabilities, HoverParams, InitializeParams,
     InitializeResult, InitializedParams, Location, MarkupKind, PartialResultParams, Position,
     PositionEncodingKind, PublishDiagnosticsClientCapabilities, ReferenceContext, ReferenceParams,
@@ -134,6 +135,18 @@ impl Client {
     /// As [`Self::supports_definition`], for `textDocument/references`.
     pub fn supports_references(&self) -> bool {
         self.capabilities.references_provider.is_some()
+    }
+
+    /// Whether this server advertised `diagnosticProvider` — LSP 3.17's
+    /// pull model (`textDocument/diagnostic`), the alternative to unsolicited
+    /// `textDocument/publishDiagnostics` notifications. Some servers (the
+    /// JetBrains kotlin-lsp, notably) speak *only* the pull model and never
+    /// push at all, so [`crate::lsp::manager::LspManager`] uses this the
+    /// same way it uses [`Self::supports_definition`]: to decide whether a
+    /// request is worth issuing at all, not to interpret a failure after
+    /// the fact.
+    pub fn supports_diagnostic_pull(&self) -> bool {
+        self.capabilities.diagnostic_provider.is_some()
     }
 
     /// The encoding the server picked for `Position::character` (from the
@@ -268,6 +281,30 @@ impl Client {
         self.transport.request("textDocument/references", params)
     }
 
+    /// Pulls `uri`'s current diagnostics (LSP 3.17 `textDocument/diagnostic`).
+    /// Callers should check [`Self::supports_diagnostic_pull`] first — this
+    /// method doesn't, matching [`Self::definition`]'s reasoning.
+    /// `previous_result_id` is the `resultId` this client stored from that
+    /// document's last pull (see
+    /// [`crate::lsp::diagnostics::PulledDocument`]); passing it lets a
+    /// server reply with a cheap "unchanged" report instead of resending
+    /// identical diagnostics. `None` for a document's first pull, when
+    /// there's nothing yet to compare against.
+    pub fn pull_diagnostics(
+        &self,
+        uri: Uri,
+        previous_result_id: Option<String>,
+    ) -> Receiver<Result<DocumentDiagnosticReportResult, LspError>> {
+        let params = DocumentDiagnosticParams {
+            text_document: TextDocumentIdentifier { uri },
+            identifier: None,
+            previous_result_id,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        self.transport.request("textDocument/diagnostic", params)
+    }
+
     /// `shutdown` request, then `exit` notification, then a bounded wait for
     /// the process to exit on its own before [`Transport::kill`] forces it —
     /// the sequence the LSP spec asks a well-behaved client to follow so the
@@ -320,6 +357,20 @@ fn client_capabilities() -> ClientCapabilities {
             // `relatedInformation`/tag/version support) is required for
             // `]d`/`[d` and the diagnostic gutter to work on TypeScript.
             publish_diagnostics: Some(PublishDiagnosticsClientCapabilities::default()),
+            // The pull-model counterpart to `publish_diagnostics`, above —
+            // required for a server that speaks LSP 3.17's
+            // `textDocument/diagnostic` instead of (not in addition to)
+            // pushing (kotlin-lsp; see `Client::supports_diagnostic_pull`)
+            // to advertise `diagnosticProvider` at all, the same way
+            // `publish_diagnostics` gates whether TS pushes anything.
+            // `related_document_support: Some(true)` lets a server fold a
+            // cross-file diagnostic (e.g. a macro error surfacing in a
+            // header) into one response instead of requiring a separate
+            // pull per affected document.
+            diagnostic: Some(DiagnosticClientCapabilities {
+                dynamic_registration: Some(false),
+                related_document_support: Some(true),
+            }),
             ..Default::default()
         }),
         general: Some(GeneralClientCapabilities {
@@ -410,10 +461,20 @@ mod tests {
         // doesn't declare this capability, so dropping it doesn't fail any
         // request — diagnostics just never arrive. Asserting on the
         // serialized JSON pins the wire shape a server actually sees.
+        //
+        // Extended to cover `textDocument/diagnostic` (the LSP 3.17 pull
+        // model) alongside it, for the same reason: kotlin-lsp advertises
+        // `diagnosticProvider` and only answers pulls, so this client must
+        // declare `textDocument.diagnostic` or a spec-compliant pull-only
+        // server has no obligation to answer sensibly either.
         let caps = serde_json::to_value(client_capabilities()).unwrap();
         assert!(
             caps.pointer("/textDocument/publishDiagnostics").is_some(),
             "initialize must declare textDocument.publishDiagnostics: {caps}"
+        );
+        assert!(
+            caps.pointer("/textDocument/diagnostic").is_some(),
+            "initialize must declare textDocument.diagnostic: {caps}"
         );
     }
 

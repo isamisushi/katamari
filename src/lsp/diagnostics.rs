@@ -9,7 +9,10 @@
 //! a hover to trigger it lazily); a file this store has no entry for isn't
 //! necessarily clean, it may just not have been opened yet.
 
-use lsp_types::{Diagnostic, DiagnosticSeverity, PublishDiagnosticsParams};
+use lsp_types::{
+    Diagnostic, DiagnosticSeverity, DocumentDiagnosticReport, DocumentDiagnosticReportKind,
+    DocumentDiagnosticReportResult, PublishDiagnosticsParams, Uri,
+};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -90,6 +93,97 @@ impl DiagnosticsStore {
 /// panicking or propagating.
 pub fn parse_publish_diagnostics(params: &serde_json::Value) -> Option<PublishDiagnosticsParams> {
     serde_json::from_value(params.clone()).ok()
+}
+
+/// One document's outcome from a `textDocument/diagnostic` pull, folded from
+/// the wire's full/unchanged distinction into what
+/// [`crate::lsp::manager::LspManager`] actually needs to act on. Either way
+/// it carries the `resultId` (if the server sent one) to store and replay as
+/// `previousResultId` on that document's next pull — the mechanism that lets
+/// a server answer "still accurate" instead of resending an identical
+/// diagnostic set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PulledDocument {
+    /// The diagnostics changed (or this is the document's first pull) —
+    /// `items` is the full, current set and should replace whatever
+    /// [`DiagnosticsStore`] held for this document, exactly as a
+    /// `publishDiagnostics` notification would.
+    Full {
+        items: Vec<Diagnostic>,
+        result_id: Option<String>,
+    },
+    /// The server confirmed nothing has changed since `result_id` was last
+    /// sent as `previousResultId` — [`DiagnosticsStore`] is left untouched.
+    Unchanged { result_id: String },
+}
+
+/// Folds one `textDocument/diagnostic` response into a flat list of
+/// `(document, outcome)` pairs: the document that was pulled, plus — when
+/// the server folded in `relatedDocuments` (a cross-file diagnostic; see
+/// [`crate::lsp::client::client_capabilities`]'s `related_document_support`)
+/// — every other document the response also carries an outcome for. A
+/// caller applies each pair to [`DiagnosticsStore`] uniformly; nothing
+/// distinguishes "the document I asked about" from "a related document" once
+/// this returns, because [`DiagnosticsStore`] doesn't either.
+///
+/// Empty for [`DocumentDiagnosticReportResult::Partial`]: that shape only
+/// arises from a streamed `$/progress`-tagged pull this client never issues
+/// (no `partial_result_params` token is sent — see
+/// [`crate::lsp::client::Client::pull_diagnostics`]), so a conforming server
+/// should never send it back; folding it to nothing rather than panicking
+/// keeps a server's protocol slip from becoming a crash.
+pub fn fold_pull_result(
+    primary: Uri,
+    result: DocumentDiagnosticReportResult,
+) -> Vec<(Uri, PulledDocument)> {
+    let report = match result {
+        DocumentDiagnosticReportResult::Report(report) => report,
+        DocumentDiagnosticReportResult::Partial(_) => return Vec::new(),
+    };
+    match report {
+        DocumentDiagnosticReport::Full(full) => {
+            let mut out = vec![(
+                primary,
+                fold_report_kind(DocumentDiagnosticReportKind::Full(
+                    full.full_document_diagnostic_report,
+                )),
+            )];
+            out.extend(related_documents(full.related_documents));
+            out
+        }
+        DocumentDiagnosticReport::Unchanged(unchanged) => {
+            let mut out = vec![(
+                primary,
+                fold_report_kind(DocumentDiagnosticReportKind::Unchanged(
+                    unchanged.unchanged_document_diagnostic_report,
+                )),
+            )];
+            out.extend(related_documents(unchanged.related_documents));
+            out
+        }
+    }
+}
+
+fn related_documents(
+    related: Option<HashMap<Uri, DocumentDiagnosticReportKind>>,
+) -> Vec<(Uri, PulledDocument)> {
+    related
+        .into_iter()
+        .flatten()
+        .map(|(uri, kind)| (uri, fold_report_kind(kind)))
+        .collect()
+}
+
+fn fold_report_kind(kind: DocumentDiagnosticReportKind) -> PulledDocument {
+    match kind {
+        DocumentDiagnosticReportKind::Full(full) => PulledDocument::Full {
+            items: full.items,
+            result_id: full.result_id,
+        },
+        DocumentDiagnosticReportKind::Unchanged(unchanged) => PulledDocument::Unchanged {
+            result_id: unchanged.result_id,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -207,5 +301,108 @@ mod tests {
     fn parse_publish_diagnostics_rejects_malformed_params() {
         let params = serde_json::json!({"not": "valid"});
         assert!(parse_publish_diagnostics(&params).is_none());
+    }
+
+    fn uri(s: &str) -> Uri {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn fold_pull_result_extracts_items_and_result_id_from_a_full_report() {
+        let params = serde_json::json!({
+            "kind": "full",
+            "resultId": "r1",
+            "items": [diagnostic(0, 0, DiagnosticSeverity::ERROR)],
+        });
+        let report: DocumentDiagnosticReportResult = serde_json::from_value(params).unwrap();
+        let primary = uri("file:///repo/src/lib.rs");
+        let folded = fold_pull_result(primary.clone(), report);
+
+        assert_eq!(folded.len(), 1);
+        assert_eq!(folded[0].0, primary);
+        match &folded[0].1 {
+            PulledDocument::Full { items, result_id } => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(result_id.as_deref(), Some("r1"));
+            }
+            other => panic!("expected Full, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fold_pull_result_carries_the_result_id_forward_on_an_unchanged_report() {
+        let params = serde_json::json!({
+            "kind": "unchanged",
+            "resultId": "r1",
+        });
+        let report: DocumentDiagnosticReportResult = serde_json::from_value(params).unwrap();
+        let primary = uri("file:///repo/src/lib.rs");
+        let folded = fold_pull_result(primary.clone(), report);
+
+        assert_eq!(
+            folded,
+            vec![(
+                primary,
+                PulledDocument::Unchanged {
+                    result_id: "r1".to_owned()
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn fold_pull_result_folds_related_documents_in_alongside_the_primary_one() {
+        // A macro in the primary document produced a diagnostic in a header
+        // it depends on — exactly the cross-file case
+        // `related_document_support` exists for.
+        let params = serde_json::json!({
+            "kind": "full",
+            "resultId": "primary-r1",
+            "items": [diagnostic(0, 0, DiagnosticSeverity::ERROR)],
+            "relatedDocuments": {
+                "file:///repo/src/header.h": {
+                    "kind": "full",
+                    "resultId": "related-r1",
+                    "items": [diagnostic(2, 2, DiagnosticSeverity::WARNING)],
+                }
+            }
+        });
+        let report: DocumentDiagnosticReportResult = serde_json::from_value(params).unwrap();
+        let primary = uri("file:///repo/src/lib.rs");
+        let related = uri("file:///repo/src/header.h");
+        let mut folded = fold_pull_result(primary.clone(), report);
+        folded.sort_by_key(|(uri, _)| uri.as_str().to_owned());
+
+        assert_eq!(folded.len(), 2);
+        let (found_primary, primary_outcome) = folded
+            .iter()
+            .find(|(u, _)| *u == primary)
+            .expect("primary document present");
+        assert_eq!(found_primary, &primary);
+        assert!(matches!(
+            primary_outcome,
+            PulledDocument::Full { result_id: Some(id), .. } if id == "primary-r1"
+        ));
+        let (_, related_outcome) = folded
+            .iter()
+            .find(|(u, _)| *u == related)
+            .expect("related document present");
+        assert!(matches!(
+            related_outcome,
+            PulledDocument::Full { result_id: Some(id), .. } if id == "related-r1"
+        ));
+    }
+
+    #[test]
+    fn fold_pull_result_is_empty_for_a_partial_result() {
+        // This client never issues a partial-result token (see
+        // `Client::pull_diagnostics`), so a well-behaved server should never
+        // send this shape back — but folding it to nothing rather than
+        // panicking means a server's protocol slip can't crash the caller.
+        let params = serde_json::json!({});
+        let report: DocumentDiagnosticReportResult = serde_json::from_value(params).unwrap();
+        assert!(matches!(report, DocumentDiagnosticReportResult::Partial(_)));
+        let folded = fold_pull_result(uri("file:///repo/src/lib.rs"), report);
+        assert!(folded.is_empty());
     }
 }

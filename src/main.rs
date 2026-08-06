@@ -1380,11 +1380,23 @@ fn print_location(location: &lsp_types::Location) {
 
 /// `--diagnostics` doesn't request anything at `line`/`col` — it opens the
 /// file (via [`lsp::LspManager::warm_up`], the same mechanism the TUI uses
-/// to make diagnostics appear without a hover) and waits for the server to
-/// push a `textDocument/publishDiagnostics` notification for it, which is
-/// how `katamari`'s core value proposition ("did the AI's edit introduce
-/// errors") actually surfaces — there is no request/response form of this
-/// in LSP.
+/// to make diagnostics appear without a hover) and waits for a
+/// `textDocument/publishDiagnostics`-shaped notification for it on
+/// `events_rx`, which is how `katamari`'s core value proposition ("did the
+/// AI's edit introduce errors") actually surfaces. That covers both models a
+/// server might speak: a push-only server (rust-analyzer, TS, most others)
+/// sends that notification unsolicited, straight off the transport; a
+/// pull-only one (kotlin-lsp — LSP 3.17's `textDocument/diagnostic`, no
+/// unsolicited push at all) has [`lsp::LspManager`] pull on its behalf right
+/// after `warm_up`'s `didOpen` and republish the answer as a notification of
+/// the same shape (see `lsp::manager::apply_pulled_diagnostics`) — so this
+/// function needs no separate pull-polling branch of its own; it was
+/// already the pull path's intended landing point. kotlin-lsp specifically
+/// can leave an early pull empty while it's still indexing the project
+/// (tens of seconds on a cold run); the manager re-pulls once indexing
+/// reports done via `$/progress end`, which is why this keeps listening
+/// past an empty wave the same way it already did for rust-analyzer's
+/// fast/flycheck waves, below.
 fn run_diagnostics_check(
     manager: &lsp::LspManager,
     events_rx: &std::sync::mpsc::Receiver<lsp::ServerEvent>,
