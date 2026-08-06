@@ -5,6 +5,20 @@ highlighting, hover/go-to-definition/find-references/diagnostics from real
 language servers, and inline review comments an AI coding agent can read
 back and address — all without leaving the terminal.
 
+- **LSP inside the diff** — hover, go-to-definition, find-references, and
+  live diagnostics on changed lines (Rust / TypeScript / Python / Go;
+  servers auto-install on first use)
+- **Watch mode** — the diff refreshes as an agent's edits land on disk
+- **Any unit of change** — working tree, staged, one commit, a range, a jj
+  change or revset; browse and pick from `ktmr log`, or switch mid-session
+  with a popup (`o`)
+- **jj snapshot timeline** — step through every save of an agent's session,
+  not just the final state
+- **Comment round-trip** — leave comments in the TUI, an agent reads and
+  resolves them via `ktmr comments`
+- **Your keybindings** — vim (default) and emacs presets, every action
+  remappable; monorepo-aware workspace roots
+
 ## Why
 
 Reviewing an AI agent's changes usually means either reading a raw `git
@@ -29,7 +43,11 @@ an agent's session passed through, not just the version currently on disk.
 
 ## Install
 
+Needs a Rust toolchain (any recent stable):
+
 ```
+git clone git@github.com:isamisushi/katamari.git
+cd katamari
 cargo install --path .
 ```
 
@@ -88,12 +106,13 @@ Leave a review comment on the current line with `c`, then `C-s` to save.
 An AI coding agent addresses them with:
 
 ```
-ktmr comments list --json     # or: ktmr comments export --format=md
+ktmr comments list --json           # or: ktmr comments export --format=md
+ktmr comments resolve <id>          # after addressing one (reopen <id> undoes it)
+ktmr comments add <file> <line> <body>   # leave a comment from a script/agent
 ```
 
-...making the requested changes and running `ktmr comments resolve <id>`
-for each one it handles — resolutions show up live in an open `ktmr diff`
-session. `ktmr skill install` drops a Claude Code skill
+...making the requested changes and resolving each comment it handles —
+resolutions show up live in an open `ktmr diff` session. `ktmr skill install` drops a Claude Code skill
 (`.claude/skills/katamari-review/SKILL.md`) into the current repository
 that teaches an agent this exact loop, so it picks it up automatically
 rather than needing the workflow spelled out in every prompt.
@@ -153,6 +172,7 @@ below) for the emacs column. `q` quits either way.
 | Open scope menu | `o` | `o` |
 | Toggle range-select (timeline/log) | `v` | `C-Space` |
 | Add comment | `c` | `C-c C-c` |
+| (in comment compose) newline / save / cancel | `Enter` / `C-s` / `Esc` | same |
 | Toggle inline comment bodies | `C` | `C` |
 | Quit | `q` | `q` |
 
@@ -278,7 +298,10 @@ jj git init --colocate
 
 That's it: jj now tracks the same working copy as git (a `.jj` directory
 appears alongside `.git`), and every save creates a new jj operation
-katamari's timeline can show. Nothing about `ktmr diff` changes if jj
+katamari's timeline can show. In watch mode, katamari itself triggers a
+snapshot (`jj util snapshot`) after each burst of edits, so an agent
+session leaves one timeline entry per save even though the agent never
+runs a jj command. Nothing about `ktmr diff` changes if jj
 isn't set up — the timeline (`t`) simply reports it's unavailable. `ktmr
 diff -r`/`--from`/`--to` and `ktmr log`'s jj-backed history need this same
 colocated setup; `ktmr log` still works without it (falling back to plain
