@@ -277,6 +277,18 @@ VSCode/Zed give you.
 | TypeScript/JavaScript | `typescript-language-server` | `npm install` (bootstraps a private Node.js runtime first if no `npm` can be found anywhere) |
 | Python | `pyright-langserver` | `npm install` (same Node.js bootstrap fallback) |
 | Go | `gopls` | `go install`, requires an existing go toolchain — katamari won't install Go itself |
+| Kotlin | `kotlin-lsp` (JetBrains) | prebuilt archive from JetBrains' CDN, bundling its own JVM — no external Java needed |
+
+kotlin-lsp is JetBrains' own server (the `fwcd/kotlin-language-server`
+community project is unmaintained as of this writing) and is still alpha
+quality: on a project with no Gradle wrapper yet cached, its first hover or
+go-to-definition can take tens of seconds while it resolves the classpath in
+the background — katamari's `ktmr lsp-check` retries handle this the same
+way they do rust-analyzer's own cold-start indexing. Diagnostics are the one
+gap: kotlin-lsp only implements pull-model `textDocument/diagnostic`, not
+the `publishDiagnostics` push notifications katamari's gutter/`--diagnostics`
+flow listens for, so error/warning highlighting doesn't yet surface for
+Kotlin files — hover, go-to-definition, and find-references all work.
 
 Managed installs live under `~/.local/share/katamari/servers/`
 (`$XDG_DATA_HOME/katamari/servers/` if set), one version-stamped
@@ -298,7 +310,7 @@ needed:
 
 ```
 ktmr lsp doctor              # where each language's server resolves from today (no installs triggered)
-ktmr lsp install <language>  # force an install into katamari's managed prefix (rust/typescript/python/go/all)
+ktmr lsp install <language>  # force an install into katamari's managed prefix (rust/typescript/python/go/kotlin/all)
 ktmr lsp update              # reinstall any pinned server that's fallen behind the current pin
 ```
 

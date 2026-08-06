@@ -22,6 +22,7 @@ pub enum Language {
     TypeScript,
     Python,
     Go,
+    Kotlin,
 }
 
 impl Language {
@@ -33,6 +34,7 @@ impl Language {
             }
             Some("py" | "pyi") => Some(Language::Python),
             Some("go") => Some(Language::Go),
+            Some("kt" | "kts") => Some(Language::Kotlin),
             _ => None,
         }
     }
@@ -52,6 +54,7 @@ impl Language {
             Language::TypeScript => "typescript",
             Language::Python => "python",
             Language::Go => "go",
+            Language::Kotlin => "kotlin",
         }
     }
 }
@@ -82,7 +85,7 @@ pub struct Unavailable {
     /// Whether [`crate::lsp::install::ensure`] could plausibly turn this
     /// into a working server — checked here (a cheap subprocess probe for
     /// gopls's go-toolchain prerequisite; unconditionally `true` for the
-    /// other three languages, see [`diagnose_language`]'s docs) rather than
+    /// other four languages, see [`diagnose_language`]'s docs) rather than
     /// by actually attempting an install, so `resolve_server` stays
     /// network-free. [`crate::lsp::manager::LspManager::spawn_server`] reads
     /// this to decide whether to call `install::ensure` at all when
@@ -202,14 +205,17 @@ pub enum ResolvedFrom {
     KatamariManaged,
 }
 
-/// The four-way dispatch [`resolve_server`] and [`diagnose`] both build on:
+/// The five-way dispatch [`resolve_server`] and [`diagnose`] both build on:
 /// which lookup tier (if any) finds `language`'s binary, and — only
 /// meaningful when none did — whether it's installable. Go is the one
 /// language where that second question needs an actual check (a go
 /// toolchain to run `go install` against, see [`go_toolchain_available`]);
-/// the other three are always installable when missing, since rust-analyzer
-/// downloads as a standalone binary and the two npm-based servers bootstrap
-/// their own Node.js runtime when npm can't be found anywhere.
+/// the other four are always installable when missing, since rust-analyzer
+/// and kotlin-lsp both download as self-contained archives (kotlin-lsp
+/// bundles its own JetBrains Runtime, so unlike Go it never needs an
+/// external JVM the way `go install` needs an external Go toolchain — see
+/// [`install::install_kotlin_lsp`]'s docs) and the two npm-based servers
+/// bootstrap their own Node.js runtime when npm can't be found anywhere.
 fn diagnose_language(language: Language, workspace_root: &Path) -> (Option<LookupHit>, bool) {
     match language {
         Language::Rust => (lookup_rust_analyzer(), true),
@@ -220,6 +226,7 @@ fn diagnose_language(language: Language, workspace_root: &Path) -> (Option<Looku
             let installable = hit.is_some() || go_toolchain_available();
             (hit, installable)
         }
+        Language::Kotlin => (lookup_kotlin_lsp(), true),
     }
 }
 
@@ -245,6 +252,10 @@ fn install_hint(language: Language, installable: bool) -> String {
         Language::Go => "gopls not found, and no go toolchain is reachable to auto-install it \
             with — install Go first (https://go.dev/dl/), then \
             `go install golang.org/x/tools/gopls@latest`"
+            .to_owned(),
+        Language::Kotlin => "kotlin-lsp not found on PATH, via `mise which`, or katamari's \
+            managed install — install it from https://github.com/Kotlin/kotlin-lsp, or let \
+            katamari auto-install it (`ktmr lsp install kotlin`)"
             .to_owned(),
     }
 }
@@ -277,6 +288,10 @@ fn command_for(language: Language, hit: LookupHit) -> ResolvedServer {
             command: pyright_command(path),
             initialization_options: None,
         },
+        Language::Kotlin => ResolvedServer {
+            command: kotlin_lsp_command(path),
+            initialization_options: None,
+        },
         _ => ResolvedServer {
             command: Command::new(path),
             initialization_options: None,
@@ -291,6 +306,12 @@ fn ts_language_server_command(path: PathBuf) -> Command {
 }
 
 fn pyright_command(path: PathBuf) -> Command {
+    let mut command = Command::new(path);
+    command.arg("--stdio");
+    command
+}
+
+fn kotlin_lsp_command(path: PathBuf) -> Command {
     let mut command = Command::new(path);
     command.arg("--stdio");
     command
@@ -330,10 +351,10 @@ impl LookupHit {
     }
 }
 
-/// The order every `lookup_*` function below checks in, common to all four
+/// The order every `lookup_*` function below checks in, common to all five
 /// languages: a language-specific project-local convention (if any) beats
 /// everything, then `PATH`, then a toolchain-specific fallback (`rustup
-/// which` for rust-analyzer; nothing for the other three), then `mise
+/// which` for rust-analyzer; nothing for the other four), then `mise
 /// which` (cheap even when katamari itself wasn't invoked through mise —
 /// see [`mise_which`]), and finally whatever [`crate::lsp::install`] has
 /// already installed into katamari's own prefix. Factored as one function
@@ -423,6 +444,19 @@ fn lookup_gopls() -> Option<LookupHit> {
     )
 }
 
+/// `kotlin-lsp` has no project-local install convention (JetBrains ships it
+/// as a standalone archive, not a per-project devDependency), so its lookup
+/// order starts at `PATH`, same as `gopls`.
+fn lookup_kotlin_lsp() -> Option<LookupHit> {
+    lookup_in_order(
+        None,
+        || which_on_path("kotlin-lsp"),
+        || None,
+        || mise_which("kotlin-lsp"),
+        || install::installed_binary_path(&install::prefix_dir(), Language::Kotlin),
+    )
+}
+
 /// Whether a go toolchain (needed to `go install golang.org/x/tools/gopls`)
 /// is reachable at all — checked only to decide [`Unavailable::installable`]
 /// for gopls specifically; see [`diagnose_language`]'s docs on why Go is the
@@ -490,6 +524,19 @@ fn root_markers(language: Language) -> &'static [&'static str] {
             "requirements.txt",
         ],
         Language::Go => &["go.mod"],
+        // `settings.gradle(.kts)` listed alongside the module-level
+        // `build.gradle(.kts)`/`pom.xml` markers so a directory with only a
+        // settings file (no build script of its own — the common shape for
+        // a multi-module Gradle root) still counts as tier 1's nearest
+        // marker, not just tier 2's workspace marker (see
+        // `is_workspace_root_marker`, below).
+        Language::Kotlin => &[
+            "settings.gradle.kts",
+            "settings.gradle",
+            "build.gradle.kts",
+            "build.gradle",
+            "pom.xml",
+        ],
     }
 }
 
@@ -603,6 +650,15 @@ fn is_workspace_root_marker(dir: &Path, language: Language) -> bool {
         }
         Language::Go => dir.join("go.work").is_file(),
         Language::Python => false,
+        // `settings.gradle(.kts)` is unconditionally the top of a Gradle
+        // build — unlike Cargo/npm's workspace markers, it needs no content
+        // check (a Gradle project either has one declaring its modules, or
+        // it's a single-module project with no workspace tier at all), so
+        // this mirrors `go.work`'s presence-only check rather than
+        // `cargo_toml_declares_workspace`'s content-parsing one.
+        Language::Kotlin => {
+            dir.join("settings.gradle.kts").is_file() || dir.join("settings.gradle").is_file()
+        }
     }
 }
 
@@ -659,6 +715,14 @@ mod tests {
             Some(Language::Python)
         );
         assert_eq!(Language::detect(Path::new("main.go")), Some(Language::Go));
+        assert_eq!(
+            Language::detect(Path::new("src/Main.kt")),
+            Some(Language::Kotlin)
+        );
+        assert_eq!(
+            Language::detect(Path::new("build.gradle.kts")),
+            Some(Language::Kotlin)
+        );
         assert_eq!(Language::detect(Path::new("README.md")), None);
         assert_eq!(Language::detect(Path::new("no_extension")), None);
     }
@@ -880,6 +944,67 @@ mod tests {
     }
 
     #[test]
+    fn workspace_root_finds_the_nearest_kotlin_build_gradle_kts() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+        let module_dir = repo_root.join("app");
+        std::fs::create_dir_all(module_dir.join("src").join("main").join("kotlin")).unwrap();
+        std::fs::write(module_dir.join("build.gradle.kts"), "").unwrap();
+        let file = module_dir
+            .join("src")
+            .join("main")
+            .join("kotlin")
+            .join("Main.kt");
+        std::fs::write(&file, "").unwrap();
+
+        assert_eq!(
+            workspace_root(&file, repo_root, Language::Kotlin),
+            module_dir
+        );
+    }
+
+    #[test]
+    fn workspace_root_prefers_the_gradle_settings_root_over_a_modules_build_gradle_kts() {
+        // Mirrors `workspace_root_prefers_the_cargo_workspace_root_over_a_members_own_cargo_toml`:
+        // a multi-module Gradle build's `settings.gradle.kts` at the repo
+        // root should win over a nearer module's own `build.gradle.kts`, so
+        // kotlin-lsp sees every module's classpath from one server rather
+        // than one server per module.
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+        std::fs::write(
+            repo_root.join("settings.gradle.kts"),
+            "rootProject.name = \"demo\"\ninclude(\"app\")\n",
+        )
+        .unwrap();
+        let module_dir = repo_root.join("app");
+        std::fs::create_dir_all(module_dir.join("src")).unwrap();
+        std::fs::write(module_dir.join("build.gradle.kts"), "").unwrap();
+        let file = module_dir.join("src").join("Main.kt");
+        std::fs::write(&file, "").unwrap();
+
+        assert_eq!(
+            workspace_root(&file, repo_root, Language::Kotlin),
+            repo_root.to_path_buf()
+        );
+    }
+
+    #[test]
+    fn workspace_root_finds_a_kotlin_pom_xml_when_no_gradle_marker_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo_root = dir.path();
+        std::fs::write(repo_root.join("pom.xml"), "").unwrap();
+        let file = repo_root.join("src").join("main").join("Main.kt");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "").unwrap();
+
+        assert_eq!(
+            workspace_root(&file, repo_root, Language::Kotlin),
+            repo_root.to_path_buf()
+        );
+    }
+
+    #[test]
     fn workspace_root_picks_the_topmost_workspace_marker_when_nested() {
         // An outer Cargo workspace containing an inner one (unusual, but not
         // invalid) — the server covering the whole monorepo should win, not
@@ -960,6 +1085,19 @@ mod tests {
         if let Err(unavailable) = resolve_server(Language::Go, Path::new("/repo"), &overrides) {
             assert!(unavailable.reason.contains("gopls"));
             assert!(unavailable.reason.starts_with("LSP: go"));
+        }
+    }
+
+    #[test]
+    fn resolve_server_reports_a_hint_when_kotlin_lsp_is_missing() {
+        // Unlike gopls, kotlin-lsp is unconditionally installable when
+        // missing (it bundles its own JVM — see `diagnose_language`'s
+        // docs), so this only asserts the hint's shape, not `installable`.
+        let overrides = HashMap::new();
+        if let Err(unavailable) = resolve_server(Language::Kotlin, Path::new("/repo"), &overrides) {
+            assert!(unavailable.reason.contains("kotlin-lsp"));
+            assert!(unavailable.reason.starts_with("LSP: kotlin"));
+            assert!(unavailable.installable);
         }
     }
 

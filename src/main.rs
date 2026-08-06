@@ -209,7 +209,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum LspCommand {
-    /// Prints, for each of the four supported languages, where its server
+    /// Prints, for each of the five supported languages, where its server
     /// would resolve from today (config override / project-local / PATH /
     /// `mise which` / katamari-managed / not found) and — only when not
     /// found — whether `[lsp] auto_install` would handle it. Read-only:
@@ -232,7 +232,7 @@ enum LspCommand {
     Update,
 }
 
-/// `ktmr lsp install <language>`'s argument — the four languages plus
+/// `ktmr lsp install <language>`'s argument — the five languages plus
 /// `all`, kebab-free since every variant here is already a single word.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum LanguageArg {
@@ -240,6 +240,7 @@ enum LanguageArg {
     Typescript,
     Python,
     Go,
+    Kotlin,
     All,
 }
 
@@ -1053,11 +1054,12 @@ fn run_skill_install() -> Result<()> {
     Ok(())
 }
 
-const ALL_LANGUAGES: [lsp::adapter::Language; 4] = [
+const ALL_LANGUAGES: [lsp::adapter::Language; 5] = [
     lsp::adapter::Language::Rust,
     lsp::adapter::Language::TypeScript,
     lsp::adapter::Language::Python,
     lsp::adapter::Language::Go,
+    lsp::adapter::Language::Kotlin,
 ];
 
 fn run_lsp(action: LspCommand) -> Result<()> {
@@ -1089,6 +1091,7 @@ fn language_label(language: lsp::adapter::Language) -> &'static str {
         lsp::adapter::Language::TypeScript => "typescript",
         lsp::adapter::Language::Python => "python",
         lsp::adapter::Language::Go => "go",
+        lsp::adapter::Language::Kotlin => "kotlin",
     }
 }
 
@@ -1138,6 +1141,7 @@ fn run_lsp_install(language: LanguageArg) -> Result<()> {
         LanguageArg::Typescript => vec![lsp::adapter::Language::TypeScript],
         LanguageArg::Python => vec![lsp::adapter::Language::Python],
         LanguageArg::Go => vec![lsp::adapter::Language::Go],
+        LanguageArg::Kotlin => vec![lsp::adapter::Language::Kotlin],
     };
     for language in languages {
         println!("=== {} ===", language_label(language));
