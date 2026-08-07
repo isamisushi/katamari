@@ -201,6 +201,17 @@ as an alias in terminals where `C-i` is active.
 
 Any binding can be overridden per action; see `[keys]` below.
 
+Pass `--show-keys` to `diff`/`open`/`log`/`timeline` (or set `[ui]
+show_keys = true` to leave it on by default) to show a small overlay chip
+in the content area's bottom-right corner with the most recent key(s)
+pressed, in the same notation as the table above (`gd`, `K`, `]d`) —
+useful for recordings and pair-review demos so a viewer can see what's
+being pressed. A multi-key sequence builds up as you type it (`g` then
+`gd`), repeated identical presses collapse (`j ×3`), the chip clears after
+~1.5s of inactivity, and while typing into the comment-compose or
+revision-input overlays it shows a generic `[typing…]` placeholder instead
+of echoing your text.
+
 ## Config
 
 TOML, merged in this order (later wins per field, not per file — setting
@@ -254,6 +265,10 @@ highlight_max_lines = 5000
 # set false to restore truncation, e.g. if you rely on it for
 # alignment-heavy code.
 wrap = true
+# Shows the key-display overlay chip described under "Keybindings" above
+# by default, without needing `--show-keys` on every invocation. Default
+# false.
+show_keys = false
 
 [watch]
 # Debounce window for `--watch`: how long a burst of filesystem changes

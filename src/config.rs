@@ -82,6 +82,14 @@ pub struct Config {
     /// on why these process-wide rendering knobs go through a `OnceLock`
     /// instead of being threaded as parameters.
     pub wrap: bool,
+    /// `[ui] show_keys` — whether the screenkey-style overlay chip
+    /// (bottom-right of the content area) shows the most recent key(s)
+    /// pressed, for recordings and pair-review demos. Defaults to `false`:
+    /// off unless a reviewer opts in, since echoing every keystroke is
+    /// noise for ordinary use. `ktmr diff`/`open`/`log`/`timeline`'s
+    /// `--show-keys` flag forces this on for one session regardless of what
+    /// this field says — see `main.rs`'s per-command flag docs.
+    pub show_keys: bool,
     pub debounce_ms: u64,
     /// `[update] check` — whether a TUI session ever looks for a newer
     /// katamari release: both the once-a-day background GitHub check
@@ -103,6 +111,7 @@ impl Default for Config {
             tab_width: DEFAULT_TAB_WIDTH,
             highlight_max_lines: DEFAULT_HIGHLIGHT_MAX_LINES,
             wrap: true,
+            show_keys: false,
             debounce_ms: DEFAULT_DEBOUNCE_MS,
             update_check: true,
         }
@@ -143,6 +152,7 @@ struct RawUi {
     tab_width: Option<usize>,
     highlight_max_lines: Option<usize>,
     wrap: Option<bool>,
+    show_keys: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -160,7 +170,7 @@ struct RawUpdate {
 const TOP_LEVEL_KEYS: &[&str] = &["keymap", "keys", "lsp", "ui", "watch", "update"];
 const LSP_KEYS: &[&str] = &["servers", "auto_install"];
 const SERVER_KEYS: &[&str] = &["command", "args"];
-const UI_KEYS: &[&str] = &["tab_width", "highlight_max_lines", "wrap"];
+const UI_KEYS: &[&str] = &["tab_width", "highlight_max_lines", "wrap", "show_keys"];
 const WATCH_KEYS: &[&str] = &["debounce_ms"];
 const UPDATE_KEYS: &[&str] = &["check"];
 
@@ -196,6 +206,9 @@ fn merge_raw(base: &mut RawFile, overlay: RawFile) {
         }
         if overlay_ui.wrap.is_some() {
             base_ui.wrap = overlay_ui.wrap;
+        }
+        if overlay_ui.show_keys.is_some() {
+            base_ui.show_keys = overlay_ui.show_keys;
         }
     }
     if let Some(overlay_watch) = overlay.watch {
@@ -353,6 +366,7 @@ fn finalize(raw: RawFile) -> Config {
             .highlight_max_lines
             .unwrap_or(DEFAULT_HIGHLIGHT_MAX_LINES),
         wrap: ui.wrap.unwrap_or(true),
+        show_keys: ui.show_keys.unwrap_or(false),
         debounce_ms: watch.debounce_ms.unwrap_or(DEFAULT_DEBOUNCE_MS),
         update_check: update.check.unwrap_or(true),
     }
@@ -484,6 +498,19 @@ mod tests {
     }
 
     #[test]
+    fn show_keys_defaults_to_false_and_can_be_enabled() {
+        let repo = fixture_repo();
+        assert!(!load_merged(&repo).show_keys, "off by default");
+
+        write_repo_config(&repo, "[ui]\nshow_keys = true\n");
+        let config = load_merged(&repo);
+        assert!(config.show_keys);
+        // Enabling show_keys doesn't reset a sibling `[ui]` field back to
+        // its default — same field-level merge guarantee `tab_width` gets.
+        assert_eq!(config.tab_width, DEFAULT_TAB_WIDTH);
+    }
+
+    #[test]
     fn wrap_defaults_to_true_and_can_be_disabled() {
         let repo = fixture_repo();
         assert!(load_merged(&repo).wrap, "on by default");
@@ -508,6 +535,7 @@ mod tests {
                 tab_width: Some(8),
                 highlight_max_lines: Some(1000),
                 wrap: None,
+                show_keys: None,
             }),
             watch: Some(RawWatch {
                 debounce_ms: Some(500),
@@ -519,6 +547,7 @@ mod tests {
                 tab_width: Some(2),
                 highlight_max_lines: None,
                 wrap: None,
+                show_keys: None,
             }),
             ..RawFile::default()
         };

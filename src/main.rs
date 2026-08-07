@@ -94,11 +94,21 @@ enum Command {
         /// numbers are the whole point of measuring this at all.
         #[arg(long, hide = true, value_name = "N")]
         bench_render: Option<usize>,
+        /// Forces the screenkey-style key-display overlay on for this
+        /// session, regardless of `[ui] show_keys` in config — see
+        /// `ui::key_display`'s module docs. The flag only ever turns this
+        /// *on*; there's no `--no-show-keys` to force it off, since config
+        /// already defaults to off.
+        #[arg(long)]
+        show_keys: bool,
     },
     /// Open a single file in a read-only, syntax-highlighted viewer.
     Open {
         /// Path to the file to open.
         file: PathBuf,
+        /// See `Diff`'s `--show-keys`.
+        #[arg(long)]
+        show_keys: bool,
     },
     /// Opens directly into the jj snapshot timeline (see `t` from `ktmr
     /// diff`). Requires a colocated jj repository — a `.jj` directory
@@ -123,6 +133,9 @@ enum Command {
         /// without a live `--watch` session.
         #[arg(long, hide = true, conflicts_with = "dump")]
         snapshot: bool,
+        /// See `Diff`'s `--show-keys`.
+        #[arg(long)]
+        show_keys: bool,
     },
     /// Opens directly into a browsable revision history (see `L` from
     /// `ktmr diff`): jj changes — including the working copy, `@`, as a
@@ -135,6 +148,9 @@ enum Command {
         /// launching the TUI — for headless verification.
         #[arg(long, hide = true)]
         dump: bool,
+        /// See `Diff`'s `--show-keys`.
+        #[arg(long)]
+        show_keys: bool,
     },
     /// Spawns a language server, requests hover (or, with a mode flag,
     /// go-to-definition/references/diagnostics) at one position, prints the
@@ -344,6 +360,7 @@ fn main() -> Result<()> {
         to: None,
         watch: false,
         bench_render: None,
+        show_keys: false,
     }) {
         Command::Diff {
             dump,
@@ -355,6 +372,7 @@ fn main() -> Result<()> {
             to,
             watch,
             bench_render,
+            show_keys,
         } => run_diff(
             dump,
             layout,
@@ -365,10 +383,16 @@ fn main() -> Result<()> {
             to,
             watch,
             bench_render,
+            show_keys,
         ),
-        Command::Open { file } => run_open(file),
-        Command::Timeline { dump, op, snapshot } => run_timeline(dump, op, snapshot),
-        Command::Log { dump } => run_log(dump),
+        Command::Open { file, show_keys } => run_open(file, show_keys),
+        Command::Timeline {
+            dump,
+            op,
+            snapshot,
+            show_keys,
+        } => run_timeline(dump, op, snapshot, show_keys),
+        Command::Log { dump, show_keys } => run_log(dump, show_keys),
         Command::LspCheck {
             file,
             line,
@@ -402,6 +426,7 @@ fn run_diff(
     to: Option<String>,
     watch: bool,
     bench_render: Option<usize>,
+    show_keys: bool,
 ) -> Result<()> {
     if watch && (staged || range.is_some()) {
         bail!(
@@ -485,7 +510,12 @@ fn run_diff(
     let mut stack = ViewStack::new(View::Diff(app));
     let pre_refresh_hook: Option<Box<dyn ui::PreRefreshHook>> =
         watch.then(|| Box::new(ui::NoopPreRefreshHook) as Box<dyn ui::PreRefreshHook>);
-    ui::run(&mut stack, pre_refresh_hook, &config)
+    ui::run(
+        &mut stack,
+        pre_refresh_hook,
+        &config,
+        show_keys || config.show_keys,
+    )
 }
 
 /// `ktmr diff --bench-render N` — see that flag's doc comment on `Command::Diff`.
@@ -558,7 +588,7 @@ fn run_bench_render(app: App, frames: usize) -> Result<()> {
     Ok(())
 }
 
-fn run_open(file: PathBuf) -> Result<()> {
+fn run_open(file: PathBuf, show_keys: bool) -> Result<()> {
     let source = std::fs::read_to_string(&file)
         .with_context(|| format!("failed to read {}", file.display()))?;
     let display_path = file.display().to_string();
@@ -586,7 +616,7 @@ fn run_open(file: PathBuf) -> Result<()> {
 
     let view = FileView::with_hover_target(display_path, &source, Some((absolute_file, git_root)));
     let mut stack = ViewStack::new(View::File(view));
-    ui::run(&mut stack, None, &config)
+    ui::run(&mut stack, None, &config, show_keys || config.show_keys)
 }
 
 /// Resolves the jj repository for the current directory, the same way
@@ -622,7 +652,7 @@ fn discover_jj_repo_at(repo_root: &Path) -> Result<jj::JjRepo> {
 /// [`TimelineView`], or (hidden, for headless E2E verification) dumps the
 /// snapshot list or one operation's diff as plain text. See
 /// [`discover_jj_repo`] for what "requires a jj repo" means here.
-fn run_timeline(dump: bool, op: Option<String>, snapshot: bool) -> Result<()> {
+fn run_timeline(dump: bool, op: Option<String>, snapshot: bool, show_keys: bool) -> Result<()> {
     let jj_repo = discover_jj_repo()?;
 
     if snapshot {
@@ -647,7 +677,7 @@ fn run_timeline(dump: bool, op: Option<String>, snapshot: bool) -> Result<()> {
 
     let timeline = TimelineView::new(jj_repo, ui::timeline_view::DEFAULT_OP_LOG_LIMIT)?;
     let mut stack = ViewStack::new(View::Timeline(timeline));
-    ui::run(&mut stack, None, &config)
+    ui::run(&mut stack, None, &config, show_keys || config.show_keys)
 }
 
 /// Prints the snapshot list (`op_id  unix_time  description`, one per
@@ -698,7 +728,7 @@ fn run_timeline_dump(jj_repo: &jj::JjRepo, op: Option<String>) -> Result<()> {
 /// history when no colocated jj repository is found, so this only ever
 /// fails the way [`run_diff`]'s plain working-tree case can (not a git
 /// repository at all, or `git` missing from `PATH`).
-fn run_log(dump: bool) -> Result<()> {
+fn run_log(dump: bool, show_keys: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo_root = GitSource::discover(&cwd)?.repo_root()?;
     let backend = vcs::LogBackend::detect(&repo_root);
@@ -714,7 +744,7 @@ fn run_log(dump: bool) -> Result<()> {
 
     let log_view = ui::log_view::LogView::new(backend, ui::log_view::DEFAULT_LOG_LIMIT)?;
     let mut stack = ViewStack::new(View::Log(log_view));
-    ui::run(&mut stack, None, &config)
+    ui::run(&mut stack, None, &config, show_keys || config.show_keys)
 }
 
 /// `ktmr lsp-check <file> <line> <col> [--definition|--references|--diagnostics]`

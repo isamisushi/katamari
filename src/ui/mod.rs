@@ -19,6 +19,7 @@ pub mod diff_view;
 pub mod file_view;
 pub mod hints;
 pub mod hover_popup;
+pub mod key_display;
 pub mod log_view;
 pub mod navigation;
 pub mod refresh;
@@ -191,10 +192,17 @@ fn detect_jj_repo(view: &View) -> Option<JjRepo> {
 /// a panic or a silently-ignored override — this is the one place a bad
 /// config value can actually stop the session from starting, since
 /// everything else `Config` carries has a safe built-in fallback.
+///
+/// `show_keys` is `config.show_keys` already OR'd with the session's
+/// `--show-keys` flag (see `main.rs`'s per-command flag docs) — the CLI flag
+/// only ever forces this *on* for one session, never off, so callers pass
+/// the already-resolved bool rather than threading `Config` and the flag
+/// through separately.
 pub fn run(
     stack: &mut ViewStack,
     pre_refresh_hook: Option<Box<dyn PreRefreshHook>>,
     config: &Config,
+    show_keys: bool,
 ) -> Result<()> {
     install_panic_hook();
 
@@ -299,6 +307,7 @@ pub fn run(
         jj_repo,
         comments_repo_root,
         initial_comments,
+        show_keys,
     );
 
     restore_terminal(&mut terminal)?;
@@ -534,7 +543,9 @@ fn event_loop(
     jj_repo: Option<JjRepo>,
     comments_repo_root: Option<PathBuf>,
     initial_comments: Vec<Comment>,
+    show_keys: bool,
 ) -> Result<()> {
+    let mut key_display = key_display::KeyDisplayState::new(show_keys);
     let mut hover_state = hover_popup::HoverState::default();
     let mut pending_hover: Option<(u64, Receiver<Result<HoverResult, LspError>>)> = None;
     let mut pending_goto: Option<(JumpEntry, PendingGoto)> = None;
@@ -668,6 +679,7 @@ fn event_loop(
         {
             watch_status = None;
         }
+        key_display.tick(Instant::now());
         let status_note = hover_state
             .status_hint()
             .or_else(|| goto_status.clone())
@@ -687,6 +699,7 @@ fn event_loop(
                 compose.as_ref(),
                 scope_menu.as_ref(),
                 jj_repo.is_some(),
+                &key_display,
             )
         })?;
 
@@ -700,7 +713,10 @@ fn event_loop(
                     // why this bypasses the keymap resolver entirely rather
                     // than only intercepting a few already-resolved
                     // actions the way the hover popup/references panel do
-                    // below.
+                    // below. The key-display overlay masks this the same
+                    // way — see `key_display`'s module docs on why it never
+                    // echoes typed characters.
+                    key_display.record_typing(Instant::now());
                     match compose::handle_key(state.buffer_mut(), key) {
                         ComposeOutcome::Continue => {}
                         ComposeOutcome::Cancel => compose = None,
@@ -718,7 +734,9 @@ fn event_loop(
                     // Bypasses the keymap resolver for the same reason
                     // `compose` does above: a revision string can contain
                     // characters (`.`, `@`, `-`) that would otherwise
-                    // resolve to unrelated `Action`s.
+                    // resolve to unrelated `Action`s. Masked the same way
+                    // too — a revision string is still user-typed text.
+                    key_display.record_typing(Instant::now());
                     match handle_revision_key(input, key) {
                         RevisionInputOutcome::Continue => {}
                         RevisionInputOutcome::Back => {
@@ -762,7 +780,10 @@ fn event_loop(
                         }
                     }
                 } else {
-                    match resolver.feed(KeyChord::from(key)) {
+                    let chord = KeyChord::from(key);
+                    let step = resolver.feed(chord);
+                    key_display.record_step(chord, step, Instant::now());
+                    match step {
                         StepResult::Matched(action) => {
                             stack.top_mut().clear_pending_keys();
                             goto_status = None;
@@ -1606,6 +1627,7 @@ fn draw(
     compose: Option<&ComposeState>,
     scope_menu: Option<&ScopeMenuState>,
     jj_available: bool,
+    key_display: &key_display::KeyDisplayState,
 ) {
     match view {
         View::Diff(app) => {
@@ -1647,6 +1669,7 @@ fn draw(
             if let Some(state) = scope_menu {
                 scope_menu::render(frame, areas.diff, state, jj_available);
             }
+            key_display::render(frame, areas.diff, key_display);
         }
         View::File(file) => {
             let hint_items = hints::file_view_items(keymap);
@@ -1660,14 +1683,15 @@ fn draw(
             if let Some(panel) = refs_panel {
                 refs_panel::render(frame, areas.content, panel);
             }
+            key_display::render(frame, areas.content, key_display);
         }
         View::Timeline(timeline) => {
             let area = frame.area();
-            timeline_view::render(frame, area, timeline, highlighter, keymap);
+            timeline_view::render(frame, area, timeline, highlighter, keymap, key_display);
         }
         View::Log(log) => {
             let area = frame.area();
-            log_view::render(frame, area, log, keymap);
+            log_view::render(frame, area, log, keymap, key_display);
         }
     }
 }

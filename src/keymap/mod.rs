@@ -279,6 +279,16 @@ impl KeySeq {
                 .join(" ")
         }
     }
+
+    /// Builds a sequence directly from chords a [`Resolver`] has already
+    /// consumed, rather than parsing a notation string — what
+    /// `ui::key_display`'s screenkey-style overlay uses to render the exact
+    /// keys a reviewer just pressed (`gd`, `C-x n`) through the same
+    /// [`Self::compact_notation`] formatting every hint/README reference
+    /// uses, instead of inventing a second notation for "keys as typed."
+    pub(crate) fn from_chords(chords: Vec<KeyChord>) -> Self {
+        Self(chords)
+    }
 }
 
 #[derive(Default)]

@@ -378,6 +378,7 @@ pub fn render(
     view: &TimelineView,
     highlighter: &mut crate::highlight::LineHighlighter,
     keymap: &Keymap,
+    key_display: &crate::ui::key_display::KeyDisplayState,
 ) {
     let hint_items = hints::timeline_view_items(keymap);
     let status_height = hints::required_height(&hint_items, area.width);
@@ -399,6 +400,7 @@ pub fn render(
         &comments,
     );
     render_status(frame, areas.status, view, &hint_items);
+    crate::ui::key_display::render(frame, areas.diff, key_display);
 }
 
 fn render_list(frame: &mut Frame, area: Rect, view: &TimelineView) {

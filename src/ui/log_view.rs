@@ -237,12 +237,19 @@ pub fn layout(area: Rect, status_height: u16) -> Areas {
     }
 }
 
-pub fn render(frame: &mut Frame, area: Rect, view: &LogView, keymap: &crate::keymap::Keymap) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    view: &LogView,
+    keymap: &crate::keymap::Keymap,
+    key_display: &crate::ui::key_display::KeyDisplayState,
+) {
     let hint_items = hints::log_view_items(keymap);
     let status_height = hints::required_height(&hint_items, area.width);
     let areas = layout(area, status_height);
     render_list(frame, areas.list, view);
     render_status(frame, areas.status, view, &hint_items);
+    crate::ui::key_display::render(frame, areas.list, key_display);
 }
 
 fn revision_line(entry: &RevisionEntry, selected: bool, in_range: bool) -> Line<'static> {
