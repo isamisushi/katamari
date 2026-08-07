@@ -29,6 +29,8 @@ mod rendering;
 mod scope_menu;
 #[path = "e2e/show_keys.rs"]
 mod show_keys;
+#[path = "e2e/skill_install.rs"]
+mod skill_install;
 #[path = "e2e/update_check.rs"]
 mod update_check;
 #[path = "e2e/wrap.rs"]

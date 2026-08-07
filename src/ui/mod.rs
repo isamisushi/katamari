@@ -50,6 +50,7 @@ use crate::lsp::{
     DefinitionResult, DiagnosticsStore, HoverResult, LspError, LspManager, ReferencesResult,
     ServerEvent, parse_publish_diagnostics, progress_status_text,
 };
+use crate::skill;
 use crate::ui::compose::{ComposeOutcome, ComposeState};
 use crate::ui::log_view::LogView;
 use crate::ui::navigation::{JumpEntry, JumpStack, navigate_to};
@@ -66,7 +67,7 @@ use crate::vcs::jj::{self, JjRepo};
 use crate::watch::{self, WatchSignal};
 use anyhow::Result;
 use crossterm::event::{
-    self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    self, Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
@@ -308,6 +309,7 @@ pub fn run(
         comments_repo_root,
         initial_comments,
         show_keys,
+        config.offer_install,
     );
 
     restore_terminal(&mut terminal)?;
@@ -544,6 +546,7 @@ fn event_loop(
     comments_repo_root: Option<PathBuf>,
     initial_comments: Vec<Comment>,
     show_keys: bool,
+    offer_skill_install: bool,
 ) -> Result<()> {
     let mut key_display = key_display::KeyDisplayState::new(show_keys);
     let mut hover_state = hover_popup::HoverState::default();
@@ -558,6 +561,17 @@ fn event_loop(
     let mut warned_languages: HashSet<Language> = HashSet::new();
     let mut compose: Option<ComposeState> = None;
     let mut scope_menu: Option<ScopeMenuState> = None;
+    // M16's first-comment skill-install prompt: `skill_prompt_offered` is a
+    // one-way session latch — set the moment the prompt is shown (whether or
+    // not the reviewer ever responds), never reset, so it never appears
+    // twice in one session. `awaiting_skill_prompt_key` is true only for the
+    // single frame between the prompt appearing and the *next* key press,
+    // which is special-cased below (see the main key-dispatch `else` arm) to
+    // consume `y` as "install now" or fall through to ordinary key handling
+    // for anything else — see that arm's docs for why a plain dismiss
+    // doesn't swallow the key.
+    let mut skill_prompt_offered = false;
+    let mut awaiting_skill_prompt_key = false;
     // Only meaningful while `pre_refresh_hook.is_some()` (watch mode is
     // actually running) — see `apply_scope_swap`'s docs and
     // `handle_watch_refresh`'s early-return on this flag.
@@ -721,13 +735,37 @@ fn event_loop(
                         ComposeOutcome::Continue => {}
                         ComposeOutcome::Cancel => compose = None,
                         ComposeOutcome::Save => {
-                            goto_status = Some(finish_compose(
+                            let (status, saved) = finish_compose(
                                 state,
                                 comments_repo_root.as_deref(),
                                 &mut comment_list,
                                 &mut comment_index,
-                            ));
+                            );
                             compose = None;
+
+                            // The prompt only ever fires once per session
+                            // (`skill_prompt_offered`), only after a comment
+                            // actually persisted (not a discarded-empty or
+                            // failed save), only when the reviewer hasn't
+                            // opted out (`offer_skill_install`), and only
+                            // when this repo doesn't already have the skill
+                            // — any one of those false means a plain status
+                            // message, same as before M16.
+                            let offer = saved
+                                && offer_skill_install
+                                && !skill_prompt_offered
+                                && comments_repo_root
+                                    .as_deref()
+                                    .is_some_and(|root| !skill::skill_installed(root));
+                            goto_status = Some(if offer {
+                                skill_prompt_offered = true;
+                                awaiting_skill_prompt_key = true;
+                                format!(
+                                    "{status} \u{b7} press y to install the Claude Code review skill (ktmr skill install)"
+                                )
+                            } else {
+                                status
+                            });
                         }
                     }
                 } else if let Some(ScopeMenuState::Revision(input)) = scope_menu.as_mut() {
@@ -780,37 +818,64 @@ fn event_loop(
                         }
                     }
                 } else {
-                    let chord = KeyChord::from(key);
-                    let step = resolver.feed(chord);
-                    key_display.record_step(chord, step, Instant::now());
-                    match step {
-                        StepResult::Matched(action) => {
-                            stack.top_mut().clear_pending_keys();
-                            goto_status = None;
-                            handle_action(
-                                action,
-                                stack,
-                                &mut hover_state,
-                                &mut pending_hover,
-                                &mut pending_goto,
-                                &mut refs_panel,
-                                &mut jump_stack,
-                                &diagnostics,
-                                &mut goto_status,
-                                lsp_manager,
-                                jj_repo.as_ref(),
-                                &mut compose,
-                                &mut scope_menu,
-                                highlighter,
-                                &mut watch_paused,
-                                watch_active,
-                                &mut watch_status,
-                            );
+                    // M16's first-comment skill-install prompt consumes
+                    // exactly the one keypress that follows it, resolved
+                    // *before* the keymap even sees this key — same
+                    // bypass-the-resolver idea `compose`/the revision input
+                    // use above, but only for this single key rather than a
+                    // whole overlay's lifetime. `y` means "install now" and
+                    // is swallowed entirely (there's nothing sensible for
+                    // the keymap to additionally do with a bare `y` — it has
+                    // no default binding). Any other key means "dismiss" —
+                    // deliberately *not* swallowed: falling through to the
+                    // ordinary resolver below means a reviewer who, say,
+                    // presses `j` to keep scrolling right after saving a
+                    // comment gets both the dismiss and the scroll from that
+                    // one keypress, rather than needing a second, wasted
+                    // press just to clear the prompt first.
+                    let mut consumed_by_skill_prompt = false;
+                    if awaiting_skill_prompt_key {
+                        awaiting_skill_prompt_key = false;
+                        if key.code == KeyCode::Char('y') && key.modifiers.is_empty() {
+                            consumed_by_skill_prompt = true;
+                            goto_status =
+                                Some(run_skill_install_prompt(comments_repo_root.as_deref()));
                         }
-                        StepResult::Pending => {
-                            stack.top_mut().set_pending_keys(resolver.pending_display());
+                    }
+
+                    if !consumed_by_skill_prompt {
+                        let chord = KeyChord::from(key);
+                        let step = resolver.feed(chord);
+                        key_display.record_step(chord, step, Instant::now());
+                        match step {
+                            StepResult::Matched(action) => {
+                                stack.top_mut().clear_pending_keys();
+                                goto_status = None;
+                                handle_action(
+                                    action,
+                                    stack,
+                                    &mut hover_state,
+                                    &mut pending_hover,
+                                    &mut pending_goto,
+                                    &mut refs_panel,
+                                    &mut jump_stack,
+                                    &diagnostics,
+                                    &mut goto_status,
+                                    lsp_manager,
+                                    jj_repo.as_ref(),
+                                    &mut compose,
+                                    &mut scope_menu,
+                                    highlighter,
+                                    &mut watch_paused,
+                                    watch_active,
+                                    &mut watch_status,
+                                );
+                            }
+                            StepResult::Pending => {
+                                stack.top_mut().set_pending_keys(resolver.pending_display());
+                            }
+                            StepResult::Cancelled => stack.top_mut().clear_pending_keys(),
                         }
-                        StepResult::Cancelled => stack.top_mut().clear_pending_keys(),
                     }
                 }
             }
@@ -915,25 +980,53 @@ fn event_loop(
 /// new [`Comment`] to `comment_list` and rebuilds `comment_index` in place
 /// so the newly saved comment renders immediately, without waiting for the
 /// comments watcher's own filesystem round trip.
+///
+/// The returned `bool` is whether a comment actually got persisted — `false`
+/// for a missing repo root, a discarded-empty buffer, or a store failure,
+/// `true` only on the success arm. The caller (this module's key-dispatch
+/// loop) uses it to gate M16's first-comment skill-install prompt, which
+/// should only ever follow a real save, never a no-op or a failure.
 fn finish_compose(
     state: &ComposeState,
     repo_root: Option<&Path>,
     comment_list: &mut Vec<Comment>,
     comment_index: &mut CommentIndex,
-) -> String {
+) -> (String, bool) {
     let Some(repo_root) = repo_root else {
-        return "comment: no repository root to save against".to_owned();
+        return (
+            "comment: no repository root to save against".to_owned(),
+            false,
+        );
     };
     if state.buffer().is_blank() {
-        return "comment: discarded (empty)".to_owned();
+        return ("comment: discarded (empty)".to_owned(), false);
     }
     match save_comment(repo_root, state) {
         Ok(comment) => {
             comment_list.push(comment);
             *comment_index = comments::build_index(repo_root, comment_list);
-            "comment: saved".to_owned()
+            ("comment: saved".to_owned(), true)
         }
-        Err(e) => format!("comment: {e}"),
+        Err(e) => (format!("comment: {e}"), false),
+    }
+}
+
+/// Runs [`skill::install`] in response to `y` on M16's first-comment prompt
+/// and reports the result as a status-bar note — the TUI-side twin of
+/// `main.rs`'s `run_skill_install`, minus the multi-line stdout report a
+/// terminal command can afford: a status bar has room for one line, so this
+/// only ever names the link outcome, not the `SKILL.md`-write detail too.
+/// `repo_root` is `None` only if the prompt somehow fired without a
+/// `View::Diff` root's comments repo (shouldn't happen — the prompt only
+/// ever arms itself right after a successful [`finish_compose`], which
+/// itself requires `Some`).
+fn run_skill_install_prompt(repo_root: Option<&Path>) -> String {
+    let Some(repo_root) = repo_root else {
+        return "skill: no repository root to install into".to_owned();
+    };
+    match skill::install(repo_root) {
+        Ok(report) => format!("skill: {}", report.link),
+        Err(e) => format!("skill: install failed: {e}"),
     }
 }
 

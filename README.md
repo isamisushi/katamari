@@ -126,10 +126,30 @@ ktmr comments add <file> <line> <body>   # leave a comment from a script/agent
 ```
 
 ...making the requested changes and resolving each comment it handles —
-resolutions show up live in an open `ktmr diff` session. `ktmr skill install` drops a Claude Code skill
-(`.claude/skills/katamari-review/SKILL.md`) into the current repository
-that teaches an agent this exact loop, so it picks it up automatically
-rather than needing the workflow spelled out in every prompt.
+resolutions show up live in an open `ktmr diff` session. `ktmr skill install`
+drops a skill that teaches an agent this exact loop into the current
+repository, so it picks it up automatically rather than needing the workflow
+spelled out in every prompt. The real files land at
+`.agents/skills/katamari-review/` — a tool-agnostic location any agent
+harness that adopts the same `.agents/` convention can pick up for free —
+with `.claude/skills/katamari-review` kept as a relative symlink into it, so
+Claude Code finds it exactly where it already looks. Re-running the command
+is always safe: it refreshes `SKILL.md` if a newer katamari version shipped
+changes, and migrates a pre-existing real `.claude/skills/katamari-review`
+directory from before this layout existed (backing up whatever was there
+rather than discarding it). If `.claude/skills/katamari-review` already
+points somewhere else, it's left alone with a warning — that's assumed to be
+deliberate.
+
+The first time you save a comment (`C-s`) in a repository that doesn't have
+the skill installed yet, `ktmr diff` offers to install it right there: the
+status bar shows `comment: saved · press y to install the Claude Code review
+skill (ktmr skill install)`. `y` installs it and reports the result in the
+status bar; any other key dismisses the offer — and, since it wasn't `y`, is
+then handled normally (a `j` right after dismissing still moves the cursor,
+for instance). Offered at most once per session either way. Set `[skill]
+offer_install = false` in config (see below) to turn the offer off entirely;
+`ktmr skill install` keeps working as an explicit command regardless.
 
 `ktmr open <file>` opens a single file read-only, with the same
 highlighting/hover/go-to-definition as the diff view — useful for reading
@@ -284,6 +304,13 @@ debounce_ms = 200
 # if stderr is a real terminal. Default true; false disables both the
 # request and the notices entirely.
 check = true
+
+[skill]
+# Whether saving your first comment in a repo without the katamari-review
+# skill installed offers to install it (see "Comments" above). Default true;
+# false turns off the offer entirely. `ktmr skill install` always keeps
+# working as an explicit command either way.
+offer_install = true
 ```
 
 ## Language servers

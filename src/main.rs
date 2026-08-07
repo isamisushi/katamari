@@ -6,6 +6,7 @@ mod diff;
 mod highlight;
 mod keymap;
 mod lsp;
+mod skill;
 mod ui;
 mod update;
 mod vcs;
@@ -324,8 +325,11 @@ enum ExportFormat {
 
 #[derive(Subcommand)]
 enum SkillCommand {
-    /// Copies the bundled `SKILL.md` to
-    /// `<repo_root>/.claude/skills/katamari-review/SKILL.md`.
+    /// Writes the bundled `SKILL.md` to
+    /// `<repo_root>/.agents/skills/katamari-review/` and links
+    /// `<repo_root>/.claude/skills/katamari-review` to it — see
+    /// [`crate::skill::install`]'s docs for the full layout and migration
+    /// rules.
     Install,
 }
 
@@ -1059,29 +1063,29 @@ fn run_comments_set_status(id: String, status: CommentStatus) -> Result<()> {
     Ok(())
 }
 
-/// The bundled Claude Code skill, embedded at compile time so `ktmr skill
-/// install` works from the installed binary alone — no separate asset to
-/// ship or locate on disk.
-const SKILL_MD: &str = include_str!("../skills/katamari-review/SKILL.md");
-
 fn run_skill(action: SkillCommand) -> Result<()> {
     match action {
         SkillCommand::Install => run_skill_install(),
     }
 }
 
+/// `ktmr skill install` — writes the current embedded skill to
+/// `.agents/skills/katamari-review/` and links `.claude/skills/katamari-review`
+/// to it (creating it fresh, refreshing an already-correct link, migrating a
+/// pre-M16 real-directory install, or leaving a foreign entry alone with a
+/// warning — see [`skill::install`]'s docs for exactly which applies). Prints
+/// what actually happened rather than a fixed "installed" message, since
+/// which of those four cases fired isn't something the caller should have to
+/// guess from silence.
 fn run_skill_install() -> Result<()> {
     let repo_root = comments_repo_root()?;
-    let dest_dir = repo_root
-        .join(".claude")
-        .join("skills")
-        .join("katamari-review");
-    std::fs::create_dir_all(&dest_dir)
-        .with_context(|| format!("failed to create {}", dest_dir.display()))?;
-    let dest = dest_dir.join("SKILL.md");
-    std::fs::write(&dest, SKILL_MD)
-        .with_context(|| format!("failed to write {}", dest.display()))?;
-    println!("installed katamari-review skill to {}", dest.display());
+    let report = skill::install(&repo_root).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if report.skill_md_changed {
+        println!("wrote {}", report.skill_md_path.display());
+    } else {
+        println!("{} already up to date", report.skill_md_path.display());
+    }
+    println!("{}", report.link);
     Ok(())
 }
 

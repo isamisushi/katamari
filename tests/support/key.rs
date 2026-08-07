@@ -25,6 +25,9 @@ pub enum Key {
     CtrlT,
     /// `Ctrl-o` — `Action::JumpBack`, unambiguous in both modes (`0x0f`).
     CtrlO,
+    /// `Ctrl-s` — the comment-compose overlay's `ComposeOutcome::Save`,
+    /// unambiguous in both modes (`0x13`).
+    CtrlS,
     /// A literal Tab / `Action::NextSymbol`. Encodes to the same `0x09` byte
     /// as legacy `Ctrl-i` in [`KittyMode::Unsupported`] — that collision is
     /// the exact thing under test there.
@@ -65,6 +68,7 @@ impl Key {
             },
             Key::CtrlT => vec![0x14],
             Key::CtrlO => vec![0x0f],
+            Key::CtrlS => vec![0x13],
             Key::Tab => vec![0x09],
             Key::Enter => vec![0x0d],
             Key::Char(c) => {

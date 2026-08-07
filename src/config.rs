@@ -99,6 +99,14 @@ pub struct Config {
     /// file is ever read or written. Defaults to `true`, matching gh CLI's
     /// own opt-out-not-opt-in default.
     pub update_check: bool,
+    /// `[skill] offer_install` — whether a TUI session offers, once per
+    /// session after the first successful comment save in a repo that
+    /// doesn't have the skill yet, to run [`crate::skill::install`] with a
+    /// single `y` keypress (see `ui::mod`'s event loop). `false` disables
+    /// the prompt entirely; `ktmr skill install` keeps working either way,
+    /// since this only gates the unprompted offer, not the explicit
+    /// command. Defaults to `true`.
+    pub offer_install: bool,
 }
 
 impl Default for Config {
@@ -114,6 +122,7 @@ impl Default for Config {
             show_keys: false,
             debounce_ms: DEFAULT_DEBOUNCE_MS,
             update_check: true,
+            offer_install: true,
         }
     }
 }
@@ -137,6 +146,7 @@ struct RawFile {
     ui: Option<RawUi>,
     watch: Option<RawWatch>,
     update: Option<RawUpdate>,
+    skill: Option<RawSkill>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -167,12 +177,19 @@ struct RawUpdate {
     check: Option<bool>,
 }
 
-const TOP_LEVEL_KEYS: &[&str] = &["keymap", "keys", "lsp", "ui", "watch", "update"];
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawSkill {
+    offer_install: Option<bool>,
+}
+
+const TOP_LEVEL_KEYS: &[&str] = &["keymap", "keys", "lsp", "ui", "watch", "update", "skill"];
 const LSP_KEYS: &[&str] = &["servers", "auto_install"];
 const SERVER_KEYS: &[&str] = &["command", "args"];
 const UI_KEYS: &[&str] = &["tab_width", "highlight_max_lines", "wrap", "show_keys"];
 const WATCH_KEYS: &[&str] = &["debounce_ms"];
 const UPDATE_KEYS: &[&str] = &["check"];
+const SKILL_KEYS: &[&str] = &["offer_install"];
 
 /// Merges `overlay`'s present fields onto `base`, in place — the field-level
 /// (not whole-file) precedence rule the module docs describe: a file that
@@ -221,6 +238,12 @@ fn merge_raw(base: &mut RawFile, overlay: RawFile) {
         let base_update = base.update.get_or_insert_with(RawUpdate::default);
         if overlay_update.check.is_some() {
             base_update.check = overlay_update.check;
+        }
+    }
+    if let Some(overlay_skill) = overlay.skill {
+        let base_skill = base.skill.get_or_insert_with(RawSkill::default);
+        if overlay_skill.offer_install.is_some() {
+            base_skill.offer_install = overlay_skill.offer_install;
         }
     }
 }
@@ -323,6 +346,9 @@ fn warn_unknown_keys(path: &Path, table: &toml::Table) {
     if let Some(update) = table.get("update").and_then(toml::Value::as_table) {
         warn_extra(path, "update.", update, UPDATE_KEYS);
     }
+    if let Some(skill) = table.get("skill").and_then(toml::Value::as_table) {
+        warn_extra(path, "skill.", skill, SKILL_KEYS);
+    }
 }
 
 fn warn_extra(
@@ -356,6 +382,7 @@ fn finalize(raw: RawFile) -> Config {
     let watch = raw.watch.unwrap_or_default();
     let lsp = raw.lsp.unwrap_or_default();
     let update = raw.update.unwrap_or_default();
+    let skill = raw.skill.unwrap_or_default();
     Config {
         keymap,
         key_overrides: raw.keys.unwrap_or_default(),
@@ -369,6 +396,7 @@ fn finalize(raw: RawFile) -> Config {
         show_keys: ui.show_keys.unwrap_or(false),
         debounce_ms: watch.debounce_ms.unwrap_or(DEFAULT_DEBOUNCE_MS),
         update_check: update.check.unwrap_or(true),
+        offer_install: skill.offer_install.unwrap_or(true),
     }
 }
 
@@ -676,6 +704,24 @@ mod tests {
         // Disabling the update check doesn't reset an unrelated section
         // back to its default — same field-level merge guarantee every
         // other section gets.
+        assert_eq!(config.tab_width, DEFAULT_TAB_WIDTH);
+    }
+
+    #[test]
+    fn offer_install_defaults_to_true() {
+        let repo = fixture_repo();
+        assert!(load_merged(&repo).offer_install);
+    }
+
+    #[test]
+    fn offer_install_can_be_disabled_explicitly() {
+        let repo = fixture_repo();
+        write_repo_config(&repo, "[skill]\noffer_install = false\n");
+        let config = load_merged(&repo);
+        assert!(!config.offer_install);
+        // Disabling the skill-install prompt doesn't reset an unrelated
+        // section back to its default — same field-level merge guarantee
+        // every other section gets.
         assert_eq!(config.tab_width, DEFAULT_TAB_WIDTH);
     }
 
