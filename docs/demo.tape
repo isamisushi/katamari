@@ -2,6 +2,9 @@
 # ktmr diff — hover, go-to-definition, diagnostics, and a review comment,
 # all without leaving the terminal. Recorded against a freshly built
 # local binary (main @ post-745acfe, soft line-wrap on by default).
+# Re-recorded with --show-keys so the bottom-right key-display chip is
+# visible throughout; the comment-typing segment intentionally shows its
+# `[typing…]` masking rather than echoing the typed text.
 
 Output demo.gif
 
@@ -25,8 +28,9 @@ Type "clear"
 Enter
 Show
 
-# Open the diff on the AI's working-tree changes.
-Type "/Users/yuya/Downloads/katamari/target/release/ktmr diff"
+# Open the diff on the AI's working-tree changes, with the key-display
+# overlay on so the recording shows what's being pressed.
+Type "/Users/yuya/Downloads/katamari/target/release/ktmr diff --show-keys"
 Enter
 Sleep 2s
 
