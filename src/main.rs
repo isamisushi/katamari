@@ -325,9 +325,11 @@ enum ExportFormat {
 
 #[derive(Subcommand)]
 enum SkillCommand {
-    /// Writes the bundled `SKILL.md` to
-    /// `<repo_root>/.agents/skills/katamari-review/` and links
-    /// `<repo_root>/.claude/skills/katamari-review` to it — see
+    /// Writes katamari's full review harness into the current repo: the
+    /// bundled `SKILL.md` at `<repo_root>/.agents/skills/katamari-review/`
+    /// with `<repo_root>/.claude/skills/katamari-review` linked to it, plus
+    /// a katamari section in `<repo_root>/AGENTS.md` and
+    /// `<repo_root>/CLAUDE.md` linked to that — see
     /// [`crate::skill::install`]'s docs for the full layout and migration
     /// rules.
     Install,
@@ -1069,14 +1071,17 @@ fn run_skill(action: SkillCommand) -> Result<()> {
     }
 }
 
-/// `ktmr skill install` — writes the current embedded skill to
-/// `.agents/skills/katamari-review/` and links `.claude/skills/katamari-review`
-/// to it (creating it fresh, refreshing an already-correct link, migrating a
-/// pre-M16 real-directory install, or leaving a foreign entry alone with a
-/// warning — see [`skill::install`]'s docs for exactly which applies). Prints
-/// what actually happened rather than a fixed "installed" message, since
-/// which of those four cases fired isn't something the caller should have to
-/// guess from silence.
+/// `ktmr skill install` — writes katamari's full review harness into the
+/// current repo: the embedded skill at `.agents/skills/katamari-review/`
+/// with `.claude/skills/katamari-review` linked to it, plus a katamari
+/// section in `AGENTS.md` and `CLAUDE.md` linked to that (creating each
+/// fresh, refreshing what's already correct, migrating a pre-M16
+/// real-directory skill install, or leaving a foreign entry alone with a
+/// warning — see [`skill::install`]'s docs for exactly which applies to
+/// each piece). Prints one line per piece describing what actually
+/// happened rather than a fixed "installed" message, since which case
+/// fired for each isn't something the caller should have to guess from
+/// silence.
 fn run_skill_install() -> Result<()> {
     let repo_root = comments_repo_root()?;
     let report = skill::install(&repo_root).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1086,6 +1091,8 @@ fn run_skill_install() -> Result<()> {
         println!("{} already up to date", report.skill_md_path.display());
     }
     println!("{}", report.link);
+    println!("{}", report.agents_md);
+    println!("{}", report.claude_md);
     Ok(())
 }
 

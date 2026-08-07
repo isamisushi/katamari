@@ -1,16 +1,27 @@
-//! M16: the first-comment skill-install prompt. A `ktmr diff` session in a
-//! repository that doesn't have the `katamari-review` skill yet offers,
-//! once per session right after the first comment successfully saves, to
-//! install it with a single `y` keypress — this is the end-to-end proof
-//! that the prompt actually appears, that `y` actually writes the new
-//! `.agents/skills/katamari-review/` + `.claude/skills/katamari-review`
-//! symlink layout onto disk through the real compiled binary (not just
-//! `crate::skill::install`'s own unit tests), and that an already-installed
-//! repo never shows the prompt at all.
+//! M16 gave `ktmr diff` a first-comment prompt that installs the
+//! `katamari-review` skill. M17 extends both the harness [`install`]
+//! writes and this prompt's gating to cover the rest of it —
+//! `<repo_root>/AGENTS.md` (a marked katamari section, coexisting with
+//! whatever else is already there) and `<repo_root>/CLAUDE.md` (a relative
+//! symlink to it) — so an agent working in a katamari-reviewed repo finds
+//! the same instructions whether it reads `AGENTS.md` directly or through
+//! Claude Code's own `CLAUDE.md` convention.
+//!
+//! This file is the end-to-end proof, through the real compiled binary,
+//! that: the prompt now waits for the *full* harness, not just the skill,
+//! before deciding a repo is done; `y` writes all four pieces with the
+//! exact shapes `crate::skill::install` promises (not just presence —
+//! symlink targets and file/symlink kind, via `std::fs`
+//! metadata/`read_link`, the same way the M16 suite already checked the
+//! skill half); a pre-existing `AGENTS.md`/`CLAUDE.md` are respected the
+//! way `crate::skill`'s own unit tests describe; and the CLI command is
+//! idempotent end-to-end, not just at the `crate::skill::install` unit
+//! level.
 
 use crate::support::{Harness, Key, SpawnOptions, fixture};
 use std::fs;
 use std::path::Path;
+use std::process::{Command, Output};
 
 /// The real bundled `SKILL.md`, read from the same file `include_str!`
 /// embeds into the binary — used to confirm the installed copy is the
@@ -23,9 +34,9 @@ fn bundled_skill_md() -> String {
     .expect("skills/katamari-review/SKILL.md must exist in the workspace")
 }
 
-/// A wide terminal for every test in this file: the prompt's status-bar
-/// text ("comment: saved · press y to install the Claude Code review skill
-/// (ktmr skill install)") is long enough to wrap on the suite's usual
+/// A wide terminal for every prompt-driving test in this file: the
+/// prompt's status-bar text is long enough — now naming all three
+/// link/write outcomes, not just one — to wrap on the suite's usual
 /// 100-column default, and a wrapped line would insert a newline into the
 /// middle of whatever substring a test waits for.
 fn wide_spawn_options() -> SpawnOptions {
@@ -38,8 +49,8 @@ fn wide_spawn_options() -> SpawnOptions {
 }
 
 /// Drives the compose overlay to save one throwaway comment, `c`
-/// opens it, types `body`, `C-s` saves. Shared by every test below since
-/// the prompt only ever fires off the back of a real save.
+/// opens it, types `body`, `C-s` saves. Shared by every prompt test below
+/// since the prompt only ever fires off the back of a real save.
 ///
 /// A session's cursor starts on row 0, which in every fixture this file
 /// uses is a file-header row — not a `Context`/`Add` line, so
@@ -60,12 +71,12 @@ fn save_a_comment(h: &Harness, body: &str) {
     h.send(Key::CtrlS);
 }
 
-/// Hand-builds the layout [`crate::skill`]'s `install` would produce,
-/// without going through the binary — for a test that needs a repo to
-/// already have the skill installed *before* `ktmr diff` even starts. Kept
-/// deliberately simple (no migration/idempotency handling): that behavior
-/// is `crate::skill::install`'s own job and is covered by its unit tests,
-/// not by this E2E suite.
+/// Hand-builds the skill half of the layout `crate::skill::install` would
+/// produce, without going through the binary — for a test that needs a
+/// repo to already have the skill (but deliberately nothing else)
+/// installed before `ktmr diff` even starts. Kept deliberately simple (no
+/// migration/idempotency handling): that behavior is `crate::skill`'s own
+/// job and is covered by its unit tests, not by this E2E suite.
 fn preinstall_skill(repo_root: &Path) {
     let agents_dir = repo_root
         .join(".agents")
@@ -83,8 +94,32 @@ fn preinstall_skill(repo_root: &Path) {
     .unwrap();
 }
 
+/// As [`preinstall_skill`], but the *complete* M17 harness: skill,
+/// `AGENTS.md`, and `CLAUDE.md` — for a test that needs the prompt gate to
+/// see nothing missing at all.
+fn preinstall_full_harness(repo_root: &Path) {
+    preinstall_skill(repo_root);
+    fs::write(
+        repo_root.join("AGENTS.md"),
+        "<!-- katamari:begin -->\nplaceholder katamari section\n<!-- katamari:end -->\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("AGENTS.md", repo_root.join("CLAUDE.md")).unwrap();
+}
+
+/// Runs the real `ktmr skill install` CLI subcommand directly (no PTY —
+/// it's a plain, non-interactive command that prints and exits) in
+/// `repo_root`.
+fn run_skill_install_cli(repo_root: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_ktmr"))
+        .args(["skill", "install"])
+        .current_dir(repo_root)
+        .output()
+        .expect("failed to spawn ktmr skill install")
+}
+
 #[test]
-fn saving_the_first_comment_in_an_uninstalled_repo_offers_the_skill_and_y_installs_it() {
+fn saving_the_first_comment_in_an_uninstalled_repo_offers_the_full_harness_and_y_installs_it() {
     let repo = fixture::basic_repo();
     let h = Harness::spawn(repo.path(), wide_spawn_options());
     h.wait_for_text("todo.txt");
@@ -96,48 +131,80 @@ fn saving_the_first_comment_in_an_uninstalled_repo_offers_the_skill_and_y_instal
     h.wait_for_text("comment: saved");
     h.wait_for_text("press y to install the Claude Code review skill (ktmr skill install)");
 
-    // Neither half of the new layout exists on disk yet — the prompt only
-    // primes the next keypress, it never writes anything by itself.
+    // None of the four pieces exists on disk yet — the prompt only primes
+    // the next keypress, it never writes anything by itself.
     assert!(!repo.path().join(".agents").exists());
     assert!(!repo.path().join(".claude").exists());
+    assert!(!repo.path().join("AGENTS.md").exists());
+    assert!(!repo.path().join("CLAUDE.md").exists());
 
     h.send(Key::Char('y'));
 
-    // `LinkOutcome::Created`'s `Display` names exactly this — see
-    // `skill::LinkOutcome`'s docs.
+    // Each of the three link/write outcomes' `Display` names exactly this
+    // — see `skill::LinkOutcome`/`AgentsMdOutcome`/`ClaudeMdOutcome`'s docs.
     h.wait_for_text(
         "skill: linked .claude/skills/katamari-review -> ../../.agents/skills/katamari-review",
     );
+    h.wait_for_text("wrote AGENTS.md");
+    h.wait_for_text("linked CLAUDE.md -> AGENTS.md");
 
-    // The real files landed exactly where `crate::skill::install` promises:
-    // genuine content at `.agents/...`, a relative symlink at `.claude/...`.
+    // Piece 1: the real skill content, a genuine file (not a symlink).
     let agents_skill_md = repo
         .path()
         .join(".agents")
         .join("skills")
         .join("katamari-review")
         .join("SKILL.md");
+    let skill_md_meta = fs::symlink_metadata(&agents_skill_md).unwrap();
+    assert!(skill_md_meta.is_file());
+    assert!(!skill_md_meta.is_symlink());
     assert_eq!(
         fs::read_to_string(&agents_skill_md).unwrap(),
         bundled_skill_md()
     );
 
+    // Piece 2: `.claude/skills/katamari-review` is a symlink with the
+    // exact relative target `crate::skill::install` promises.
     let claude_dest = repo
         .path()
         .join(".claude")
         .join("skills")
         .join("katamari-review");
-    let target = fs::read_link(&claude_dest).unwrap();
+    let claude_dest_meta = fs::symlink_metadata(&claude_dest).unwrap();
+    assert!(claude_dest_meta.is_symlink());
     assert_eq!(
-        target,
+        fs::read_link(&claude_dest).unwrap(),
         Path::new("../../.agents/skills/katamari-review"),
-        "the .claude symlink must be relative, not absolute"
     );
     assert_eq!(
         fs::read_to_string(claude_dest.join("SKILL.md")).unwrap(),
         bundled_skill_md(),
         "the symlink must actually resolve to the real SKILL.md content"
     );
+
+    // Piece 3: `AGENTS.md` contains the marked katamari section.
+    let agents_md_path = repo.path().join("AGENTS.md");
+    let agents_md_meta = fs::symlink_metadata(&agents_md_path).unwrap();
+    assert!(agents_md_meta.is_file());
+    assert!(!agents_md_meta.is_symlink());
+    let agents_md = fs::read_to_string(&agents_md_path).unwrap();
+    assert!(agents_md.contains("<!-- katamari:begin -->"));
+    assert!(agents_md.contains("<!-- katamari:end -->"));
+    assert!(agents_md.contains("ktmr comments list --json"));
+    assert!(agents_md.contains("ktmr comments resolve"));
+    assert!(agents_md.contains(".agents/skills/katamari-review/SKILL.md"));
+
+    // Piece 4: `CLAUDE.md` is a relative symlink to `AGENTS.md`, resolving
+    // to that exact content.
+    let claude_md_path = repo.path().join("CLAUDE.md");
+    let claude_md_meta = fs::symlink_metadata(&claude_md_path).unwrap();
+    assert!(claude_md_meta.is_symlink());
+    assert_eq!(
+        fs::read_link(&claude_md_path).unwrap(),
+        Path::new("AGENTS.md"),
+        "CLAUDE.md must be a relative symlink, not absolute or a copy"
+    );
+    assert_eq!(fs::read_to_string(&claude_md_path).unwrap(), agents_md);
 }
 
 #[test]
@@ -158,25 +225,164 @@ fn dismissing_the_prompt_with_another_key_both_clears_it_and_still_acts_on_that_
         !screen.contents().contains("press y to install")
     });
 
-    // Nothing was installed — a dismiss must never silently write anything.
+    // Nothing was installed — a dismiss must never silently write anything,
+    // for any of the four pieces.
     assert!(!repo.path().join(".agents").exists());
     assert!(!repo.path().join(".claude").exists());
+    assert!(!repo.path().join("AGENTS.md").exists());
+    assert!(!repo.path().join("CLAUDE.md").exists());
 }
 
 #[test]
-fn a_repo_that_already_has_the_skill_never_shows_the_prompt() {
+fn a_repo_with_only_the_skill_preinstalled_still_offers_the_prompt_for_the_rest() {
+    // M17 extended the prompt's gate from "is the skill installed" to "is
+    // the *whole* harness installed" (see `skill::harness_installed`'s
+    // docs) — a repo that only ever ran an older katamari's `ktmr skill
+    // install`, before AGENTS.md/CLAUDE.md existed, must still be offered
+    // the rest exactly once. This supersedes M16's
+    // `a_repo_that_already_has_the_skill_never_shows_the_prompt`, whose
+    // premise (skill alone means "fully installed") M17 deliberately
+    // changed.
     let repo = fixture::basic_repo();
     preinstall_skill(repo.path());
 
     let h = Harness::spawn(repo.path(), wide_spawn_options());
     h.wait_for_text("todo.txt");
 
-    save_a_comment(&h, "already have the skill, thanks");
+    save_a_comment(&h, "skill already here, but not the rest");
+    h.wait_for_text("comment: saved");
+    h.wait_for_text("press y to install the Claude Code review skill");
+
+    h.send(Key::Char('y'));
+    // The skill link is already correct and the AGENTS.md/CLAUDE.md pieces
+    // are freshly written — a mix of "already" and "wrote"/"linked",
+    // proving install ran against the real partial state rather than
+    // blindly redoing everything.
+    h.wait_for_text(".claude/skills/katamari-review already linked correctly");
+    h.wait_for_text("wrote AGENTS.md");
+    h.wait_for_text("linked CLAUDE.md -> AGENTS.md");
+
+    assert!(repo.path().join("AGENTS.md").is_file());
+    assert_eq!(
+        fs::read_link(repo.path().join("CLAUDE.md")).unwrap(),
+        Path::new("AGENTS.md")
+    );
+}
+
+#[test]
+fn a_repo_with_the_full_harness_already_installed_never_shows_the_prompt() {
+    let repo = fixture::basic_repo();
+    preinstall_full_harness(repo.path());
+
+    let h = Harness::spawn(repo.path(), wide_spawn_options());
+    h.wait_for_text("todo.txt");
+
+    save_a_comment(&h, "already have everything, thanks");
     h.wait_for_text("comment: saved");
 
     assert!(
         !h.screen_contents()
             .contains("install the Claude Code review skill"),
-        "an already-installed repo must never be offered the prompt"
+        "a repo with the complete harness must never be offered the prompt"
+    );
+}
+
+#[test]
+fn cli_install_preserves_a_custom_agents_md_and_leaves_a_real_claude_md_untouched() {
+    let repo = fixture::basic_repo();
+    let custom_agents_md =
+        "# Contributor notes\n\nBuild with `cargo build`.\nRun tests with `cargo test`.\n";
+    fs::write(repo.path().join("AGENTS.md"), custom_agents_md).unwrap();
+    let custom_claude_md =
+        "# Claude-specific notes\n\nSomething this project already wrote here.\n";
+    fs::write(repo.path().join("CLAUDE.md"), custom_claude_md).unwrap();
+
+    let output = run_skill_install_cli(repo.path());
+    assert!(
+        output.status.success(),
+        "ktmr skill install failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("AGENTS.md exists; appended katamari section"));
+    assert!(stdout.contains("warning: CLAUDE.md already exists and points elsewhere"));
+
+    // The custom content is preserved exactly, with the katamari section
+    // only appended after it — never replacing or reordering what was
+    // already there.
+    let updated_agents_md = fs::read_to_string(repo.path().join("AGENTS.md")).unwrap();
+    assert!(
+        updated_agents_md.starts_with(custom_agents_md),
+        "custom AGENTS.md content must come first, byte-for-byte: {updated_agents_md:?}"
+    );
+    assert!(updated_agents_md.contains("<!-- katamari:begin -->"));
+    assert!(updated_agents_md.contains("<!-- katamari:end -->"));
+
+    // A real pre-existing CLAUDE.md is foreign territory — left completely
+    // untouched, byte-identical to what the test wrote.
+    assert_eq!(
+        fs::read_to_string(repo.path().join("CLAUDE.md")).unwrap(),
+        custom_claude_md,
+        "a real pre-existing CLAUDE.md must never be modified"
+    );
+    assert!(
+        !repo
+            .path()
+            .join("CLAUDE.md")
+            .symlink_metadata()
+            .unwrap()
+            .is_symlink(),
+        "it must still be the real file, not replaced by a symlink"
+    );
+}
+
+#[test]
+fn cli_install_run_twice_is_idempotent() {
+    let repo = fixture::basic_repo();
+
+    let first = run_skill_install_cli(repo.path());
+    assert!(first.status.success());
+    let first_stdout = String::from_utf8_lossy(&first.stdout).into_owned();
+    assert!(first_stdout.contains("wrote"));
+    assert!(first_stdout.contains("linked .claude/skills/katamari-review"));
+    assert!(first_stdout.contains("wrote AGENTS.md"));
+    assert!(first_stdout.contains("linked CLAUDE.md -> AGENTS.md"));
+
+    let agents_skill_md_path = repo
+        .path()
+        .join(".agents")
+        .join("skills")
+        .join("katamari-review")
+        .join("SKILL.md");
+    let agents_md_path = repo.path().join("AGENTS.md");
+    let skill_md_after_first = fs::read_to_string(&agents_skill_md_path).unwrap();
+    let agents_md_after_first = fs::read_to_string(&agents_md_path).unwrap();
+    let claude_link_after_first = fs::read_link(repo.path().join("CLAUDE.md")).unwrap();
+
+    let second = run_skill_install_cli(repo.path());
+    assert!(second.status.success());
+    let second_stdout = String::from_utf8_lossy(&second.stdout).into_owned();
+    assert!(
+        second_stdout.contains("already up to date"),
+        "second run's SKILL.md line should report no change: {second_stdout}"
+    );
+    assert!(second_stdout.contains(".claude/skills/katamari-review already linked correctly"));
+    assert!(second_stdout.contains("AGENTS.md already up to date"));
+    assert!(second_stdout.contains("CLAUDE.md already linked correctly"));
+
+    // Every file is byte-identical to after the first run — a second,
+    // already-current install must never rewrite anything.
+    assert_eq!(
+        fs::read_to_string(&agents_skill_md_path).unwrap(),
+        skill_md_after_first
+    );
+    assert_eq!(
+        fs::read_to_string(&agents_md_path).unwrap(),
+        agents_md_after_first
+    );
+    assert_eq!(
+        fs::read_link(repo.path().join("CLAUDE.md")).unwrap(),
+        claude_link_after_first
     );
 }

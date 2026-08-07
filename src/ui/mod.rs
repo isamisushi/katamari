@@ -748,15 +748,21 @@ fn event_loop(
                             // actually persisted (not a discarded-empty or
                             // failed save), only when the reviewer hasn't
                             // opted out (`offer_skill_install`), and only
-                            // when this repo doesn't already have the skill
-                            // — any one of those false means a plain status
-                            // message, same as before M16.
+                            // when this repo doesn't already have the full
+                            // harness — skill, AGENTS.md, and CLAUDE.md, see
+                            // `skill::harness_installed`'s docs on why *any*
+                            // missing piece re-offers (M17 extended this
+                            // from a skill-only check so a repo that only
+                            // ran an older `ktmr skill install` still gets
+                            // offered the rest) — any one of those false
+                            // means a plain status message, same as before
+                            // M16.
                             let offer = saved
                                 && offer_skill_install
                                 && !skill_prompt_offered
                                 && comments_repo_root
                                     .as_deref()
-                                    .is_some_and(|root| !skill::skill_installed(root));
+                                    .is_some_and(|root| !skill::harness_installed(root));
                             goto_status = Some(if offer {
                                 skill_prompt_offered = true;
                                 awaiting_skill_prompt_key = true;
@@ -1015,7 +1021,9 @@ fn finish_compose(
 /// and reports the result as a status-bar note — the TUI-side twin of
 /// `main.rs`'s `run_skill_install`, minus the multi-line stdout report a
 /// terminal command can afford: a status bar has room for one line, so this
-/// only ever names the link outcome, not the `SKILL.md`-write detail too.
+/// names each of the three link/write outcomes (skill link, `AGENTS.md`,
+/// `CLAUDE.md`) but skips the `SKILL.md`-write detail `run_skill_install`
+/// also prints — redundant with the link outcome for a status-bar reader.
 /// `repo_root` is `None` only if the prompt somehow fired without a
 /// `View::Diff` root's comments repo (shouldn't happen — the prompt only
 /// ever arms itself right after a successful [`finish_compose`], which
@@ -1025,7 +1033,10 @@ fn run_skill_install_prompt(repo_root: Option<&Path>) -> String {
         return "skill: no repository root to install into".to_owned();
     };
     match skill::install(repo_root) {
-        Ok(report) => format!("skill: {}", report.link),
+        Ok(report) => format!(
+            "skill: {} \u{b7} {} \u{b7} {}",
+            report.link, report.agents_md, report.claude_md
+        ),
         Err(e) => format!("skill: install failed: {e}"),
     }
 }
