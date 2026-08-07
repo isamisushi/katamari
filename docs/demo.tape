@@ -24,13 +24,18 @@ Set TypingSpeed 45ms
 Hide
 Type "cd /private/tmp/claude-501/-Users-yuya-Downloads-tako/158c067e-92e3-4775-9fef-8ea1da600422/scratchpad/gif-take2/demo-repo"
 Enter
+# The on-screen command should read like a normal install (`ktmr diff`),
+# not a developer's target/release path — put the fresh build on PATH
+# out of frame instead.
+Type "export PATH=/Users/yuya/Downloads/katamari/target/release:$PATH"
+Enter
 Type "clear"
 Enter
 Show
 
 # Open the diff on the AI's working-tree changes, with the key-display
 # overlay on so the recording shows what's being pressed.
-Type "/Users/yuya/Downloads/katamari/target/release/ktmr diff --show-keys"
+Type "ktmr diff --show-keys"
 Enter
 Sleep 2s
 
