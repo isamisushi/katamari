@@ -22,18 +22,18 @@
 //! neither one ever populates `node_modules/.bin`/`$GOBIN` without
 //! succeeding first).
 //!
-//! HTTPS to four kinds of host only, enforced by [`assert_allowed_host`]:
+//! HTTPS to five kinds of host only, enforced by [`assert_allowed_host`]:
 //! `github.com` (rust-analyzer releases — note the initial request's
 //! redirect to a signed, time-limited `githubusercontent.com` asset URL is
 //! trusted implicitly, since it's `github.com` itself issuing that
 //! redirect, not a third party), `nodejs.org` (the Node.js bootstrap),
 //! `download-cdn.jetbrains.com` (kotlin-lsp releases — JetBrains' own CDN,
 //! not fronted through GitHub release assets the way rust-analyzer's are),
-//! and the npm registry (reached through `npm` itself, which this module
-//! treats as a trusted subprocess rather than an HTTP endpoint it talks to
-//! directly).
+//! `download.eclipse.org` (jdtls milestone releases), and the npm registry
+//! (reached through `npm` itself, which this module treats as a trusted
+//! subprocess rather than an HTTP endpoint it talks to directly).
 
-use crate::lsp::adapter::{Language, mise_which, which_on_path};
+use crate::lsp::adapter::{Language, jdtls_config_dir_name, mise_which, which_on_path};
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -66,9 +66,32 @@ const GOPLS_VERSION: &str = "0.23.0";
 const KOTLIN_LSP_VERSION: &str = "262.9593.0";
 /// Node.js LTS used only as a bootstrap runtime for the two npm-based
 /// strategies below, when no `npm` can be found anywhere (not even via
-/// `mise which npm`) — not itself one of the five languages katamari
+/// `mise which npm`) — not itself one of the six languages katamari
 /// reviews.
 const NODE_BOOTSTRAP_VERSION: &str = "24.19.0";
+/// jdtls 1.60.0. Eclipse's milestone releases embed a build timestamp in
+/// both the tarball filename and (independently) the launcher jar's
+/// filename inside it — neither is derivable from `JDTLS_VERSION` alone, so
+/// a version bump must update all three of these constants together. To
+/// find the new values for a bump: `latest.txt` in the milestone's own
+/// directory (`https://download.eclipse.org/jdtls/milestones/<ver>/latest.txt`)
+/// resolves the exact tarball filename, and the launcher jar's versioned
+/// name is only discoverable by listing `plugins/` inside that tarball —
+/// there's no separate feed for it. [`install_jdtls`] fails loudly rather
+/// than silently if [`JDTLS_LAUNCHER_JAR`]'s pin has gone stale for a given
+/// [`JDTLS_TARBALL`] (the jar it expects to find after extracting simply
+/// won't be there under a mismatched pin).
+const JDTLS_VERSION: &str = "1.60.0";
+const JDTLS_TARBALL: &str = "jdt-language-server-1.60.0-202606262232.tar.gz";
+/// Referenced by its exact filename from `config_<os>/config.ini`'s
+/// `osgi.bundles` line inside the real jdtls tarball — this is why the jar
+/// is never renamed on install (see [`install_jdtls`]) and why its filename
+/// is pinned as its own constant rather than derived from
+/// [`JDTLS_VERSION`]. `pub(crate)` so [`crate::lsp::adapter`]'s
+/// managed-launch command building can reference the exact same name
+/// rather than duplicating the pin.
+pub(crate) const JDTLS_LAUNCHER_JAR: &str =
+    "org.eclipse.equinox.launcher_1.7.200.v20260619-2039.jar";
 
 /// One pinned server's on-disk identity: the directory name under
 /// `<prefix>/` and the pinned version that names its version subdirectory.
@@ -82,50 +105,38 @@ struct ServerSpec {
     version: &'static str,
 }
 
-const REGISTRY: [(Language, ServerSpec); 5] = [
-    (
-        Language::Rust,
-        ServerSpec {
+/// Every language's on-disk identity, matched exhaustively rather than
+/// looked up in a `REGISTRY` array — the compiler forces every
+/// [`Language`] variant to have an arm here at compile time, instead of a
+/// `.find(...).expect(...)` panicking at runtime the day a variant is added
+/// without a matching entry.
+fn spec_for(language: Language) -> ServerSpec {
+    match language {
+        Language::Rust => ServerSpec {
             dir_name: "rust-analyzer",
             version: RUST_ANALYZER_VERSION,
         },
-    ),
-    (
-        Language::TypeScript,
-        ServerSpec {
+        Language::TypeScript => ServerSpec {
             dir_name: "typescript-language-server",
             version: TS_LANGUAGE_SERVER_VERSION,
         },
-    ),
-    (
-        Language::Python,
-        ServerSpec {
+        Language::Python => ServerSpec {
             dir_name: "pyright",
             version: PYRIGHT_VERSION,
         },
-    ),
-    (
-        Language::Go,
-        ServerSpec {
+        Language::Go => ServerSpec {
             dir_name: "gopls",
             version: GOPLS_VERSION,
         },
-    ),
-    (
-        Language::Kotlin,
-        ServerSpec {
+        Language::Kotlin => ServerSpec {
             dir_name: "kotlin-lsp",
             version: KOTLIN_LSP_VERSION,
         },
-    ),
-];
-
-fn spec_for(language: Language) -> ServerSpec {
-    REGISTRY
-        .iter()
-        .find(|(l, _)| *l == language)
-        .map(|(_, spec)| *spec)
-        .expect("every Language has a REGISTRY entry")
+        Language::Java => ServerSpec {
+            dir_name: "jdt-language-server",
+            version: JDTLS_VERSION,
+        },
+    }
 }
 
 /// Where the pinned binary for `language` would live under `prefix` once
@@ -151,6 +162,12 @@ fn binary_path(prefix: &Path, language: Language) -> PathBuf {
         // `install_kotlin_lsp`), so the launcher always lands at the same
         // path regardless of which per-arch asset produced it.
         Language::Kotlin => version_dir.join("bin").join("intellij-server"),
+        // Unlike Kotlin, jdtls's tarball has no wrapping top-level
+        // directory to rename away (see `install_jdtls`) — `version_dir`
+        // *is* the extracted tree, so this is a pure join with no per-arch
+        // variation to account for (jdtls ships one platform-independent
+        // tarball).
+        Language::Java => version_dir.join("plugins").join(JDTLS_LAUNCHER_JAR),
     }
 }
 
@@ -282,6 +299,12 @@ fn ensure_in(
         ),
         Language::Go => install_gopls(prefix, &mut on_progress),
         Language::Kotlin => install_kotlin_lsp(prefix, &mut on_progress),
+        // Deliberately no JDK probe here — see `install_jdtls`'s docs: an
+        // install can proceed with nothing but a download, so `ktmr lsp
+        // install java` succeeding while `ktmr lsp doctor` still reports
+        // "needs a JDK" is correct, self-consistent behavior, not a bug.
+        // The JDK gate lives entirely in `adapter`'s diagnose/command path.
+        Language::Java => install_jdtls(prefix, &mut on_progress),
     }
 }
 
@@ -574,6 +597,78 @@ fn install_kotlin_lsp(
     Ok(binary)
 }
 
+// --- jdtls: prebuilt tarball from Eclipse's milestone downloads -------------
+
+/// Downloads and installs the pinned jdtls build — platform-independent
+/// (Eclipse ships one tarball for every OS/arch, unlike rust-analyzer's or
+/// kotlin-lsp's per-target assets, so there's no `<os>/<arch>` asset-name
+/// mapping needed here). Verified by hand against the real 1.60.0 release:
+/// the tarball extracts FLAT — `bin/`, `config_linux/`, `plugins/`, etc. sit
+/// directly at its top level with no wrapping directory the way
+/// kotlin-lsp's archive has — so unlike [`install_kotlin_lsp`]'s
+/// find-the-sole-subdirectory approach, the temporary extraction directory
+/// itself is renamed straight into `version_dir`.
+fn install_jdtls(
+    prefix: &Path,
+    on_progress: &mut impl FnMut(String),
+) -> Result<PathBuf, InstallError> {
+    let spec = spec_for(Language::Java);
+    let parent_dir = prefix.join(spec.dir_name);
+    let version_dir = parent_dir.join(spec.version);
+    create_dir_all(&parent_dir)?;
+
+    let url = format!(
+        "https://download.eclipse.org/jdtls/milestones/{}/{JDTLS_TARBALL}",
+        spec.version
+    );
+    on_progress(format!("downloading jdt-language-server {}", spec.version));
+    let archive = http_get(&url)?;
+
+    on_progress("extracting jdt-language-server".to_owned());
+    let tmp_dir = parent_dir.join(format!(".tmp-extract-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    create_dir_all(&tmp_dir)?;
+    extract_archive(JDTLS_TARBALL, &archive, &tmp_dir)?;
+
+    let _ = std::fs::remove_dir_all(&version_dir);
+    std::fs::rename(&tmp_dir, &version_dir).map_err(|e| {
+        InstallError(format!(
+            "installing jdt-language-server into {}: {e}",
+            version_dir.display()
+        ))
+    })?;
+
+    // The launcher jar is referenced by config.ini using this exact
+    // versioned filename (see `JDTLS_LAUNCHER_JAR`'s docs), so its absence
+    // here means the pin itself has gone stale for this tarball — a loud
+    // failure now is far more useful than a server that spawns and then
+    // fails to find its own `-jar` argument.
+    let launcher = version_dir.join("plugins").join(JDTLS_LAUNCHER_JAR);
+    ensure_executable(&launcher)?;
+    if !is_executable(&launcher) {
+        return Err(InstallError(format!(
+            "jdt-language-server {} extracted, but its pinned launcher jar {} was not found — \
+             JDTLS_LAUNCHER_JAR has likely gone stale for this version (see this module's \
+             version-pin doc comment)",
+            spec.version,
+            launcher.display()
+        )));
+    }
+
+    let config_dir_name = jdtls_config_dir_name(std::env::consts::OS).map_err(InstallError)?;
+    let config_dir = version_dir.join(config_dir_name);
+    if !config_dir.is_dir() {
+        return Err(InstallError(format!(
+            "jdt-language-server {} extracted, but its shared-configuration directory {} was not \
+             found",
+            spec.version,
+            config_dir.display()
+        )));
+    }
+
+    Ok(launcher)
+}
+
 /// Extracts `bytes` (the full body of `asset`) into `dest_dir`, dispatching
 /// on `asset`'s filename suffix: `.tar.gz` the same gzip+tar path
 /// [`bootstrap_node`] uses, `.sit`/`.zip` via the `zip` crate. Both are
@@ -753,8 +848,9 @@ fn http_get(url: &str) -> Result<Vec<u8>, InstallError> {
 
 /// The allowlist backing this module's "HTTPS, official hosts only"
 /// guarantee (see the module doc comment): `github.com` for rust-analyzer
-/// releases, `nodejs.org` for the Node.js bootstrap, and
-/// `download-cdn.jetbrains.com` for kotlin-lsp releases are the only hosts
+/// releases, `nodejs.org` for the Node.js bootstrap,
+/// `download-cdn.jetbrains.com` for kotlin-lsp releases, and
+/// `download.eclipse.org` for jdtls milestone releases are the only hosts
 /// this module's own HTTP client ever talks to directly — npm's registry is
 /// reached through the `npm` binary instead, never through here.
 fn assert_allowed_host(url: &str) -> Result<(), InstallError> {
@@ -762,8 +858,10 @@ fn assert_allowed_host(url: &str) -> Result<(), InstallError> {
         return Err(InstallError(format!("refusing a non-HTTPS URL: {url}")));
     };
     let host = rest.split('/').next().unwrap_or("");
-    let allowed =
-        host == "github.com" || host == "nodejs.org" || host == "download-cdn.jetbrains.com";
+    let allowed = host == "github.com"
+        || host == "nodejs.org"
+        || host == "download-cdn.jetbrains.com"
+        || host == "download.eclipse.org";
     if !allowed {
         return Err(InstallError(format!(
             "refusing a download from an untrusted host: {host}"
@@ -902,6 +1000,13 @@ mod tests {
     }
 
     #[test]
+    fn assert_allowed_host_accepts_the_eclipse_download_host() {
+        assert!(
+            assert_allowed_host("https://download.eclipse.org/jdtls/milestones/1.60.0/x").is_ok()
+        );
+    }
+
+    #[test]
     fn assert_allowed_host_rejects_plain_http() {
         let err = assert_allowed_host("http://github.com/foo").unwrap_err();
         assert!(err.to_string().contains("non-HTTPS"));
@@ -956,6 +1061,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn binary_path_joins_the_pinned_launcher_jar_under_plugins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = binary_path(dir.path(), Language::Java);
+        assert!(path.ends_with(format!(
+            "jdt-language-server/{JDTLS_VERSION}/plugins/{JDTLS_LAUNCHER_JAR}"
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_binary_path_finds_jdtls_at_a_fake_managed_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = binary_path(dir.path(), Language::Java);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"PK\x03\x04fake jar").unwrap();
+        make_executable(&path);
+
+        assert_eq!(
+            installed_binary_path(dir.path(), Language::Java),
+            Some(path)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn installed_binary_path_ignores_a_non_executable_file() {
@@ -997,6 +1126,25 @@ mod tests {
 
         let mut progress_calls = 0;
         let result = ensure_in(dir.path(), Language::Kotlin, |_| progress_calls += 1);
+
+        assert_eq!(result.unwrap(), path);
+        assert_eq!(
+            progress_calls, 0,
+            "no progress callback fired means install work (and any network call) was never attempted"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_in_returns_an_already_installed_jdtls_without_any_install_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = binary_path(dir.path(), Language::Java);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"PK\x03\x04fake jar").unwrap();
+        make_executable(&path);
+
+        let mut progress_calls = 0;
+        let result = ensure_in(dir.path(), Language::Java, |_| progress_calls += 1);
 
         assert_eq!(result.unwrap(), path);
         assert_eq!(
@@ -1120,5 +1268,26 @@ mod tests {
         );
         let output = Command::new(&path).arg("--help").output().unwrap();
         assert!(output.status.success());
+    }
+
+    /// Exercises the actual jdtls download end to end — downloads the real
+    /// 50MB+ milestone tarball and asserts the pinned launcher jar lands
+    /// exactly where `JDTLS_LAUNCHER_JAR`/`binary_path` say it should.
+    /// Deliberately `#[ignore]`d for the same reason as the other two
+    /// real-network tests in this module: `cargo test` must stay hermetic
+    /// and network-free. Run it explicitly with `cargo test -- --ignored
+    /// install_jdtls`.
+    #[test]
+    #[ignore = "hits the real network (download.eclipse.org); run manually"]
+    fn install_jdtls_downloads_and_extracts_the_pinned_launcher_jar() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut messages = Vec::new();
+        let path = ensure_in(dir.path(), Language::Java, |m| messages.push(m)).unwrap();
+        assert!(
+            !messages.is_empty(),
+            "expected progress messages along the way"
+        );
+        assert!(path.ends_with(JDTLS_LAUNCHER_JAR));
+        assert!(path.is_file());
     }
 }

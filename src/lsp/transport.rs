@@ -253,10 +253,13 @@ impl Transport {
     }
 
     /// The last bytes of the server's stderr, for diagnostics when it exits
-    /// unexpectedly. Not yet surfaced anywhere in the UI — M3b's
-    /// `Unavailable`/`Crashed` status messages are the natural place for
-    /// it, once there's a status bar indicator to put them in.
-    #[allow(dead_code)]
+    /// unexpectedly or fails to answer `initialize` in time. Read by
+    /// [`crate::lsp::client::Client::start`]'s failure path, which appends
+    /// this into the error message a user actually sees — the fix for a
+    /// documented class of bug where a language server dies almost
+    /// immediately for an environment reason (jdtls printing "requires at
+    /// least Java 21" and exiting, say) and a naive caller reports a plain
+    /// 30s timeout instead, with no hint why.
     pub fn stderr_tail(&self) -> String {
         self.stderr_log
             .lock()

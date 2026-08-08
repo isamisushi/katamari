@@ -25,6 +25,7 @@ pub enum Language {
     Python,
     Go,
     Kotlin,
+    Java,
     Plain,
 }
 
@@ -37,6 +38,7 @@ impl Language {
             "py" | "pyi" => Language::Python,
             "go" => Language::Go,
             "kt" | "kts" => Language::Kotlin,
+            "java" => Language::Java,
             _ => Language::Plain,
         }
     }
@@ -150,6 +152,11 @@ fn build_config(language: Language) -> Option<HighlightConfiguration> {
             tree_sitter_kotlin_sg::HIGHLIGHTS_QUERY,
             "",
         ),
+        Language::Java => (
+            tree_sitter_java::LANGUAGE.into(),
+            tree_sitter_java::HIGHLIGHTS_QUERY,
+            "",
+        ),
         Language::Plain => return None,
     };
 
@@ -173,6 +180,7 @@ fn language_name(language: Language) -> &'static str {
         Language::Python => "python",
         Language::Go => "go",
         Language::Kotlin => "kotlin",
+        Language::Java => "java",
         Language::Plain => "plain",
     }
 }
@@ -449,6 +457,7 @@ mod tests {
         assert_eq!(Language::detect("main.go"), Language::Go);
         assert_eq!(Language::detect("src/Main.kt"), Language::Kotlin);
         assert_eq!(Language::detect("build.gradle.kts"), Language::Kotlin);
+        assert_eq!(Language::detect("src/Main.java"), Language::Java);
         assert_eq!(Language::detect("README.md"), Language::Plain);
         assert_eq!(Language::detect("no_extension"), Language::Plain);
     }
@@ -536,6 +545,19 @@ mod tests {
         );
         let joined: String = spans.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(joined, "val x = 1");
+    }
+
+    #[test]
+    fn java_keyword_is_highlighted() {
+        let mut hl = LineHighlighter::new();
+        let spans = hl.highlight_line(Language::Java, "public class Main {}");
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.kind == HighlightKind::Keyword && s.text == "class")
+        );
+        let joined: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(joined, "public class Main {}");
     }
 
     #[test]

@@ -267,7 +267,7 @@ fn revision_line(entry: &RevisionEntry, selected: bool, in_range: bool) -> Line<
     let text = format!(
         "{marker} {:>8}  {}  {summary}{refs}",
         relative_time(entry.time_unix),
-        &entry.short_id,
+        entry.short_id,
     );
     let mut style = Style::default();
     if in_range {

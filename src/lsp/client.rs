@@ -106,7 +106,8 @@ impl Client {
         };
 
         let rx = transport.request::<InitializeParams, InitializeResult>("initialize", params);
-        let result = recv_with_timeout(rx, INITIALIZE_TIMEOUT)?;
+        let result = recv_with_timeout(rx, INITIALIZE_TIMEOUT)
+            .map_err(|e| augment_with_stderr(e, &transport.stderr_tail()))?;
         transport.notify("initialized", InitializedParams {});
 
         let position_encoding = result
@@ -340,6 +341,38 @@ fn recv_with_timeout<R>(
     }
 }
 
+/// Appends `stderr_tail` to `error`'s message when it's non-empty — the fix
+/// for a documented failure mode where a language server dies almost
+/// immediately for an environment reason (wrong JDK version, a missing
+/// dependency, ...) and a naive client just sees its `initialize` request
+/// time out or the pipe close, reporting a generic "no response within 30s"
+/// that gives no hint why. Called only from [`Client::start`]'s `initialize`
+/// failure path (see [`crate::lsp::transport::Transport::stderr_tail`]'s
+/// docs), not from every possible transport error site — a request that
+/// fails *after* a successful `initialize` already has a running server that
+/// answered at least one message correctly, so its stderr is far less likely
+/// to explain that particular failure the way it explains a server that
+/// never got off the ground at all. `LspError::Closed` carries no message of
+/// its own to append to, so it's turned into an `Io` with one; every other
+/// variant keeps its shape and just gets its message extended.
+fn augment_with_stderr(error: LspError, stderr_tail: &str) -> LspError {
+    let tail = stderr_tail.trim();
+    if tail.is_empty() {
+        return error;
+    }
+    match error {
+        LspError::Io(msg) => LspError::Io(format!("{msg} — server stderr: {tail}")),
+        LspError::Json(msg) => LspError::Json(format!("{msg} — server stderr: {tail}")),
+        LspError::Server { code, message } => LspError::Server {
+            code,
+            message: format!("{message} — server stderr: {tail}"),
+        },
+        LspError::Closed => LspError::Io(format!(
+            "lsp transport closed before a response arrived — server stderr: {tail}"
+        )),
+    }
+}
+
 fn client_capabilities() -> ClientCapabilities {
     ClientCapabilities {
         text_document: Some(TextDocumentClientCapabilities {
@@ -452,6 +485,61 @@ pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- augment_with_stderr -----------------------------------------------
+
+    #[test]
+    fn augment_with_stderr_appends_a_non_empty_tail_to_an_io_error() {
+        let err = LspError::Io("no response within 30s".to_owned());
+        let augmented = augment_with_stderr(err, "jdtls requires at least Java 21\n");
+        assert_eq!(
+            augmented.to_string(),
+            "lsp transport io error: no response within 30s — server stderr: jdtls requires at \
+             least Java 21"
+        );
+    }
+
+    #[test]
+    fn augment_with_stderr_turns_closed_into_an_io_error_with_the_tail_appended() {
+        let augmented = augment_with_stderr(LspError::Closed, "segfault\n");
+        assert_eq!(
+            augmented.to_string(),
+            "lsp transport io error: lsp transport closed before a response arrived — server \
+             stderr: segfault"
+        );
+    }
+
+    #[test]
+    fn augment_with_stderr_leaves_the_error_untouched_when_stderr_is_empty() {
+        let augmented = augment_with_stderr(LspError::Closed, "");
+        assert_eq!(
+            augmented.to_string(),
+            "lsp transport closed before a response arrived"
+        );
+    }
+
+    #[test]
+    fn augment_with_stderr_treats_whitespace_only_stderr_as_empty() {
+        let augmented = augment_with_stderr(LspError::Closed, "   \n\n  ");
+        assert_eq!(
+            augmented.to_string(),
+            "lsp transport closed before a response arrived"
+        );
+    }
+
+    #[test]
+    fn augment_with_stderr_extends_a_server_errors_message_without_losing_its_code() {
+        let err = LspError::Server {
+            code: -32602,
+            message: "invalid params".to_owned(),
+        };
+        let augmented = augment_with_stderr(err, "bad config\n");
+        assert!(matches!(augmented, LspError::Server { code: -32602, .. }));
+        assert_eq!(
+            augmented.to_string(),
+            "lsp server error -32602: invalid params — server stderr: bad config"
+        );
+    }
 
     #[test]
     fn initialize_capabilities_declare_publish_diagnostics() {

@@ -440,6 +440,7 @@ fn language_from_hint(hint: &str) -> Language {
         "python" | "py" => Language::Python,
         "go" | "golang" => Language::Go,
         "kotlin" | "kt" => Language::Kotlin,
+        "java" => Language::Java,
         _ => Language::Plain,
     }
 }

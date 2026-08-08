@@ -36,16 +36,62 @@ pub enum KeymapPreset {
     Emacs,
 }
 
-/// One `[lsp.servers.<lang>]` entry: overrides the command
-/// [`crate::lsp::adapter::resolve_server`] would otherwise resolve for that
-/// language, taking priority over every built-in lookup (PATH, project-local
-/// installs, `rustup which`) — useful for a pinned server version, a wrapper
-/// script, or a server this module doesn't know how to find on its own.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+/// One `[lsp.servers.<id>]` entry. For one of the six built-in languages'
+/// own `<id>` (see [`crate::lsp::adapter::Language::lsp_id`]), it overrides
+/// the command [`crate::lsp::adapter::resolve_server`] would otherwise
+/// resolve, taking priority over every built-in lookup (PATH, project-local
+/// installs, `rustup which`) — useful for a pinned server version, a
+/// wrapper script, or a server this module doesn't know how to find on its
+/// own. For any other `<id>`, it defines an entirely *custom* server this
+/// module has never heard of — see
+/// [`crate::lsp::adapter::LangKey`]/[`crate::lsp::adapter::custom_extension_map`]'s
+/// docs for how `extensions` turns an id into something files actually get
+/// routed to.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct ServerOverride {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
+    /// File extensions this id claims — empty (the default) for a plain
+    /// built-in override, which needs no claim of its own since
+    /// [`crate::lsp::adapter::Language::detect`] already owns its
+    /// extensions; a *custom* id needs at least one entry here to ever be
+    /// reached by a real file. A leading `.` is accepted and stripped (so
+    /// `"rb"` and `".rb"` are equivalent) — `Path::extension()` never
+    /// includes it, so this is normalized away before it can ever silently
+    /// make an entry unroutable. A claim on an extension a built-in
+    /// language already owns, or that a lexicographically earlier custom id
+    /// already claimed, is silently dropped (with a stderr warning) — see
+    /// [`crate::lsp::adapter::custom_extension_map`]'s docs. Setting this on
+    /// an id that names one of the six built-in languages is also
+    /// ignored (with a warning): `<id>` is what decides override-vs-custom,
+    /// so a built-in-named id can never additionally define a custom
+    /// filetype claim.
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    /// Nearest-ancestor project-root marker filenames for a *custom* id's
+    /// workspace (e.g. `["Gemfile"]`) — empty (the default) means "use the
+    /// git root," the same fallback [`crate::lsp::adapter::workspace_root`]
+    /// uses when a built-in language finds no marker either. Meaningless
+    /// for a built-in override, which already has its own adapter-side
+    /// marker list.
+    #[serde(default)]
+    pub root_markers: Vec<String>,
+    /// The LSP `languageId` to announce in `didOpen`, when a *custom* id's
+    /// server expects something other than the `<id>` key itself (e.g. a
+    /// `[lsp.servers.ruby-lsp]` entry whose server still wants
+    /// `"ruby"`). `None` (the default) falls back to the id.
+    #[serde(default)]
+    pub language_id: Option<String>,
+    /// Extra `initializationOptions` sent with `initialize` — TOML here
+    /// (so it reads naturally alongside the rest of this file), converted
+    /// to JSON at resolve time (see
+    /// [`crate::lsp::adapter::toml_value_to_json`]). Works for both a
+    /// custom server and a built-in override alike (e.g. rust-analyzer
+    /// settings through `[lsp.servers.rust]`) — there's nothing
+    /// language-specific about this field, unlike the three above.
+    #[serde(default)]
+    pub initialization_options: Option<toml::Value>,
 }
 
 /// The fully resolved configuration for one session: defaults with every
@@ -60,9 +106,12 @@ pub struct Config {
     /// notation (see [`KeySeq::try_parse`]), applied over the selected
     /// preset by [`apply_key_overrides`].
     pub key_overrides: HashMap<String, String>,
-    /// `[lsp.servers.<lang>]`, keyed by the same lowercase language name
-    /// [`crate::lsp::adapter::Language::lsp_id`] reports (`"rust"`,
-    /// `"typescript"`, `"python"`, `"go"`).
+    /// `[lsp.servers.<id>]`, keyed either by the same lowercase language
+    /// name [`crate::lsp::adapter::Language::lsp_id`] reports (`"rust"`,
+    /// `"typescript"`, `"python"`, `"go"`, `"kotlin"`, `"java"`) to override
+    /// a built-in language's resolution, or by any other id of the user's
+    /// choosing to define a wholly custom server — see
+    /// [`crate::lsp::adapter::LangKey`]'s docs.
     pub lsp_servers: HashMap<String, ServerOverride>,
     /// `[lsp] auto_install` — whether [`crate::lsp::manager::LspManager`]
     /// may silently download/build a missing language server into
@@ -185,7 +234,14 @@ struct RawSkill {
 
 const TOP_LEVEL_KEYS: &[&str] = &["keymap", "keys", "lsp", "ui", "watch", "update", "skill"];
 const LSP_KEYS: &[&str] = &["servers", "auto_install"];
-const SERVER_KEYS: &[&str] = &["command", "args"];
+const SERVER_KEYS: &[&str] = &[
+    "command",
+    "args",
+    "extensions",
+    "root_markers",
+    "language_id",
+    "initialization_options",
+];
 const UI_KEYS: &[&str] = &["tab_width", "highlight_max_lines", "wrap", "show_keys"];
 const WATCH_KEYS: &[&str] = &["debounce_ms"];
 const UPDATE_KEYS: &[&str] = &["check"];
@@ -736,5 +792,159 @@ mod tests {
         let rust = config.lsp_servers.get("rust").unwrap();
         assert_eq!(rust.command, "/opt/bin/rust-analyzer");
         assert_eq!(rust.args, vec!["--foo".to_owned()]);
+    }
+
+    #[test]
+    fn custom_server_override_parses_every_new_field() {
+        let repo = fixture_repo();
+        write_repo_config(
+            &repo,
+            r#"
+            [lsp.servers.ruby]
+            command = "solargraph"
+            args = ["stdio"]
+            extensions = ["rb", "erb"]
+            root_markers = ["Gemfile"]
+            language_id = "ruby"
+
+            [lsp.servers.ruby.initialization_options]
+            formatting = true
+            "#,
+        );
+        let config = load_merged(&repo);
+        let ruby = config.lsp_servers.get("ruby").unwrap();
+        assert_eq!(ruby.command, "solargraph");
+        assert_eq!(ruby.args, vec!["stdio".to_owned()]);
+        assert_eq!(ruby.extensions, vec!["rb".to_owned(), "erb".to_owned()]);
+        assert_eq!(ruby.root_markers, vec!["Gemfile".to_owned()]);
+        assert_eq!(ruby.language_id.as_deref(), Some("ruby"));
+        let init = ruby.initialization_options.as_ref().unwrap();
+        assert_eq!(
+            init.get("formatting").and_then(toml::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_server_override_entrys_new_fields_all_default_to_empty() {
+        // Only `command` is required — every field this milestone added is
+        // `#[serde(default)]`, so an entry that predates them (or a custom
+        // one that only ever needed `command`/`args`) still parses.
+        let repo = fixture_repo();
+        write_repo_config(&repo, "[lsp.servers.rust]\ncommand = \"rust-analyzer\"\n");
+        let config = load_merged(&repo);
+        let rust = config.lsp_servers.get("rust").unwrap();
+        assert!(rust.extensions.is_empty());
+        assert!(rust.root_markers.is_empty());
+        assert_eq!(rust.language_id, None);
+        assert_eq!(rust.initialization_options, None);
+    }
+
+    #[test]
+    fn server_override_entries_replace_wholesale_on_merge_not_field_by_field() {
+        // `merge_raw`'s mechanics are unchanged by this milestone (see the
+        // module docs and `merge_raw`'s own doc comment): a `[lsp.servers]`
+        // map merges key-by-key, but each *entry* (one language/id's whole
+        // `ServerOverride`) replaces wholesale — a repo file that only sets
+        // `command` for an id the home file already configured doesn't keep
+        // the home file's `args`/`extensions`/etc. for that same id.
+        let mut base = RawFile {
+            lsp: Some(RawLsp {
+                servers: HashMap::from([
+                    (
+                        "rust".to_owned(),
+                        ServerOverride {
+                            command: "old-rust-analyzer".to_owned(),
+                            args: vec!["--old-flag".to_owned()],
+                            ..ServerOverride::default()
+                        },
+                    ),
+                    (
+                        "go".to_owned(),
+                        ServerOverride {
+                            command: "gopls".to_owned(),
+                            ..ServerOverride::default()
+                        },
+                    ),
+                ]),
+                auto_install: None,
+            }),
+            ..RawFile::default()
+        };
+        let overlay = RawFile {
+            lsp: Some(RawLsp {
+                servers: HashMap::from([(
+                    "rust".to_owned(),
+                    ServerOverride {
+                        command: "new-rust-analyzer".to_owned(),
+                        ..ServerOverride::default()
+                    },
+                )]),
+                auto_install: None,
+            }),
+            ..RawFile::default()
+        };
+        merge_raw(&mut base, overlay);
+        let servers = base.lsp.unwrap().servers;
+
+        let rust = servers.get("rust").unwrap();
+        assert_eq!(rust.command, "new-rust-analyzer");
+        assert!(
+            rust.args.is_empty(),
+            "the overlay's `rust` entry replaced the base's wholesale — it \
+             didn't inherit the base entry's `args`"
+        );
+
+        // A sibling id the overlay never mentioned is untouched.
+        let go = servers.get("go").unwrap();
+        assert_eq!(go.command, "gopls");
+    }
+
+    #[test]
+    fn server_keys_recognizes_every_new_field_by_its_snake_case_name() {
+        for key in [
+            "command",
+            "args",
+            "extensions",
+            "root_markers",
+            "language_id",
+            "initialization_options",
+        ] {
+            assert!(SERVER_KEYS.contains(&key), "{key} should be recognized");
+        }
+    }
+
+    #[test]
+    fn unknown_key_warning_still_fires_for_a_kebab_case_typo_of_root_markers() {
+        // Desirable, not a bug: every top-level section in this config
+        // format is kebab-case, so a user is likely to guess
+        // `root-markers` for this snake_case field. `SERVER_KEYS` (checked
+        // by `warn_unknown_keys`/`warn_extra`, see their docs) is the exact
+        // mechanism that turns a typo like this into a visible warning
+        // rather than a silently-ignored no-op — this test can't capture
+        // the actual stderr line (nothing else in this file does either),
+        // so it instead pins the two facts that combine to produce it: the
+        // real key is recognized, the kebab-case typo of it is not, so
+        // `warn_extra` would flag exactly this key and nothing else.
+        assert!(SERVER_KEYS.contains(&"root_markers"));
+        assert!(!SERVER_KEYS.contains(&"root-markers"));
+
+        // And behaviorally: the typo'd key still doesn't crash the load,
+        // still doesn't populate `root_markers` (serde only ever
+        // recognizes the real field name), while a correctly-spelled
+        // sibling field on the same entry applies normally.
+        let repo = fixture_repo();
+        write_repo_config(
+            &repo,
+            "[lsp.servers.ruby]\ncommand = \"solargraph\"\nextensions = [\"rb\"]\nroot-markers = [\"Gemfile\"]\n",
+        );
+        let config = load_merged(&repo);
+        let ruby = config.lsp_servers.get("ruby").unwrap();
+        assert_eq!(ruby.command, "solargraph");
+        assert_eq!(ruby.extensions, vec!["rb".to_owned()]);
+        assert!(
+            ruby.root_markers.is_empty(),
+            "the kebab-case typo `root-markers` must not populate `root_markers`"
+        );
     }
 }

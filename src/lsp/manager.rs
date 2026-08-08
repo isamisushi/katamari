@@ -11,7 +11,7 @@
 //! only what happens once a connection is available differs between them.
 
 use crate::diff::ColumnMap;
-use crate::lsp::adapter::{self, Language};
+use crate::lsp::adapter::{self, LangKey};
 use crate::lsp::client::{Client, DefinitionResult, HoverResult, ReferencesResult, file_uri};
 use crate::lsp::diagnostics::{PulledDocument, fold_pull_result};
 use crate::lsp::install;
@@ -81,16 +81,21 @@ pub enum ServerState {
     },
 }
 
-type ServerKey = (Language, PathBuf);
+type ServerKey = (LangKey, PathBuf);
 
 /// One spawned server's events, tagged with which server sent them —
 /// M3a forwarded these unlabeled (fine with exactly one server per
 /// session); M3b can run up to four languages concurrently, so a
 /// `$/progress` tick or `publishDiagnostics` notification needs to say
-/// which server it came from for a caller juggling more than one.
+/// which server it came from for a caller juggling more than one. `language`
+/// keeps its M3b name even though a custom (non-built-in) server can send
+/// these too as of M-custom — [`LangKey`]'s `Display` impl (used wherever
+/// this is shown, e.g. the `$/progress` status line) reads the same either
+/// way (`"rust"`, `"ruby"`), so renaming the field to something more
+/// generic wouldn't earn its churn.
 #[derive(Debug, Clone)]
 pub struct ServerEvent {
-    pub language: Language,
+    pub language: LangKey,
     /// The workspace root half of this event's server key — kept alongside
     /// `language` for symmetry and because a future multi-root session
     /// (two Rust workspaces open in the same review, say) will need it to
@@ -229,11 +234,20 @@ impl WarmUpSummary {
 pub struct LspManager {
     events_tx: Sender<ServerEvent>,
     servers: Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
-    /// Config's `[lsp.servers.<lang>]` overrides — see
+    /// Config's `[lsp.servers.<id>]` overrides — see
     /// [`adapter::resolve_server`]'s docs. Shared via `Arc` rather than
     /// cloned per spawn, since it's read-only for this manager's whole
     /// lifetime and every `spawn_server` thread needs its own handle.
     overrides: Arc<HashMap<String, crate::config::ServerOverride>>,
+    /// `{extension -> custom id}`, derived once from `overrides` (see
+    /// [`adapter::custom_extension_map`]) rather than recomputed per file —
+    /// `overrides` never changes for the life of a session, so neither does
+    /// this. Fed to every [`LangKey::detect`] call this manager makes (see
+    /// [`Self::detect`]/[`Self::key_for`]) so a custom server's file
+    /// extensions get routed the same way a built-in language's do,
+    /// without `LspManager::new`'s own signature needing to grow a second
+    /// parameter derivable from the first.
+    custom_extensions: Arc<HashMap<String, String>>,
     /// Config's `[lsp] auto_install` (default `true`) — whether
     /// [`resolve_or_install`] is allowed to call [`install::ensure`] at all
     /// when a server is missing but [`adapter::Unavailable::installable`]
@@ -248,12 +262,24 @@ impl LspManager {
         overrides: Arc<HashMap<String, crate::config::ServerOverride>>,
         auto_install: bool,
     ) -> Self {
+        let custom_extensions = Arc::new(adapter::custom_extension_map(&overrides));
         Self {
             events_tx,
             servers: Arc::new(Mutex::new(HashMap::new())),
             overrides,
+            custom_extensions,
             auto_install,
         }
+    }
+
+    /// Routes `path` to the [`LangKey`] that would handle it — built-in
+    /// first, then this session's custom extension map (see
+    /// [`LangKey::detect`]'s docs) — for callers (currently just
+    /// [`crate::ui::mod`]'s per-language warning dedup) that need the same
+    /// answer [`Self::key_for`] would use without also computing a
+    /// workspace root or touching any server state.
+    pub fn detect(&self, path: &Path) -> Option<LangKey> {
+        LangKey::detect(path, &self.custom_extensions)
     }
 
     /// The coarse state of the server that would handle `file`, for a
@@ -367,10 +393,7 @@ impl LspManager {
     /// availability, which isn't known synchronously — see
     /// [`Self::state`]).
     pub fn warm_up(&self, files: &[PathBuf], git_root: &Path) -> WarmUpSummary {
-        let eligible: Vec<&PathBuf> = files
-            .iter()
-            .filter(|f| Language::detect(f).is_some())
-            .collect();
+        let eligible: Vec<&PathBuf> = files.iter().filter(|f| self.detect(f).is_some()).collect();
         let total_eligible = eligible.len();
         let mut opened = 0;
         for file in eligible.into_iter().take(WARM_UP_CAP) {
@@ -487,9 +510,27 @@ impl LspManager {
     }
 
     fn key_for(&self, file: &Path, git_root: &Path) -> Option<ServerKey> {
-        let language = Language::detect(file)?;
-        let workspace_root = adapter::workspace_root(file, git_root, language);
-        Some((language, workspace_root))
+        let lang_key = self.detect(file)?;
+        let workspace_root = match &lang_key {
+            LangKey::Builtin(language) => adapter::workspace_root(file, git_root, *language),
+            // A custom id has no adapter-specific tier-2 workspace-marker
+            // logic (see `adapter::custom_workspace_root`'s docs) — just
+            // its own configured `root_markers`, or the git root if it
+            // configured none. `overrides` is guaranteed to have an entry
+            // for `id` here: `lang_key` only ever came back `Custom(id)`
+            // because `self.custom_extensions` (derived from this same
+            // `overrides` map, see `Self::new`) has an entry claiming this
+            // extension for it.
+            LangKey::Custom(id) => {
+                let root_markers = self
+                    .overrides
+                    .get(id)
+                    .map(|over| over.root_markers.as_slice())
+                    .unwrap_or(&[]);
+                adapter::custom_workspace_root(file, git_root, root_markers)
+            }
+        };
+        Some((lang_key, workspace_root))
     }
 
     /// The shared entry point every public request method funnels through:
@@ -537,6 +578,7 @@ impl LspManager {
                     Arc::clone(&self.servers),
                     key,
                     self.events_tx.clone(),
+                    Arc::clone(&self.overrides),
                 );
             }
             ServerState::Unavailable { reason } | ServerState::Crashed { reason } => {
@@ -629,6 +671,7 @@ impl LspManager {
                     Arc::clone(&servers),
                     key.clone(),
                     events_tx.clone(),
+                    Arc::clone(&overrides),
                 );
             }
 
@@ -663,7 +706,12 @@ impl LspManager {
                     }
                 }
                 let _ = events_tx.send(ServerEvent {
-                    language,
+                    // `language` (unlike the old `Language`) isn't `Copy` —
+                    // this loop can run many iterations per server, so each
+                    // one needs its own clone rather than moving the outer
+                    // binding out on the first (see this module's docs on
+                    // `LangKey`'s Copy-loss ripple).
+                    language: language.clone(),
                     root: workspace_root.clone(),
                     event,
                 });
@@ -734,12 +782,12 @@ fn fail_entry(
     }
 }
 
-/// The one seam where a missing server can turn into an install: tries
-/// [`adapter::resolve_server`] first, exactly as before M8b, and only when
-/// that comes back `Unavailable { installable: true, .. }` *and* `[lsp]
-/// auto_install` is on does this reach for the network, via
-/// [`install::ensure`]. Each progress message `ensure` reports is written
-/// straight into `key`'s entry as `ServerState::Installing` (see
+/// The one seam where a missing server can turn into an install: for a
+/// built-in [`LangKey`], tries [`adapter::resolve_server`] first, exactly as
+/// before M8b, and only when that comes back `Unavailable { installable:
+/// true, .. }` *and* `[lsp] auto_install` is on does this reach for the
+/// network, via [`install::ensure`]. Each progress message `ensure` reports
+/// is written straight into `key`'s entry as `ServerState::Installing` (see
 /// [`set_installing`]) so the status bar reflects real download/build
 /// progress rather than sitting on a frozen `Starting` the whole time.
 /// Once `ensure` succeeds, this re-resolves rather than trusting the
@@ -749,13 +797,33 @@ fn fail_entry(
 /// threading a second, install-specific code path through to `Command`
 /// construction, and it re-validates that the binary is actually where
 /// `adapter` expects before this manager trusts it.
+///
+/// A custom [`LangKey`] skips every bit of that: [`adapter::resolve_custom_server`]
+/// resolves straight from the user's own `command`, with no lookup tiers
+/// and — since [`adapter::Unavailable::installable`] is unconditionally
+/// `false` for a custom server (this module has no install recipe for
+/// something it's never heard of) — no `install::ensure` call regardless of
+/// `auto_install`.
 fn resolve_or_install(
     servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
     key: &ServerKey,
     overrides: &HashMap<String, crate::config::ServerOverride>,
     auto_install: bool,
 ) -> Result<adapter::ResolvedServer, adapter::Unavailable> {
-    let (language, workspace_root) = key.clone();
+    let (lang_key, workspace_root) = key.clone();
+    let language = match lang_key {
+        LangKey::Builtin(language) => language,
+        LangKey::Custom(id) => {
+            return match overrides.get(&id) {
+                Some(over) => adapter::resolve_custom_server(&id, over),
+                None => Err(adapter::unavailable(
+                    &id,
+                    "custom server config disappeared mid-session",
+                    false,
+                )),
+            };
+        }
+    };
     match adapter::resolve_server(language, &workspace_root, overrides) {
         Ok(resolved) => Ok(resolved),
         Err(unavailable) if unavailable.installable && auto_install => {
@@ -878,6 +946,7 @@ fn dispatch(
     servers: Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
     key: ServerKey,
     events_tx: Sender<ServerEvent>,
+    overrides: Arc<HashMap<String, crate::config::ServerOverride>>,
 ) {
     std::thread::spawn(move || {
         let content = match std::fs::read_to_string(&request.file) {
@@ -905,8 +974,13 @@ fn dispatch(
             entry.versions.insert(request.file.clone(), 1).is_none()
         };
         if needs_open {
-            let language_id = adapter::lsp_language_id(key.0, &request.file);
-            client.did_open(uri.clone(), language_id, 1, &content);
+            // `key.0` is a `LangKey`, not `Copy` (unlike the old bare
+            // `Language`) — borrowing it here rather than moving it out of
+            // `key` (which is used again below, both by reference and by
+            // `.clone()`) is what avoids the partial-move this milestone's
+            // `Language` -> `LangKey` retype otherwise introduces here.
+            let language_id = adapter::lsp_language_id_for(&key.0, &request.file, &overrides);
+            client.did_open(uri.clone(), &language_id, 1, &content);
             maybe_pull_diagnostics(
                 &client,
                 &request.file,
@@ -1080,7 +1154,11 @@ fn apply_pulled_diagnostics(
         let result_id = match pulled {
             PulledDocument::Full { items, result_id } => {
                 let _ = events_tx.send(ServerEvent {
-                    language: key.0,
+                    // `key: &ServerKey` here — `key.0` is a `LangKey`, not
+                    // `Copy`, so it can't be moved out of a borrow the way
+                    // the old `Language` could; `.clone()` it instead, same
+                    // as `key.1` (the `PathBuf`) right below always has.
+                    language: key.0.clone(),
                     root: key.1.clone(),
                     event: LspEvent::Notification {
                         method: "textDocument/publishDiagnostics".to_owned(),
@@ -1227,9 +1305,18 @@ mod tests {
     #[test]
     fn select_lru_victim_picks_the_least_recently_touched_server() {
         let now = Instant::now();
-        let a = (Language::Rust, PathBuf::from("/repo/a"));
-        let b = (Language::TypeScript, PathBuf::from("/repo/b"));
-        let c = (Language::Go, PathBuf::from("/repo/c"));
+        let a = (
+            LangKey::Builtin(adapter::Language::Rust),
+            PathBuf::from("/repo/a"),
+        );
+        let b = (
+            LangKey::Builtin(adapter::Language::TypeScript),
+            PathBuf::from("/repo/b"),
+        );
+        let c = (
+            LangKey::Builtin(adapter::Language::Go),
+            PathBuf::from("/repo/c"),
+        );
         // `a` touched longest ago, `c` most recently — `a` should be picked
         // regardless of map iteration order, which is why the candidates
         // below are deliberately not given in oldest-to-newest order.
@@ -1253,8 +1340,14 @@ mod tests {
         // `last_touched` across candidates — its language or workspace root
         // plays no role in the ordering.
         let now = Instant::now();
-        let older = (Language::Python, PathBuf::from("/repo/py"));
-        let newer = (Language::Python, PathBuf::from("/repo/py2"));
+        let older = (
+            LangKey::Builtin(adapter::Language::Python),
+            PathBuf::from("/repo/py"),
+        );
+        let newer = (
+            LangKey::Builtin(adapter::Language::Python),
+            PathBuf::from("/repo/py2"),
+        );
         let older_touched = now;
         let newer_touched = now + Duration::from_millis(1);
         let candidates = [(&newer, &newer_touched), (&older, &older_touched)];

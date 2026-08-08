@@ -43,7 +43,7 @@ use crate::config::{self, Config};
 use crate::diff::parse_unified_diff;
 use crate::highlight::LineHighlighter;
 use crate::keymap::{Action, KeyChord, Keymap, Resolver, StepResult, emacs_preset, vim_preset};
-use crate::lsp::adapter::Language;
+use crate::lsp::adapter::LangKey;
 use crate::lsp::client::uri_to_path;
 use crate::lsp::manager::ServerState;
 use crate::lsp::{
@@ -442,8 +442,7 @@ fn warm_up_root(view: &View, lsp_manager: &LspManager) -> Option<String> {
 /// away (normal shutdown) or a read fails (terminal gone).
 fn spawn_input_thread(tx: Sender<AppEvent>) {
     std::thread::spawn(move || {
-        loop {
-            let Ok(ev) = event::read() else { break };
+        while let Ok(ev) = event::read() {
             if tx.send(AppEvent::Terminal(ev)).is_err() {
                 break;
             }
@@ -558,7 +557,7 @@ fn event_loop(
     let mut lsp_status: Option<String> = startup_status;
     let mut goto_status: Option<String> = None;
     let mut watch_status: Option<WatchStatus> = initial_watch_status.map(WatchStatus::new);
-    let mut warned_languages: HashSet<Language> = HashSet::new();
+    let mut warned_languages: HashSet<LangKey> = HashSet::new();
     let mut compose: Option<ComposeState> = None;
     let mut scope_menu: Option<ScopeMenuState> = None;
     // M16's first-comment skill-install prompt: `skill_prompt_offered` is a
@@ -675,7 +674,7 @@ fn event_loop(
         // messages already read like a status-bar hint — "LSP: typescript
         // ✕ — npm i -g …" — so repeating it every frame would add nothing).
         if let Some(query) = stack.top().hover_query()
-            && let Some(language) = Language::detect(&query.file)
+            && let Some(language) = lsp_manager.detect(&query.file)
         {
             match lsp_manager.state(&query.file, &query.git_root) {
                 ServerState::Installing { message } => lsp_status = Some(message),
@@ -901,8 +900,8 @@ fn event_loop(
                         // rust-analyzer indexing tick as if it might be
                         // about the TypeScript file the cursor happens to
                         // be on.
-                        lsp_status = progress_status_text(&params)
-                            .map(|text| format!("{language:?}: {text}"));
+                        lsp_status =
+                            progress_status_text(&params).map(|text| format!("{language}: {text}"));
                     } else if method == "textDocument/publishDiagnostics"
                         && let Some(parsed) = parse_publish_diagnostics(&params)
                         && let Some(path) = uri_to_path(&parsed.uri)

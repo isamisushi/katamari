@@ -319,8 +319,19 @@ fn write_cache_atomic(path: &Path, cache: &Cache) -> io::Result<()> {
 /// docs for why this is a separate directory from
 /// [`crate::lsp::install::prefix_dir`].
 fn state_file_path() -> PathBuf {
+    state_dir().join("update-check.json")
+}
+
+/// `$XDG_STATE_HOME/katamari`, or `~/.local/state/katamari` when unset.
+/// Public (unlike [`state_file_path`]) because [`crate::lsp::adapter`]'s
+/// jdtls per-workspace index directories belong under this same state root
+/// — a project's language-server index is exactly the kind of large,
+/// disposable, re-buildable-on-demand cache this directory is for, same as
+/// this module's own update-check cache — and the crate should have exactly
+/// one place that knows the `$XDG_STATE_HOME` fallback rule rather than two
+/// copies drifting apart.
+pub fn state_dir() -> PathBuf {
     state_dir_from_env(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
-        .join("update-check.json")
 }
 
 fn state_dir_from_env(xdg_state_home: Option<OsString>, home: Option<OsString>) -> PathBuf {

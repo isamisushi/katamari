@@ -227,10 +227,15 @@ enum Command {
 
 #[derive(Subcommand)]
 enum LspCommand {
-    /// Prints, for each of the five supported languages, where its server
+    /// Prints, for each of the six supported languages, where its server
     /// would resolve from today (config override / project-local / PATH /
     /// `mise which` / katamari-managed / not found) and — only when not
-    /// found — whether `[lsp] auto_install` would handle it. Read-only:
+    /// found — whether `[lsp] auto_install` would handle it. Also prints a
+    /// second table listing every `[lsp.servers.<id>]` entry that defines a
+    /// custom (non-built-in) server, reporting whether its `command`
+    /// resolves — and, where a claimed extension is actually shadowed by a
+    /// built-in language, lost to another custom id, or ignored because
+    /// `<id>` itself names a built-in language, a note saying so. Read-only:
     /// never downloads or installs anything, and runs fully offline.
     Doctor,
     /// Installs `language`'s pinned server into katamari's managed prefix,
@@ -250,7 +255,7 @@ enum LspCommand {
     Update,
 }
 
-/// `ktmr lsp install <language>`'s argument — the five languages plus
+/// `ktmr lsp install <language>`'s argument — the six languages plus
 /// `all`, kebab-free since every variant here is already a single word.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum LanguageArg {
@@ -259,6 +264,7 @@ enum LanguageArg {
     Python,
     Go,
     Kotlin,
+    Java,
     All,
 }
 
@@ -1096,12 +1102,13 @@ fn run_skill_install() -> Result<()> {
     Ok(())
 }
 
-const ALL_LANGUAGES: [lsp::adapter::Language; 5] = [
+const ALL_LANGUAGES: [lsp::adapter::Language; 6] = [
     lsp::adapter::Language::Rust,
     lsp::adapter::Language::TypeScript,
     lsp::adapter::Language::Python,
     lsp::adapter::Language::Go,
     lsp::adapter::Language::Kotlin,
+    lsp::adapter::Language::Java,
 ];
 
 fn run_lsp(action: LspCommand) -> Result<()> {
@@ -1134,6 +1141,7 @@ fn language_label(language: lsp::adapter::Language) -> &'static str {
         lsp::adapter::Language::Python => "python",
         lsp::adapter::Language::Go => "go",
         lsp::adapter::Language::Kotlin => "kotlin",
+        lsp::adapter::Language::Java => "java",
     }
 }
 
@@ -1172,8 +1180,136 @@ fn run_lsp_doctor() -> Result<()> {
             "{:<12} {source:<20} {auto_install:<13} {detail}",
             language_label(diagnosis.language)
         );
+        // jdtls's own resolution above says nothing about the JDK it needs
+        // to run on (`diagnose_language` collapses any JDK problem straight
+        // to "not found", discarding the JDK's own path/version — see
+        // `diagnose_language`'s docs) — this note is the only place that
+        // detail surfaces, so a user can tell "no JDK at all" apart from
+        // "found one, but it's too old" without re-running with a debugger.
+        if language == lsp::adapter::Language::Java {
+            println!("{:<12} jdk: {}", "", lsp::adapter::java_jdk_note());
+        }
     }
+    print_custom_server_doctor(&overrides);
     Ok(())
+}
+
+/// The second half of `ktmr lsp doctor`'s output: every `[lsp.servers.<id>]`
+/// entry that defines a *custom* server (a non-empty `extensions` list —
+/// the same test [`lsp::adapter::custom_extension_map`] uses to tell a
+/// custom entry apart from a plain built-in override, which the loop above
+/// already covers via its own `<lang>` key). Printed in a second table
+/// beneath the built-in one, column-aligned to match it, rather than
+/// interleaved — a custom id has no `Language`/[`ALL_LANGUAGES`] ordering
+/// to slot into, so sorting alphabetically here (rather than leaving
+/// `overrides`' `HashMap` iteration order to vary the report run to run) is
+/// what keeps repeated `doctor` calls diffable. `ktmr lsp install` doesn't
+/// support a custom id (see `LanguageArg`'s docs) — this only ever reports,
+/// it never installs.
+///
+/// Every row's `command` half was already checked against the real
+/// filesystem/`PATH` (via [`locate_custom_command`]), but a `command` that
+/// resolves says nothing about whether the entry's *extensions* actually
+/// route anywhere — an id shadowed by a built-in language, lost to another
+/// custom id's earlier lexicographic claim, or (after this diff) ignored
+/// because `<id>` itself names a built-in language would otherwise print as
+/// if fully configured, with no hint that it's permanently unreachable.
+/// [`lsp::adapter::custom_extension_map`] is the one place that precedence
+/// is decided — this calls it directly (via [`custom_extension_note`]) and
+/// reads its result back, rather than re-deriving the same rules a second
+/// time here, so a doctor note can never disagree with what a live session
+/// would actually route a file to.
+fn print_custom_server_doctor(overrides: &HashMap<String, config::ServerOverride>) {
+    let mut custom_ids: Vec<&String> = overrides
+        .iter()
+        .filter(|(_, over)| !over.extensions.is_empty())
+        .map(|(id, _)| id)
+        .collect();
+    if custom_ids.is_empty() {
+        return;
+    }
+    custom_ids.sort();
+
+    // Reuses `custom_extension_map`'s own precedence decisions (below)
+    // rather than re-implementing the built-in/collision rules here.
+    let active = lsp::adapter::custom_extension_map(overrides);
+
+    println!();
+    println!(
+        "{:<12} {:<20} {:<13} path / notes",
+        "custom", "extensions", "command"
+    );
+    for id in custom_ids {
+        let over = &overrides[id];
+        let extensions = over
+            .extensions
+            .iter()
+            .map(|ext| format!(".{}", lsp::adapter::normalize_extension(ext)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let (source, mut detail) = match locate_custom_command(&over.command) {
+            Some(path) => ("found", path.display().to_string()),
+            None => ("not found", String::new()),
+        };
+        if let Some(note) = custom_extension_note(id, over, &active) {
+            if !detail.is_empty() {
+                detail.push_str("  ");
+            }
+            detail.push_str(&note);
+        }
+        println!("{id:<12} {extensions:<20} {source:<13} {detail}");
+    }
+}
+
+/// Why (if at all) `id`'s `extensions` claim doesn't actually route any file
+/// to it — `None` when every extension it claims is the one
+/// [`lsp::adapter::custom_extension_map`] (`active`) actually assigned it.
+/// Three distinct reasons, all read straight off `active` rather than
+/// re-checking built-in ownership or collision order by hand: `id` itself
+/// names a built-in language (its whole `extensions` field is ignored,
+/// unconditionally — see [`lsp::adapter::is_builtin_language_id`]); an
+/// extension is missing from `active` entirely (nothing claims it, which
+/// given `id` isn't built-in-named can only mean a built-in language owns
+/// it — `custom_extension_map` never omits a non-built-in-owned extension
+/// for any other reason); or `active` maps it to a different id (lost to
+/// that id's lexicographically-earlier claim on the same extension).
+fn custom_extension_note(
+    id: &str,
+    over: &config::ServerOverride,
+    active: &HashMap<String, String>,
+) -> Option<String> {
+    if lsp::adapter::is_builtin_language_id(id) {
+        return Some(format!(
+            "ignored: `{id}` overrides the built-in {id} server, extensions unused"
+        ));
+    }
+    let lost: Vec<String> = over
+        .extensions
+        .iter()
+        .filter_map(|raw| {
+            let ext = lsp::adapter::normalize_extension(raw);
+            match active.get(ext) {
+                Some(winner) if winner == id => None,
+                Some(winner) => Some(format!(".{ext} lost to `{winner}`")),
+                None => Some(format!(".{ext} shadowed by a built-in server")),
+            }
+        })
+        .collect();
+    (!lost.is_empty()).then(|| lost.join("; "))
+}
+
+/// A plain which-style lookup for a custom server's configured `command` —
+/// deliberately not [`lsp::adapter::resolve_custom_server`] itself (which
+/// builds a `Command`, not a doctor-report line), just enough to tell a
+/// reviewer whether the command they configured is actually reachable.
+/// Mirrors how a shell resolves a bare command name: a path containing a
+/// separator is checked directly, otherwise it's searched for on `PATH`.
+fn locate_custom_command(command: &str) -> Option<PathBuf> {
+    let as_path = PathBuf::from(command);
+    if command.contains(std::path::MAIN_SEPARATOR) {
+        return as_path.is_file().then_some(as_path);
+    }
+    lsp::adapter::which_on_path(command)
 }
 
 fn run_lsp_install(language: LanguageArg) -> Result<()> {
@@ -1184,6 +1320,7 @@ fn run_lsp_install(language: LanguageArg) -> Result<()> {
         LanguageArg::Python => vec![lsp::adapter::Language::Python],
         LanguageArg::Go => vec![lsp::adapter::Language::Go],
         LanguageArg::Kotlin => vec![lsp::adapter::Language::Kotlin],
+        LanguageArg::Java => vec![lsp::adapter::Language::Java],
     };
     for language in languages {
         println!("=== {} ===", language_label(language));
