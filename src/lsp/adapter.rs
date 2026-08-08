@@ -506,7 +506,14 @@ fn diagnose_language(language: Language, workspace_root: &Path) -> (Option<Looku
     }
 }
 
-fn install_hint(language: Language, installable: bool) -> String {
+/// `pub(crate)` (not just [`resolve_server`]'s own use, below) so
+/// [`crate::doctor`]'s lsp-resolution section can build the same
+/// not-found/install hint text `ktmr lsp doctor` and a live session's
+/// status bar already show — see [`resolve_server`]'s docs on why sharing
+/// this instead of re-deriving it matters: two independently-written hints
+/// could drift apart, and a diagnostic that disagrees with the thing it's
+/// diagnosing is worse than useless.
+pub(crate) fn install_hint(language: Language, installable: bool) -> String {
     match language {
         Language::Rust => "rust-analyzer not found on PATH, via `rustup which`, `mise which`, or \
             katamari's managed install — install it with `rustup component add rust-analyzer`, \
@@ -583,13 +590,32 @@ fn java_install_hint() -> String {
 /// [`java_install_hint`]'s reprobe — cheap enough not to matter on the
 /// doctor's already print-only, offline path.
 pub fn java_jdk_note() -> String {
+    java_jdk_status().1
+}
+
+/// `(a usable JDK was found, [`java_jdk_note`]'s note text)` — the same
+/// [`probe_java`] outcome, computed once so a caller that needs to *tag* the
+/// note (`doctor.rs`'s Java sub-check) can never disagree with what the note
+/// itself says. Before this existed, `doctor.rs` hardcoded that row to
+/// `Check::ok` unconditionally, so a report could show `ok  java: jdk: not
+/// found` — a green tag directly contradicting its own text — for exactly
+/// the JDK-missing/too-old cases this dimension exists to catch; deriving
+/// both halves from one probe closes that gap structurally rather than
+/// relying on a caller to remember to match them up by hand.
+pub(crate) fn java_jdk_status() -> (bool, String) {
     match probe_java() {
-        JavaProbe::Ok(java) => format!("{} (Java {})", java.path.display(), java.major),
-        JavaProbe::TooOld { path, major } => format!(
-            "{} (Java {major}, jdtls needs {JDTLS_MIN_JAVA_MAJOR}+)",
-            path.display()
+        JavaProbe::Ok(java) => (
+            true,
+            format!("{} (Java {})", java.path.display(), java.major),
         ),
-        JavaProbe::NotFound => "not found".to_owned(),
+        JavaProbe::TooOld { path, major } => (
+            false,
+            format!(
+                "{} (Java {major}, jdtls needs {JDTLS_MIN_JAVA_MAJOR}+)",
+                path.display()
+            ),
+        ),
+        JavaProbe::NotFound => (false, "not found".to_owned()),
     }
 }
 
@@ -1937,6 +1963,18 @@ mod tests {
             note == "not found" || note.contains("Java"),
             "unexpected note: {note}"
         );
+    }
+
+    #[test]
+    fn java_jdk_status_note_matches_java_jdk_note_and_ok_flag_matches_a_fresh_probe() {
+        // Pins that `java_jdk_note` is now a thin wrapper over
+        // `java_jdk_status` (same text either way) and that the `ok` half
+        // agrees with `probe_java`'s own `Ok` variant — the exact pairing
+        // `doctor.rs`'s Java sub-check relies on to never tag a "not found"/
+        // "too old" note as `ok`.
+        let (ok, note) = java_jdk_status();
+        assert_eq!(java_jdk_note(), note);
+        assert_eq!(ok, matches!(probe_java(), JavaProbe::Ok(_)));
     }
 
     #[test]

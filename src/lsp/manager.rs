@@ -282,6 +282,25 @@ impl LspManager {
         LangKey::detect(path, &self.custom_extensions)
     }
 
+    /// The exact `(language, workspace root)` identity [`Self::key_for`]
+    /// resolves for `file` — i.e. which distinct server *instance* would
+    /// handle it, not just which language. Exposed (unlike `key_for` itself,
+    /// which stays private) so [`crate::ui::mod`]'s per-server-instance
+    /// warning dedup can build the identical key this manager already
+    /// tracks server state by, instead of either re-deriving the
+    /// builtin/custom workspace-root logic a second time (see `key_for`'s
+    /// docs on why that split exists) or falling back to a coarser,
+    /// workspace-blind `LangKey`-only key — which would conflate two
+    /// independently-rooted servers of the same language (e.g. two
+    /// unrelated Cargo workspaces reviewed in one session) into a single
+    /// dedup slot, silently swallowing a real crash in the second workspace
+    /// once the first has already warned once. `None` in exactly the case
+    /// [`Self::detect`] would also return `None` for — no language server
+    /// configured for this file type.
+    pub fn server_identity(&self, file: &Path, git_root: &Path) -> Option<(LangKey, PathBuf)> {
+        self.key_for(file, git_root)
+    }
+
     /// The coarse state of the server that would handle `file`, for a
     /// status-bar indicator. Never spawns anything — this is a read, not a
     /// request.
@@ -1376,6 +1395,48 @@ mod tests {
     fn progress_is_end_rejects_malformed_params() {
         assert!(!progress_is_end(&serde_json::json!({})));
         assert!(!progress_is_end(&serde_json::json!("not an object")));
+    }
+
+    #[test]
+    fn server_identity_distinguishes_two_workspace_roots_of_the_same_language() {
+        // The crux fact a `LangKey`-only dedup key (the pre-fix shape) would
+        // conflate: two independently-rooted Cargo workspaces under the same
+        // git root share a `LangKey::Builtin(Rust)` but must resolve to
+        // distinct server identities, since `LspManager` itself spawns a
+        // separate server per `(LangKey, workspace_root)` — see `key_for`'s
+        // docs.
+        let (events_tx, _events_rx) = channel();
+        let manager = LspManager::new(events_tx, Arc::new(HashMap::new()), false);
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_a = dir.path().join("a");
+        let workspace_b = dir.path().join("b");
+        std::fs::create_dir_all(workspace_a.join("src")).unwrap();
+        std::fs::create_dir_all(workspace_b.join("src")).unwrap();
+        std::fs::write(workspace_a.join("Cargo.toml"), "[package]\nname = \"a\"\n").unwrap();
+        std::fs::write(workspace_b.join("Cargo.toml"), "[package]\nname = \"b\"\n").unwrap();
+        let file_a = workspace_a.join("src/main.rs");
+        let file_b = workspace_b.join("src/main.rs");
+
+        let id_a = manager.server_identity(&file_a, dir.path()).unwrap();
+        let id_b = manager.server_identity(&file_b, dir.path()).unwrap();
+
+        assert_eq!(id_a.0, id_b.0, "same language: {id_a:?} vs {id_b:?}");
+        assert_ne!(
+            id_a.1, id_b.1,
+            "two independently-rooted Rust workspaces must resolve to distinct server \
+             identities — this is exactly what a `LangKey`-only dedup key would conflate"
+        );
+    }
+
+    #[test]
+    fn server_identity_is_none_for_a_file_with_no_configured_language() {
+        let (events_tx, _events_rx) = channel();
+        let manager = LspManager::new(events_tx, Arc::new(HashMap::new()), false);
+        assert!(
+            manager
+                .server_identity(Path::new("/repo/README.md"), Path::new("/repo"))
+                .is_none()
+        );
     }
 
     #[test]

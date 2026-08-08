@@ -3,6 +3,7 @@ mod cjk_regression;
 mod comments;
 mod config;
 mod diff;
+mod doctor;
 mod highlight;
 mod keymap;
 mod lsp;
@@ -223,6 +224,38 @@ enum Command {
         #[command(subcommand)]
         action: LspCommand,
     },
+    /// Checkhealth-style diagnostic report: version control, config files,
+    /// and (unlike `ktmr lsp doctor`, which only ever checks where a
+    /// server *would* resolve from) a real spawn-and-hover round trip
+    /// against every language server this repository's files actually need
+    /// — the health check filed as issue #4, for telling "katamari is
+    /// broken" apart from "the language server is broken" apart from
+    /// "nothing's broken, it's just still indexing." Read-only: never
+    /// installs, writes config, or touches `.katamari/` — see
+    /// [`doctor`]'s module docs. Exits 1 if any check reports `error`
+    /// (warnings alone still exit 0).
+    Doctor {
+        /// Skip the live spawn-and-hover probe entirely and report only the
+        /// static sections (vcs, config, lsp resolution) — useful in CI, or
+        /// anywhere spawning real language servers isn't wanted.
+        #[arg(long)]
+        no_live: bool,
+        /// Limit the live probe to one language or custom server id (e.g.
+        /// `rust`, or a `[lsp.servers.<id>]` id of your own) instead of
+        /// probing every language this repository's tracked/untracked
+        /// files need. A plain string, not a closed enum: an id from
+        /// `[lsp.servers.<id>]` isn't known until config is loaded, well
+        /// after clap parses argv.
+        #[arg(long, value_name = "LANGUAGE")]
+        language: Option<String>,
+        /// Print the report as JSON (one object, `{"sections": [...]}`)
+        /// instead of plain text — see [`doctor`]'s module docs for the
+        /// exact shape. Same stability promise as `ktmr comments list
+        /// --json`: a plain, direct `Serialize` of the report's own types,
+        /// not a versioned schema.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -236,7 +269,11 @@ enum LspCommand {
     /// resolves — and, where a claimed extension is actually shadowed by a
     /// built-in language, lost to another custom id, or ignored because
     /// `<id>` itself names a built-in language, a note saying so. Read-only:
-    /// never downloads or installs anything, and runs fully offline.
+    /// never downloads or installs anything, and runs fully offline. This
+    /// table is one section of the fuller `ktmr doctor` — vcs, config, and
+    /// (unlike this command) a real live spawn-and-hover probe against
+    /// every language the repository actually needs — run that for the
+    /// complete health check.
     Doctor,
     /// Installs `language`'s pinned server into katamari's managed prefix,
     /// streaming progress lines to stdout. Deliberately ignores whatever
@@ -421,6 +458,11 @@ fn main() -> Result<()> {
         Command::Comments { action } => run_comments(action),
         Command::Skill { action } => run_skill(action),
         Command::Lsp { action } => run_lsp(action),
+        Command::Doctor {
+            no_live,
+            language,
+            json,
+        } => run_doctor(no_live, language, json),
     }
 }
 
@@ -1109,7 +1151,16 @@ fn run_skill_install() -> Result<()> {
     Ok(())
 }
 
-const ALL_LANGUAGES: [lsp::adapter::Language; 6] = [
+/// `pub(crate)` so [`doctor::lsp_resolution_checks`] can enumerate the same
+/// six languages `ktmr lsp doctor` does, and `doctor`'s `--language`
+/// validation (`resolve_language_filter`/`builtin_language_by_name`) can
+/// look one up by name, rather than a second hand-maintained copy of this
+/// list drifting from either. Not the live-probe section, despite the name
+/// suggesting "every doctor.rs language enumeration": that section finds
+/// its targets by scanning which files are actually present in the repo
+/// (see `doctor::detect_present_languages`), a deliberately different,
+/// file-presence-driven mechanism — it never iterates this list at all.
+pub(crate) const ALL_LANGUAGES: [lsp::adapter::Language; 6] = [
     lsp::adapter::Language::Rust,
     lsp::adapter::Language::TypeScript,
     lsp::adapter::Language::Python,
@@ -1152,7 +1203,11 @@ fn language_label(language: lsp::adapter::Language) -> &'static str {
     }
 }
 
-fn resolved_from_label(from: lsp::adapter::ResolvedFrom) -> &'static str {
+/// `pub(crate)` so [`doctor::lsp_resolution_checks`] can render a
+/// `Diagnosis`'s tier the exact same way `ktmr lsp doctor`'s table does —
+/// see [`ALL_LANGUAGES`]'s doc comment for why sharing this list of labels
+/// instead of a second copy matters.
+pub(crate) fn resolved_from_label(from: lsp::adapter::ResolvedFrom) -> &'static str {
     use lsp::adapter::ResolvedFrom;
     match from {
         ResolvedFrom::ConfigOverride => "override",
@@ -1280,7 +1335,11 @@ fn print_custom_server_doctor(overrides: &HashMap<String, config::ServerOverride
 /// it — `custom_extension_map` never omits a non-built-in-owned extension
 /// for any other reason); or `active` maps it to a different id (lost to
 /// that id's lexicographically-earlier claim on the same extension).
-fn custom_extension_note(
+///
+/// `pub(crate)` so [`doctor`]'s own custom-server checks can reuse this
+/// exact note instead of re-deriving it — see [`ALL_LANGUAGES`]'s doc
+/// comment for the same anti-drift reasoning.
+pub(crate) fn custom_extension_note(
     id: &str,
     over: &config::ServerOverride,
     active: &HashMap<String, String>,
@@ -1311,7 +1370,9 @@ fn custom_extension_note(
 /// reviewer whether the command they configured is actually reachable.
 /// Mirrors how a shell resolves a bare command name: a path containing a
 /// separator is checked directly, otherwise it's searched for on `PATH`.
-fn locate_custom_command(command: &str) -> Option<PathBuf> {
+/// `pub(crate)` so [`doctor`]'s custom-server checks share this instead of
+/// a second which-style lookup.
+pub(crate) fn locate_custom_command(command: &str) -> Option<PathBuf> {
     let as_path = PathBuf::from(command);
     if command.contains(std::path::MAIN_SEPARATOR) {
         return as_path.is_file().then_some(as_path);
@@ -1359,6 +1420,43 @@ fn run_lsp_update() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `ktmr doctor [--no-live] [--language <id>] [--json]` — thin CLI glue
+/// over [`doctor::build_report`] (assembly) and
+/// [`doctor::render_text`]/`serde_json` (rendering); every actual health
+/// check lives in [`doctor`], colocated with its own tests, so this
+/// function's only jobs are resolving the current directory, choosing a
+/// renderer, and translating [`doctor::exit_code`] into the process's real
+/// exit status. Uses [`std::process::exit`] rather than returning an `Err`
+/// for an error-level report: the report itself, already printed, *is* the
+/// explanation — a second "Error: ..." line from `anyhow`'s own top-level
+/// handler would just repeat (and outrank on screen) what the report
+/// already said more usefully.
+fn run_doctor(no_live: bool, language: Option<String>, json: bool) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let report = doctor::build_report(
+        &cwd,
+        doctor::DoctorOptions {
+            no_live,
+            language_filter: language.as_deref(),
+        },
+    )?;
+
+    if json {
+        println!("{}", serde_json::to_string(&report)?);
+    } else {
+        print!("{}", doctor::render_text(&report));
+    }
+
+    // `print!`/`println!` write through a `LineWriter`, which flushes on
+    // every `\n` (both branches above end in one) — this `flush` is just
+    // defense in depth against that buffering detail changing under us,
+    // since `process::exit` below skips the normal unwind that would
+    // otherwise flush stdout on the way out.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    std::process::exit(doctor::exit_code(&report));
 }
 
 /// The very first request against a freshly resolved key is also what makes
@@ -1416,7 +1514,10 @@ fn poll_request<T>(
         let state = manager.state(file, git_root);
         if last_state.as_ref() != Some(&state) {
             println!("[state] {state:?}");
-            last_state = Some(state);
+            last_state = Some(state.clone());
+        }
+        if let Some(err) = terminal_state_error(&state) {
+            return Err(err);
         }
 
         if std::time::Instant::now() > deadline {
@@ -1426,6 +1527,39 @@ fn poll_request<T>(
                 ))
             });
         }
+    }
+}
+
+/// The short-circuit [`poll_request`] needs to stop spinning to its 60s
+/// deadline once a server is definitively dead. `Unavailable`/`Crashed` are
+/// the two [`lsp::manager::ServerState`] variants
+/// [`lsp::manager::LspManager::submit`]'s synchronous-fail path produces
+/// (see that function's `Ready`/`Unavailable`/`Crashed` match arm) — once a
+/// server's in either, every future `issue()` call in the retry loop above
+/// will keep re-failing with this exact same reason forever (`submit` never
+/// re-attempts a spawn for a key it's already given up on), so continuing
+/// to poll until the deadline would just re-observe the same failure up to
+/// twenty more times for no benefit, and make a doomed `ktmr lsp-check`
+/// wait a full minute to report what it already knows.
+///
+/// Deliberately keyed off `ServerState` rather than inspecting the `LspError`
+/// text `issue()`'s `Receiver` carries: `submit`'s synchronous fail and a
+/// genuine transport error both surface as the identical
+/// `LspError::Io(String)` shape (see `lsp::transport::LspError`'s docs), so
+/// string-matching an error message here could misfire on a transport error
+/// that merely happens to reuse similar wording. `state` is a plumbed-through
+/// fact, not a guess — this just asks it the question directly. The returned
+/// error reuses `state`'s own `reason` in the same `LspError::Io` shape
+/// `submit` itself produces, so a caller sees exactly the message it would
+/// have gotten from one more (wasted) retry.
+fn terminal_state_error(state: &lsp::manager::ServerState) -> Option<lsp::LspError> {
+    match state {
+        lsp::manager::ServerState::Unavailable { reason }
+        | lsp::manager::ServerState::Crashed { reason } => Some(lsp::LspError::Io(reason.clone())),
+        lsp::manager::ServerState::NotStarted
+        | lsp::manager::ServerState::Starting
+        | lsp::manager::ServerState::Installing { .. }
+        | lsp::manager::ServerState::Ready => None,
     }
 }
 
@@ -1976,5 +2110,79 @@ index 1111111..2222222 100644\n\
         assert!(dump.contains("GAP unchanged (to EOF)"), "dump:\n{dump}");
         assert!(dump.contains("FILE f.txt"), "dump:\n{dump}");
         assert!(dump.contains("HUNK"), "dump:\n{dump}");
+    }
+
+    #[test]
+    fn terminal_state_error_is_none_for_every_non_terminal_state() {
+        use lsp::manager::ServerState;
+        assert!(terminal_state_error(&ServerState::NotStarted).is_none());
+        assert!(terminal_state_error(&ServerState::Starting).is_none());
+        assert!(
+            terminal_state_error(&ServerState::Installing {
+                message: "downloading".to_owned()
+            })
+            .is_none()
+        );
+        assert!(terminal_state_error(&ServerState::Ready).is_none());
+    }
+
+    #[test]
+    fn terminal_state_error_reuses_the_reason_for_unavailable_and_crashed() {
+        use lsp::manager::ServerState;
+        let unavailable = ServerState::Unavailable {
+            reason: "no server found".to_owned(),
+        };
+        match terminal_state_error(&unavailable) {
+            Some(lsp::LspError::Io(msg)) => assert_eq!(msg, "no server found"),
+            other => panic!("expected a terminal Io error, got {other:?}"),
+        }
+
+        let crashed = ServerState::Crashed {
+            reason: "server exited".to_owned(),
+        };
+        match terminal_state_error(&crashed) {
+            Some(lsp::LspError::Io(msg)) => assert_eq!(msg, "server exited"),
+            other => panic!("expected a terminal Io error, got {other:?}"),
+        }
+    }
+
+    /// `poll_request` itself, not just the pure `terminal_state_error` it's
+    /// built on: a file with no configured language server makes
+    /// `LspManager::submit` fail synchronously (`key_for` finds no server
+    /// for the extension — see `LspManager::state`'s docs) with
+    /// `ServerState::Unavailable`, right from the very first poll. Before
+    /// the short-circuit fix, `poll_request` would spin at `RETRY_INTERVAL`
+    /// all the way to `CHECK_DEADLINE` (60s) re-observing the identical
+    /// synchronous failure; this asserts it now returns in well under
+    /// `RETRY_INTERVAL` (3s) instead — the elapsed-time assertion is the
+    /// actual regression guard here, not just the returned error's shape.
+    #[test]
+    fn poll_request_short_circuits_on_a_terminal_state_instead_of_waiting_for_the_deadline() {
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let manager = lsp::LspManager::new(events_tx, std::sync::Arc::new(HashMap::new()), false);
+        let file = PathBuf::from("/tmp/katamari-poll-request-test.nolang");
+        let git_root = PathBuf::from("/tmp");
+
+        let started = std::time::Instant::now();
+        let result = poll_request(
+            &manager,
+            &events_rx,
+            &file,
+            &git_root,
+            || manager.hover(&file, &git_root, "", 0, 0),
+            Option::is_some,
+        );
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "poll_request took {:?} — the terminal-state short-circuit did not fire",
+            started.elapsed()
+        );
+        match result {
+            Err(lsp::LspError::Io(msg)) => {
+                assert!(msg.contains("no language server configured"), "{msg}")
+            }
+            other => panic!("expected a terminal Io error, got {other:?}"),
+        }
     }
 }

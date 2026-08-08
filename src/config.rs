@@ -186,9 +186,15 @@ impl Default for Config {
 // deserialize identically. `RawFile` keeps every field optional so merging
 // (see `merge_raw`) only ever overwrites what a file actually specified.
 
+// `pub(crate)` (not just this module's own use) because it's half of
+// `parse_with_warnings`'s return type, which `crate::doctor`'s config
+// section calls directly (see that function's docs) — the caller doesn't
+// need the parsed fields (it only reads the warnings), but Rust's
+// private-in-public rule still requires the type itself to be at least as
+// visible as the function that returns it.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
-struct RawFile {
+pub(crate) struct RawFile {
     keymap: Option<String>,
     keys: Option<HashMap<String, String>>,
     lsp: Option<RawLsp>,
@@ -329,7 +335,7 @@ fn merge_from_file(base: &mut RawFile, path: &Path) {
     merge_raw(base, parse_and_warn(path, &text));
 }
 
-fn home_config_path() -> Option<PathBuf> {
+pub(crate) fn home_config_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(
         PathBuf::from(home)
@@ -340,46 +346,67 @@ fn home_config_path() -> Option<PathBuf> {
 }
 
 /// Parses `text` (from `path`, used only to name it in a warning) as a
-/// [`RawFile`], first scanning it for keys this module doesn't recognize
-/// (see [`warn_unknown_keys`]) and then deserializing normally — serde
-/// itself silently ignores unknown fields, which is right for *not
-/// crashing* but wrong for *not saying anything*, hence the separate scan.
-/// A file that fails to parse as TOML at all, or whose recognized fields
-/// have the wrong shape (e.g. `tab_width = "four"`), is reported the same
-/// way and treated as empty rather than propagated as an error — see
-/// [`load_merged`]'s docs on why a bad file degrades instead of failing the
-/// session.
+/// [`RawFile`], printing every warning [`parse_with_warnings`] collects
+/// (parse/deserialize failure, unknown keys) straight to stderr — the
+/// behavior every normal config load has always had. A thin wrapper now:
+/// see [`parse_with_warnings`] for the actual parsing/warning logic, split
+/// out so a caller that needs the warnings as *values* (`ktmr doctor`'s
+/// config section — see [`crate::doctor`]) can get them without this
+/// function's side effect.
 fn parse_and_warn(path: &Path, text: &str) -> RawFile {
+    let (raw, warnings) = parse_with_warnings(path, text);
+    for warning in &warnings {
+        eprintln!("katamari: warning: {warning}");
+    }
+    raw
+}
+
+/// As [`parse_and_warn`], minus the eprintln! side effect: returns every
+/// warning that call would have printed as plain strings instead, from
+/// every site this module can produce one — a bad TOML parse, a
+/// recognized-but-wrong-shaped field (`tab_width = "four"`), and each
+/// unknown key at every level this format has fixed keys for (see
+/// [`warn_unknown_keys`]). `ktmr doctor`'s config section (see
+/// [`crate::doctor`]) is the reason this exists at all: a session's normal
+/// stderr warnings are fine for a human watching the terminal, but a
+/// diagnostic report needs the same information as a value it can render or
+/// serialize, not a side effect it has no way to observe. Still degrades to
+/// an empty [`RawFile`] on any failure rather than propagating one, exactly
+/// like [`parse_and_warn`] — see [`load_merged`]'s docs on why a bad file
+/// degrades instead of failing the session.
+pub(crate) fn parse_with_warnings(path: &Path, text: &str) -> (RawFile, Vec<String>) {
+    let mut warnings = Vec::new();
     // `toml::Value: FromStr` parses a single value *literal* (e.g. `"42"`),
     // not a whole document — `toml::Table` is the document-level parser
     // (a TOML file's top level is always a table of key/value pairs).
     let table: toml::Table = match text.parse() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("katamari: warning: {}: {e}", path.display());
-            return RawFile::default();
+            warnings.push(format!("{}: {e}", path.display()));
+            return (RawFile::default(), warnings);
         }
     };
-    warn_unknown_keys(path, &table);
+    warn_unknown_keys(path, &table, &mut warnings);
     match table.try_into() {
-        Ok(raw) => raw,
+        Ok(raw) => (raw, warnings),
         Err(e) => {
-            eprintln!("katamari: warning: {}: {e}", path.display());
-            RawFile::default()
+            warnings.push(format!("{}: {e}", path.display()));
+            (RawFile::default(), warnings)
         }
     }
 }
 
-/// Prints one `katamari: warning: <path>: unknown config key '<dotted
-/// path>'` line per key this module has never heard of, at every level this
-/// config format has fixed keys for. `[keys]` is deliberately excluded: its
-/// keys are action names, i.e. data this module validates at
+/// Collects one `<path>: unknown config key '<dotted path>'` message per key
+/// this module has never heard of, at every level this config format has
+/// fixed keys for, into `warnings` rather than printing directly — see
+/// [`parse_with_warnings`]'s docs for why. `[keys]` is deliberately
+/// excluded: its keys are action names, i.e. data this module validates at
 /// [`apply_key_overrides`] time (against the live `Action` enum, with a
 /// clear per-entry error), not schema to check here.
-fn warn_unknown_keys(path: &Path, table: &toml::Table) {
-    warn_extra(path, "", table, TOP_LEVEL_KEYS);
+fn warn_unknown_keys(path: &Path, table: &toml::Table, warnings: &mut Vec<String>) {
+    warn_extra(path, "", table, TOP_LEVEL_KEYS, warnings);
     if let Some(lsp) = table.get("lsp").and_then(toml::Value::as_table) {
-        warn_extra(path, "lsp.", lsp, LSP_KEYS);
+        warn_extra(path, "lsp.", lsp, LSP_KEYS, warnings);
         if let Some(servers) = lsp.get("servers").and_then(toml::Value::as_table) {
             for (lang, server) in servers {
                 if let Some(server_table) = server.as_table() {
@@ -388,22 +415,23 @@ fn warn_unknown_keys(path: &Path, table: &toml::Table) {
                         &format!("lsp.servers.{lang}."),
                         server_table,
                         SERVER_KEYS,
+                        warnings,
                     );
                 }
             }
         }
     }
     if let Some(ui) = table.get("ui").and_then(toml::Value::as_table) {
-        warn_extra(path, "ui.", ui, UI_KEYS);
+        warn_extra(path, "ui.", ui, UI_KEYS, warnings);
     }
     if let Some(watch) = table.get("watch").and_then(toml::Value::as_table) {
-        warn_extra(path, "watch.", watch, WATCH_KEYS);
+        warn_extra(path, "watch.", watch, WATCH_KEYS, warnings);
     }
     if let Some(update) = table.get("update").and_then(toml::Value::as_table) {
-        warn_extra(path, "update.", update, UPDATE_KEYS);
+        warn_extra(path, "update.", update, UPDATE_KEYS, warnings);
     }
     if let Some(skill) = table.get("skill").and_then(toml::Value::as_table) {
-        warn_extra(path, "skill.", skill, SKILL_KEYS);
+        warn_extra(path, "skill.", skill, SKILL_KEYS, warnings);
     }
 }
 
@@ -412,13 +440,14 @@ fn warn_extra(
     prefix: &str,
     table: &toml::map::Map<String, toml::Value>,
     known: &[&str],
+    warnings: &mut Vec<String>,
 ) {
     for key in table.keys() {
         if !known.contains(&key.as_str()) {
-            eprintln!(
-                "katamari: warning: {}: unknown config key `{prefix}{key}`",
+            warnings.push(format!(
+                "{}: unknown config key `{prefix}{key}`",
                 path.display()
-            );
+            ));
         }
     }
 }
@@ -675,6 +704,60 @@ mod tests {
         write_repo_config(&repo, "this is not [ valid toml");
         let config = load_merged(&repo);
         assert_eq!(config, Config::default());
+    }
+
+    #[test]
+    fn parse_with_warnings_returns_no_warnings_for_a_clean_file() {
+        let path = PathBuf::from("/fake/config.toml");
+        let (raw, warnings) = parse_with_warnings(&path, "[ui]\ntab_width = 8\n");
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        assert_eq!(raw.ui.unwrap().tab_width, Some(8));
+    }
+
+    #[test]
+    fn parse_with_warnings_reports_a_toml_syntax_error_and_degrades_to_defaults() {
+        let path = PathBuf::from("/fake/config.toml");
+        let (raw, warnings) = parse_with_warnings(&path, "this is not [ valid toml");
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert!(warnings[0].contains("/fake/config.toml"));
+        assert!(
+            raw.ui.is_none(),
+            "a syntax error degrades to an empty RawFile"
+        );
+    }
+
+    #[test]
+    fn parse_with_warnings_reports_a_wrong_shaped_recognized_field() {
+        let path = PathBuf::from("/fake/config.toml");
+        let (raw, warnings) = parse_with_warnings(&path, "[ui]\ntab_width = \"four\"\n");
+        assert_eq!(warnings.len(), 1, "warnings: {warnings:?}");
+        assert!(
+            raw.ui.is_none(),
+            "a deserialize error degrades to an empty RawFile"
+        );
+    }
+
+    #[test]
+    fn parse_with_warnings_reports_each_unknown_key_at_every_nesting_level() {
+        let path = PathBuf::from("/fake/config.toml");
+        let (_, warnings) = parse_with_warnings(
+            &path,
+            "not_a_real_field = 42\n[ui]\ntab_width = 6\nnot_ui_either = 1\n",
+        );
+        assert_eq!(warnings.len(), 2, "warnings: {warnings:?}");
+        assert!(warnings.iter().any(|w| w.contains("not_a_real_field")));
+        assert!(warnings.iter().any(|w| w.contains("ui.not_ui_either")));
+    }
+
+    #[test]
+    fn parse_and_warn_still_prints_to_stderr_and_returns_the_same_raw_file() {
+        // `parse_and_warn` is now a thin wrapper over `parse_with_warnings`
+        // (see its docs) — this pins that the wrapping didn't change what a
+        // normal `load_merged` call actually parses, only where the
+        // warnings go.
+        let path = PathBuf::from("/fake/config.toml");
+        let raw = parse_and_warn(&path, "[ui]\ntab_width = 8\n");
+        assert_eq!(raw.ui.unwrap().tab_width, Some(8));
     }
 
     #[test]

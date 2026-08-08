@@ -487,10 +487,54 @@ rust-analyzer settings through `[lsp.servers.rust]`.
 needed:
 
 ```
-ktmr lsp doctor              # where each language's server resolves from today (no installs triggered)
+ktmr lsp doctor              # where each language's server resolves from today (no installs triggered) — see "Health check" below for the fuller report
 ktmr lsp install <language>  # force an install into katamari's managed prefix (rust/typescript/python/go/kotlin/java/all)
 ktmr lsp update              # reinstall any pinned server that's fallen behind the current pin
 ```
+
+## Health check
+
+`ktmr doctor` is a checkhealth-style report for when something isn't working
+and you can't tell whether it's katamari, the language server, or just a slow
+first index — the diagnostic surface issue #4 was filed over ("is the LSP
+server running as expected in my env?"):
+
+```
+ktmr doctor                    # full report: vcs, config, lsp resolution, lsp live probe
+ktmr doctor --no-live          # skip the live spawn-and-hover probe; static sections only
+ktmr doctor --language rust    # limit the live probe to one language or a [lsp.servers.<id>] id
+ktmr doctor --json             # machine-readable: {"sections": [{"title", "checks": [{"status", "label", "detail"}]}]}
+```
+
+Four sections, always in this order:
+
+- **vcs** — is `git` on `PATH` (with its version), is the current directory
+  actually inside a repository, and (only when one is detected) is it a
+  colocated jj repo, with the `jj` binary's version. Absent jj is not a
+  warning in a plain git repo.
+- **config** — for each of the two config files (`~/.config/katamari/config.toml`,
+  `<repo>/.katamari/config.toml`): missing (defaults apply), parsed clean, or
+  every parse/unknown-key warning a normal session would otherwise only
+  print to stderr.
+- **lsp (resolution)** — the same static, offline information `ktmr lsp
+  doctor` prints (above), folded in as checks: where each of the six
+  built-in languages' server resolves from today, plus every
+  `[lsp.servers.<id>]` custom entry.
+- **lsp (live probe)** — the reason this command exists: for every built-in
+  or custom language with at least one matching file in the repository
+  (tracked or untracked-and-not-ignored) *and* a static resolution, actually
+  spawns the real server (headless — no config/`--json`/TUI dependency) and
+  reports `spawn+initialize` and `hover round-trip` as separate, timed
+  checks — `ok "ready in 1.4s"`, or an actionable error naming what went
+  wrong (including the server's own stderr, where available). Never
+  installs anything, even with `[lsp] auto_install` on — a diagnostic
+  doesn't mutate your environment. A language present in the repo whose
+  server didn't resolve gets a `skipped` note instead of a probe attempt.
+  Probes run one at a time, with a progress line per language on stderr, so
+  a slow one (jdtls) doesn't look stuck.
+
+Exit code is `0` unless at least one check is `error` (warnings alone still
+exit `0`) — safe to wire into a script or CI step as a pass/fail gate.
 
 ## jj colocated setup
 

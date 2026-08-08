@@ -3,6 +3,49 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Splits `git ls-files -z`'s NUL-delimited stdout into `PathBuf`s without
+/// ever requiring the bytes to be valid UTF-8 — a legal filename on
+/// Linux/macOS can contain arbitrary non-UTF-8 bytes, and [`String::from_utf8`]
+/// over the *entire* buffer (the old approach) meant a single such filename
+/// anywhere in the repo made [`GitSource::tracked_files`]/
+/// [`GitSource::untracked_files`] fail outright — which
+/// [`crate::doctor::scan_repo_files`] then propagated as one report-wide
+/// error, aborting every per-language live-probe check regardless of how
+/// many other, perfectly healthy languages were also present. Decoding
+/// path-by-path instead means one bad name can never take down the rest of
+/// the scan: [`crate::lsp::adapter::LangKey::detect`] only ever needs
+/// [`Path::extension`], which stays available even when the rest of the
+/// path isn't valid Unicode.
+fn paths_from_nul_delimited(bytes: &[u8]) -> Vec<PathBuf> {
+    bytes
+        .split(|&b| b == 0)
+        .filter(|chunk| !chunk.is_empty())
+        .map(path_from_bytes)
+        .collect()
+}
+
+/// On Unix, [`std::ffi::OsStr`] is just an unvalidated byte string (no
+/// encoding requirement at all — the kernel treats a path as bytes, full
+/// stop), so this is lossless: the exact bytes git printed become the exact
+/// bytes in the resulting `PathBuf`, valid UTF-8 or not.
+#[cfg(unix)]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(OsStr::from_bytes(bytes))
+}
+
+/// Off Unix, [`std::ffi::OsStr`] *does* have an encoding (WTF-8, layered on
+/// UTF-16 paths), so an arbitrary byte slice can't be wrapped losslessly the
+/// way [`OsStrExt::from_bytes`] does on Unix. A lossy fallback is still
+/// strictly better than the old behavior: it can turn a handful of bytes
+/// into the Unicode replacement character instead of aborting the entire
+/// scan over one filename.
+#[cfg(not(unix))]
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
 /// Git's well-known empty-tree object hash. It is deterministic (it's just
 /// the SHA-1 of an empty tree object, the same in every git repository ever
 /// created — `git hash-object -t tree /dev/null` always reproduces it), so
@@ -142,7 +185,14 @@ impl GitSource {
     /// the output instead of the default newline-delimited, quoted-for-shell
     /// format, so filenames with unusual bytes (spaces, non-ASCII) come back
     /// exactly as they are on disk rather than octal-escaped.
-    fn untracked_files(&self) -> Result<Vec<PathBuf>> {
+    ///
+    /// `pub(crate)` (not just this file's own callers) so [`crate::doctor`]'s
+    /// extension scan can union this with [`Self::tracked_files`] — katamari
+    /// reviews untracked files too (that's the whole point of
+    /// [`Self::untracked_diff`]), so a language server health check that
+    /// only looked at tracked files would miss "new file, LSP silent," the
+    /// issue that motivated the doctor command in the first place.
+    pub(crate) fn untracked_files(&self) -> Result<Vec<PathBuf>> {
         let output = self
             .git_command()
             .args(["ls-files", "--others", "--exclude-standard", "-z"])
@@ -155,9 +205,27 @@ impl GitSource {
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        let raw =
-            String::from_utf8(output.stdout).context("git ls-files produced non-UTF-8 output")?;
-        Ok(raw.split_terminator('\0').map(PathBuf::from).collect())
+        Ok(paths_from_nul_delimited(&output.stdout))
+    }
+
+    /// Every path git considers tracked (`git ls-files --cached`), relative
+    /// to the repo root — the tracked half of [`crate::doctor`]'s extension
+    /// scan; [`Self::untracked_files`] is the other half. Same `-z`
+    /// NUL-delimited reasoning as that method.
+    pub(crate) fn tracked_files(&self) -> Result<Vec<PathBuf>> {
+        let output = self
+            .git_command()
+            .args(["ls-files", "--cached", "-z"])
+            .output()
+            .context("failed to run `git ls-files --cached`")?;
+
+        if !output.status.success() {
+            bail!(
+                "git ls-files --cached failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(paths_from_nul_delimited(&output.stdout))
     }
 
     /// A single untracked file's content as an all-add pseudo-diff, by
@@ -473,6 +541,111 @@ mod tests {
         let diff = source.working_tree_diff().unwrap();
 
         assert!(!diff.contains("ignored.txt"), "diff:\n{diff}");
+    }
+
+    #[test]
+    fn tracked_files_and_untracked_files_partition_the_working_tree() {
+        // `crate::doctor`'s extension scan unions these two — pinning that
+        // they're actually disjoint (a staged-but-uncommitted file is
+        // "tracked" the moment it's added, not still "untracked") is what
+        // keeps that union from double-counting a file.
+        let dir = init_repo();
+        std::fs::write(dir.path().join("committed.txt"), "a\n").unwrap();
+        git(dir.path(), &["add", "committed.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "init"]);
+
+        std::fs::write(dir.path().join("staged_new.txt"), "b\n").unwrap();
+        git(dir.path(), &["add", "staged_new.txt"]);
+        std::fs::write(dir.path().join("untracked.txt"), "c\n").unwrap();
+
+        let source = GitSource::discover(dir.path()).unwrap();
+        let tracked = source.tracked_files().unwrap();
+        let untracked = source.untracked_files().unwrap();
+
+        assert!(
+            tracked.contains(&PathBuf::from("committed.txt")),
+            "{tracked:?}"
+        );
+        assert!(
+            tracked.contains(&PathBuf::from("staged_new.txt")),
+            "{tracked:?}"
+        );
+        assert!(
+            !tracked.contains(&PathBuf::from("untracked.txt")),
+            "{tracked:?}"
+        );
+
+        assert_eq!(untracked, vec![PathBuf::from("untracked.txt")]);
+    }
+
+    /// A filename byte sequence that's legal on a Unix filesystem (no `/`
+    /// or NUL) but not valid UTF-8 — `0xff` can never start a valid UTF-8
+    /// sequence, so `String::from_utf8` over anything containing it always
+    /// fails.
+    #[cfg(unix)]
+    fn non_utf8_name() -> &'static std::ffi::OsStr {
+        use std::os::unix::ffi::OsStrExt;
+        std::ffi::OsStr::from_bytes(b"\xffbad.txt")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untracked_files_decodes_a_non_utf8_filename_instead_of_erroring() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = init_repo();
+        git(dir.path(), &["commit", "-q", "-m", "init", "--allow-empty"]);
+        std::fs::write(dir.path().join(non_utf8_name()), "hello\n").unwrap();
+
+        let source = GitSource::discover(dir.path()).unwrap();
+        let files = source.untracked_files().unwrap();
+
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].as_os_str().as_bytes(), non_utf8_name().as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tracked_files_decodes_a_non_utf8_filename_instead_of_erroring() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = init_repo();
+        std::fs::write(dir.path().join(non_utf8_name()), "hello\n").unwrap();
+        let status = Command::new("git")
+            .current_dir(dir.path())
+            .arg("add")
+            .arg("--")
+            .arg(non_utf8_name())
+            .status()
+            .expect("git must be on PATH for these tests");
+        assert!(status.success());
+        git(dir.path(), &["commit", "-q", "-m", "add non-utf8 file"]);
+
+        let source = GitSource::discover(dir.path()).unwrap();
+        let files = source.tracked_files().unwrap();
+
+        assert!(
+            files
+                .iter()
+                .any(|f| f.as_os_str().as_bytes() == non_utf8_name().as_bytes()),
+            "{files:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_filename_does_not_abort_the_rest_of_the_untracked_scan() {
+        // Regression for the doctor live-probe bug this was pulled out to
+        // fix: one bad filename must not make `untracked_files` return
+        // `Err`, taking every other, perfectly fine file down with it.
+        let dir = init_repo();
+        git(dir.path(), &["commit", "-q", "-m", "init", "--allow-empty"]);
+        std::fs::write(dir.path().join("good.txt"), "a\n").unwrap();
+        std::fs::write(dir.path().join(non_utf8_name()), "b\n").unwrap();
+
+        let source = GitSource::discover(dir.path()).unwrap();
+        let files = source.untracked_files().unwrap();
+
+        assert!(files.contains(&PathBuf::from("good.txt")), "{files:?}");
+        assert_eq!(files.len(), 2, "{files:?}");
     }
 
     #[test]

@@ -559,7 +559,15 @@ fn event_loop(
     let mut lsp_status: Option<String> = startup_status;
     let mut goto_status: Option<String> = None;
     let mut watch_status: Option<WatchStatus> = initial_watch_status.map(WatchStatus::new);
-    let mut warned_languages: HashSet<LangKey> = HashSet::new();
+    // Keyed by `(LangKey, workspace_root)` — a full server *instance*, not
+    // just a language — so two independently-rooted servers of the same
+    // language (e.g. two unrelated Cargo workspaces reviewed in one
+    // session) each get their own one-time warning instead of the second
+    // one's crash going silently unreported because the first one already
+    // consumed the language-wide slot. See the `Unavailable`/`Crashed` arms
+    // below and `LspManager::server_identity`'s docs for why a `LangKey`-only
+    // key would be wrong.
+    let mut warned_servers: HashSet<(LangKey, PathBuf)> = HashSet::new();
     let mut compose: Option<ComposeState> = None;
     let mut scope_menu: Option<ScopeMenuState> = None;
     let mut help: Option<HelpState> = None;
@@ -687,13 +695,32 @@ fn event_loop(
         // messages already read like a status-bar hint — "LSP: typescript
         // ✕ — npm i -g …" — so repeating it every frame would add nothing).
         if let Some(query) = stack.top().hover_query()
-            && let Some(language) = lsp_manager.detect(&query.file)
+            && let Some(server_key) = lsp_manager.server_identity(&query.file, &query.git_root)
         {
             match lsp_manager.state(&query.file, &query.git_root) {
                 ServerState::Installing { message } => lsp_status = Some(message),
-                ServerState::Unavailable { reason } if !warned_languages.contains(&language) => {
+                ServerState::Unavailable { reason } if !warned_servers.contains(&server_key) => {
                     lsp_status = Some(reason);
-                    warned_languages.insert(language);
+                    warned_servers.insert(server_key);
+                }
+                // A server that crashed mid-session is at least as worth
+                // surfacing as one that was never available in the first
+                // place — before this arm, `Crashed` fell through to the
+                // wildcard below and a reviewer had no in-session signal at
+                // all that go-to-definition/hover had gone silent (see
+                // issue #4's motivating report). Same once-per-server-instance
+                // dedup as `Unavailable`, and deliberately reusing the very
+                // same `warned_servers` set rather than a second one: a
+                // server this session already warned about as `Unavailable`
+                // and a later `Crashed` for that *same instance* are both
+                // "stop repeating this," not two independent budgets. Keyed
+                // by the full `(LangKey, workspace_root)` identity, not just
+                // the language, so this doesn't also collapse two distinct
+                // server instances of the same language into one budget —
+                // see `warned_servers`' docs above.
+                ServerState::Crashed { reason } if !warned_servers.contains(&server_key) => {
+                    lsp_status = Some(reason);
+                    warned_servers.insert(server_key);
                 }
                 _ => {}
             }
