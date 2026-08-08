@@ -9,7 +9,8 @@ back and address — all without leaving the terminal.
 
 - **LSP inside the diff** — hover, go-to-definition, find-references, and
   live diagnostics on changed lines (Rust / TypeScript / Python / Go /
-  Kotlin / Java; servers auto-install on first use)
+  Kotlin / Java; servers auto-install on first use; `[lsp.servers.<id>]`
+  wires up a custom server for any other filetype)
 - **Watch mode** — the diff refreshes as an agent's edits land on disk
 - **Any unit of change** — working tree, staged, one commit, a range, a jj
   change or revset; browse and pick from `ktmr log`, or switch mid-session
@@ -18,6 +19,12 @@ back and address — all without leaving the terminal.
   not just the final state
 - **Comment round-trip** — leave comments in the TUI, an agent reads and
   resolves them via `ktmr comments`
+- **Find your way around** — `/` searches the diff vim-style (`n`/`N`),
+  `z o` unfolds the unchanged context git omitted around hunks, and `?`
+  opens a filterable help window showing every live binding
+- **`ktmr doctor`** — a checkhealth-style report answering "is the LSP
+  actually working in my environment," down to a live spawn-and-hover
+  probe of every server
 - **Your keybindings** — vim (default) and emacs presets, every action
   remappable; monorepo-aware workspace roots
 
@@ -389,7 +396,7 @@ check = true
 [skill]
 # Whether saving your first comment in a repo without the full katamari
 # review harness installed (skill + AGENTS.md + CLAUDE.md) offers to
-# install it (see "Comments" above). Default true; false turns off the
+# install it (see "Quickstart" above). Default true; false turns off the
 # offer entirely. `ktmr skill install` always keeps working as an explicit
 # command either way.
 offer_install = true

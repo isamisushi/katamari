@@ -76,7 +76,7 @@ const AGENTS_MD_END: &str = "<!-- katamari:end -->";
 const AGENTS_MD_SECTION: &str = "<!-- katamari:begin -->
 ## Reviewing with katamari
 
-This repo is reviewed with [katamari](https://github.com/) (`ktmr`), a
+This repo is reviewed with [katamari](https://github.com/isamisushi/katamari) (`ktmr`), a
 terminal diff-review tool. A human reviewer leaves comments anchored to
 file/line positions, stored in `.katamari/comments.jsonl`. When asked to
 address review feedback:

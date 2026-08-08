@@ -9,12 +9,13 @@ section below for that.
 
 `cargo` is not on `PATH` in this environment; every command goes through
 mise: `mise exec -- cargo <args>` (or `mise run <task>` for the tasks in
-`mise.toml`: `build`, `test`, `lint`, `fmt`, `e2e`, `e2e-tmux`).
+`mise.toml`: `build`, `test`,
+`lint`, `fmt`, `e2e`, `e2e-tmux`, `release-check`, `release-check-full`).
 
 Three gates must stay green before any change is done:
 
 ```
-mise exec -- cargo test                                    # 487+ unit tests
+mise exec -- cargo test                                    # 745+ unit tests
 mise exec -- cargo clippy --all-targets -- -D warnings      # includes tests/
 mise exec -- cargo fmt --check
 ```
@@ -47,6 +48,9 @@ mise exec -- cargo fmt --check
   between display columns, UTF-8 byte offsets, and UTF-16 code units
   (what LSP wants), grapheme-cluster aware. Most cursor/highlight/wrap bugs
   trace back to something in this file.
+- `src/doctor.rs` — `ktmr doctor`'s checkhealth-style report: static
+  vcs/config/lsp-resolution sections plus a live spawn-and-hover probe per
+  language, reusing `src/lsp/`'s resolution and spawn paths headlessly.
 
 ## Style
 
@@ -84,7 +88,7 @@ iterating. A FAIL blocks the release; don't ship past one.
 <!-- katamari:begin -->
 ## Reviewing with katamari
 
-This repo is reviewed with [katamari](https://github.com/) (`ktmr`), a
+This repo is reviewed with [katamari](https://github.com/isamisushi/katamari) (`ktmr`), a
 terminal diff-review tool. A human reviewer leaves comments anchored to
 file/line positions, stored in `.katamari/comments.jsonl`. When asked to
 address review feedback:
