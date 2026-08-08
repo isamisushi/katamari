@@ -195,7 +195,26 @@ print_summary() {
 
 # --- sandbox: pristine by construction ------------------------------------
 
-SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/katamari-release-check.XXXXXX")"
+# The sandbox holds real language-server installs — a --full run peaks past
+# 2GB (bootstrapped Node, jdtls, a compiled gopls, and kotlin-lsp's ~1GB
+# extraction) — so it must live on a disk-backed filesystem. /tmp (and
+# TMPDIR) is tmpfs on most modern Linux, where a full run dies mid-extract
+# with a misleading "failed to unpack <some jar>" once the RAM-backed fs
+# fills; /var/tmp is the FHS-designated disk-backed temp. Deliberately NOT
+# honoring TMPDIR here for that reason — override with RELEASE_CHECK_TMPDIR
+# if /var/tmp is unsuitable.
+SANDBOX_PARENT="${RELEASE_CHECK_TMPDIR:-/var/tmp}"
+SANDBOX="$(mktemp -d "$SANDBOX_PARENT/katamari-release-check.XXXXXX")"
+avail_kb="$(df -Pk "$SANDBOX" | awk 'NR==2 {print $4}')"
+need_kb=$((1024 * 1024)) # 1GB for the default language set
+if [[ "$FULL" -eq 1 ]]; then
+    need_kb=$((4 * 1024 * 1024)) # 4GB headroom for --full's server payloads
+fi
+if [[ -n "$avail_kb" && "$avail_kb" -lt "$need_kb" ]]; then
+    echo "release-check: warning: only $((avail_kb / 1024))MB free under $SANDBOX_PARENT" \
+        "(want $((need_kb / 1024))MB) — a mid-extraction unpack failure likely means disk," \
+        "not a bad archive; set RELEASE_CHECK_TMPDIR to a roomier filesystem" >&2
+fi
 SANDBOX_HOME="$SANDBOX/home"
 SANDBOX_CONFIG="$SANDBOX/home/config"
 SANDBOX_DATA="$SANDBOX/home/data"
