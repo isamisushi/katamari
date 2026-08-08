@@ -513,6 +513,13 @@ fn run_diff(
     let mut app = App::new(repo_name, repo_root, files);
     app.layout = layout.into();
     app.interactive = interactive;
+    // The only one of this function's scopes whose new side is genuinely
+    // the live working tree — `--staged`'s is the index, a git range/
+    // revision or a jj revision/range is historical content (see
+    // `App::disk_is_new_side`'s docs for why `interactive` alone isn't the
+    // right gate: it's `true` for `--staged` too).
+    app.disk_is_new_side =
+        !staged && range.is_none() && revision.is_none() && from.is_none() && to.is_none();
     app.scope_label = scope_label;
 
     if let Some(frames) = bench_render {
@@ -1729,6 +1736,13 @@ fn format_render_row(files: &[DiffFile], row: RenderRow) -> String {
             hunk_idx,
             row_idx,
         } => format_line_row(&files[file_idx].hunks[hunk_idx].rows[row_idx]),
+        RenderRow::Gap { file_idx, gap_idx } => {
+            let gaps = diff::file_gaps(&files[file_idx]);
+            match gaps.get(gap_idx).and_then(diff::Gap::line_count) {
+                Some(n) => format!("  GAP {n} unchanged\n"),
+                None => "  GAP unchanged (to EOF)\n".to_owned(),
+            }
+        }
     }
 }
 
@@ -1905,4 +1919,62 @@ fn format_comment_marker(annotation: &CommentAnnotation) -> String {
     };
     let first_line = annotation.body.lines().next().unwrap_or("");
     format!("      COMMENT {} [{status}] {first_line}\n", annotation.id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two hunks far enough apart to leave both a known-size gap between
+    /// them and an unknown-size one after the last hunk — `ktmr diff
+    /// --dump`'s one existing shape check for every other `RenderRow`
+    /// variant, extended here to the `Gap` arm.
+    const GAP_FIXTURE: &str = "diff --git a/f.txt b/f.txt\n\
+index 1111111..2222222 100644\n\
+--- a/f.txt\n\
++++ b/f.txt\n\
+@@ -1,3 +1,3 @@\n\
+ one\n\
+ two\n\
+ three\n\
+@@ -10,3 +10,3 @@\n\
+ ten\n\
+ eleven\n\
+-twelve\n\
++twelve changed\n";
+
+    #[test]
+    fn format_render_row_reports_the_known_line_count_for_a_between_hunks_gap() {
+        let files = parse_unified_diff(GAP_FIXTURE);
+        let rows = flatten(&files);
+        let gap = rows
+            .iter()
+            .find(|r| matches!(r, RenderRow::Gap { gap_idx: 0, .. }))
+            .copied()
+            .expect("a between-hunks gap exists");
+        assert_eq!(format_render_row(&files, gap), "  GAP 6 unchanged\n");
+    }
+
+    #[test]
+    fn format_render_row_reports_no_count_for_an_unbounded_trailing_gap() {
+        let files = parse_unified_diff(GAP_FIXTURE);
+        let rows = flatten(&files);
+        let gap = rows
+            .iter()
+            .find(|r| matches!(r, RenderRow::Gap { gap_idx: 1, .. }))
+            .copied()
+            .expect("a trailing gap exists");
+        assert_eq!(format_render_row(&files, gap), "  GAP unchanged (to EOF)\n");
+    }
+
+    #[test]
+    fn format_dump_includes_gap_lines_alongside_every_other_row_kind() {
+        let files = parse_unified_diff(GAP_FIXTURE);
+        let comments = CommentIndex::default();
+        let dump = format_dump(&files, &comments);
+        assert!(dump.contains("GAP 6 unchanged"), "dump:\n{dump}");
+        assert!(dump.contains("GAP unchanged (to EOF)"), "dump:\n{dump}");
+        assert!(dump.contains("FILE f.txt"), "dump:\n{dump}");
+        assert!(dump.contains("HUNK"), "dump:\n{dump}");
+    }
 }

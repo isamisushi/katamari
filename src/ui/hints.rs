@@ -213,6 +213,7 @@ pub fn diff_view_items(keymap: &Keymap) -> Vec<HintItem> {
             "half-page",
         ),
         HintItem::for_actions(keymap, &[Action::NextHunk, Action::PrevHunk], "hunk"),
+        HintItem::for_actions(keymap, &[Action::ExpandFold, Action::CollapseFold], "fold"),
         HintItem::for_actions(keymap, &[Action::NextFile, Action::PrevFile], "file"),
         HintItem::for_actions(keymap, &[Action::Hover], "hover"),
         HintItem::for_actions(
@@ -490,6 +491,30 @@ mod tests {
         assert_eq!(def.display(), "M-. def");
         let refs = items.iter().find(|i| i.label == "refs").unwrap();
         assert_eq!(refs.display(), "M-? refs");
+    }
+
+    /// `diff_view_items` was already close to filling [`MAX_HINT_LINES`] at
+    /// a realistic 100-column pane before the fold hint existed — this
+    /// pins down that adding it didn't quietly push a lower-priority item
+    /// (here, `quit`, the last-listed and therefore first-dropped one per
+    /// [`wrap_items`]'s policy) off the status bar entirely.
+    #[test]
+    fn fold_hint_does_not_push_quit_off_the_status_bar_at_a_realistic_width() {
+        let keymap = Keymap::from_bindings(&vim_preset(false));
+        let items = diff_view_items(&keymap);
+        assert!(
+            items.iter().any(|i| i.display().starts_with("zo/zc")),
+            "the fold hint should be present in the curated list"
+        );
+        let wrapped = wrap_for_area(&items, 100);
+        assert!(
+            wrapped.len() <= MAX_HINT_LINES,
+            "must still fit within the hint area's line cap"
+        );
+        assert!(
+            wrapped.iter().any(|line| line.contains("quit")),
+            "quit must still survive at a realistic width; wrapped:\n{wrapped:?}"
+        );
     }
 
     #[test]

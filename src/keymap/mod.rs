@@ -123,6 +123,20 @@ pub enum Action {
     /// Unlike `AddComment`, this *is* a pure state flip handled inside
     /// `App::update`, mirroring `ToggleSidebar`.
     ToggleComments,
+    /// Expands the gap a `RenderRow::Gap` fold row stands for into ordinary
+    /// context rows — vimdiff's `zo`. `ui::mod`'s event loop intercepts
+    /// this rather than forwarding it through `App::update` (mirroring
+    /// `AddComment`'s reasoning): it needs to read the live file off disk,
+    /// which is I/O `App` doesn't own. A no-op outside
+    /// [`crate::ui::view::View::Diff`], off a `Gap` row, or when the diff's
+    /// new side isn't the working tree (see `App::disk_is_new_side`).
+    ExpandFold,
+    /// Folds an expanded gap back into its `RenderRow::Gap` row — vimdiff's
+    /// `zc`. Unlike `ExpandFold` this needs no I/O (the expanded rows are
+    /// already in memory), but stays intercepted by `ui::mod` alongside it
+    /// for the same `View::Diff`-only gating and so both fold actions read
+    /// as one pair rather than one pure and one not.
+    CollapseFold,
     Quit,
 }
 
@@ -467,6 +481,8 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("v", Action::ToggleRangeSelect),
         ("c", Action::AddComment),
         ("C", Action::ToggleComments),
+        ("z o", Action::ExpandFold),
+        ("z c", Action::CollapseFold),
         ("q", Action::Quit),
     ]);
     bindings
@@ -534,6 +550,12 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("C-Space", Action::ToggleRangeSelect),
         ("C-c C-c", Action::AddComment),
         ("C", Action::ToggleComments),
+        // No strong emacs convention for fold expand/collapse, so this
+        // reuses vim's `zo`/`zc` verbatim (matching outline-mode's own
+        // `z`-prefixed `hide-*`/`show-*` fold commands isn't close enough a
+        // fit to be worth a different binding here).
+        ("z o", Action::ExpandFold),
+        ("z c", Action::CollapseFold),
         ("q", Action::Quit),
     ]);
     bindings
@@ -587,6 +609,8 @@ pub fn action_name(action: Action) -> &'static str {
         Action::OpenScopeMenu => "open-scope-menu",
         Action::AddComment => "add-comment",
         Action::ToggleComments => "toggle-comments",
+        Action::ExpandFold => "expand-fold",
+        Action::CollapseFold => "collapse-fold",
         Action::Quit => "quit",
     }
 }
@@ -626,6 +650,8 @@ pub fn action_by_name(name: &str) -> Option<Action> {
         "open-scope-menu" => Action::OpenScopeMenu,
         "add-comment" => Action::AddComment,
         "toggle-comments" => Action::ToggleComments,
+        "expand-fold" => Action::ExpandFold,
+        "collapse-fold" => Action::CollapseFold,
         "quit" => Action::Quit,
         _ => return None,
     })
@@ -744,6 +770,24 @@ mod tests {
             emacs.feed(shifted_l),
             StepResult::Matched(Action::ToggleLogView)
         );
+    }
+
+    #[test]
+    fn z_o_and_z_c_resolve_to_expand_and_collapse_fold_in_both_presets() {
+        for preset in [vim_preset(false), emacs_preset(false)] {
+            let keymap = Keymap::from_bindings(&preset);
+            let mut resolver = keymap.resolver();
+            assert_eq!(resolver.feed(chord('z')), StepResult::Pending);
+            assert_eq!(
+                resolver.feed(chord('o')),
+                StepResult::Matched(Action::ExpandFold)
+            );
+            assert_eq!(resolver.feed(chord('z')), StepResult::Pending);
+            assert_eq!(
+                resolver.feed(chord('c')),
+                StepResult::Matched(Action::CollapseFold)
+            );
+        }
     }
 
     #[test]
@@ -879,6 +923,8 @@ mod tests {
             Action::OpenScopeMenu,
             Action::AddComment,
             Action::ToggleComments,
+            Action::ExpandFold,
+            Action::CollapseFold,
             Action::Quit,
         ];
         for action in all {
@@ -975,17 +1021,17 @@ mod tests {
         assert_eq!(KeySeq::parse("q").compact_notation(), "q");
     }
 
-    /// The 30 actions (see the `action_name_and_action_by_name_round_trip…`
+    /// The 32 actions (see the `action_name_and_action_by_name_round_trip…`
     /// test's `all` list) each get exactly one binding — except
     /// `JumpForward`, which gets a *second* one (`C-i`) precisely when
     /// `ci_distinguishable` is set, per [`vim_preset`]/[`emacs_preset`]'s
     /// docs. So this checks two things per preset: every action is still
-    /// reachable (`actions.len() == 30` after dedup), and the raw entry
+    /// reachable (`actions.len() == 32` after dedup), and the raw entry
     /// count is exactly one more than that when the extra `C-i` alias is
     /// present, exactly equal otherwise.
     #[test]
     fn every_vim_and_emacs_binding_covers_every_action_exactly_once() {
-        const ACTION_COUNT: usize = 30;
+        const ACTION_COUNT: usize = 32;
         for ci_distinguishable in [false, true] {
             for preset in [
                 vim_preset(ci_distinguishable),

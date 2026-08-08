@@ -140,12 +140,19 @@ fn row_file_idx(row: RenderRow) -> usize {
         RenderRow::FileHeader { file_idx }
         | RenderRow::BinaryNotice { file_idx }
         | RenderRow::HunkHeader { file_idx, .. }
-        | RenderRow::Line { file_idx, .. } => file_idx,
+        | RenderRow::Line { file_idx, .. }
+        | RenderRow::Gap { file_idx, .. } => file_idx,
     }
 }
 
-/// `(new_line, text)` for a `Line` row, `(None, None)` for anything else —
-/// only `Line` rows have either.
+/// `(new_line, text)` for a `Line` row, `(None, None)` for a header/binary
+/// notice — but a synthetic `(Some(gap's starting new-side line), Some(""))`
+/// for a `Gap` row rather than the same `(None, None)` a header gets: a gap
+/// has a real new-side line number even though it has no text of its own,
+/// and reporting it here is what lets [`restore_anchor`] fall through to
+/// its nearest-line tier for a refresh whose cursor sat on a fold row,
+/// instead of degrading all the way to "jump to the file header" the way a
+/// `(None, None)` anchor would.
 fn row_line_and_text(files: &[DiffFile], row: RenderRow) -> (Option<u32>, Option<&str>) {
     match row {
         RenderRow::Line {
@@ -156,11 +163,32 @@ fn row_line_and_text(files: &[DiffFile], row: RenderRow) -> (Option<u32>, Option
             let r = &files[file_idx].hunks[hunk_idx].rows[row_idx];
             (r.new_line, Some(r.text.as_str()))
         }
-        _ => (None, None),
+        RenderRow::Gap { file_idx, gap_idx } => {
+            let gap = crate::diff::file_gaps(&files[file_idx])
+                .into_iter()
+                .nth(gap_idx);
+            match gap {
+                Some(gap) => (Some(gap.new_start), Some("")),
+                None => (None, None),
+            }
+        }
+        RenderRow::FileHeader { .. }
+        | RenderRow::BinaryNotice { .. }
+        | RenderRow::HunkHeader { .. } => (None, None),
     }
 }
 
-fn find_exact_line(files: &[DiffFile], rows: &[RenderRow], file: &str, line: u32) -> Option<usize> {
+/// `pub(crate)` (not just private) because [`crate::ui::app::App::collapse_fold_at_cursor`]
+/// needs this exact "flat row whose `(file, new_line)` matches" search too
+/// — sharing it there means a future fix here (e.g. around renamed files or
+/// duplicate display paths) reaches both callers instead of only this
+/// module's own [`restore_anchor`].
+pub(crate) fn find_exact_line(
+    files: &[DiffFile],
+    rows: &[RenderRow],
+    file: &str,
+    line: u32,
+) -> Option<usize> {
     rows.iter().position(|&row| {
         files[row_file_idx(row)].display_path() == file
             && row_line_and_text(files, row).0 == Some(line)
@@ -253,6 +281,10 @@ mod tests {
                 new_start: 1,
                 new_lines: lines.len() as u32,
                 header: String::new(),
+                // These tests are about anchor preservation, not fold
+                // rows — no trailing gap, so every row `flatten` produces
+                // is one of `lines`.
+                known_eof: true,
                 rows,
             }],
             ..Default::default()
@@ -327,6 +359,9 @@ mod tests {
             new_start: 10,
             new_lines: 2,
             header: String::new(),
+            // Also not testing fold rows — no trailing gap on this now-last
+            // hunk either.
+            known_eof: true,
             rows: vec![
                 DiffRow {
                     kind: DiffLineKind::Context,

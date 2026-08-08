@@ -40,7 +40,7 @@ pub use view::{View, ViewStack};
 
 use crate::comments::{self, Comment, CommentIndex, CommentStore};
 use crate::config::{self, Config};
-use crate::diff::parse_unified_diff;
+use crate::diff::{RenderRow, parse_unified_diff};
 use crate::highlight::LineHighlighter;
 use crate::keymap::{Action, KeyChord, Keymap, Resolver, StepResult, emacs_preset, vim_preset};
 use crate::lsp::adapter::LangKey;
@@ -1068,6 +1068,41 @@ fn save_comment(repo_root: &Path, state: &ComposeState) -> std::result::Result<C
     Ok(comment)
 }
 
+/// `z o`'s fallible half: reads the gap's file fresh off disk and hands the
+/// content to [`App::expand_gap`], mapping every way that can fail into the
+/// same status-bar string [`save_comment`] does for comments — a gating
+/// check, a missing path, and a read error, each `?`'d/`ok_or_else`'d in a
+/// flat line rather than nested inline in `handle_action`'s `ExpandFold`
+/// arm the way this used to be (six levels of `match`/`if` deep, in the
+/// same function `save_comment`/`finish_compose` already show the
+/// alternative for). [`App::expand_gap`]'s own three-way [`app::ExpandOutcome`]
+/// is passed through as `Ok` unchanged — only *this* function's own
+/// disk-access failures become `Err`.
+fn try_expand_fold(
+    app: &mut App,
+    file_idx: usize,
+    gap_idx: usize,
+) -> std::result::Result<app::ExpandOutcome, String> {
+    if !app.disk_is_new_side {
+        return Err("fold: expanding needs a working-tree diff".to_owned());
+    }
+    let display = app.files[file_idx].display_path().to_owned();
+    // A deleted file has no new side to read and never has gaps in the
+    // first place (see `file_gaps`), so this is defensive, not reachable
+    // in practice.
+    let rel = app.files[file_idx]
+        .new_path
+        .clone()
+        .ok_or_else(|| format!("fold: can't read {display}"))?;
+    let content = std::fs::read_to_string(app.repo_root.join(&rel))
+        .map_err(|_| format!("fold: can't read {display}"))?;
+    // Must match the parser's own split convention — see
+    // `parse_unified_diff` — or a CRLF file's boundary rows would never
+    // validate.
+    let lines: Vec<&str> = content.lines().collect();
+    Ok(app.expand_gap(file_idx, gap_idx, &lines))
+}
+
 /// Applies one matched [`Action`], handling every concern the pure
 /// `App`/`FileView::update` methods can't: issuing LSP requests
 /// (`Hover`/`GotoDefinition`/`FindReferences`), navigating on their
@@ -1253,6 +1288,37 @@ fn handle_action(
             },
             View::File(_) | View::Timeline(_) | View::Log(_) => {
                 *goto_status = Some("comment: only available in the diff view".to_owned());
+            }
+        },
+        Action::ExpandFold => match stack.top_mut() {
+            View::Diff(app) => match app.rows.get(app.cursor) {
+                Some(RenderRow::Gap { file_idx, gap_idx }) => {
+                    let (file_idx, gap_idx) = (*file_idx, *gap_idx);
+                    *goto_status = match try_expand_fold(app, file_idx, gap_idx) {
+                        Ok(app::ExpandOutcome::Revealed) => None,
+                        Ok(app::ExpandOutcome::ProbedEmpty) => {
+                            Some("fold: already at end of file".to_owned())
+                        }
+                        Ok(app::ExpandOutcome::Rejected) => {
+                            Some("fold: diff is stale here".to_owned())
+                        }
+                        Err(e) => Some(e),
+                    };
+                }
+                _ => *goto_status = Some("fold: nothing to expand here".to_owned()),
+            },
+            View::File(_) | View::Timeline(_) | View::Log(_) => {
+                *goto_status = Some("fold: only available in the diff view".to_owned());
+            }
+        },
+        Action::CollapseFold => match stack.top_mut() {
+            View::Diff(app) => {
+                if !app.collapse_fold_at_cursor() {
+                    *goto_status = Some("fold: nothing to collapse here".to_owned());
+                }
+            }
+            View::File(_) | View::Timeline(_) | View::Log(_) => {
+                *goto_status = Some("fold: only available in the diff view".to_owned());
             }
         },
         Action::NextDiagnostic | Action::PrevDiagnostic => {
@@ -1474,7 +1540,17 @@ fn apply_scope_swap(
             }
         };
     let text = result.map_err(|e| e.to_string())?;
-    app.apply_scope_swap(parse_unified_diff(&text), interactive, scope_label);
+    // Only `WorkingTree`'s new side is genuinely the live working tree —
+    // `Staged`'s is the index, and `Revision`'s is historical (see
+    // `App::disk_is_new_side`'s docs for why this can't just reuse
+    // `interactive`, which is `true` for `Staged` too).
+    let disk_is_new_side = matches!(choice, ScopeChoice::WorkingTree);
+    app.apply_scope_swap(
+        parse_unified_diff(&text),
+        interactive,
+        disk_is_new_side,
+        scope_label,
+    );
 
     hover_state.invalidate();
     *refs_panel = None;

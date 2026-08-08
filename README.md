@@ -116,6 +116,16 @@ servers spawn lazily, the first time something asks, and auto-install
 themselves if missing — see [Language servers](#language-servers) if a
 feature reports a server as unavailable.
 
+Wherever git omits unchanged context — between two hunks, before the first
+one, or after the last — a dim fold row shows `··· N unchanged lines ···`
+(vimdiff's own convention). `zo` with the cursor on it expands the whole gap
+in place as ordinary lines, `zc` folds it back; comments, hover, and
+diagnostics work on the unfolded lines exactly like any other row.
+Expanding reads the file straight off disk, so it's only available on a
+diff whose new side is the live working tree (a plain `ktmr diff`) — fold
+rows still show everywhere else (staged, a revision diff, `ktmr log`), `zo`
+there just explains why it can't expand.
+
 Leave a review comment on the current line with `c`, then `C-s` to save.
 An AI coding agent addresses them with:
 
@@ -210,6 +220,7 @@ below) for the emacs column. `q` quits either way.
 | Half page down / up | `C-d` / `C-u` | `C-v` / `M-v` |
 | Top / bottom | `gg` / `G` | `M-<` / `M->` |
 | Next / prev hunk | `]c` / `[c` | `M-n` / `M-p` |
+| Expand / collapse fold | `zo` / `zc` | `zo` / `zc` |
 | Next / prev file | `]f` / `[f` | `C-x n` / `C-x p` |
 | Next / prev diagnostic | `]d` / `[d` | `M-g M-n` / `M-g M-p` |
 | Hover | `K` | `C-h` |

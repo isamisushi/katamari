@@ -329,6 +329,10 @@ mod tests {
                 new_start: 1,
                 new_lines: 1,
                 header: String::new(),
+                // Not testing fold rows here — pin this fixture to the
+                // pre-fold-feature shape (no trailing gap) so this test
+                // stays about wrapping/hover, not gap arithmetic.
+                known_eof: true,
                 rows: vec![DiffRow {
                     kind: DiffLineKind::Context,
                     text: line.clone(),

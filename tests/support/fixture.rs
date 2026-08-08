@@ -173,3 +173,29 @@ pub fn long_line_repo(wrap: bool) -> FixtureRepo {
 
     FixtureRepo { dir }
 }
+
+/// A repo whose working-tree edit touches two lines far apart in one
+/// 40-line file (line 3 and line 35) — far enough apart that git's default
+/// 3-line unified context leaves a real, non-adjacent gap between the two
+/// resulting hunks. `GAPMARKER_UNIQUE_TEXT` sits at line 20, squarely
+/// inside that gap and nowhere else in the fixture, so its (dis)appearance
+/// on screen is an unambiguous witness for whether the fold row is
+/// expanded or collapsed. The Issue #2 fold E2E test (`tests/e2e/fold.rs`)
+/// is the one thing that cares about this exact shape — see that file for
+/// the row-layout arithmetic it depends on.
+pub fn fold_gap_repo() -> FixtureRepo {
+    let dir = init_repo();
+    let root = dir.path();
+
+    let mut lines: Vec<String> = (1..=40).map(|n| format!("line {n}")).collect();
+    lines[19] = "GAPMARKER_UNIQUE_TEXT".to_owned();
+    std::fs::write(root.join("big.txt"), lines.join("\n") + "\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "initial commit"]);
+
+    lines[2] = "line 3 CHANGED".to_owned();
+    lines[34] = "line 35 CHANGED".to_owned();
+    std::fs::write(root.join("big.txt"), lines.join("\n") + "\n").unwrap();
+
+    FixtureRepo { dir }
+}

@@ -38,6 +38,19 @@ pub struct DiffHunk {
     /// git appends for context. Empty when there is none.
     pub header: String,
     pub rows: Vec<DiffRow>,
+    /// Whether this hunk is its file's last and reaches the *new* side's
+    /// true end of file — set by the parser only for the unambiguous case
+    /// (a `\ No newline at end of file` marker following a row that exists
+    /// on the new side; see [`parse_unified_diff`]'s handling of that
+    /// marker), and by [`crate::ui::app::App`] during derivation once an
+    /// expand has actually probed past this hunk and found nothing there
+    /// (see `App`'s `trailing_probed_empty` tracking). An ordinary context
+    /// diff gives no other way to tell "this hunk's neighborhood just
+    /// wasn't near anything else that changed" apart from "the file
+    /// genuinely ends here" — this field is what lets [`file_gaps`]
+    /// suppress a trailing fold row once either signal has confirmed there
+    /// is nothing left to hide.
+    pub known_eof: bool,
 }
 
 /// All hunks belonging to one file entry in the diff, plus the file-level
@@ -193,11 +206,23 @@ pub fn parse_unified_diff(text: &str) -> Vec<DiffFile> {
                     new_lines,
                     header,
                     rows: Vec::new(),
+                    known_eof: false,
                 });
             }
         } else if line == "\\ No newline at end of file" {
             // Not a content row; the preceding row's text already lacks a
-            // trailing newline because we split on `.lines()`.
+            // trailing newline because we split on `.lines()`. When that
+            // row also carries a *new*-side line number (`Context`/`Add` —
+            // a `Del`-only row only says the *old* file's last line lacked
+            // one, which says nothing about where the new file ends),
+            // that's the unambiguous signal this hunk reaches the new
+            // file's true EOF, so `file_gaps` should never invent a
+            // trailing fold row below it.
+            if let Some(hunk) = current_hunk.as_mut()
+                && matches!(hunk.rows.last(), Some(r) if r.new_line.is_some())
+            {
+                hunk.known_eof = true;
+            }
         } else if let Some(hunk) = current_hunk.as_mut() {
             match line.as_bytes().first() {
                 Some(b' ') => {
@@ -294,9 +319,20 @@ fn parse_range(s: &str) -> (u32, u32) {
 }
 
 /// One entry in the flattened, indexable render sequence. The index of a
-/// `RenderRow` within the `Vec` returned by [`flatten`] is the stable
-/// position used for cursor/scroll state — it never changes for the
-/// lifetime of a parsed diff.
+/// `RenderRow` within the `Vec` returned by [`flatten`] is the position
+/// [`crate::ui::app::App`]'s cursor/scroll state addresses — but only
+/// stable *between* rederives, not for a parsed diff's whole lifetime: a
+/// `z o`/`z c` fold toggle (or a watch refresh) calls `App::rederive`,
+/// which re-flattens `files` from scratch and can shift every later row's
+/// index or delete one outright — splicing a `Between`/`Trailing` gap
+/// merges two hunks (see [`splice_gap`]), removing the second hunk's own
+/// `HunkHeader` row from the very next `flatten()` call. Every rebuild
+/// funnels through `App::rederive`, which re-establishes `cursor`/
+/// `scroll_offset` deliberately rather than assuming an old index still
+/// points at the same thing — anything that must survive a fold toggle (a
+/// comment anchor, a diagnostic, a jump target) keys off content
+/// (`display_path`, line number), never a raw `RenderRow` index held onto
+/// across a rederive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderRow {
     FileHeader {
@@ -316,16 +352,44 @@ pub enum RenderRow {
         hunk_idx: usize,
         row_idx: usize,
     },
+    /// A fold row standing in for a run of unchanged lines git omitted from
+    /// the diff — `gap_idx` indexes [`file_gaps`]'s output for `file_idx`,
+    /// recomputed fresh (not stored) every time a caller needs the gap's
+    /// actual line range/offset, the same "structural, not cached"
+    /// discipline the rest of this module already applies to
+    /// hunk/line addressing. Cursor-addressable like any other row (`z o`
+    /// expands the gap it stands on, `App::selected_file` highlights its
+    /// file in the sidebar), but never a `Line` — hover/comments/
+    /// diagnostics all key off `RenderRow::Line` alone, so a fold row is
+    /// simply invisible to those systems until `z o` replaces it with real
+    /// `Line` rows.
+    Gap {
+        file_idx: usize,
+        gap_idx: usize,
+    },
 }
 
 /// Flattens parsed files into the sequence the UI renders and scrolls
-/// through, in file → hunk → line order.
+/// through, in file → hunk → line order, with a [`RenderRow::Gap`] spliced
+/// in wherever [`file_gaps`] reports git omitted unchanged lines.
 pub fn flatten(files: &[DiffFile]) -> Vec<RenderRow> {
     let mut rows = Vec::new();
     for (file_idx, file) in files.iter().enumerate() {
         rows.push(RenderRow::FileHeader { file_idx });
         if file.is_binary {
             rows.push(RenderRow::BinaryNotice { file_idx });
+        }
+        let gaps = file_gaps(file);
+        let mut gap_idx = 0;
+        if matches!(
+            gaps.first(),
+            Some(Gap {
+                position: GapPosition::Leading,
+                ..
+            })
+        ) {
+            rows.push(RenderRow::Gap { file_idx, gap_idx });
+            gap_idx += 1;
         }
         for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
             rows.push(RenderRow::HunkHeader { file_idx, hunk_idx });
@@ -336,9 +400,304 @@ pub fn flatten(files: &[DiffFile]) -> Vec<RenderRow> {
                     row_idx,
                 });
             }
+            let follows_this_hunk = matches!(
+                gaps.get(gap_idx),
+                Some(Gap {
+                    position: GapPosition::Between(i) | GapPosition::Trailing(i),
+                    ..
+                }) if *i == hunk_idx
+            );
+            if follows_this_hunk {
+                rows.push(RenderRow::Gap { file_idx, gap_idx });
+                gap_idx += 1;
+            }
         }
     }
     rows
+}
+
+/// Where one [`Gap`] sits relative to a file's hunks — which hunk(s), if
+/// any, border it, and therefore where [`flatten`] inserts its
+/// [`RenderRow::Gap`] and which hunk(s) [`splice_gap`] merges it into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapPosition {
+    /// Before the first hunk (only possible when that hunk doesn't start at
+    /// line 1 on either side).
+    Leading,
+    /// Between hunk `.0` and the hunk right after it.
+    Between(usize),
+    /// After hunk `.0`, the file's last, through EOF.
+    Trailing(usize),
+}
+
+/// One run of unchanged lines git omitted from the diff — computed by pure
+/// arithmetic over a file's hunk boundaries ([`file_gaps`]), never stored on
+/// [`DiffFile`] itself, so it's always in lockstep with whatever hunk shape
+/// the file currently has (post-splice included).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Gap {
+    pub position: GapPosition,
+    /// 1-based new-side line where the hidden block starts.
+    pub new_start: u32,
+    /// 1-based new-side line where the hidden block ends, inclusive —
+    /// `None` only for an unbounded trailing gap (nothing has probed the
+    /// live file to find out how much further it actually goes; see
+    /// `App::expand_gap`).
+    pub new_end: Option<u32>,
+    /// `old_line = new_line - offset` for every line in this gap: since
+    /// nothing changes across a gap, the running difference between the two
+    /// sides' line numbers stays exactly what it was the moment the
+    /// preceding hunk (or, for the leading gap, the following one) ended —
+    /// see this module's docs on why that's pinned to hunk-level fields
+    /// rather than derived from any one row.
+    pub offset: i64,
+}
+
+impl Gap {
+    /// How many lines this gap hides, when known — `None` for an unbounded
+    /// trailing gap, matching [`Self::new_end`].
+    pub fn line_count(&self) -> Option<u32> {
+        self.new_end.map(|end| end - self.new_start + 1)
+    }
+}
+
+/// The last line number on one side (old or new — same formula for either,
+/// so this takes a bare `(start, lines)` pair rather than a `DiffHunk`)
+/// that a hunk's range actually reaches: ordinarily `start + lines - 1`,
+/// the last of its `lines` covered lines. Per the unified-diff zero-count
+/// convention, a hunk with `lines == 0` (a pure deletion with nothing
+/// inserted on the new side, or a pure insertion with nothing removed on
+/// the old side) has no covered line at all — `start` instead denotes the
+/// anchor line the change is attached to, so it's already the answer with
+/// no `- 1` to apply. [`side_after`] and [`file_gaps`]'s Leading/Between/
+/// Trailing arithmetic are both built on top of this one formula rather
+/// than each re-deriving the zero-count special case separately.
+fn side_end(start: u32, lines: u32) -> u32 {
+    if lines > 0 { start + lines - 1 } else { start }
+}
+
+/// One past [`side_end`] — the first line on this side that's untouched by
+/// the hunk, immediately following whatever it covers (or, for a
+/// zero-count side, following its anchor line). Where a Between/Trailing
+/// gap's `new_start`/offset math starts counting from.
+fn side_after(start: u32, lines: u32) -> u32 {
+    side_end(start, lines) + 1
+}
+
+/// The line immediately before a hunk's range begins on this side — the
+/// last untouched line preceding it, i.e. where a Leading gap ends.
+/// Ordinarily `start - 1`. When `lines == 0`, [`side_end`]'s doc explains
+/// why `start` itself is already the anchor line rather than one past it —
+/// which means `start` is *also* already the last untouched line before
+/// the hunk, not `start - 1` (the exact off-by-one that used to underflow
+/// when `start == 0` and invert the range whenever `start == 1`).
+fn side_before(start: u32, lines: u32) -> u32 {
+    if lines > 0 { start - 1 } else { start }
+}
+
+/// The gaps a file's hunk boundaries imply, in file order (leading, then
+/// each between-hunks gap, then trailing) — the per-file list
+/// [`RenderRow::Gap::gap_idx`] indexes and [`flatten`] inserts rows from.
+/// `&[]` for anything with no hunks to have a gap between (`is_binary`,
+/// `is_new`, `is_deleted`, or a hunk-less rename) — none of those represent
+/// "content git chose not to show," just content that never had any to
+/// begin with.
+///
+/// Every boundary here goes through [`side_before`]/[`side_after`] rather
+/// than the seemingly-simpler `start`/`start - 1`/`start + lines` directly,
+/// so a hunk with a zero-count side (`diff.context=0`'s pure deletions and
+/// insertions — see those functions' docs) computes the same correct
+/// boundary an ordinary hunk does instead of an inverted or negative range.
+/// A gap is only ever pushed when its range is non-empty (`new_before >=
+/// new_after`-shaped checks below), which is also what keeps
+/// [`Gap::line_count`] from ever underflowing on what this function hands
+/// back.
+pub fn file_gaps(file: &DiffFile) -> Vec<Gap> {
+    if file.is_binary || file.is_new || file.is_deleted || file.hunks.is_empty() {
+        return Vec::new();
+    }
+    let mut gaps = Vec::new();
+
+    let first = &file.hunks[0];
+    let new_before = side_before(first.new_start, first.new_lines);
+    let old_before = side_before(first.old_start, first.old_lines);
+    if new_before > 0 || old_before > 0 {
+        gaps.push(Gap {
+            position: GapPosition::Leading,
+            new_start: 1,
+            new_end: Some(new_before),
+            offset: new_before as i64 - old_before as i64,
+        });
+    }
+
+    for i in 0..file.hunks.len().saturating_sub(1) {
+        let cur = &file.hunks[i];
+        let next = &file.hunks[i + 1];
+        let cur_new_after = side_after(cur.new_start, cur.new_lines);
+        let next_new_before = side_before(next.new_start, next.new_lines);
+        if next_new_before >= cur_new_after {
+            let cur_old_after = side_after(cur.old_start, cur.old_lines);
+            gaps.push(Gap {
+                position: GapPosition::Between(i),
+                new_start: cur_new_after,
+                new_end: Some(next_new_before),
+                offset: cur_new_after as i64 - cur_old_after as i64,
+            });
+        }
+    }
+
+    let last_idx = file.hunks.len() - 1;
+    let last = &file.hunks[last_idx];
+    if !last.known_eof {
+        let new_after = side_after(last.new_start, last.new_lines);
+        let old_after = side_after(last.old_start, last.old_lines);
+        gaps.push(Gap {
+            position: GapPosition::Trailing(last_idx),
+            new_start: new_after,
+            new_end: None,
+            offset: new_after as i64 - old_after as i64,
+        });
+    }
+
+    gaps
+}
+
+/// Which side of a [`Gap`] to look for a boundary row on — shared by the
+/// disk-backed validation an interactive expand runs
+/// ([`gap_boundary_matches`]) and the pristine-vs-pristine comparison a
+/// watch refresh runs when deciding whether a previously expanded fold
+/// still safely reapplies (`App`'s refresh-reapply pruning), so both walk a
+/// gap's neighboring hunk exactly the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapSide {
+    Above,
+    Below,
+}
+
+/// The nearest row bordering `gap` on `side` that carries a *new*-side line
+/// number (`Context` or `Add` — a pure-`Del` hunk edge, e.g. a
+/// replaced-single-line file with zero context rows, has none), scanning
+/// inward from that side's hunk boundary rather than just checking the
+/// hunk's first/last row, since several `Del`-only rows can sit between the
+/// true edge and the nearest row that actually has a new-side coordinate to
+/// validate. `None` when that side has no bordering hunk at all (the
+/// leading gap's `Above`, the trailing gap's `Below`) or the bordering hunk
+/// has no new-side row anywhere in it.
+pub fn gap_adjacent_line(
+    file: &DiffFile,
+    position: GapPosition,
+    side: GapSide,
+) -> Option<(u32, &str)> {
+    let hunk_idx = match (position, side) {
+        (GapPosition::Leading, GapSide::Above) => return None,
+        (GapPosition::Trailing(_), GapSide::Below) => return None,
+        (GapPosition::Leading, GapSide::Below) => 0,
+        (GapPosition::Between(i) | GapPosition::Trailing(i), GapSide::Above) => i,
+        (GapPosition::Between(i), GapSide::Below) => i + 1,
+    };
+    let hunk = file.hunks.get(hunk_idx)?;
+    let row = match side {
+        GapSide::Above => hunk.rows.iter().rev().find(|r| r.new_line.is_some()),
+        GapSide::Below => hunk.rows.iter().find(|r| r.new_line.is_some()),
+    }?;
+    Some((
+        row.new_line.expect("filtered by find above"),
+        row.text.as_str(),
+    ))
+}
+
+/// Whether `gap`'s boundary rows (whichever side(s) have one — see
+/// [`gap_adjacent_line`]) still match `file_lines` (0-based, matching the
+/// parser's own `.lines()` convention) at those rows' recorded new-side line
+/// numbers. `true` when neither side has a boundary row to check (nothing
+/// to contradict), which is the correct, permissive default rather than a
+/// special case: a gap with no adjacent content row simply has nothing this
+/// check can catch drift with. The one guard against expanding a gap whose
+/// surrounding diff no longer matches what's actually on disk right now —
+/// see `App::expand_gap`'s docs for why this, rather than re-verifying the
+/// gap's entire hidden content, is the deliberate scope of this check.
+pub fn gap_boundary_matches(file: &DiffFile, gap: &Gap, file_lines: &[&str]) -> bool {
+    [GapSide::Above, GapSide::Below].into_iter().all(|side| {
+        match gap_adjacent_line(file, gap.position, side) {
+            Some((line, text)) => file_lines.get((line - 1) as usize) == Some(&text),
+            None => true,
+        }
+    })
+}
+
+/// The ordinary `Context` rows a gap's hidden lines become once expanded,
+/// numbered through [`Gap::offset`] — shared by a fresh interactive expand
+/// (`texts` read live off disk) and a watch refresh reapplying a
+/// previously expanded fold (`texts` read back from its cached lines), so
+/// both number old/new lines through the exact same formula. `None` if
+/// `offset` would ever put an old-side line below `1` — a malformed gap
+/// (shouldn't happen for anything [`file_gaps`] itself produced) rather
+/// than something worth panicking over.
+pub fn context_rows_for_gap(gap: &Gap, texts: &[String]) -> Option<Vec<DiffRow>> {
+    texts
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let new_line = gap.new_start + i as u32;
+            let old_line = new_line as i64 - gap.offset;
+            if old_line < 1 {
+                return None;
+            }
+            Some(DiffRow {
+                kind: DiffLineKind::Context,
+                text: text.clone(),
+                old_line: Some(old_line as u32),
+                new_line: Some(new_line),
+            })
+        })
+        .collect()
+}
+
+/// Splices `rows` (from [`context_rows_for_gap`]) into `file` at
+/// `gap.position`, replacing the gap [`file_gaps`] reported there. Only the
+/// four `u32` boundary fields change on whichever hunk(s) are touched —
+/// never `header`, since the `@@ ... @@` text is formatted from those
+/// fields at render time rather than stored (see `diff_view`'s/`main`'s
+/// hunk-header rendering) — so there is no header string to rebuild, and a
+/// `Between` merge keeps the earlier hunk's own header suffix rather than
+/// the later hunk's.
+pub fn splice_gap(file: &mut DiffFile, gap: &Gap, rows: Vec<DiffRow>) {
+    let n = rows.len() as u32;
+    match gap.position {
+        GapPosition::Leading => {
+            let hunk = &mut file.hunks[0];
+            let mut merged = rows;
+            merged.append(&mut hunk.rows);
+            hunk.rows = merged;
+            hunk.old_start = 1;
+            hunk.new_start = 1;
+            hunk.old_lines += n;
+            hunk.new_lines += n;
+        }
+        GapPosition::Between(i) => {
+            let next = file.hunks.remove(i + 1);
+            let hunk = &mut file.hunks[i];
+            hunk.rows.extend(rows);
+            hunk.rows.extend(next.rows);
+            hunk.old_lines = (next.old_start + next.old_lines) - hunk.old_start;
+            hunk.new_lines = (next.new_start + next.new_lines) - hunk.new_start;
+            hunk.known_eof = next.known_eof;
+        }
+        GapPosition::Trailing(i) => {
+            let hunk = &mut file.hunks[i];
+            hunk.rows.extend(rows);
+            hunk.old_lines += n;
+            hunk.new_lines += n;
+            // A trailing splice always reads through the disk file's real
+            // end — there is no other endpoint an unbounded gap could stop
+            // at — so the hunk now provably reaches EOF. Without this,
+            // `file_gaps` would emit a fresh trailing gap right below the
+            // just-revealed lines, and expanding *that* dangling row would
+            // take the empty-probe path and silently collapse the content
+            // it appeared to extend.
+            hunk.known_eof = true;
+        }
+    }
 }
 
 /// One cell of a [`SideBySideRow`]: either a line that exists on this side,
@@ -765,5 +1124,478 @@ mod tests {
                 "{path} should skip highlighting regardless of its tiny diff"
             );
         }
+    }
+
+    // -- Gap computation, splicing, and validation (fold rows) ------------
+
+    fn hunk(old_start: u32, old_lines: u32, new_start: u32, new_lines: u32) -> DiffHunk {
+        DiffHunk {
+            old_start,
+            old_lines,
+            new_start,
+            new_lines,
+            header: String::new(),
+            known_eof: false,
+            rows: (0..new_lines)
+                .map(|i| DiffRow {
+                    kind: DiffLineKind::Context,
+                    text: format!("line {}", new_start + i),
+                    old_line: Some(old_start + i),
+                    new_line: Some(new_start + i),
+                })
+                .collect(),
+        }
+    }
+
+    fn file_with_hunks(hunks: Vec<DiffHunk>) -> DiffFile {
+        DiffFile {
+            new_path: Some("f.txt".to_owned()),
+            old_path: Some("f.txt".to_owned()),
+            hunks,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn adjacent_hunks_produce_no_between_gap() {
+        // Hunk 0 covers new 1..=3, hunk 1 starts exactly at new 4 — nothing
+        // hidden between them.
+        let file = file_with_hunks(vec![hunk(1, 3, 1, 3), hunk(4, 3, 4, 3)]);
+        let gaps = file_gaps(&file);
+        assert!(
+            gaps.iter()
+                .all(|g| !matches!(g.position, GapPosition::Between(_))),
+            "adjacent hunks must not produce a Between gap: {gaps:?}"
+        );
+    }
+
+    #[test]
+    fn leading_gap_appears_when_the_first_hunk_does_not_start_at_line_one() {
+        let file = file_with_hunks(vec![hunk(10, 3, 10, 3)]);
+        let gaps = file_gaps(&file);
+        let leading = gaps
+            .iter()
+            .find(|g| g.position == GapPosition::Leading)
+            .expect("leading gap present");
+        assert_eq!(leading.new_start, 1);
+        assert_eq!(leading.new_end, Some(9));
+        assert_eq!(leading.offset, 0);
+    }
+
+    #[test]
+    fn no_leading_gap_when_the_first_hunk_starts_at_line_one() {
+        let file = file_with_hunks(vec![hunk(1, 3, 1, 3)]);
+        let gaps = file_gaps(&file);
+        assert!(!gaps.iter().any(|g| g.position == GapPosition::Leading));
+    }
+
+    #[test]
+    fn trailing_gap_appears_for_an_ordinary_hunk_with_unknown_size() {
+        let file = file_with_hunks(vec![hunk(1, 3, 1, 3)]);
+        let gaps = file_gaps(&file);
+        let trailing = gaps
+            .iter()
+            .find(|g| matches!(g.position, GapPosition::Trailing(0)))
+            .expect("trailing gap present");
+        assert_eq!(trailing.new_start, 4);
+        assert_eq!(trailing.new_end, None);
+        assert_eq!(trailing.line_count(), None);
+    }
+
+    #[test]
+    fn known_eof_suppresses_the_trailing_gap() {
+        let mut file = file_with_hunks(vec![hunk(1, 3, 1, 3)]);
+        file.hunks[0].known_eof = true;
+        let gaps = file_gaps(&file);
+        assert!(
+            !gaps
+                .iter()
+                .any(|g| matches!(g.position, GapPosition::Trailing(_))),
+            "known_eof must suppress the trailing gap: {gaps:?}"
+        );
+    }
+
+    #[test]
+    fn the_no_newline_marker_after_a_new_side_row_sets_known_eof() {
+        let diff = "diff --git a/f.txt b/f.txt\n\
+index 1111111..2222222 100644\n\
+--- a/f.txt\n\
++++ b/f.txt\n\
+@@ -1,2 +1,2 @@\n\
+ one\n\
+-two\n\
++two changed\n\
+\\ No newline at end of file\n";
+        let files = parse_unified_diff(diff);
+        assert!(
+            files[0].hunks[0].known_eof,
+            "an Add row's own EOF marker is unambiguous — new-file EOF"
+        );
+        assert!(
+            file_gaps(&files[0])
+                .iter()
+                .all(|g| !matches!(g.position, GapPosition::Trailing(_)))
+        );
+    }
+
+    #[test]
+    fn the_no_newline_marker_after_a_del_only_row_does_not_set_known_eof() {
+        // The marker follows the `-old` row, which has no new-side line at
+        // all — it says the *old* file's last line lacked a newline, which
+        // says nothing about where the *new* file ends.
+        let diff = "diff --git a/f.txt b/f.txt\n\
+index 1111111..2222222 100644\n\
+--- a/f.txt\n\
++++ b/f.txt\n\
+@@ -1,2 +1,1 @@\n\
+ one\n\
+-old last line\n\
+\\ No newline at end of file\n";
+        let files = parse_unified_diff(diff);
+        assert!(!files[0].hunks[0].known_eof);
+        assert!(
+            file_gaps(&files[0])
+                .iter()
+                .any(|g| matches!(g.position, GapPosition::Trailing(_))),
+            "without an unambiguous new-side EOF marker, the trailing gap must still render"
+        );
+    }
+
+    #[test]
+    fn new_is_deleted_is_binary_and_hunk_less_files_never_get_gaps() {
+        let mut new_file = file_with_hunks(vec![hunk(10, 3, 10, 3)]);
+        new_file.is_new = true;
+        assert!(file_gaps(&new_file).is_empty());
+
+        let mut deleted_file = file_with_hunks(vec![hunk(10, 3, 10, 3)]);
+        deleted_file.is_deleted = true;
+        assert!(file_gaps(&deleted_file).is_empty());
+
+        let mut binary_file = file_with_hunks(vec![hunk(10, 3, 10, 3)]);
+        binary_file.is_binary = true;
+        assert!(file_gaps(&binary_file).is_empty());
+
+        let hunk_less = file_with_hunks(vec![]);
+        assert!(file_gaps(&hunk_less).is_empty());
+    }
+
+    #[test]
+    fn splice_leading_prepends_to_the_first_hunk_and_resets_its_start() {
+        let mut file = file_with_hunks(vec![hunk(10, 3, 10, 3)]);
+        let gap = file_gaps(&file)
+            .into_iter()
+            .find(|g| g.position == GapPosition::Leading)
+            .unwrap();
+        let texts: Vec<String> = (1..=9).map(|n| format!("pre {n}")).collect();
+        let rows = context_rows_for_gap(&gap, &texts).unwrap();
+        assert_eq!(rows.len(), 9);
+        splice_gap(&mut file, &gap, rows);
+
+        assert_eq!(file.hunks.len(), 1);
+        let h = &file.hunks[0];
+        assert_eq!((h.old_start, h.new_start), (1, 1));
+        assert_eq!((h.old_lines, h.new_lines), (12, 12));
+        assert_eq!(h.rows[0].text, "pre 1");
+        assert_eq!(h.rows[0].old_line, Some(1));
+        assert_eq!(h.rows[0].new_line, Some(1));
+        assert_eq!(h.rows[8].text, "pre 9");
+        // The original hunk's own first row follows the spliced-in ones.
+        assert_eq!(h.rows[9].text, "line 10");
+    }
+
+    #[test]
+    fn splice_between_merges_two_hunks_and_keeps_the_earlier_headers_suffix() {
+        let mut file = file_with_hunks(vec![hunk(1, 3, 1, 3), hunk(10, 3, 10, 3)]);
+        file.hunks[0].header = "fn earlier()".to_owned();
+        file.hunks[1].header = "fn later()".to_owned();
+        let gap = file_gaps(&file)
+            .into_iter()
+            .find(|g| matches!(g.position, GapPosition::Between(0)))
+            .unwrap();
+        assert_eq!((gap.new_start, gap.new_end), (4, Some(9)));
+        let texts: Vec<String> = (4..=9).map(|n| format!("mid {n}")).collect();
+        let rows = context_rows_for_gap(&gap, &texts).unwrap();
+        splice_gap(&mut file, &gap, rows);
+
+        assert_eq!(file.hunks.len(), 1, "the two hunks merge into one");
+        let h = &file.hunks[0];
+        assert_eq!((h.old_start, h.old_lines), (1, 12));
+        assert_eq!((h.new_start, h.new_lines), (1, 12));
+        assert_eq!(
+            h.header, "fn earlier()",
+            "keeps the earlier hunk's own header suffix"
+        );
+        assert_eq!(h.rows.len(), 12);
+        assert_eq!(h.rows[3].text, "mid 4");
+        assert_eq!(h.rows[8].text, "mid 9");
+        assert_eq!(
+            h.rows[9].text, "line 10",
+            "the later hunk's own rows follow"
+        );
+    }
+
+    #[test]
+    fn splice_trailing_appends_through_the_probed_end_of_file() {
+        let mut file = file_with_hunks(vec![hunk(1, 3, 1, 3)]);
+        let gap = file_gaps(&file)
+            .into_iter()
+            .find(|g| matches!(g.position, GapPosition::Trailing(0)))
+            .unwrap();
+        assert_eq!(gap.new_start, 4);
+        let texts: Vec<String> = vec!["tail 4".to_owned(), "tail 5".to_owned()];
+        let rows = context_rows_for_gap(&gap, &texts).unwrap();
+        splice_gap(&mut file, &gap, rows);
+
+        let h = &file.hunks[0];
+        assert_eq!((h.old_lines, h.new_lines), (5, 5));
+        assert_eq!(h.rows.len(), 5);
+        assert_eq!(h.rows[3].text, "tail 4");
+        assert_eq!(h.rows[4].text, "tail 5");
+        assert_eq!(h.rows[4].new_line, Some(5));
+    }
+
+    #[test]
+    fn splice_trailing_marks_eof_so_no_dangling_trailing_gap_reappears() {
+        // Regression: without `known_eof = true` here, `file_gaps` emitted
+        // a fresh unbounded trailing gap right below the just-spliced
+        // lines, and expanding that dangling row took the empty-probe path
+        // — silently collapsing the content the first press revealed.
+        let mut file = file_with_hunks(vec![hunk(1, 3, 1, 3)]);
+        let gap = file_gaps(&file)
+            .into_iter()
+            .find(|g| matches!(g.position, GapPosition::Trailing(0)))
+            .unwrap();
+        let texts: Vec<String> = vec!["tail 4".to_owned(), "tail 5".to_owned()];
+        let rows = context_rows_for_gap(&gap, &texts).unwrap();
+        splice_gap(&mut file, &gap, rows);
+
+        assert!(file.hunks[0].known_eof, "a trailing splice reaches EOF");
+        assert!(
+            !file_gaps(&file)
+                .iter()
+                .any(|g| matches!(g.position, GapPosition::Trailing(_))),
+            "no trailing gap may survive a trailing splice"
+        );
+    }
+
+    #[test]
+    fn context_rows_for_gap_over_an_empty_probe_produces_an_empty_splice() {
+        // The pure half of a "trailing gap probed and found genuinely
+        // empty" expand — zero lines in, zero `DiffRow`s out, not a
+        // rejection.
+        let gap = Gap {
+            position: GapPosition::Trailing(0),
+            new_start: 4,
+            new_end: None,
+            offset: 0,
+        };
+        let rows = context_rows_for_gap(&gap, &[]).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    /// The between-hunk offset formula (`(new_start + new_lines) -
+    /// (old_start + old_lines)` of the *preceding* hunk) and the leading
+    /// offset formula (`new_start - old_start` of the *following* hunk)
+    /// must agree with each other on a fixture where the two sides have
+    /// actually diverged (more adds than dels before the gap, so the
+    /// running old/new offset isn't the trivial zero every same-length
+    /// fixture above uses) — pinning down that both formulas track the
+    /// same running difference rather than happening to coincide only when
+    /// nothing has shifted.
+    #[test]
+    fn offset_formulas_agree_on_an_add_del_imbalanced_fixture() {
+        // Hunk 0: old 1..=3 (3 lines) become new 1..=5 (5 lines) — net +2.
+        // Hunk 1 (after a gap): starts at old 20, new 22 — consistent with
+        // the +2 running offset hunk 0 leaves behind.
+        let file = file_with_hunks(vec![hunk(1, 3, 1, 5), hunk(20, 3, 22, 3)]);
+        let gaps = file_gaps(&file);
+        let between = gaps
+            .iter()
+            .find(|g| matches!(g.position, GapPosition::Between(0)))
+            .expect("between gap present");
+        assert_eq!(between.offset, 2);
+
+        // A leading gap on a *different* file whose only hunk mirrors
+        // hunk 1's start here must derive the identical offset from the
+        // opposite formula.
+        let leading_file = file_with_hunks(vec![hunk(20, 3, 22, 3)]);
+        let leading_gaps = file_gaps(&leading_file);
+        let leading = leading_gaps
+            .iter()
+            .find(|g| g.position == GapPosition::Leading)
+            .expect("leading gap present");
+        assert_eq!(
+            leading.offset, between.offset,
+            "both formulas agree on the same running offset"
+        );
+    }
+
+    // -- Zero-context (`diff.context=0`) hunks ----------------------------
+    //
+    // Real `git -c diff.context=0` output for a pure deletion or pure
+    // insertion carries a `,0` count on the side that has nothing shown —
+    // per the unified-diff spec, that side's `start` then denotes the
+    // anchor line the change is attached to rather than one past its first
+    // covered line. Built from `parse_unified_diff` directly (not the
+    // synthetic `hunk()` helper above) so these also lock in that the
+    // parser itself reads the shorthand/zero-count header forms git
+    // actually emits — see `parse_hunk_header`/`parse_range`.
+
+    #[test]
+    fn shorthand_hunk_header_with_implied_single_line_counts_parses_correctly() {
+        // Changing exactly one line with no surrounding context: both
+        // sides omit `,1` — `@@ -6 +5 @@`, not `@@ -6,1 +5,1 @@`.
+        let diff = "diff --git a/f.txt b/f.txt\n\
+index 1111111..2222222 100644\n\
+--- a/f.txt\n\
++++ b/f.txt\n\
+@@ -6 +5 @@ e\n\
+-f\n\
++X\n";
+        let files = parse_unified_diff(diff);
+        let hunk = &files[0].hunks[0];
+        assert_eq!((hunk.old_start, hunk.old_lines), (6, 1));
+        assert_eq!((hunk.new_start, hunk.new_lines), (5, 1));
+        assert_eq!(hunk.header, "e");
+    }
+
+    #[test]
+    fn zero_context_pure_deletion_mid_file_produces_a_valid_leading_gap_and_does_not_panic() {
+        // Deleting line 2 of a 7-line file under `diff.context=0`:
+        // `@@ -2 +1,0 @@` — old_start=2/old_lines=1 (shorthand, implied
+        // count 1), new_start=1/new_lines=0 (explicit zero count).
+        // Regression for the underflow panic this exact hunk shape used to
+        // trigger in `Gap::line_count` whenever `new_start == 1` (see this
+        // module's `side_before` docs).
+        let diff = "diff --git a/f.txt b/f.txt\n\
+index 1111111..2222222 100644\n\
+--- a/f.txt\n\
++++ b/f.txt\n\
+@@ -2 +1,0 @@\n\
+-b\n";
+        let files = parse_unified_diff(diff);
+        let hunk = &files[0].hunks[0];
+        assert_eq!((hunk.old_start, hunk.old_lines), (2, 1));
+        assert_eq!((hunk.new_start, hunk.new_lines), (1, 0));
+
+        let gaps = file_gaps(&files[0]);
+        let leading = gaps
+            .iter()
+            .find(|g| g.position == GapPosition::Leading)
+            .expect("one untouched line (new line 1) precedes this deletion");
+        assert_eq!((leading.new_start, leading.new_end), (1, Some(1)));
+        assert_eq!(leading.offset, 0);
+        assert_eq!(
+            leading.line_count(),
+            Some(1),
+            "must not underflow-panic on a zero-count new side"
+        );
+    }
+
+    #[test]
+    fn zero_context_deletion_at_the_very_top_of_file_emits_no_leading_gap() {
+        // `new_start == 0` is git's zero-count convention for "the anchor
+        // sits before line 1 entirely" — deleting the file's own first
+        // line with no context. Must not read as "0 untouched lines
+        // precede this, so new_end = -1" the way the pre-fix
+        // `first.new_start - 1` formula would have.
+        let diff = "diff --git a/f.txt b/f.txt\n\
+index 1111111..2222222 100644\n\
+--- a/f.txt\n\
++++ b/f.txt\n\
+@@ -1 +0,0 @@\n\
+-a\n";
+        let files = parse_unified_diff(diff);
+        let hunk = &files[0].hunks[0];
+        assert_eq!((hunk.old_start, hunk.old_lines), (1, 1));
+        assert_eq!((hunk.new_start, hunk.new_lines), (0, 0));
+
+        let gaps = file_gaps(&files[0]);
+        assert!(
+            !gaps.iter().any(|g| g.position == GapPosition::Leading),
+            "no leading gap: nothing precedes a deletion at the very top"
+        );
+    }
+
+    #[test]
+    fn zero_context_addition_only_hunk_produces_a_valid_leading_gap() {
+        // `@@ -5,0 +6,3 @@`-shaped: inserting 3 new lines after old line
+        // 5, nothing deleted — old_lines == 0 on this hunk's own side, the
+        // mirror image of the pure-deletion case above.
+        let diff = "diff --git a/f.txt b/f.txt\n\
+index 1111111..2222222 100644\n\
+--- a/f.txt\n\
++++ b/f.txt\n\
+@@ -5,0 +6,3 @@\n\
++x\n\
++y\n\
++z\n";
+        let files = parse_unified_diff(diff);
+        let hunk = &files[0].hunks[0];
+        assert_eq!((hunk.old_start, hunk.old_lines), (5, 0));
+        assert_eq!((hunk.new_start, hunk.new_lines), (6, 3));
+
+        let gaps = file_gaps(&files[0]);
+        let leading = gaps
+            .iter()
+            .find(|g| g.position == GapPosition::Leading)
+            .expect("5 untouched lines precede the insertion point");
+        assert_eq!((leading.new_start, leading.new_end), (1, Some(5)));
+        assert_eq!(leading.offset, 0, "nothing has shifted yet at this point");
+    }
+
+    #[test]
+    fn gap_boundary_matches_accepts_disk_content_that_matches_the_hunk_edges() {
+        let file = file_with_hunks(vec![hunk(1, 3, 1, 3), hunk(10, 3, 10, 3)]);
+        let gap = file_gaps(&file)
+            .into_iter()
+            .find(|g| matches!(g.position, GapPosition::Between(0)))
+            .unwrap();
+        // The disk content agrees with both hunks' own edge rows ("line 3"
+        // above the gap, "line 10" below it) — irrespective of what's in
+        // between, which this check never inspects.
+        let mut lines = vec![String::new(); 12];
+        lines[0] = "line 1".to_owned();
+        lines[1] = "line 2".to_owned();
+        lines[2] = "line 3".to_owned();
+        lines[9] = "line 10".to_owned();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        assert!(gap_boundary_matches(&file, &gap, &refs));
+    }
+
+    #[test]
+    fn gap_boundary_matches_rejects_disk_content_that_drifted_from_the_hunk_edge() {
+        let file = file_with_hunks(vec![hunk(1, 3, 1, 3), hunk(10, 3, 10, 3)]);
+        let gap = file_gaps(&file)
+            .into_iter()
+            .find(|g| matches!(g.position, GapPosition::Between(0)))
+            .unwrap();
+        let mut lines = vec![String::new(); 12];
+        lines[2] = "line 3 EDITED ON DISK".to_owned(); // drifted from the diff's own "line 3"
+        lines[9] = "line 10".to_owned();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        assert!(!gap_boundary_matches(&file, &gap, &refs));
+    }
+
+    #[test]
+    fn flatten_inserts_a_gap_row_between_two_non_adjacent_hunks() {
+        let file = file_with_hunks(vec![hunk(1, 3, 1, 3), hunk(10, 3, 10, 3)]);
+        let rows = flatten(std::slice::from_ref(&file));
+        let gap_positions: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r, RenderRow::Gap { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        // FileHeader, HunkHeader, 3 rows, Gap, HunkHeader, 3 rows, Gap(trailing)
+        assert_eq!(gap_positions.len(), 2, "one Between gap, one Trailing gap");
+        assert!(matches!(
+            rows[gap_positions[0]],
+            RenderRow::Gap { gap_idx: 0, .. }
+        ));
+        assert!(matches!(
+            rows[gap_positions[1]],
+            RenderRow::Gap { gap_idx: 1, .. }
+        ));
     }
 }

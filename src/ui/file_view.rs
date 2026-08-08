@@ -242,7 +242,10 @@ impl FileView {
             // timeline/log/scope-menu popup only relate to the root diff,
             // and `ui::mod` never even offers `t`/`L`/`o` a view to push or
             // a diff to swap when a `FileView` is on top (see
-            // `handle_action`).
+            // `handle_action`). `ExpandFold`/`CollapseFold` too: an opened
+            // file is read whole (no hunks means no gaps — see
+            // `crate::diff::file_gaps`), so there is never a fold row here
+            // to act on.
             Action::NextHunk
             | Action::PrevHunk
             | Action::NextFile
@@ -254,7 +257,9 @@ impl FileView {
             | Action::ToggleRangeSelect
             | Action::OpenScopeMenu
             | Action::AddComment
-            | Action::ToggleComments => {}
+            | Action::ToggleComments
+            | Action::ExpandFold
+            | Action::CollapseFold => {}
         }
         if self.cursor != cursor_before {
             self.active_symbol = 0;

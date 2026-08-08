@@ -388,7 +388,50 @@ fn render_row(
             comments_for_row(app, row, comments),
             wrap,
         ),
+        RenderRow::Gap { file_idx, gap_idx } => {
+            vec![gap_line(app, file_idx, gap_idx, width, is_cursor)]
+        }
     }
+}
+
+/// A fold row: full-width like a hunk header (no gutter — there's no line
+/// number to show, since it stands for a whole run of them), dim, always
+/// exactly one visual row (never wraps or truncates mid-word — see
+/// [`pad_or_truncate`]). `gap_idx` out of range (shouldn't happen for
+/// anything [`crate::diff::flatten`] itself produced, but this is render
+/// code, not a place to panic over a stale index) falls back to a plain
+/// "unchanged" label rather than crashing the frame.
+///
+/// Reads `app.gap_cache` (recomputed once per [`App`] rederive, not per
+/// frame) rather than calling [`crate::diff::file_gaps`] itself — this runs
+/// once per visible fold row on *every* redraw (any keystroke, resize, LSP
+/// push, watch tick), and re-walking a whole file's hunks just to read one
+/// entry and discard the rest would repeat that work for as long as the row
+/// stays on screen.
+fn gap_line(
+    app: &App,
+    file_idx: usize,
+    gap_idx: usize,
+    width: usize,
+    is_cursor: bool,
+) -> Line<'static> {
+    let text = match app
+        .gap_cache
+        .get(file_idx)
+        .and_then(|gaps| gaps.get(gap_idx))
+        .and_then(crate::diff::Gap::line_count)
+    {
+        Some(1) => "\u{00b7}\u{00b7}\u{00b7} 1 unchanged line \u{00b7}\u{00b7}\u{00b7}".to_owned(),
+        Some(n) => format!("\u{00b7}\u{00b7}\u{00b7} {n} unchanged lines \u{00b7}\u{00b7}\u{00b7}"),
+        None => "\u{00b7}\u{00b7}\u{00b7} unchanged lines \u{00b7}\u{00b7}\u{00b7}".to_owned(),
+    };
+    let style = cursor_style(
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+        is_cursor,
+    );
+    Line::from(Span::styled(pad_or_truncate(&text, width), style))
 }
 
 /// The most severe diagnostic touching `row`'s current-file line, if any —
@@ -777,6 +820,9 @@ mod tests {
                 new_start: 1,
                 new_lines: rows.len() as u32,
                 header: String::new(),
+                // These render tests aren't about fold rows — no trailing
+                // gap, so `app.rows` is exactly the rows this helper built.
+                known_eof: true,
                 rows,
             }],
             ..Default::default()
@@ -994,6 +1040,98 @@ mod tests {
             SideBySideRow::Full { flat_idx: 0 }, // the file header row
             20,
             20,
+            &mut highlighter,
+            &diagnostics,
+            &comments,
+            true,
+        );
+        assert_eq!(lines.len(), 1);
+    }
+
+    // -- Gap row rendering --------------------------------------------
+
+    /// One file, two hunks (new 1..=3, new `second_hunk_start`..=`+2`) — the
+    /// same shape `ui::app`'s own fold fixture uses. Parameterized over the
+    /// second hunk's start so a single helper covers both the multi-line
+    /// between-hunks gap (`app_with_a_gap(10)`, the same fixture `ui::app`
+    /// uses) and a one-line gap (`app_with_a_gap(5)`) without two near-
+    /// identical `mk_hunk` closures in this module.
+    fn app_with_a_gap(second_hunk_start: u32) -> App {
+        let mk_hunk = |start: u32, lines: u32| DiffHunk {
+            old_start: start,
+            old_lines: lines,
+            new_start: start,
+            new_lines: lines,
+            header: String::new(),
+            known_eof: false,
+            rows: (0..lines)
+                .map(|i| row(DiffLineKind::Context, "x", Some(start + i), Some(start + i)))
+                .collect(),
+        };
+        let file = DiffFile {
+            old_path: Some("f.txt".to_owned()),
+            new_path: Some("f.txt".to_owned()),
+            hunks: vec![mk_hunk(1, 3), mk_hunk(second_hunk_start, 3)],
+            ..Default::default()
+        };
+        App::new("repo".to_owned(), PathBuf::from("/repo"), vec![file])
+    }
+
+    #[test]
+    fn gap_line_shows_the_known_line_count_for_a_between_hunks_gap() {
+        let app = app_with_a_gap(10);
+        let line = gap_line(&app, 0, 0, 40, false);
+        assert_eq!(
+            line_text(&line).trim(),
+            "\u{00b7}\u{00b7}\u{00b7} 6 unchanged lines \u{00b7}\u{00b7}\u{00b7}"
+        );
+    }
+
+    #[test]
+    fn gap_line_uses_the_singular_for_exactly_one_hidden_line() {
+        // A one-line gap: hunk 0 ends at new 4 (exclusive), hunk 1 starts
+        // at new 5.
+        let app = app_with_a_gap(5);
+        let line = gap_line(&app, 0, 0, 40, false);
+        assert_eq!(
+            line_text(&line).trim(),
+            "\u{00b7}\u{00b7}\u{00b7} 1 unchanged line \u{00b7}\u{00b7}\u{00b7}"
+        );
+    }
+
+    #[test]
+    fn gap_line_omits_a_count_for_an_unbounded_trailing_gap() {
+        let app = app_with_a_gap(10);
+        // gap_idx 1 is the trailing gap — file_gaps orders Between before
+        // Trailing, see `file_gaps`'s docs.
+        let line = gap_line(&app, 0, 1, 40, false);
+        assert_eq!(
+            line_text(&line).trim(),
+            "\u{00b7}\u{00b7}\u{00b7} unchanged lines \u{00b7}\u{00b7}\u{00b7}"
+        );
+    }
+
+    #[test]
+    fn gap_line_pads_to_the_exact_requested_width() {
+        let app = app_with_a_gap(10);
+        let line = gap_line(&app, 0, 0, 50, false);
+        assert_eq!(display_width(&line_text(&line)), 50);
+    }
+
+    #[test]
+    fn render_row_never_produces_more_than_one_visual_row_for_a_gap() {
+        let app = app_with_a_gap(10);
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let comments = CommentIndex::default();
+        let lines = render_row(
+            &app,
+            RenderRow::Gap {
+                file_idx: 0,
+                gap_idx: 0,
+            },
+            false,
+            10, // deliberately narrow — a gap row must truncate, never wrap
             &mut highlighter,
             &diagnostics,
             &comments,
