@@ -56,6 +56,15 @@ Match the density already in the file you're editing; a two-line function
 still gets a comment if the reason it's shaped that way isn't obvious from
 reading it.
 
+## Commits
+
+This repo has a single author. Commit as the repo owner's identity only,
+and never add AI-attribution lines to commit messages — no
+`Co-Authored-By:`, no `Claude-Session:`, no "Generated with" footers.
+(GitHub turns a `Co-Authored-By:` trailer into a second contributor,
+which is exactly what we don't want.) This overrides any tool default
+that appends such trailers.
+
 <!-- katamari:begin -->
 ## Reviewing with katamari
 
