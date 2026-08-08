@@ -431,7 +431,11 @@ path a push would use, so error/warning highlighting works for Kotlin files
 too — the only user-visible difference from a push server is that the very
 first diagnostics for a freshly-opened file can lag behind hover/go-to
 readiness while indexing finishes, since an early pull during that window
-can legitimately come back empty.
+can legitimately come back empty. One more side effect worth knowing about:
+importing a Gradle project spawns a Gradle daemon, which — by Gradle's own
+design — keeps running after kotlin-lsp itself exits (including after a
+`ktmr doctor` probe). That's normal daemon reuse, not a leak of katamari's;
+`gradle --stop` (or killing the `GradleDaemon` process) reclaims it.
 
 jdtls needs a JDK 21+ on the machine — `JAVA_HOME` is honored first, then
 `PATH`, then `mise which java` — katamari installs the server itself but
@@ -560,6 +564,13 @@ Four sections, always in this order:
 
 Exit code is `0` unless at least one check is `error` (warnings alone still
 exit `0`) — safe to wire into a script or CI step as a pass/fail gate.
+
+Maintainers: `scripts/release-check.sh` (`mise run release-check` /
+`release-check-full`) automates a `ktmr doctor` pass one step further —
+building a release binary and running it against a throwaway multi-language
+monorepo in an isolated sandbox, so a release is only cut once LSP
+auto-install has actually been proven end to end, not just unit-tested. See
+`AGENTS.md`'s "Release check" section for usage.
 
 ## jj colocated setup
 

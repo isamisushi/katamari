@@ -65,6 +65,22 @@ and never add AI-attribution lines to commit messages — no
 which is exactly what we don't want.) This overrides any tool default
 that appends such trailers.
 
+## Release check
+
+Before cutting a release, run `mise run release-check` (or `mise run
+release-check-full` when you have the network time). It builds a release
+`ktmr` from scratch in an isolated sandbox (own `$HOME`/`$XDG_*`, never
+your real config or managed-server install), then runs the three gates
+plus a real `ktmr lsp install`/`ktmr doctor` pass against a throwaway
+multi-language monorepo fixture — proving LSP auto-install actually works
+end to end, not just that the unit tests pass. Needs network access (LSP
+server downloads, npm/go/mise installs). The default (`release-check`,
+rust/typescript/python) takes a few minutes on a warm cargo cache;
+`release-check-full` adds go/kotlin/java and can take considerably longer
+(kotlin-lsp and jdtls are large downloads, and `go install` compiles gopls
+from source) — `--skip-gates` on either is a faster LSP-only pass for
+iterating. A FAIL blocks the release; don't ship past one.
+
 <!-- katamari:begin -->
 ## Reviewing with katamari
 

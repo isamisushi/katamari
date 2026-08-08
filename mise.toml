@@ -29,3 +29,11 @@ description = "Run the PTY-driven E2E suite (tests/e2e.rs) against the real ktmr
 [tasks."e2e-tmux"]
 run = ["cargo build --bin ktmr", "scripts/e2e-tmux.sh"]
 description = "Real-terminal (tmux) smoke test of the kitty-protocol fallback"
+
+[tasks."release-check"]
+run = "scripts/release-check.sh"
+description = "Pre-release from-scratch verification: gates + a real LSP install/doctor pass over a throwaway monorepo (rust/typescript/python by default)"
+
+[tasks."release-check-full"]
+run = "scripts/release-check.sh --full"
+description = "release-check, all six languages (provisions java/go via mise if needed) — needs network and takes longer"
