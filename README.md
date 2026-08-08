@@ -53,54 +53,55 @@ an agent's session passed through, not just the version currently on disk.
 ## Install
 
 Every method installs two identical binaries, `katamari` and `ktmr` (the
-short name is what the rest of this document uses).
+short name is what the rest of this document uses). There are no distro
+packages (apt/dnf/pacman) yet — the channels below are the complete list.
 
-### macOS
-
-[Homebrew](https://brew.sh), Apple Silicon and Intel:
+### Homebrew (macOS and Linux)
 
 ```
 brew install isamisushi/tap/katamari
 ```
 
-Or skip Homebrew and take the raw archive from the
-[latest release](https://github.com/isamisushi/katamari/releases/latest)
-(Intel Macs: substitute `x86_64-apple-darwin`):
+### Prebuilt binaries (macOS and Linux)
 
-```
-curl -LO https://github.com/isamisushi/katamari/releases/latest/download/katamari-aarch64-apple-darwin.tar.xz
-tar -xJf katamari-aarch64-apple-darwin.tar.xz
-sudo install katamari-aarch64-apple-darwin/ktmr katamari-aarch64-apple-darwin/katamari /usr/local/bin/
-```
+Each [release](https://github.com/isamisushi/katamari/releases) ships a
+`tar.xz` per target, each with a matching `.sha256` alongside it:
 
-### Linux
+| OS    | CPU                     | archive                                   |
+| ----- | ----------------------- | ----------------------------------------- |
+| macOS | Apple Silicon           | `katamari-aarch64-apple-darwin.tar.xz`    |
+| macOS | Intel                   | `katamari-x86_64-apple-darwin.tar.xz`     |
+| Linux | x86_64 (glibc)          | `katamari-x86_64-unknown-linux-gnu.tar.xz` |
+| Linux | aarch64 (glibc)         | `katamari-aarch64-unknown-linux-gnu.tar.xz` |
 
-Prebuilt archives for x86_64 and aarch64 (glibc — for musl/Alpine, build
-from source below):
+Download, extract, and put the binaries anywhere on `$PATH` — the same
+three commands work on both OSes (shown for Linux x86_64; substitute your
+archive name from the table):
 
 ```
 curl -LO https://github.com/isamisushi/katamari/releases/latest/download/katamari-x86_64-unknown-linux-gnu.tar.xz
 tar -xJf katamari-x86_64-unknown-linux-gnu.tar.xz
-install katamari-x86_64-unknown-linux-gnu/ktmr katamari-x86_64-unknown-linux-gnu/katamari ~/.local/bin/
+sudo install katamari-x86_64-unknown-linux-gnu/ktmr katamari-x86_64-unknown-linux-gnu/katamari /usr/local/bin/
 ```
 
-(aarch64: substitute `aarch64-unknown-linux-gnu`; each archive on the
-[releases page](https://github.com/isamisushi/katamari/releases) has a
-matching `.sha256` if you want to verify the download.)
-[Homebrew on Linux](https://docs.brew.sh/Homebrew-on-Linux) also works,
-with the same `brew install isamisushi/tap/katamari` as macOS.
+The Linux binaries need glibc 2.34 or newer — in distro terms, Ubuntu
+22.04, Debian 12, RHEL/Rocky/Alma 9, or anything more recent (`ldd
+--version` prints yours). Older glibc and musl-based distros (Alpine)
+need the from-source route below.
 
-### Windows
+### mise
 
-No prebuilt binaries, and katamari isn't tested natively on Windows — run
-it inside [WSL](https://learn.microsoft.com/windows/wsl/) and follow the
-Linux instructions there. (A native `cargo install` may compile, but parts
-of the tool — `ktmr skill install`'s symlinks, LSP auto-install's
-executable-bit handling — assume a Unix filesystem.)
+If you already use [mise](https://mise.jdx.dev/), its `ubi` backend
+installs `ktmr` straight from the same release archives, on any of the
+four targets above:
+
+```
+mise use -g "ubi:isamisushi/katamari[exe=ktmr]"
+```
 
 ### From source
 
-Any OS with a Rust toolchain (any recent stable) — also the route for
+Any OS with a Rust toolchain (any recent stable) — and the route for
 targets without prebuilt archives, like musl Linux or the BSDs:
 
 ```
@@ -113,6 +114,14 @@ If this repository itself is managed with [mise](https://mise.jdx.dev/),
 `mise.toml` already pins a Rust toolchain and defines `mise run
 build`/`test`/`lint`/`fmt` tasks for working on katamari's own source;
 none of that is required to build or run it.
+
+### Windows
+
+No prebuilt binaries, and katamari isn't tested natively on Windows — run
+it inside [WSL](https://learn.microsoft.com/windows/wsl/) and follow the
+Linux instructions there. (A native `cargo install` may compile, but parts
+of the tool — `ktmr skill install`'s symlinks, LSP auto-install's
+executable-bit handling — assume a Unix filesystem.)
 
 ## Quickstart
 
