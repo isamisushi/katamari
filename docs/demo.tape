@@ -1,10 +1,16 @@
 # katamari demo: reviewing an AI agent's TypeScript refactor with
-# ktmr diff — hover, go-to-definition, diagnostics, and a review comment,
-# all without leaving the terminal. Recorded against a freshly built
-# local binary (main @ post-745acfe, soft line-wrap on by default).
-# Re-recorded with --show-keys so the bottom-right key-display chip is
-# visible throughout; the comment-typing segment intentionally shows its
-# `[typing…]` masking rather than echoing the typed text.
+# ktmr diff — hover, go-to-definition, diagnostics, a review comment,
+# and the v0.4.0 additions: `/` search with n, `z o` fold expansion,
+# the `?` help window, and a closing `ktmr doctor` health check.
+# Recorded against a freshly built local binary (main @ v0.4.0+,
+# soft line-wrap on by default) with --show-keys so the bottom-right
+# key-display chip shows what's being pressed; the comment-typing
+# segment intentionally shows its `[typing…]` masking rather than
+# echoing the typed text.
+#
+# NOTE: the two `Hide`-section paths below (fixture repo cd + PATH) are
+# machine-local — update them to wherever your demo repo and freshly
+# built target/release live before running `vhs docs/demo.tape`.
 
 Output demo.gif
 
@@ -75,6 +81,51 @@ Sleep 500ms
 Ctrl+S
 Sleep 2s
 
+# v0.4.0: search the diff vim-style — money shot #4. `/` prompts on the
+# status line, matches highlight as you type, n hops between them.
+Type "/"
+Sleep 400ms
+Type "createUser"
+Sleep 1200ms
+Enter
+Sleep 800ms
+Type "n"
+Sleep 900ms
+Type "n"
+Sleep 1200ms
+Escape
+Sleep 600ms
+
+# v0.4.0: unfold the context git omitted. G lands on the file's trailing
+# `···` fold row; z o splices the real source lines in, LSP-ready.
+Type "G"
+Sleep 800ms
+Type "zo"
+Sleep 2000ms
+Type "zc"
+Sleep 1000ms
+
+# v0.4.0: `?` — every binding, live and filterable. Type a few letters
+# into its `/` filter, then close.
+Type "?"
 Sleep 1500ms
+Type "/"
+Sleep 300ms
+Type "fold"
+Sleep 1500ms
+Escape
+Sleep 400ms
+Escape
+Sleep 600ms
+
+Sleep 1000ms
 Type "q"
 Sleep 500ms
+
+# v0.4.0 closer: `ktmr doctor` — the checkhealth-style report, ending on
+# the live spawn-and-hover probe timings for the repo's language.
+Type "clear"
+Enter
+Type "ktmr doctor"
+Enter
+Sleep 8s
