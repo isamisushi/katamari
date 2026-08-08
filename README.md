@@ -62,6 +62,15 @@ packages (apt/dnf/pacman) yet — the channels below are the complete list.
 brew install isamisushi/tap/katamari
 ```
 
+### Install script (macOS and Linux)
+
+Detects your platform — on Linux, choosing between the glibc and static
+musl builds — and installs without needing a Rust toolchain:
+
+```
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/isamisushi/katamari/releases/latest/download/katamari-installer.sh | sh
+```
+
 ### Prebuilt binaries (macOS and Linux)
 
 Each [release](https://github.com/isamisushi/katamari/releases) ships a
@@ -73,6 +82,8 @@ Each [release](https://github.com/isamisushi/katamari/releases) ships a
 | macOS | Intel                   | `katamari-x86_64-apple-darwin.tar.xz`     |
 | Linux | x86_64 (glibc)          | `katamari-x86_64-unknown-linux-gnu.tar.xz` |
 | Linux | aarch64 (glibc)         | `katamari-aarch64-unknown-linux-gnu.tar.xz` |
+| Linux | x86_64 (musl, static)   | `katamari-x86_64-unknown-linux-musl.tar.xz` |
+| Linux | aarch64 (musl, static)  | `katamari-aarch64-unknown-linux-musl.tar.xz` |
 
 Download, extract, and put the binaries anywhere on `$PATH` — the same
 three commands work on both OSes (shown for Linux x86_64; substitute your
@@ -84,16 +95,16 @@ tar -xJf katamari-x86_64-unknown-linux-gnu.tar.xz
 sudo install katamari-x86_64-unknown-linux-gnu/ktmr katamari-x86_64-unknown-linux-gnu/katamari /usr/local/bin/
 ```
 
-The Linux binaries need glibc 2.34 or newer — in distro terms, Ubuntu
+The gnu archives need glibc 2.34 or newer — in distro terms, Ubuntu
 22.04, Debian 12, RHEL/Rocky/Alma 9, or anything more recent (`ldd
---version` prints yours). Older glibc and musl-based distros (Alpine)
-need the from-source route below.
+--version` prints yours). On anything older, and on musl-based distros
+like Alpine, use the musl archives: fully static, they run on any Linux.
 
 ### mise
 
 If you already use [mise](https://mise.jdx.dev/), its `ubi` backend
 installs `ktmr` straight from the same release archives, on any of the
-four targets above:
+targets above:
 
 ```
 mise use -g "ubi:isamisushi/katamari[exe=ktmr]"
@@ -102,7 +113,7 @@ mise use -g "ubi:isamisushi/katamari[exe=ktmr]"
 ### From source
 
 Any OS with a Rust toolchain (any recent stable) — and the route for
-targets without prebuilt archives, like musl Linux or the BSDs:
+targets without prebuilt archives, like the BSDs:
 
 ```
 git clone https://github.com/isamisushi/katamari.git
