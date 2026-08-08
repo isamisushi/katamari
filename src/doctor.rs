@@ -575,6 +575,19 @@ fn language_resolution_checks(
             Check::warn(label, note)
         });
     }
+    if language == Language::Go {
+        // Same shape as Java's jdk row, for the same reason: gopls is the
+        // second server with a runtime prerequisite the resolution row
+        // can't see — it spawns and initializes without `go`, then fails
+        // every request with an opaque "no views".
+        let (go_ok, note) = adapter::go_toolchain_status();
+        let label = format!("{}: toolchain", language.lsp_id());
+        checks.push(if go_ok {
+            Check::ok(label, note)
+        } else {
+            Check::warn(label, note)
+        });
+    }
     checks
 }
 
@@ -1697,6 +1710,26 @@ mod tests {
             jdk_check.status,
             if ok { Status::Ok } else { Status::Warn },
             "a `not found`/too-old note must never be tagged `ok`: {jdk_check:?}"
+        );
+    }
+
+    #[test]
+    fn language_resolution_checks_go_toolchain_subcheck_status_matches_go_toolchain_status() {
+        // Go's twin of the jdk sub-check test above: gopls initializes fine
+        // without a `go` binary and then fails every request with "no
+        // views", so the toolchain row must exist and must never tag a
+        // not-found note `ok`.
+        let checks = language_resolution_checks(Language::Go, Path::new("/repo"), &HashMap::new());
+        let toolchain_check = checks
+            .iter()
+            .find(|c| c.label == "go: toolchain")
+            .expect("a `go: toolchain` row is always present for the Go language");
+        let (ok, note) = adapter::go_toolchain_status();
+        assert_eq!(toolchain_check.detail, note, "{toolchain_check:?}");
+        assert_eq!(
+            toolchain_check.status,
+            if ok { Status::Ok } else { Status::Warn },
+            "a not-found note must never be tagged `ok`: {toolchain_check:?}"
         );
     }
 

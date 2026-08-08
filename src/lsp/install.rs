@@ -183,6 +183,18 @@ fn binary_path(prefix: &Path, language: Language) -> PathBuf {
 /// from this same managed install (a project-local or `PATH` server is left
 /// to its own default resolution, which is more likely to already agree
 /// with that project's own `tsconfig.json`/typescript version).
+/// Where [`bootstrap_node`]'s runtime lands — the directory
+/// [`crate::lsp::adapter`] must put on a managed npm-strategy server's
+/// child `PATH`, since those servers are `#!/usr/bin/env node` scripts and
+/// the bootstrap is only ever taken on machines where no other `node`
+/// exists to satisfy that shebang.
+pub(crate) fn bootstrapped_node_bin_dir() -> PathBuf {
+    prefix_dir()
+        .join("node")
+        .join(NODE_BOOTSTRAP_VERSION)
+        .join("bin")
+}
+
 pub fn managed_tsserver_path() -> PathBuf {
     let spec = spec_for(Language::TypeScript);
     prefix_dir()
@@ -397,13 +409,31 @@ fn install_npm_package(
     package_specs.extend(peers.iter().map(|(pkg, ver)| format!("{pkg}@{ver}")));
 
     on_progress(format!("npm install {}", package_specs.join(" ")));
-    let status = Command::new(&npm)
+    let mut npm_command = Command::new(&npm);
+    npm_command
         .arg("install")
         .arg("--no-audit")
         .arg("--no-fund")
         .arg("--prefix")
         .arg(&install_dir)
-        .args(&package_specs)
+        .args(&package_specs);
+    // `npm` is a `#!/usr/bin/env node` script, so the child must be able to
+    // resolve plain `node` on its PATH — which a machine with no Node at all
+    // (the whole reason `bootstrap_node` ran) by definition can't. The
+    // bootstrap lays `node` out next to `npm` in the same `bin/`, so
+    // prepending npm's own directory makes the shebang resolve regardless of
+    // which tier `resolve_npm` found npm through; without this the install
+    // dies with a bare exit-127 before npm even starts.
+    if let Some(bin_dir) = npm.parent() {
+        let mut paths = vec![bin_dir.to_path_buf()];
+        if let Some(existing) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&existing));
+        }
+        if let Ok(joined) = std::env::join_paths(paths) {
+            npm_command.env("PATH", joined);
+        }
+    }
+    let status = npm_command
         .status()
         .map_err(|e| InstallError(format!("running {}: {e}", npm.display())))?;
     if !status.success() {

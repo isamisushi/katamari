@@ -642,15 +642,25 @@ fn command_for(
                 .map(|tsserver| {
                     serde_json::json!({ "tsserver": { "path": tsserver.display().to_string() } })
                 });
+            let mut command = ts_language_server_command(path);
+            if from_katamari_managed {
+                prepend_bootstrapped_node_path(&mut command);
+            }
             Ok(ResolvedServer {
-                command: ts_language_server_command(path),
+                command,
                 initialization_options,
             })
         }
-        Language::Python => Ok(ResolvedServer {
-            command: pyright_command(path),
-            initialization_options: None,
-        }),
+        Language::Python => {
+            let mut command = pyright_command(path);
+            if from_katamari_managed {
+                prepend_bootstrapped_node_path(&mut command);
+            }
+            Ok(ResolvedServer {
+                command,
+                initialization_options: None,
+            })
+        }
         Language::Kotlin => Ok(ResolvedServer {
             command: kotlin_lsp_command(path),
             initialization_options: None,
@@ -1193,6 +1203,46 @@ fn lookup_kotlin_lsp() -> Option<LookupHit> {
 /// one language this question matters for.
 fn go_toolchain_available() -> bool {
     which_on_path("go").is_some() || mise_which("go").is_some()
+}
+
+/// The npm-strategy servers (`typescript-language-server`,
+/// `pyright-langserver`) are `#!/usr/bin/env node` scripts: launched from
+/// katamari's own managed install on a machine with no system Node — the
+/// very machine `install::bootstrap_node` exists for — the shebang can't
+/// resolve `node` and the server dies before speaking a byte of LSP (the
+/// initialize failure surfaces only the shebang's `env:` error). Prepending
+/// the bootstrapped runtime's bin directory to the child's `PATH` fixes
+/// exactly that case; PATH/mise/project-local servers are left to the
+/// environment that already resolved them.
+fn prepend_bootstrapped_node_path(command: &mut Command) {
+    let bin_dir = install::bootstrapped_node_bin_dir();
+    if !bin_dir.is_dir() {
+        return;
+    }
+    let mut paths = vec![bin_dir];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    if let Ok(joined) = std::env::join_paths(paths) {
+        command.env("PATH", joined);
+    }
+}
+
+/// `ktmr doctor`'s go-toolchain sub-check, mirroring [`java_jdk_status`]:
+/// gopls resolves and initializes fine without a `go` binary, then fails
+/// every real request with an opaque "no views" — a found-server row alone
+/// would read as healthy while the one thing a user does (hover) breaks.
+pub(crate) fn go_toolchain_status() -> (bool, String) {
+    if let Some(path) = which_on_path("go").or_else(|| mise_which("go")) {
+        (true, path.display().to_string())
+    } else {
+        (
+            false,
+            "not found — gopls needs a go toolchain at runtime (hover/definition will fail \
+             with \"no views\" without one)"
+                .to_owned(),
+        )
+    }
 }
 
 /// Builds every [`Unavailable`] in this module (and — via `pub(crate)` —

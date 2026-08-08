@@ -1390,12 +1390,23 @@ fn run_lsp_install(language: LanguageArg) -> Result<()> {
         LanguageArg::Kotlin => vec![lsp::adapter::Language::Kotlin],
         LanguageArg::Java => vec![lsp::adapter::Language::Java],
     };
+    let mut failed: Vec<&'static str> = Vec::new();
     for language in languages {
         println!("=== {} ===", language_label(language));
         match lsp::install::ensure(language, |message| println!("  {message}")) {
             Ok(path) => println!("  installed: {}", path.display()),
-            Err(e) => println!("  skipped: {e}"),
+            Err(e) => {
+                println!("  failed: {e}");
+                failed.push(language_label(language));
+            }
         }
+    }
+    // A failed install must be visible to scripts (release checks, CI) via
+    // the exit code — "printed an error but exited 0" is how the npm-
+    // bootstrap regression went unnoticed until a from-scratch environment
+    // hit it.
+    if !failed.is_empty() {
+        anyhow::bail!("install failed for: {}", failed.join(", "));
     }
     Ok(())
 }
