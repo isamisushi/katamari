@@ -55,7 +55,7 @@ impl HintItem {
     /// (callers `.flatten()` a list of these). If at least one does, the
     /// item is built from whichever bindings are present; in practice every
     /// action this is called with always has one (both built-in presets
-    /// bind all 28 actions, and `[keys]` only rebinds/appends — see
+    /// bind all 33 actions, and `[keys]` only rebinds/appends — see
     /// `Keymap::binding_for`'s docs), so this only ever loses a pair down to
     /// its single working half, never disappears outright.
     pub fn for_actions(keymap: &Keymap, actions: &[Action], label: &'static str) -> Option<Self> {
@@ -204,6 +204,14 @@ pub fn diff_view_items(keymap: &Keymap) -> Vec<HintItem> {
     [
         HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "move"),
         HintItem::for_actions(keymap, &[Action::JumpBack, Action::JumpForward], "jump"),
+        // Early, not tucked at the end with the other toggles below: the
+        // whole point of `?` is discoverability, so it needs to survive
+        // `wrap_items`' first-N-items-fit cutoff on a realistic-width
+        // terminal (see
+        // `fold_and_help_hints_do_not_push_quit_off_the_status_bar_at_a_realistic_width`
+        // below) rather than being the kind of low-priority entry that
+        // policy is designed to drop first.
+        HintItem::for_actions(keymap, &[Action::OpenHelp], "help"),
         HintItem::for_actions(keymap, &[Action::GotoDefinition], "def"),
         HintItem::for_actions(keymap, &[Action::FindReferences], "refs"),
         HintItem::for_actions(keymap, &[Action::Top, Action::Bottom], "top/bottom"),
@@ -242,6 +250,7 @@ pub fn file_view_items(keymap: &Keymap) -> Vec<HintItem> {
     [
         HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "move"),
         HintItem::for_actions(keymap, &[Action::JumpBack, Action::JumpForward], "jump"),
+        HintItem::for_actions(keymap, &[Action::OpenHelp], "help"),
         HintItem::for_actions(keymap, &[Action::GotoDefinition], "def"),
         HintItem::for_actions(keymap, &[Action::FindReferences], "refs"),
         HintItem::for_actions(keymap, &[Action::Top, Action::Bottom], "top/bottom"),
@@ -271,6 +280,7 @@ pub fn file_view_items(keymap: &Keymap) -> Vec<HintItem> {
 pub fn timeline_view_items(keymap: &Keymap) -> Vec<HintItem> {
     [
         HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "select"),
+        HintItem::for_actions(keymap, &[Action::OpenHelp], "help"),
         HintItem::for_actions(keymap, &[Action::NextSymbol], "focus"),
         HintItem::for_actions(keymap, &[Action::ToggleRangeSelect], "range"),
         HintItem::for_actions(keymap, &[Action::Confirm], "back to diff"),
@@ -292,6 +302,7 @@ pub fn timeline_view_items(keymap: &Keymap) -> Vec<HintItem> {
 pub fn log_view_items(keymap: &Keymap) -> Vec<HintItem> {
     [
         HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "select"),
+        HintItem::for_actions(keymap, &[Action::OpenHelp], "help"),
         HintItem::for_actions(keymap, &[Action::Confirm], "open diff"),
         HintItem::for_actions(keymap, &[Action::ToggleRangeSelect], "range"),
         HintItem::for_actions(
@@ -495,16 +506,24 @@ mod tests {
 
     /// `diff_view_items` was already close to filling [`MAX_HINT_LINES`] at
     /// a realistic 100-column pane before the fold hint existed — this
-    /// pins down that adding it didn't quietly push a lower-priority item
-    /// (here, `quit`, the last-listed and therefore first-dropped one per
-    /// [`wrap_items`]'s policy) off the status bar entirely.
+    /// pins down that adding it (and, later, the `?` help hint) didn't
+    /// quietly push a lower-priority item (here, `quit`, the last-listed
+    /// and therefore first-dropped one per [`wrap_items`]'s policy) off the
+    /// status bar entirely. `help` itself is listed early (see
+    /// `diff_view_items`'s own item list) specifically so it isn't the one
+    /// that goes missing here instead — discoverability is the entire
+    /// point of `?`.
     #[test]
-    fn fold_hint_does_not_push_quit_off_the_status_bar_at_a_realistic_width() {
+    fn fold_and_help_hints_do_not_push_quit_off_the_status_bar_at_a_realistic_width() {
         let keymap = Keymap::from_bindings(&vim_preset(false));
         let items = diff_view_items(&keymap);
         assert!(
             items.iter().any(|i| i.display().starts_with("zo/zc")),
             "the fold hint should be present in the curated list"
+        );
+        assert!(
+            items.iter().any(|i| i.display() == "? help"),
+            "the help hint should be present in the curated list"
         );
         let wrapped = wrap_for_area(&items, 100);
         assert!(
@@ -512,9 +531,43 @@ mod tests {
             "must still fit within the hint area's line cap"
         );
         assert!(
+            wrapped.iter().any(|line| line.contains("? help")),
+            "help must be visible at a realistic width; wrapped:\n{wrapped:?}"
+        );
+        assert!(
             wrapped.iter().any(|line| line.contains("quit")),
             "quit must still survive at a realistic width; wrapped:\n{wrapped:?}"
         );
+    }
+
+    /// [`file_view_items`]/[`timeline_view_items`]/[`log_view_items`] each
+    /// have far more slack than the diff view's own 18-item list (10/5/4
+    /// items even after adding `help`), but the same regression is cheap to
+    /// guard against for all three: `help` visible, and the list's own
+    /// last-listed item (the one [`wrap_items`] would drop first) still
+    /// surviving too, at the same realistic 100-column width the diff-view
+    /// test above uses.
+    #[test]
+    fn help_hint_is_visible_in_file_timeline_and_log_lists_at_a_realistic_width() {
+        let keymap = Keymap::from_bindings(&vim_preset(false));
+
+        let file_items = file_view_items(&keymap);
+        let file_wrapped = wrap_for_area(&file_items, 100);
+        assert!(file_wrapped.len() <= MAX_HINT_LINES);
+        assert!(file_wrapped.iter().any(|l| l.contains("? help")));
+        assert!(file_wrapped.iter().any(|l| l.contains("quit")));
+
+        let timeline_items = timeline_view_items(&keymap);
+        let timeline_wrapped = wrap_for_area(&timeline_items, 100);
+        assert!(timeline_wrapped.len() <= MAX_HINT_LINES);
+        assert!(timeline_wrapped.iter().any(|l| l.contains("? help")));
+        assert!(timeline_wrapped.iter().any(|l| l.contains("close")));
+
+        let log_items = log_view_items(&keymap);
+        let log_wrapped = wrap_for_area(&log_items, 100);
+        assert!(log_wrapped.len() <= MAX_HINT_LINES);
+        assert!(log_wrapped.iter().any(|l| l.contains("? help")));
+        assert!(log_wrapped.iter().any(|l| l.contains("close")));
     }
 
     #[test]

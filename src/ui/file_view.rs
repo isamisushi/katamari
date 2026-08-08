@@ -260,6 +260,13 @@ impl FileView {
             | Action::ToggleComments
             | Action::ExpandFold
             | Action::CollapseFold => {}
+            // `ui::mod` intercepts this before it reaches here, same as
+            // every other action in the `Hover`/`Cancel`/... group above —
+            // opening `ui::help`'s popup needs the live `Keymap`, which
+            // `FileView` doesn't own, and it opens from any view, so it's a
+            // no-op here rather than something this view ever handles
+            // itself. See `Action::OpenHelp`'s docs.
+            Action::OpenHelp => {}
         }
         if self.cursor != cursor_before {
             self.active_symbol = 0;

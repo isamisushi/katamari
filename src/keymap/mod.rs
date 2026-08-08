@@ -138,6 +138,15 @@ pub enum Action {
     /// as one pair rather than one pure and one not.
     CollapseFold,
     Quit,
+    /// Opens [`crate::ui::help`]'s popup — every action, grouped, with its
+    /// live binding. `ui::mod`'s event loop intercepts this the same way it
+    /// intercepts `OpenScopeMenu`/`ToggleTimeline`/`ToggleLogView` (building
+    /// the popup's row list needs the live [`Keymap`], which neither `App`
+    /// nor `FileView` owns) — but unlike `OpenScopeMenu`'s `View::Diff`-only
+    /// gate, this opens from *any* view: the bindings a reviewer might have
+    /// forgotten are global information, not something tied to whichever
+    /// screen happens to be on top when they reach for `?`.
+    OpenHelp,
 }
 
 /// One key press, normalized for matching: the SHIFT modifier is dropped
@@ -351,25 +360,53 @@ impl Keymap {
     }
 
     /// The key sequence bound to `action` in this keymap, if any — the
-    /// single source of truth `ui::hints` reads to render status-bar hints,
-    /// so a `[keys]` rebind or switching to the emacs preset changes hint
-    /// text automatically instead of a hardcoded string drifting out of
-    /// sync with it (the bug this method exists to fix).
+    /// single source of truth `ui::hints`/`ui::help` read to render
+    /// status-bar hints and the `?` popup's live bindings, so a `[keys]`
+    /// rebind or switching to the emacs preset changes them automatically
+    /// instead of a hardcoded string drifting out of sync (the bug this
+    /// method exists to fix).
     ///
-    /// When `bindings` holds more than one entry for `action`, the first one
-    /// wins — preset insertion order, which every built-in preset also
-    /// happens to list in "primary binding first" order. In practice this
-    /// tie only matters for a pathological `[keys]` config that adds an
-    /// alias without touching the original (`apply_key_overrides` rebinds
-    /// the *existing* slot in place, so a normal override never creates a
-    /// second entry); `None` only if `action` has no binding at all, which
-    /// neither built-in preset ever produces (see this module's
-    /// `every_vim_and_emacs_binding_covers_every_action_exactly_once` test).
+    /// When `bindings` holds more than one entry for `action`, the first
+    /// one that the trie actually resolves *back* to `action` wins — not
+    /// just the first one naming `action` at all. `apply_key_overrides`
+    /// has no collision detection: a `[keys]` override can rebind one
+    /// action's sequence onto a key sequence another action already owns,
+    /// in which case [`Self::from_bindings`]'s trie (built by iterating
+    /// `bindings` in order and overwriting the matching node on each entry)
+    /// resolves that sequence to whichever entry comes *last*, same as
+    /// `Resolver::feed` would live. A naive first-match-by-action scan
+    /// would happily report the *earlier*, now-shadowed entry as still
+    /// bound — e.g. an override that lands `Quit` on `CursorDown`'s
+    /// preset key `j` would make this method claim `CursorDown` is still
+    /// bound to `j` too, when pressing `j` actually quits. Skipping a
+    /// shadowed entry and continuing to scan (rather than stopping at the
+    /// first name match) means this can never disagree with what
+    /// `Resolver::feed` would really do — an action that only has shadowed
+    /// entries correctly comes back `None` (unbound) instead of a binding
+    /// that lies.
     pub fn binding_for(&self, action: Action) -> Option<&KeySeq> {
         self.bindings
             .iter()
-            .find(|(_, a)| *a == action)
+            .find(|(seq, a)| *a == action && self.trie_resolution(seq) == Some(action))
             .map(|(seq, _)| seq)
+    }
+
+    /// Walks `seq` through this keymap's trie exactly as
+    /// [`Resolver::feed`] would, one chord at a time, and returns the
+    /// action a complete traversal lands on — `None` if `seq` doesn't fully
+    /// resolve to *any* bound action in this trie (a dead sequence, or one
+    /// left pending). The one ground truth [`Self::binding_for`] cross-checks
+    /// every candidate binding against, since `bindings` (a flat list of
+    /// "an action was configured with this sequence") and the trie (what a
+    /// live keystroke sequence actually resolves to) can disagree the
+    /// moment a `[keys]` override creates a collision — see
+    /// [`Self::binding_for`]'s docs.
+    fn trie_resolution(&self, seq: &KeySeq) -> Option<Action> {
+        let mut node = &self.root;
+        for chord in &seq.0 {
+            node = node.children.get(chord)?;
+        }
+        node.action
     }
 }
 
@@ -484,6 +521,7 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("z o", Action::ExpandFold),
         ("z c", Action::CollapseFold),
         ("q", Action::Quit),
+        ("?", Action::OpenHelp),
     ]);
     bindings
         .into_iter()
@@ -557,6 +595,12 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("z o", Action::ExpandFold),
         ("z c", Action::CollapseFold),
         ("q", Action::Quit),
+        // Same vim-keys-for-things-with-no-emacs-identity rule as `q`/`b`/
+        // `s` above: `?` is unbound and not a prefix of anything else in
+        // this preset (`M-?` — FindReferences — is a different chord, since
+        // `KeyChord` compares modifiers too), so there's no real collision
+        // to design around.
+        ("?", Action::OpenHelp),
     ]);
     bindings
         .into_iter()
@@ -570,14 +614,14 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
 /// exact inverse, so a name printed by one always round-trips through the
 /// other. Kept as two matches rather than a derive, since neither `Action`
 /// nor this mapping has any reason to live in a proc-macro-worthy crate for
-/// what's fundamentally a 28-line lookup table.
+/// what's fundamentally a plain lookup table.
 ///
-/// No production caller yet — only [`action_by_name`] (config's `[keys]`
-/// parsing) is on that path today. Kept anyway, the same way
-/// `diff::coords::ColumnMap`'s `display_len`/`utf8_len` are: it's the other
-/// half of a documented round-trip this module's own tests hold it to, and
-/// a natural fit for a future `ktmr config keys` listing/validation command.
-#[allow(dead_code)]
+/// Two production callers as of the help popup (issue #3): [`action_by_name`]
+/// itself (config's `[keys]` parsing) and [`crate::ui::help`]'s filter
+/// matching, which treats an action's kebab name as one of the substrings a
+/// typed filter can match against (alongside its description and live
+/// binding notation) — a reviewer half-remembering "cursor-down" as well as
+/// "move" should find the same row either way.
 pub fn action_name(action: Action) -> &'static str {
     match action {
         Action::CursorDown => "cursor-down",
@@ -612,6 +656,7 @@ pub fn action_name(action: Action) -> &'static str {
         Action::ExpandFold => "expand-fold",
         Action::CollapseFold => "collapse-fold",
         Action::Quit => "quit",
+        Action::OpenHelp => "open-help",
     }
 }
 
@@ -653,6 +698,7 @@ pub fn action_by_name(name: &str) -> Option<Action> {
         "expand-fold" => Action::ExpandFold,
         "collapse-fold" => Action::CollapseFold,
         "quit" => Action::Quit,
+        "open-help" => Action::OpenHelp,
         _ => return None,
     })
 }
@@ -811,6 +857,40 @@ mod tests {
     }
 
     #[test]
+    fn open_help_binds_to_plain_question_mark_in_both_presets() {
+        for preset_fn in [vim_preset, emacs_preset] {
+            let keymap = Keymap::from_bindings(&preset_fn(false));
+            let mut resolver = keymap.resolver();
+            assert_eq!(
+                resolver.feed(chord('?')),
+                StepResult::Matched(Action::OpenHelp)
+            );
+        }
+    }
+
+    /// The verified-architecture claim this milestone's spec leans on,
+    /// pinned down directly: a bare `?` (no modifiers — `KeyChord::new`
+    /// strips SHIFT, so `Shift-/`'s `Char('?')` normalizes the same way)
+    /// and emacs's `M-?` (`FindReferences`, a real `xref-find-references`
+    /// convention — see [`emacs_preset`]'s docs) are different `KeyChord`s
+    /// because `KeyChord` compares modifiers too, not just `KeyCode`. Each
+    /// resolves independently to its own action in the same keymap; neither
+    /// steals the other's binding.
+    #[test]
+    fn plain_question_mark_does_not_collide_with_emacs_meta_question_mark() {
+        let keymap = Keymap::from_bindings(&emacs_preset(false));
+
+        let mut help = keymap.resolver();
+        assert_eq!(help.feed(chord('?')), StepResult::Matched(Action::OpenHelp));
+
+        let mut refs = keymap.resolver();
+        assert_eq!(
+            refs.feed(alt('?')),
+            StepResult::Matched(Action::FindReferences)
+        );
+    }
+
+    #[test]
     fn emacs_preset_single_key_control_n_matches_cursor_down() {
         let keymap = Keymap::from_bindings(&emacs_preset(false));
         let mut resolver = keymap.resolver();
@@ -926,6 +1006,7 @@ mod tests {
             Action::ExpandFold,
             Action::CollapseFold,
             Action::Quit,
+            Action::OpenHelp,
         ];
         for action in all {
             let name = action_name(action);
@@ -1000,6 +1081,44 @@ mod tests {
     }
 
     #[test]
+    fn binding_for_never_reports_an_entry_the_trie_resolves_to_a_different_action() {
+        // Reproduces a real `[keys]` collision: `apply_key_overrides`
+        // rebinds `Quit`'s own slot onto vim's `CursorDown` key ("j") in
+        // place, with no collision detection. `from_bindings` builds the
+        // trie by iterating `bindings` in order, so whichever of the two
+        // entries claiming "j" comes *last* — `Quit`'s, since it's
+        // rewritten after `CursorDown`'s untouched preset entry — is what
+        // `Resolver::feed` actually reaches.
+        let mut bindings = vim_preset(false);
+        let quit = bindings
+            .iter_mut()
+            .find(|(_, a)| *a == Action::Quit)
+            .unwrap();
+        quit.0 = KeySeq::parse("j");
+        let keymap = Keymap::from_bindings(&bindings);
+
+        let mut resolver = keymap.resolver();
+        assert_eq!(
+            resolver.feed(chord('j')),
+            StepResult::Matched(Action::Quit),
+            "sanity check: the trie really does resolve \"j\" to Quit here"
+        );
+
+        // `CursorDown`'s own bindings-list entry still says "j" — but that
+        // entry is shadowed in the trie, so reporting it as CursorDown's
+        // live binding would be a lie a reviewer could act on (pressing
+        // "j" expecting cursor movement, and quitting instead).
+        assert!(
+            keymap.binding_for(Action::CursorDown).is_none(),
+            "CursorDown must show unbound, not a binding the trie no longer honors"
+        );
+        assert_eq!(
+            keymap.binding_for(Action::Quit).unwrap().compact_notation(),
+            "j"
+        );
+    }
+
+    #[test]
     fn compact_notation_joins_bare_multi_key_sequences_without_a_separator() {
         assert_eq!(KeySeq::parse("g g").compact_notation(), "gg");
         assert_eq!(KeySeq::parse("] c").compact_notation(), "]c");
@@ -1021,17 +1140,22 @@ mod tests {
         assert_eq!(KeySeq::parse("q").compact_notation(), "q");
     }
 
-    /// The 32 actions (see the `action_name_and_action_by_name_round_trip…`
+    /// The 33 actions (see the `action_name_and_action_by_name_round_trip…`
     /// test's `all` list) each get exactly one binding — except
     /// `JumpForward`, which gets a *second* one (`C-i`) precisely when
     /// `ci_distinguishable` is set, per [`vim_preset`]/[`emacs_preset`]'s
     /// docs. So this checks two things per preset: every action is still
-    /// reachable (`actions.len() == 32` after dedup), and the raw entry
+    /// reachable (`actions.len() == 33` after dedup), and the raw entry
     /// count is exactly one more than that when the extra `C-i` alias is
-    /// present, exactly equal otherwise.
+    /// present, exactly equal otherwise. As a side effect, this also forces
+    /// `?` to be bound in both presets the moment `ACTION_COUNT` bumps to
+    /// 33 — [`Action::OpenHelp`] with no binding in either preset would fail
+    /// the `actions.len() == ACTION_COUNT` assertion below, not just the
+    /// dedicated `open_help_binds_to_plain_question_mark_in_both_presets`
+    /// test.
     #[test]
     fn every_vim_and_emacs_binding_covers_every_action_exactly_once() {
-        const ACTION_COUNT: usize = 32;
+        const ACTION_COUNT: usize = 33;
         for ci_distinguishable in [false, true] {
             for preset in [
                 vim_preset(ci_distinguishable),

@@ -234,6 +234,7 @@ below) for the emacs column. `q` quits either way.
 | Toggle timeline | `t` | `t` |
 | Toggle log view | `L` | `L` |
 | Open scope menu | `o` | `o` |
+| Open help | `?` | `?` |
 | Toggle range-select (timeline/log) | `v` | `C-Space` |
 | Add comment | `c` | `C-c C-c` |
 | (in comment compose) newline / save / cancel | `Enter` / `C-s` / `Esc` | same |
@@ -248,6 +249,19 @@ as the same byte, and Tab already means next-symbol-on-line, so katamari
 falls back to `C-t` there instead (notably Terminal.app, which doesn't
 implement the protocol). Detected once at startup; `C-t` also keeps working
 as an alias in terminals where `C-i` is active.
+
+`?` from any view opens a floating help window listing every command,
+grouped, with its actual key next to it — the bindings shown are live
+(preset plus any `[keys]` override below), never a hardcoded reference the
+table above could drift out of sync with. `j`/`k`/arrows/`C-n`/`C-p` (and
+`PageDown`/`PageUp`/`C-d`/`C-u`, and `gg`/`G` for top/bottom) scroll; `/`
+starts a filter that narrows the list live as you type, matching against
+each row's description, its config name, and its key; `Enter` keeps the
+filter and returns to scrolling. `Esc` while typing the filter clears it
+and returns to scrolling; `Esc` while scrolling the list closes the window
+outright, same as `q`/`?`, whether or not a filter is still narrowing it.
+The window is modal while open — every key goes to it, not whatever view
+is underneath.
 
 Any binding can be overridden per action; see `[keys]` below.
 

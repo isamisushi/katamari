@@ -688,6 +688,13 @@ impl App {
             | Action::ToggleLogView
             | Action::OpenScopeMenu
             | Action::ToggleRangeSelect => {}
+            // `ui::mod` intercepts this before it reaches here too, same
+            // bucket as `ToggleTimeline`/`ToggleLogView`/`OpenScopeMenu`
+            // above — opening `ui::help`'s popup needs the live `Keymap` to
+            // build its row list, which `App` doesn't own, and (unlike
+            // those three) it opens from *any* view rather than gating on
+            // `View::Diff` — see `Action::OpenHelp`'s docs.
+            Action::OpenHelp => {}
             Action::Quit => self.should_quit = true,
         }
         if self.cursor != cursor_before {

@@ -17,6 +17,7 @@ pub mod app;
 pub mod compose;
 pub mod diff_view;
 pub mod file_view;
+pub mod help;
 pub mod hints;
 pub mod hover_popup;
 pub mod key_display;
@@ -52,6 +53,7 @@ use crate::lsp::{
 };
 use crate::skill;
 use crate::ui::compose::{ComposeOutcome, ComposeState};
+use crate::ui::help::{HelpOutcome, HelpState};
 use crate::ui::log_view::LogView;
 use crate::ui::navigation::{JumpEntry, JumpStack, navigate_to};
 use crate::ui::refs_panel::RefsPanel;
@@ -560,6 +562,17 @@ fn event_loop(
     let mut warned_languages: HashSet<LangKey> = HashSet::new();
     let mut compose: Option<ComposeState> = None;
     let mut scope_menu: Option<ScopeMenuState> = None;
+    let mut help: Option<HelpState> = None;
+    // Memoizes `help::build_rows(keymap, filter).len()` against the filter
+    // text it was computed for — most keys the help popup's raw-key bypass
+    // sees while open (every scroll/page/top/bottom key in `Browse` mode)
+    // can't possibly change the row count, only `Filter` mode's
+    // insert/backspace/clear can, so rebuilding the whole row list from
+    // scratch on every keystroke (as opposed to just the ones that can
+    // change its length) would be pure waste. `keymap` never changes
+    // within a session (built once above), so the cache only needs to
+    // track `filter`, not `keymap` too.
+    let mut help_row_count_cache: Option<(String, usize)> = None;
     // M16's first-comment skill-install prompt: `skill_prompt_offered` is a
     // one-way session latch — set the moment the prompt is shown (whether or
     // not the reviewer ever responds), never reset, so it never appears
@@ -711,6 +724,7 @@ fn event_loop(
                 &comment_index,
                 compose.as_ref(),
                 scope_menu.as_ref(),
+                help.as_ref(),
                 jj_repo.is_some(),
                 &key_display,
             )
@@ -772,6 +786,45 @@ fn event_loop(
                                 status
                             });
                         }
+                    }
+                } else if let Some(state) = help.as_mut() {
+                    // The help popup is modal (see `ui::help`'s module
+                    // docs): every key while it's open is consumed here,
+                    // never falling through to the resolver below, so
+                    // there's nothing more this arm needs to do once
+                    // `handle_key` returns other than decide whether to
+                    // close. Sits right after `compose` and before the
+                    // scope-menu revision input in this `else if` chain —
+                    // mutual exclusion between the three holds structurally,
+                    // not by any extra check here: `?` only ever reaches the
+                    // resolver (and so only ever produces `Action::OpenHelp`,
+                    // see `handle_action` below) when neither `compose` nor
+                    // `ScopeMenuState::Revision` is already claiming every
+                    // keystroke as literal text, so `help` can never become
+                    // `Some` while either of those is open, and both of
+                    // those arms sit ahead of this one regardless.
+                    //
+                    // Deliberately does *not* call `key_display.record_typing`
+                    // the way `compose`/the revision input do above: that
+                    // masking exists to keep private review content (a
+                    // comment body, a revision string) off the
+                    // `--show-keys` overlay — see `key_display`'s module
+                    // docs — but `Filter` mode only ever narrows a list of
+                    // public command names/descriptions/bindings, so
+                    // there's nothing here worth hiding.
+                    let filter = state.filter_text();
+                    let total_rows = match &help_row_count_cache {
+                        Some((cached_filter, count)) if cached_filter == filter => *count,
+                        _ => {
+                            let count = help::build_rows(keymap, filter).len();
+                            help_row_count_cache = Some((filter.to_owned(), count));
+                            count
+                        }
+                    };
+                    let viewport = help::viewport_rows(area);
+                    match help::handle_key(state, key, total_rows, viewport) {
+                        HelpOutcome::Continue => {}
+                        HelpOutcome::Close => help = None,
                     }
                 } else if let Some(ScopeMenuState::Revision(input)) = scope_menu.as_mut() {
                     // Bypasses the keymap resolver for the same reason
@@ -870,6 +923,7 @@ fn event_loop(
                                     jj_repo.as_ref(),
                                     &mut compose,
                                     &mut scope_menu,
+                                    &mut help,
                                     highlighter,
                                     &mut watch_paused,
                                     watch_active,
@@ -1131,6 +1185,7 @@ fn handle_action(
     jj_repo: Option<&JjRepo>,
     compose: &mut Option<ComposeState>,
     scope_menu: &mut Option<ScopeMenuState>,
+    help: &mut Option<HelpState>,
     highlighter: &mut LineHighlighter,
     watch_paused: &mut bool,
     watch_active: bool,
@@ -1352,6 +1407,25 @@ fn handle_action(
         Action::Cancel => {} // nothing open; no effect
         Action::ToggleTimeline => open_or_close_timeline(stack, jj_repo, goto_status),
         Action::ToggleLogView => open_or_close_log(stack, goto_status),
+        // Explicit, not folded into the `other` catch-all below on
+        // purpose: unlike every action that bucket forwards to
+        // `View::update`, this one has no view-level effect at all (see
+        // `App`/`FileView::update`'s own `Action::OpenHelp` no-op arms) —
+        // an explicit arm here is the only place the popup actually opens.
+        // Forgetting it would still compile (the wildcard would silently
+        // swallow `?` into a no-op) — this is the one item on this
+        // feature's checklist that isn't compile-checked; the e2e suite is
+        // what backstops it.
+        //
+        // Cancels any in-flight hover/goto request first — see
+        // `cancel_pending_lsp_requests_for_help`'s docs for why a response
+        // that arrived while the modal was up would otherwise be able to
+        // mutate `stack`/`refs_panel` or draw a hover popup with the
+        // reviewer unable to even see it happen, let alone react.
+        Action::OpenHelp => {
+            cancel_pending_lsp_requests_for_help(hover_state, pending_goto);
+            *help = Some(HelpState::new());
+        }
         Action::OpenScopeMenu => match stack.top() {
             View::Diff(_) => *scope_menu = Some(ScopeMenuState::new_list(jj_repo.is_some())),
             View::File(_) | View::Timeline(_) | View::Log(_) => {
@@ -1385,6 +1459,32 @@ fn handle_action(
             }
         }
     }
+}
+
+/// Cancels whatever hover/goto-definition/find-references request is still
+/// in flight the instant the help modal opens, so a response arriving
+/// while (or after) it's up can never mutate `stack`/`refs_panel` or draw a
+/// hover popup out from under it. This matters specifically because the
+/// modal intercepts every keystroke until it closes (see `run`'s `help`
+/// arm) — the reviewer would have no way to even notice, let alone
+/// dismiss, whatever changed underneath.
+///
+/// Mirrors what a cursor move already does to a pending hover, via
+/// [`hover_popup::HoverState::invalidate`]: its generation bump makes
+/// [`hover_popup::HoverState::apply`] a no-op for a response tagged with
+/// the now-stale generation, so `pending_hover` itself is left alone here,
+/// same as at every other `invalidate()` call site in this file — no need
+/// to also drop its `Receiver`. `pending_goto` has no generation to lean
+/// on (`apply_definition_result`/`apply_references_result` run
+/// unconditionally on whatever they're given), so it's dropped outright
+/// instead, discarding the `Receiver` along with whatever answer the
+/// request eventually produces.
+fn cancel_pending_lsp_requests_for_help(
+    hover_state: &mut hover_popup::HoverState,
+    pending_goto: &mut Option<(JumpEntry, PendingGoto)>,
+) {
+    hover_state.invalidate();
+    *pending_goto = None;
 }
 
 /// `Action::ToggleTimeline`'s handling, factored out so the scope-menu
@@ -1805,6 +1905,7 @@ fn draw(
     comments: &CommentIndex,
     compose: Option<&ComposeState>,
     scope_menu: Option<&ScopeMenuState>,
+    help: Option<&HelpState>,
     jj_available: bool,
     key_display: &key_display::KeyDisplayState,
 ) {
@@ -1872,6 +1973,16 @@ fn draw(
             let area = frame.area();
             log_view::render(frame, area, log, keymap, key_display);
         }
+    }
+
+    // Rendered once, unconditionally, *outside* the match above rather than
+    // nested in `View::Diff`'s arm the way `compose`/`scope_menu` are —
+    // those two only ever open from a live `View::Diff` session, but
+    // `Action::OpenHelp` opens from any view (see its docs), and sizing
+    // this against `frame.area()` rather than `areas.diff` is what makes
+    // that true on screen, not just in `handle_action`'s dispatch.
+    if let Some(state) = help {
+        help::render(frame, frame.area(), state, keymap);
     }
 }
 
@@ -2028,5 +2139,38 @@ mod tests {
         // "anything else," matching the milestone spec's "non-working-tree
         // scope" wording exactly.
         assert_eq!(watch_pause_decision(true, true, false), Some(true));
+    }
+
+    // ---- cancel_pending_lsp_requests_for_help ------------------------------
+
+    #[test]
+    fn opening_help_invalidates_a_pending_hover_and_drops_a_pending_goto() {
+        let mut hover_state = hover_popup::HoverState::default();
+        hover_state.set_pending();
+        let generation_before = hover_state.generation();
+
+        let (_tx, rx) = mpsc::channel();
+        let mut pending_goto: Option<(JumpEntry, PendingGoto)> = Some((
+            JumpEntry {
+                file: PathBuf::from("a.rs"),
+                git_root: PathBuf::from("."),
+                line: 0,
+                col: 0,
+            },
+            PendingGoto::Definition(rx),
+        ));
+
+        cancel_pending_lsp_requests_for_help(&mut hover_state, &mut pending_goto);
+
+        // The pending hover is discarded by bumping the generation
+        // (mirroring a cursor move), not by touching `Status::Pending`
+        // directly — a late response tagged with the old generation is
+        // simply ignored by `apply` whenever it does arrive.
+        assert_ne!(generation_before, hover_state.generation());
+        assert!(!hover_state.is_open());
+        // `pending_goto` has no generation to lean on, so it's dropped
+        // outright — its `Receiver` (and whatever answer arrives on it)
+        // goes with it.
+        assert!(pending_goto.is_none());
     }
 }
