@@ -147,6 +147,24 @@ pub enum Action {
     /// forgotten are global information, not something tied to whichever
     /// screen happens to be on top when they reach for `?`.
     OpenHelp,
+    /// Opens Issue #5's `/` incremental search prompt in the diff view —
+    /// vim's own `/`. `ui::mod`'s event loop intercepts this the same way
+    /// it intercepts `OpenHelp`/`OpenScopeMenu`: the prompt overlay itself
+    /// (raw-key-bypass, live-recomputed matches) is event-loop state, not
+    /// something `App::update`'s pure `Action -> ()` shape could express.
+    /// Diff-view only — a no-op everywhere else, same as `AddComment`/
+    /// `ExpandFold` (see `App::update`'s docs on the shared bucket they all
+    /// join).
+    OpenSearch,
+    /// `n`: jump to the next match of the confirmed search, wrapping
+    /// around with a "search wrapped" status note. Intercepted by
+    /// `ui::mod`'s event loop rather than reaching `App::update` — like
+    /// `NextDiagnostic`/`PrevDiagnostic`, it needs to report a status note
+    /// `App::update`'s return type has no room for, even though the actual
+    /// jump is a real `App` method (`App::next_match`), not I/O.
+    NextMatch,
+    /// `N`: as `NextMatch`, the previous match.
+    PrevMatch,
 }
 
 /// One key press, normalized for matching: the SHIFT modifier is dropped
@@ -518,6 +536,9 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("v", Action::ToggleRangeSelect),
         ("c", Action::AddComment),
         ("C", Action::ToggleComments),
+        ("/", Action::OpenSearch),
+        ("n", Action::NextMatch),
+        ("N", Action::PrevMatch),
         ("z o", Action::ExpandFold),
         ("z c", Action::CollapseFold),
         ("q", Action::Quit),
@@ -588,6 +609,16 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("C-Space", Action::ToggleRangeSelect),
         ("C-c C-c", Action::AddComment),
         ("C", Action::ToggleComments),
+        // Same vim-keys-for-things-with-no-emacs-identity rule this preset
+        // already follows for `q`/`b`/`s`/`?`: emacs has its own
+        // incremental search (`C-s`), but it's a fundamentally different
+        // interaction (search-as-you-move, not a confirm-then-`n`/`N`
+        // two-step) — not close enough a fit to be worth reinventing here,
+        // so this reuses vim's `/`/`n`/`N` verbatim, matching Issue #5's
+        // reuse-vim rule.
+        ("/", Action::OpenSearch),
+        ("n", Action::NextMatch),
+        ("N", Action::PrevMatch),
         // No strong emacs convention for fold expand/collapse, so this
         // reuses vim's `zo`/`zc` verbatim (matching outline-mode's own
         // `z`-prefixed `hide-*`/`show-*` fold commands isn't close enough a
@@ -657,6 +688,9 @@ pub fn action_name(action: Action) -> &'static str {
         Action::CollapseFold => "collapse-fold",
         Action::Quit => "quit",
         Action::OpenHelp => "open-help",
+        Action::OpenSearch => "open-search",
+        Action::NextMatch => "next-match",
+        Action::PrevMatch => "prev-match",
     }
 }
 
@@ -699,6 +733,9 @@ pub fn action_by_name(name: &str) -> Option<Action> {
         "collapse-fold" => Action::CollapseFold,
         "quit" => Action::Quit,
         "open-help" => Action::OpenHelp,
+        "open-search" => Action::OpenSearch,
+        "next-match" => Action::NextMatch,
+        "prev-match" => Action::PrevMatch,
         _ => return None,
     })
 }
@@ -868,6 +905,35 @@ mod tests {
         }
     }
 
+    /// Issue #5's search keys — same keys in both presets, per this
+    /// milestone's reuse-vim rule (see `emacs_preset`'s own comment on
+    /// `/`/`n`/`N`).
+    #[test]
+    fn slash_n_and_shift_n_resolve_to_search_actions_in_both_presets() {
+        for preset_fn in [vim_preset, emacs_preset] {
+            let keymap = Keymap::from_bindings(&preset_fn(false));
+
+            let mut resolver = keymap.resolver();
+            assert_eq!(
+                resolver.feed(chord('/')),
+                StepResult::Matched(Action::OpenSearch)
+            );
+
+            let mut resolver = keymap.resolver();
+            assert_eq!(
+                resolver.feed(chord('n')),
+                StepResult::Matched(Action::NextMatch)
+            );
+
+            let mut resolver = keymap.resolver();
+            let shifted_n = KeyChord::new(KeyCode::Char('N'), KeyModifiers::SHIFT);
+            assert_eq!(
+                resolver.feed(shifted_n),
+                StepResult::Matched(Action::PrevMatch)
+            );
+        }
+    }
+
     /// The verified-architecture claim this milestone's spec leans on,
     /// pinned down directly: a bare `?` (no modifiers — `KeyChord::new`
     /// strips SHIFT, so `Shift-/`'s `Char('?')` normalizes the same way)
@@ -1007,6 +1073,9 @@ mod tests {
             Action::CollapseFold,
             Action::Quit,
             Action::OpenHelp,
+            Action::OpenSearch,
+            Action::NextMatch,
+            Action::PrevMatch,
         ];
         for action in all {
             let name = action_name(action);
@@ -1140,22 +1209,23 @@ mod tests {
         assert_eq!(KeySeq::parse("q").compact_notation(), "q");
     }
 
-    /// The 33 actions (see the `action_name_and_action_by_name_round_trip…`
+    /// The 36 actions (see the `action_name_and_action_by_name_round_trip…`
     /// test's `all` list) each get exactly one binding — except
     /// `JumpForward`, which gets a *second* one (`C-i`) precisely when
     /// `ci_distinguishable` is set, per [`vim_preset`]/[`emacs_preset`]'s
     /// docs. So this checks two things per preset: every action is still
-    /// reachable (`actions.len() == 33` after dedup), and the raw entry
+    /// reachable (`actions.len() == 36` after dedup), and the raw entry
     /// count is exactly one more than that when the extra `C-i` alias is
     /// present, exactly equal otherwise. As a side effect, this also forces
-    /// `?` to be bound in both presets the moment `ACTION_COUNT` bumps to
-    /// 33 — [`Action::OpenHelp`] with no binding in either preset would fail
+    /// `?`/`/`/`n`/`N` to be bound in both presets the moment `ACTION_COUNT`
+    /// bumps — [`Action::OpenHelp`]/[`Action::OpenSearch`]/[`Action::NextMatch`]/
+    /// [`Action::PrevMatch`] with no binding in either preset would fail
     /// the `actions.len() == ACTION_COUNT` assertion below, not just the
     /// dedicated `open_help_binds_to_plain_question_mark_in_both_presets`
     /// test.
     #[test]
     fn every_vim_and_emacs_binding_covers_every_action_exactly_once() {
-        const ACTION_COUNT: usize = 33;
+        const ACTION_COUNT: usize = 36;
         for ci_distinguishable in [false, true] {
             for preset in [
                 vim_preset(ci_distinguishable),

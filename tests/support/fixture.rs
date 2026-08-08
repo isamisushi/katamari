@@ -199,3 +199,36 @@ pub fn fold_gap_repo() -> FixtureRepo {
 
     FixtureRepo { dir }
 }
+
+/// A repo whose working-tree edit appends 60 consecutive new lines to one
+/// file — all part of a single hunk (unlike [`fold_gap_repo`], nothing here
+/// is far enough from a change to leave a git-omitted gap, so every line is
+/// real, searchable `RenderRow::Line` content, never a fold row). One of
+/// them, near the bottom of the appended block, is
+/// `SEARCH_TARGET_UNIQUE` — the Issue #5 search E2E suite's witness that
+/// `/` actually moved the viewport to reveal it, rather than something
+/// already on screen: a 30-row terminal's diff pane shows nowhere near 63
+/// rows (`FileHeader` + `HunkHeader` + 3 unchanged intro lines + 60 added
+/// lines) without scrolling.
+pub fn search_repo() -> FixtureRepo {
+    let dir = init_repo();
+    let root = dir.path();
+
+    std::fs::write(
+        root.join("search.txt"),
+        "intro line one\nintro line two\nintro line three\n",
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "initial commit"]);
+
+    let mut appended: Vec<String> = (1..=60).map(|n| format!("filler line {n}")).collect();
+    appended[54] = "SEARCH_TARGET_UNIQUE appears here".to_owned();
+    let content = format!(
+        "intro line one\nintro line two\nintro line three\n{}\n",
+        appended.join("\n")
+    );
+    std::fs::write(root.join("search.txt"), content).unwrap();
+
+    FixtureRepo { dir }
+}

@@ -27,6 +27,7 @@ pub mod refresh;
 pub mod refs_panel;
 pub mod scope_menu;
 pub mod scroll;
+pub mod search;
 pub mod sidebar;
 pub mod status_bar;
 pub mod symbols;
@@ -571,6 +572,11 @@ fn event_loop(
     let mut compose: Option<ComposeState> = None;
     let mut scope_menu: Option<ScopeMenuState> = None;
     let mut help: Option<HelpState> = None;
+    // Issue #5's `/` search prompt — `Some` only while it's actually open;
+    // the confirmed search it produces on Enter lives on `App::search`
+    // instead (see `search::SearchPromptState`'s docs for why the two are
+    // split this way).
+    let mut search_prompt: Option<search::SearchPromptState> = None;
     // Memoizes `help::build_rows(keymap, filter).len()` against the filter
     // text it was computed for — most keys the help popup's raw-key bypass
     // sees while open (every scroll/page/top/bottom key in `Browse` mode)
@@ -752,6 +758,7 @@ fn event_loop(
                 compose.as_ref(),
                 scope_menu.as_ref(),
                 help.as_ref(),
+                search_prompt.as_ref(),
                 jj_repo.is_some(),
                 &key_display,
             )
@@ -821,15 +828,20 @@ fn event_loop(
                     // there's nothing more this arm needs to do once
                     // `handle_key` returns other than decide whether to
                     // close. Sits right after `compose` and before the
-                    // scope-menu revision input in this `else if` chain —
-                    // mutual exclusion between the three holds structurally,
-                    // not by any extra check here: `?` only ever reaches the
-                    // resolver (and so only ever produces `Action::OpenHelp`,
-                    // see `handle_action` below) when neither `compose` nor
+                    // search prompt and the scope-menu revision input in
+                    // this `else if` chain — mutual exclusion between all
+                    // four holds structurally, not by any extra check here:
+                    // `?` only ever reaches the resolver (and so only ever
+                    // produces `Action::OpenHelp`, see `handle_action`
+                    // below) when none of `compose`, `search_prompt`, or
                     // `ScopeMenuState::Revision` is already claiming every
                     // keystroke as literal text, so `help` can never become
-                    // `Some` while either of those is open, and both of
-                    // those arms sit ahead of this one regardless.
+                    // `Some` while any of those is open, and all three sit
+                    // ahead of this one regardless (`search_prompt`'s own
+                    // arm below sits *after* this one, for the same reason
+                    // in reverse: `/` while help is open filters its own
+                    // row list rather than opening a second, unrelated
+                    // prompt underneath it).
                     //
                     // Deliberately does *not* call `key_display.record_typing`
                     // the way `compose`/the revision input do above: that
@@ -852,6 +864,52 @@ fn event_loop(
                     match help::handle_key(state, key, total_rows, viewport) {
                         HelpOutcome::Continue => {}
                         HelpOutcome::Close => help = None,
+                    }
+                } else if let Some(prompt) = search_prompt.as_mut() {
+                    // Bypasses the keymap resolver for the same reason
+                    // `compose`/the revision input do below: a query like
+                    // `fn main` or `TODO(` can contain characters (space,
+                    // `(`) that would otherwise resolve to unrelated
+                    // `Action`s. Sits between `help` and the scope-menu
+                    // revision input in this `else if` chain — see `help`'s
+                    // own comment above for why the four-way mutual
+                    // exclusion holds structurally.
+                    //
+                    // Deliberately does *not* call `key_display.record_typing`
+                    // the way `compose`/the revision input do — same
+                    // reasoning as `help`'s own filter text above: a search
+                    // query only ever narrows down to content already
+                    // visible on screen (the diff itself), never private
+                    // review prose, so there's nothing here worth masking
+                    // from `--show-keys`.
+                    match search::handle_prompt_key(&mut prompt.input, key) {
+                        search::SearchPromptOutcome::Continue => {
+                            if let View::Diff(app) = stack.top_mut() {
+                                app.recompute_search_live(prompt.input.text(), &prompt.origin);
+                            }
+                        }
+                        search::SearchPromptOutcome::Cancel => {
+                            let origin = prompt.origin.clone();
+                            if let View::Diff(app) = stack.top_mut() {
+                                app.cancel_search(&origin);
+                            }
+                            search_prompt = None;
+                        }
+                        search::SearchPromptOutcome::Confirm => {
+                            let origin = prompt.origin.clone();
+                            // The prompt's own current text, not
+                            // `app.search`'s prior state — see
+                            // `App::confirm_search`'s docs on why a
+                            // reopened prompt confirmed with nothing typed
+                            // must cancel rather than silently reconfirm
+                            // whatever search was already active before
+                            // this `/` press.
+                            let query = prompt.input.text().to_owned();
+                            if let View::Diff(app) = stack.top_mut() {
+                                goto_status = app.confirm_search(&query, &origin);
+                            }
+                            search_prompt = None;
+                        }
                     }
                 } else if let Some(ScopeMenuState::Revision(input)) = scope_menu.as_mut() {
                     // Bypasses the keymap resolver for the same reason
@@ -951,6 +1009,7 @@ fn event_loop(
                                     &mut compose,
                                     &mut scope_menu,
                                     &mut help,
+                                    &mut search_prompt,
                                     highlighter,
                                     &mut watch_paused,
                                     watch_active,
@@ -1002,6 +1061,21 @@ fn event_loop(
                 }
             }
             Ok(AppEvent::Watch(WatchSignal::Flushed(batch))) => {
+                // Only meaningful when the currently-open prompt (if any)
+                // actually belongs to the *root* diff `handle_watch_refresh`
+                // is about to touch — a prompt open on a pushed diff (e.g.
+                // one opened from `LogView::confirm`) has nothing to do
+                // with a root-diff refresh, and passing it through would
+                // recompute the wrong `App`'s search entirely. Safe to
+                // check once here rather than inside `handle_watch_refresh`
+                // itself: nothing can change which view is on top while a
+                // modal prompt has every key (this bypass chain runs before
+                // the resolver ever sees one), so the stack's shape is
+                // stable for as long as `search_prompt` stays `Some`.
+                let live_search = stack
+                    .is_at_root()
+                    .then(|| search_prompt.as_ref().map(|p| (p.input.text(), &p.origin)))
+                    .flatten();
                 handle_watch_refresh(
                     batch,
                     stack,
@@ -1012,6 +1086,7 @@ fn event_loop(
                     &mut refs_panel,
                     &mut watch_status,
                     watch_paused,
+                    live_search,
                 );
                 // The working tree just changed, which can shift where
                 // every comment relocates to even though the comment log
@@ -1213,6 +1288,7 @@ fn handle_action(
     compose: &mut Option<ComposeState>,
     scope_menu: &mut Option<ScopeMenuState>,
     help: &mut Option<HelpState>,
+    search_prompt: &mut Option<search::SearchPromptState>,
     highlighter: &mut LineHighlighter,
     watch_paused: &mut bool,
     watch_active: bool,
@@ -1403,6 +1479,58 @@ fn handle_action(
                 *goto_status = Some("fold: only available in the diff view".to_owned());
             }
         },
+        // Opens the prompt (see `search::SearchPromptState`'s docs); the
+        // origin `Anchor` is captured *here*, from the cursor/scroll `/`
+        // was actually pressed at, rather than inside `App` itself — `App`
+        // has no notion of "a prompt is opening," only of the confirmed
+        // search a closed one leaves behind (see `App::search`'s docs).
+        // No pending-LSP-request cancellation the way `OpenHelp` does
+        // (search doesn't obscure the view the way a modal popup does), but
+        // an open hover popup still closes first: this arm sits *after*
+        // the `hover_state.is_open()` interception above, whose wildcard
+        // arm closes-then-falls-through for any action it doesn't
+        // specifically handle — see that block's docs.
+        Action::OpenSearch => match stack.top_mut() {
+            View::Diff(app) => {
+                let origin =
+                    refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
+                *search_prompt = Some(search::SearchPromptState {
+                    input: search::SearchInput::new(),
+                    origin,
+                });
+            }
+            View::File(_) | View::Timeline(_) | View::Log(_) => {
+                *goto_status = Some("search: only available in the diff view".to_owned());
+            }
+        },
+        // `n`/`N`: real navigation lives here (an `App` method), not in
+        // `App::update` — see `App::next_match`'s docs on why keeping the
+        // logic out of `App::update` matters even though this arm already
+        // gates on `View::Diff` on its own (defense in depth: it also keeps
+        // `TimelineView`'s nested `diff_app.update(action)` fallthrough,
+        // see `timeline_view::TimelineView::update`, from ever running real
+        // search navigation against its embedded diff pane).
+        Action::NextMatch | Action::PrevMatch => match stack.top_mut() {
+            View::Diff(app) => {
+                let before = (app.cursor, app.active_symbol);
+                let result = if action == Action::NextMatch {
+                    app.next_match()
+                } else {
+                    app.prev_match()
+                };
+                *goto_status = match result {
+                    Some(true) => Some("search wrapped".to_owned()),
+                    Some(false) => None,
+                    None => Some(app.search_status_note()),
+                };
+                if (app.cursor, app.active_symbol) != before {
+                    hover_state.invalidate();
+                }
+            }
+            View::File(_) | View::Timeline(_) | View::Log(_) => {
+                *goto_status = Some("search: only available in the diff view".to_owned());
+            }
+        },
         Action::NextDiagnostic | Action::PrevDiagnostic => {
             let forward = action == Action::NextDiagnostic;
             let before = stack.top().hover_cursor_key();
@@ -1431,7 +1559,22 @@ fn handle_action(
                 None => *goto_status = Some("jump: no later position".to_owned()),
             }
         }
-        Action::Cancel => {} // nothing open; no effect
+        // vim's `:noh`: with nothing else open to cancel (hover/the refs
+        // panel/the scope-menu list already intercepted `Cancel` above if
+        // any of those *were* open — reaching here means none was), a
+        // plain `Esc` in the ordinary diff view clears an active
+        // *confirmed* search's highlight, if any. This is a different
+        // `Esc` from the prompt's own (cancel-and-restore-the-cursor,
+        // handled entirely inside `run`'s raw-key bypass arm before an
+        // `Action` is ever resolved) — this one only ever fires once the
+        // prompt has already closed, on whatever highlight Enter left
+        // behind. A no-op on any other view, and a no-op with nothing
+        // active either way (`App::clear_search`'s own guard).
+        Action::Cancel => {
+            if let View::Diff(app) = stack.top_mut() {
+                app.clear_search();
+            }
+        }
         Action::ToggleTimeline => open_or_close_timeline(stack, jj_repo, goto_status),
         Action::ToggleLogView => open_or_close_log(stack, goto_status),
         // Explicit, not folded into the `other` catch-all below on
@@ -1724,6 +1867,19 @@ fn apply_scope_swap(
 /// filesystem watcher thread keeps running regardless — nothing here tears
 /// it down — so the moment the reviewer swaps back to `Working tree`,
 /// refreshes resume on the very next flush with no restart needed.
+///
+/// `live_search` is `Some((query_text, origin))` exactly when Issue #5's
+/// `/` prompt is currently open *on the root diff* (see this function's one
+/// call site for why any other case passes `None`) — [`App::apply_refresh`]
+/// already recomputes a *confirmed* search's matches on its own (anchored
+/// on the cursor, which is right for the ordinary no-prompt case), but a
+/// live prompt's incremental preview must stay anchored on where `/` was
+/// first pressed, not wherever the cursor happens to be mid-typing — see
+/// [`crate::ui::search::compute_search`]'s docs. When `Some`,
+/// [`App::recompute_search_live`] re-runs after [`App::apply_refresh`] and
+/// simply overwrites whatever that call's own recompute produced with the
+/// origin-correct result — a small amount of redundant work on an
+/// infrequent, already-debounced event, not a correctness concern.
 #[allow(clippy::too_many_arguments)] // each parameter is a distinct piece
 // of session state one refresh cycle touches — see `handle_action`'s
 // comment for why bundling into a struct wouldn't reduce this.
@@ -1737,6 +1893,7 @@ fn handle_watch_refresh(
     refs_panel: &mut Option<RefsPanelState>,
     watch_status: &mut Option<WatchStatus>,
     watch_paused: bool,
+    live_search: Option<(&str, &refresh::Anchor)>,
 ) {
     if watch_paused {
         return;
@@ -1759,6 +1916,9 @@ fn handle_watch_refresh(
     };
 
     let overlay_survives = app.apply_refresh(files);
+    if let Some((query, origin)) = live_search {
+        app.recompute_search_live(query, origin);
+    }
     hover_state.bump_generation_for_refresh();
     // Bounds the highlight cache's memory to roughly one diff's worth of
     // content rather than accumulating across every refresh of a long
@@ -1933,6 +2093,7 @@ fn draw(
     compose: Option<&ComposeState>,
     scope_menu: Option<&ScopeMenuState>,
     help: Option<&HelpState>,
+    search_prompt: Option<&search::SearchPromptState>,
     jj_available: bool,
     key_display: &key_display::KeyDisplayState,
 ) {
@@ -1960,6 +2121,7 @@ fn draw(
                 app,
                 effective_layout,
                 status_note,
+                search_prompt.map(|p| (p.input.text(), p.input.cursor())),
                 &hint_items,
             );
             if let Some(row) = view.cursor_screen_row() {

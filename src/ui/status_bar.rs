@@ -5,6 +5,7 @@
 //! silently truncate on a narrow terminal.
 
 use crate::ui::app::{App, Layout};
+use crate::ui::compose;
 use crate::ui::hints::{self, HintItem};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -25,6 +26,19 @@ use ratatui::widgets::Paragraph;
 /// issuing and tracking it isn't a pure state transition; see
 /// `hover_popup`'s module docs for why.
 ///
+/// `search_prompt` is `Some((text, char_cursor_index))` exactly while
+/// Issue #5's `/` overlay is open, and takes **absolute priority** over
+/// `status_note` on this line — deliberately not folded into `status_note`
+/// itself (a plain `&str`) the way every other transient note is: a
+/// hover-status note computed the same frame would otherwise silently mask
+/// the echo mid-typing (see `ui::mod`'s event loop, where `hover_state`'s
+/// `status_hint()` outranks `goto_status`/`lsp_status`/`watch_status` in
+/// the chain that produces `status_note`), and a bare `&str` has no way to
+/// carry a cursor position for [`compose::cursor_marked_line`] to mark.
+/// Threaded straight from `ui::mod`'s live `search_prompt: Option<SearchPromptState>`
+/// every frame while the prompt is open, unlike `status_note`'s note-typed
+/// siblings, which are one-shot until something else replaces them.
+///
 /// `hint_items` is [`hints::diff_view_items`] read off the session's active
 /// [`crate::keymap::Keymap`] — built once per frame by the caller (which
 /// also uses it to size `area` via [`hints::required_height`] before the
@@ -36,6 +50,7 @@ pub fn render(
     app: &App,
     effective_layout: Layout,
     status_note: Option<&str>,
+    search_prompt: Option<(&str, usize)>,
     hint_items: &[HintItem],
 ) {
     let position = format!("{}/{}", app.cursor + 1, app.rows.len().max(1));
@@ -83,7 +98,16 @@ pub fn render(
         ));
     }
 
-    if let Some(note) = status_note {
+    if let Some((text, cursor)) = search_prompt {
+        // Absolute priority over `status_note` — see this function's docs.
+        // `compose::cursor_marked_line` already returns styled spans (the
+        // char under the cursor reverse-video'd), so these are appended
+        // directly rather than wrapped in one more `Span::styled` the way
+        // `status_note`'s plain text is.
+        spans.push(Span::raw("\u{b7} /"));
+        spans.extend(compose::cursor_marked_line(text, cursor).spans);
+        spans.push(Span::raw(" "));
+    } else if let Some(note) = status_note {
         spans.push(Span::styled(
             format!("· {note} "),
             Style::default()

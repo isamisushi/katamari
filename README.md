@@ -227,6 +227,7 @@ below) for the emacs column. `q` quits either way.
 | Go to definition | `gd` | `M-.` |
 | Find references | `gr` | `M-?` |
 | Jump back / forward | `C-o` / `C-i`\* | `C-o` / `C-i`\* |
+| Search diff / next / prev match | `/` / `n` / `N` | `/` / `n` / `N` |
 | Next / prev symbol on line | `Tab` / `BackTab` | `Tab` / `BackTab` |
 | Confirm / cancel | `Enter` / `Esc` | `Enter` / `Esc` |
 | Toggle sidebar | `b` | `b` |
@@ -262,6 +263,30 @@ and returns to scrolling; `Esc` while scrolling the list closes the window
 outright, same as `q`/`?`, whether or not a filter is still narrowing it.
 The window is modal while open — every key goes to it, not whatever view
 is underneath.
+
+### Search
+
+`/` in the diff view (not the help window's own filter above) opens a
+search prompt on the status bar. Typing narrows incrementally: every match
+across every file highlights live, and the cursor jumps to the first match
+at or after where you started typing as the query narrows further. `Enter`
+confirms — the matches and highlight stay, the prompt closes — and `n`/`N`
+then jump to the next/previous match, wrapping around with a "search
+wrapped" note. `Esc` while typing cancels, restoring the cursor and scroll
+position from before you pressed `/`; `Esc` in the diff view afterward (not
+the prompt) clears an already-confirmed search's highlight, vim's `:noh`. A
+query matching nowhere shows `no matches: <query>` and returns the cursor to
+where `/` was pressed.
+
+Matching is literal substring (no regex), smartcase like vim's own
+`'smartcase'`: an all-lowercase query matches either case, but typing even
+one uppercase letter makes it case-sensitive. Match granularity is
+per-occurrence — a row with three hits is three `n` stops — across every
+file in the diff, in file → hunk → line order. Only visible content is
+searched: a fold row's hidden, unchanged context (git's own omitted context
+between hunks — see `zo`/`zc` above) isn't matched until you unfold it,
+at which point a confirmed search's matches recompute automatically over
+the newly revealed rows.
 
 Any binding can be overridden per action; see `[keys]` below.
 

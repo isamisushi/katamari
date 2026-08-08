@@ -4,7 +4,7 @@
 //! testable without a real terminal.
 
 use crate::diff::{
-    DiffFile, Gap, RenderRow, SideBySideRow, context_rows_for_gap, file_gaps, flatten,
+    ColumnMap, DiffFile, Gap, RenderRow, SideBySideRow, context_rows_for_gap, file_gaps, flatten,
     flatten_side_by_side, gap_boundary_matches, lsp_target, splice_gap,
 };
 use crate::keymap::Action;
@@ -12,6 +12,7 @@ use crate::lsp::DiagnosticsStore;
 use crate::ui::hover_popup::HoverQuery;
 use crate::ui::refresh;
 use crate::ui::scroll;
+use crate::ui::search;
 use crate::ui::symbols;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -204,6 +205,24 @@ pub struct App {
     /// pairs correctly, it just isn't what `ensure-cursor-visible`/
     /// half-page math measures against.
     content_width: usize,
+    /// Issue #5's active search: `Some` both while the `/` prompt is open
+    /// (live-updated every keystroke — see [`Self::recompute_search_live`])
+    /// and after Enter confirms it (see [`Self::confirm_search`]), `None`
+    /// when there's genuinely nothing to repeat (never opened, cancelled
+    /// via Esc while typing, or a scope swap — see
+    /// [`Self::apply_scope_swap`]). A bare `Esc` in the *normal* view
+    /// (vim's `:noh`) does *not* clear this — see [`Self::clear_search`] —
+    /// it only flips [`search::SearchHighlight::highlight_visible`] off, so
+    /// `n`/`N` keep working on a "cleared" search the same way they do in
+    /// real vim. `pub` so [`crate::ui::diff_view`] reads it directly to
+    /// mark match ranges, the same way it already reads `active_symbol`.
+    /// Kept alive across a rows rebuild by [`Self::recompute_search`]
+    /// (called from every method that funnels through [`Self::rederive`]
+    /// and has a settled `cursor` to recompute against — see that method's
+    /// own docs for exactly which ones and why); a scope swap clears it
+    /// outright instead, since a swap's new diff has no relationship to the
+    /// old one for a match to persist against.
+    pub search: Option<search::SearchHighlight>,
 }
 
 impl App {
@@ -236,6 +255,7 @@ impl App {
             // every row as exactly one visual row, matching `wrap = false`
             // behavior, rather than wrapping against a width of `0`.
             content_width: usize::MAX,
+            search: None,
         };
         // No folds exist yet, so this just moves `pristine_files` in
         // verbatim — reusing the one derivation path rather than
@@ -506,6 +526,7 @@ impl App {
         if self.rows.is_empty() {
             self.cursor = 0;
             self.scroll_offset = 0;
+            self.recompute_search();
             return false;
         }
 
@@ -515,6 +536,7 @@ impl App {
             .row_index
             .saturating_sub(refresh::scroll_delta(&anchor));
         self.clamp_scroll();
+        self.recompute_search();
         restored.overlay_survives
     }
 
@@ -599,6 +621,14 @@ impl App {
         self.interactive = interactive;
         self.disk_is_new_side = disk_is_new_side;
         self.scope_label = scope_label;
+        // Cleared outright, matching fold state's own reset above, rather
+        // than recomputed via `Self::recompute_search`: a scope swap's new
+        // diff isn't a later version of the old one (see this method's own
+        // docs), so a query that matched the *previous* scope has no
+        // meaningful relationship to this one for a match to persist
+        // against — unlike `Self::apply_refresh`, which re-diffs the same
+        // scope and so keeps a confirmed search alive across it.
+        self.search = None;
         self.clamp_scroll();
     }
 
@@ -667,6 +697,21 @@ impl App {
             // which `App` doesn't do) — `App::expand_gap`/
             // `collapse_fold_at_cursor` are the real pure implementations,
             // called directly from there instead.
+            //
+            // `OpenSearch`/`NextMatch`/`PrevMatch` join it too, but for a
+            // slightly different reason than the I/O ones above: opening
+            // the prompt is ordinary in-memory state, and `next_match`/
+            // `prev_match` are real `App` methods (unlike `expand_gap`'s
+            // I/O) — but `ui::mod::handle_action` still needs to report a
+            // "search wrapped" status note, which `App::update`'s `()`
+            // return type has no way to carry, and to construct the prompt
+            // overlay it owns, which `App` doesn't. Staying no-ops here
+            // also means `TimelineView`'s nested `diff_app.update(action)`
+            // fallthrough (see `timeline_view::TimelineView::update`) can
+            // never leak real search navigation into its embedded diff
+            // pane even if it were ever reached for these actions — see
+            // `ui::mod::handle_action`'s `NextMatch`/`PrevMatch` arm for
+            // the primary guard (a `View::Diff`-only gate) this backs up.
             Action::Hover
             | Action::Cancel
             | Action::GotoDefinition
@@ -678,6 +723,9 @@ impl App {
             | Action::AddComment
             | Action::ExpandFold
             | Action::CollapseFold
+            | Action::OpenSearch
+            | Action::NextMatch
+            | Action::PrevMatch
             | Action::Confirm => {}
             // `ui::mod` intercepts `ToggleTimeline`/`ToggleLogView`/
             // `OpenScopeMenu` before they reach here (constructing/tearing
@@ -890,6 +938,7 @@ impl App {
                     self.rederive();
                     self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
                     self.clamp_scroll();
+                    self.recompute_search();
                     return ExpandOutcome::ProbedEmpty;
                 }
                 disk_len
@@ -920,6 +969,7 @@ impl App {
             });
         self.rederive();
         self.clamp_scroll();
+        self.recompute_search();
         ExpandOutcome::Revealed
     }
 
@@ -977,7 +1027,233 @@ impl App {
             self.cursor = idx.min(self.rows.len().saturating_sub(1));
         }
         self.clamp_scroll();
+        self.recompute_search();
         true
+    }
+
+    // ---- Issue #5: search ------------------------------------------------
+
+    /// The live incremental prompt's per-keystroke recomputation: reruns
+    /// [`search::compute_search`] for `query` against the rows as they
+    /// stand *right now*, with `origin` (captured once, when `/` was first
+    /// pressed — see `search::SearchPromptState`'s docs) resolved fresh via
+    /// [`refresh::restore_anchor`] rather than trusted as a fixed row index,
+    /// since a watch refresh can rebuild `rows` mid-prompt (see
+    /// `ui::mod::handle_watch_refresh`'s `live_search` parameter). Jumps the
+    /// cursor to whichever match the recompute selected as current (via
+    /// [`Self::jump_cursor_to`], the exact function every search jump in
+    /// this module funnels through) so the incremental preview updates live
+    /// as the reviewer types; when there's nothing to jump to (an empty
+    /// query, or a query that currently matches nothing), restores the
+    /// cursor/scroll to `origin` instead — real vim's incsearch snaps the
+    /// view back to the position `/` was pressed from the instant a pattern
+    /// stops matching, rather than sticking wherever a previous,
+    /// less-narrow prefix's preview happened to land the cursor (see
+    /// [`Self::cancel_search`], which restores the same way for the
+    /// "give up on the whole prompt" case, and [`search::compute_search`]'s
+    /// own doc comment for the general claim this makes true even in the
+    /// zero-match case).
+    pub fn recompute_search_live(&mut self, query: &str, origin: &refresh::Anchor) {
+        let origin_row = refresh::restore_anchor(&self.files, &self.rows, origin).row_index;
+        self.search = search::compute_search(&self.files, &self.rows, query, origin_row);
+        match self
+            .search
+            .as_ref()
+            .and_then(|h| h.matches.get(h.current).copied())
+        {
+            Some(m) => {
+                let display_col = self.display_col_for_match(m.row_idx, m.start);
+                self.jump_cursor_to(m.row_idx, display_col);
+            }
+            None => {
+                self.cursor = origin_row;
+                self.scroll_offset = origin_row.saturating_sub(refresh::scroll_delta(origin));
+                self.active_symbol = 0;
+                self.clamp_scroll();
+            }
+        }
+    }
+
+    /// Esc in the prompt: restores the cursor/scroll to exactly where `/`
+    /// was pressed (via `origin`, the same [`refresh::Anchor`]
+    /// [`Self::recompute_search_live`] resolves against — see
+    /// [`refresh::restore_anchor`]/[`refresh::scroll_delta`], the identical
+    /// pair [`Self::apply_refresh`] uses to restore a watch refresh's
+    /// cursor) and clears the highlight entirely — vim's own "cancel a
+    /// search in progress" behavior, distinct from `Esc` in the *normal*
+    /// view afterward, which only clears an already-*confirmed* search
+    /// (see `ui::mod::handle_action`'s `Action::Cancel` handling, which
+    /// reaches `App::update`'s ordinary cursor-movement path — clearing a
+    /// confirmed search on plain `Esc` is `Self::clear_search`, not this).
+    pub fn cancel_search(&mut self, origin: &refresh::Anchor) {
+        let restored = refresh::restore_anchor(&self.files, &self.rows, origin);
+        self.cursor = restored.row_index;
+        self.scroll_offset = restored
+            .row_index
+            .saturating_sub(refresh::scroll_delta(origin));
+        self.active_symbol = 0;
+        self.clamp_scroll();
+        self.search = None;
+    }
+
+    /// Enter in the prompt: locks the current live preview in as the
+    /// confirmed search (already sitting in `self.search`, current match
+    /// already jumped to by the last [`Self::recompute_search_live`] call —
+    /// there's nothing more to *do* here beyond deciding what to report).
+    /// `query` is the prompt's own current text, checked directly rather
+    /// than inferred from `self.search.is_none()`: `self.search` only
+    /// becomes `None` via a `recompute_search_live("")` call, which never
+    /// happens for a prompt confirmed the instant it opens (Enter with
+    /// nothing typed goes straight from `SearchPromptOutcome::Confirm` to
+    /// here with no intervening `Continue`) — so if a search was already
+    /// confirmed *before* this `/` press, `self.search` would still hold
+    /// that stale query, and checking it instead of `query` would silently
+    /// reconfirm the stale search rather than cancelling the empty prompt
+    /// the way `Esc` would. An empty `query` confirms into the same outcome
+    /// `Esc` would, restoring the origin rather than leaving a query-less
+    /// "confirmed search" — or a stale prior one — that doesn't reflect
+    /// anything the reviewer just typed. Returns the status-bar note the
+    /// caller should show: `Some("no matches: …")` for a real, zero-hit
+    /// query, `None` otherwise (matches found and already highlighted, or
+    /// nothing was typed at all).
+    pub fn confirm_search(&mut self, query: &str, origin: &refresh::Anchor) -> Option<String> {
+        if query.is_empty() {
+            self.cancel_search(origin);
+            return None;
+        }
+        let Some(highlight) = &self.search else {
+            return None;
+        };
+        if highlight.matches.is_empty() {
+            return Some(format!("no matches: {}", highlight.query));
+        }
+        None
+    }
+
+    /// `n`/`N`'s real navigation (`ui::mod::handle_action`'s
+    /// `Action::NextMatch`/`PrevMatch` arm calls these — see its docs on
+    /// why the logic lives here and not in [`Self::update`]). `None` when
+    /// there's no confirmed search *or* it currently has zero matches (see
+    /// [`Self::search_status_note`] for the status-bar text either case
+    /// gets); `Some(wrapped)` otherwise, where `wrapped` is whether this
+    /// step crossed either end of the match list — see [`search::step`]'s
+    /// docs on why a single-match search always reports `true`.
+    pub fn next_match(&mut self) -> Option<bool> {
+        self.jump_to_match(true)
+    }
+
+    pub fn prev_match(&mut self) -> Option<bool> {
+        self.jump_to_match(false)
+    }
+
+    fn jump_to_match(&mut self, forward: bool) -> Option<bool> {
+        let (len, current) = {
+            let highlight = self.search.as_ref()?;
+            (highlight.matches.len(), highlight.current)
+        };
+        let (next, wrapped) = search::step(current, len, forward)?;
+        let m = self.search.as_ref().unwrap().matches[next];
+        let highlight = self.search.as_mut().unwrap();
+        highlight.current = next;
+        // Real vim re-enables `:nohlsearch`-suppressed highlighting the
+        // instant you search again — `n`/`N` count as "searching again"
+        // just as much as a fresh `/` does, so a step here un-suppresses
+        // it too (see `SearchHighlight::highlight_visible`'s docs and
+        // `Self::clear_search`, the only place that ever sets it `false`).
+        highlight.highlight_visible = true;
+        let display_col = self.display_col_for_match(m.row_idx, m.start);
+        self.jump_cursor_to(m.row_idx, display_col);
+        Some(wrapped)
+    }
+
+    /// The status-bar note `n`/`N` show when [`Self::next_match`]/
+    /// [`Self::prev_match`] return `None`: distinguishes "there's no
+    /// confirmed search to repeat at all" from "there's a confirmed query,
+    /// but it currently matches nothing" (the case
+    /// `Self::recompute_search`'s docs describe — a fold toggle or refresh
+    /// can shrink a confirmed search's matches down to zero without
+    /// clearing the query itself).
+    pub fn search_status_note(&self) -> String {
+        match &self.search {
+            Some(highlight) => format!("no matches: {}", highlight.query),
+            None => "search: nothing to repeat".to_owned(),
+        }
+    }
+
+    /// `Esc` in the *normal* diff view (not the prompt — see
+    /// [`Self::cancel_search`]): vim's `:noh`, which only *suppresses* the
+    /// active search's highlight without moving the cursor — the confirmed
+    /// query, its matches, and `current` all stay exactly as they were (see
+    /// [`search::SearchHighlight::highlight_visible`]'s docs), so `n`/`N`
+    /// keep working immediately afterward, matching real vim's
+    /// `:nohlsearch` (the pattern lives on in the search register; only the
+    /// drawing stops). [`Self::jump_to_match`] flips the flag back to
+    /// `true` the moment `n`/`N` jump again, since vim re-enables
+    /// highlighting the instant you search again too. A no-op with nothing
+    /// active.
+    pub fn clear_search(&mut self) {
+        if let Some(highlight) = &mut self.search {
+            highlight.highlight_visible = false;
+        }
+    }
+
+    /// The display column `byte_offset` (a [`search::Match`]'s `start`/`end`
+    /// — into `row_idx`'s raw, unwrapped text) converts to, via
+    /// [`ColumnMap::utf8_to_display`] — the byte→display leg of the
+    /// conversion pipeline described in [`search::Match`]'s own docs.
+    /// `0` for a `row_idx` that isn't a [`RenderRow::Line`] — shouldn't
+    /// happen, since every [`search::Match`] is only ever built from one
+    /// (see [`search::compute_matches`]), but this is cursor-jump code, not
+    /// a place to panic over a stale index.
+    fn display_col_for_match(&self, row_idx: usize, byte_offset: usize) -> usize {
+        let Some(RenderRow::Line {
+            file_idx,
+            hunk_idx,
+            row_idx: line_idx,
+        }) = self.rows.get(row_idx).copied()
+        else {
+            return 0;
+        };
+        let text = &self.files[file_idx].hunks[hunk_idx].rows[line_idx].text;
+        ColumnMap::new(text).utf8_to_display(byte_offset)
+    }
+
+    /// Recomputes a *confirmed* search's matches against `self.files`/
+    /// `self.rows` as they stand right now, keeping the same `query` and
+    /// moving `current` to the nearest match at-or-after `self.cursor` (via
+    /// [`search::nearest_match_index`] — the same "which match is closest"
+    /// rule [`search::compute_search`]'s origin selection uses). Called at
+    /// the end of every method that rebuilds rows out from under a possibly-
+    /// active confirmed search — [`Self::apply_refresh`], [`Self::expand_gap`]
+    /// (both outcomes that actually rederive), [`Self::collapse_fold_at_cursor`]
+    /// — each *after* `self.cursor` has already landed at its own final
+    /// position for that operation, so "nearest to the cursor" means the
+    /// cursor a reviewer actually sees once the redraw happens, not a stale
+    /// pre-rebuild one. Deliberately does *not* move the cursor itself (unlike
+    /// [`Self::recompute_search_live`]) — a fold toggle or a background watch
+    /// refresh recomputing which match `n`/`N` would land on next shouldn't
+    /// also yank the cursor there uninvited; the reviewer sees the updated
+    /// highlight set on the next redraw and drives `n`/`N` themselves.
+    /// [`Self::apply_scope_swap`] doesn't call this — it clears `self.search`
+    /// outright instead (see its own docs). Carries `highlight_visible`
+    /// over from the existing highlight unchanged: a fold toggle or watch
+    /// refresh that happens to land mid-`:noh` (see [`Self::clear_search`])
+    /// shouldn't quietly re-show a highlight the reviewer explicitly
+    /// suppressed. A no-op with no confirmed search active.
+    fn recompute_search(&mut self) {
+        let Some(existing) = &self.search else {
+            return;
+        };
+        let query = existing.query.clone();
+        let highlight_visible = existing.highlight_visible;
+        let matches = search::compute_matches(&self.files, &self.rows, &query);
+        let current = search::nearest_match_index(&matches, self.cursor);
+        self.search = Some(search::SearchHighlight {
+            query,
+            matches,
+            current,
+            highlight_visible,
+        });
     }
 }
 
@@ -1361,6 +1637,323 @@ mod tests {
         assert!(app.rows.is_empty());
     }
 
+    // -- Issue #5: search ---------------------------------------------------
+
+    #[test]
+    fn clear_search_suppresses_the_highlight_without_discarding_the_query_vims_noh() {
+        let mut app = test_app();
+        let origin = refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
+        // "fn " matches several rows — enough for `next_match` below to
+        // have somewhere real to jump.
+        app.recompute_search_live("fn ", &origin);
+        assert!(app.search.is_some(), "sanity: a search is active");
+        let matches_before = app.search.as_ref().unwrap().matches.clone();
+        let current_before = app.search.as_ref().unwrap().current;
+
+        app.clear_search();
+        let highlight = app.search.as_ref().expect(
+            "a bare Esc's :noh must only suppress the highlight, not discard the confirmed query",
+        );
+        assert!(!highlight.highlight_visible);
+        assert_eq!(highlight.matches, matches_before);
+        assert_eq!(highlight.current, current_before);
+
+        // Real vim's `n`/`N` keep working right after a bare `:noh` — the
+        // pattern stays live in the search register — and re-show the
+        // highlight the instant you search again.
+        let cursor_before = app.cursor;
+        assert!(
+            app.next_match().is_some(),
+            "n must still work after :noh, unlike an actually-cleared search"
+        );
+        assert_ne!(app.cursor, cursor_before, "n must actually jump");
+        assert!(
+            app.search.as_ref().unwrap().highlight_visible,
+            "n must re-enable the highlight, mirroring vim's auto-restore-on-repeat-search"
+        );
+    }
+
+    #[test]
+    fn clear_search_is_a_no_op_with_nothing_active() {
+        let mut app = test_app();
+        app.clear_search(); // must not panic
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn apply_scope_swap_clears_a_noh_suppressed_search_too() {
+        let mut app = test_app();
+        let origin = refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
+        app.recompute_search_live("new_name", &origin);
+        app.clear_search();
+        assert!(
+            !app.search.as_ref().unwrap().highlight_visible,
+            "sanity: the search is confirmed but its highlight is suppressed"
+        );
+
+        let files = parse_unified_diff(FIXTURE);
+        app.apply_scope_swap(files, true, true, None);
+
+        assert!(
+            app.search.is_none(),
+            "a scope swap clears a :noh-suppressed search just as completely as a visible one"
+        );
+    }
+
+    #[test]
+    fn recompute_search_live_jumps_to_the_first_match_at_or_after_the_origin() {
+        let mut app = test_app();
+        app.update(Action::Bottom); // origin near the end of the diff
+        let origin = refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
+
+        // "added_one"/"added_two" (src/new_module.rs) sit *before* the
+        // bottom of the diff — with the origin at the very end, every match
+        // is before it, so the incremental jump wraps to the first one.
+        app.recompute_search_live("added_", &origin);
+        let highlight = app.search.as_ref().expect("query is non-empty");
+        assert_eq!(highlight.matches.len(), 2);
+        assert_eq!(highlight.current, 0);
+        assert_eq!(app.cursor, highlight.matches[0].row_idx);
+    }
+
+    /// vim incsearch parity: once a query narrows to zero matches, the
+    /// cursor/scroll must snap back to exactly where `/` was pressed, not
+    /// stay wherever a previous, less-narrow prefix's preview happened to
+    /// land them (see `Self::recompute_search_live`'s docs).
+    #[test]
+    fn recompute_search_live_with_zero_matches_restores_the_cursor_and_scroll_to_the_origin() {
+        let mut app = test_app();
+        app.update(Action::Top);
+        let cursor_before = app.cursor;
+        let scroll_before = app.scroll_offset;
+        let origin = refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
+
+        // A shorter prefix matches and jumps the cursor away from the
+        // origin first — the exact stale position the zero-match narrowing
+        // below must undo.
+        app.recompute_search_live("new_name", &origin);
+        assert_ne!(
+            app.cursor, cursor_before,
+            "sanity: the incremental jump actually moved the cursor"
+        );
+
+        app.recompute_search_live("new_name_that_matches_nothing", &origin);
+        let highlight = app
+            .search
+            .as_ref()
+            .expect("a real, zero-hit query still returns a highlight");
+        assert!(highlight.matches.is_empty());
+        assert_eq!(
+            app.cursor, cursor_before,
+            "zero matches must snap the cursor back to the origin, not leave it at the stale jump"
+        );
+        assert_eq!(app.scroll_offset, scroll_before);
+    }
+
+    #[test]
+    fn recompute_search_live_with_an_empty_query_clears_the_search() {
+        let mut app = test_app();
+        let origin = refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
+        app.recompute_search_live("new_name", &origin);
+        assert!(app.search.is_some());
+
+        app.recompute_search_live("", &origin);
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn cancel_search_restores_the_pre_search_cursor_and_scroll_and_clears_the_highlight() {
+        let mut app = test_app();
+        app.update(Action::Top);
+        let cursor_before = app.cursor;
+        let scroll_before = app.scroll_offset;
+        let origin = refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
+
+        // Typing narrows the query and jumps the cursor away from the
+        // origin — the exact thing `cancel_search` has to undo.
+        app.recompute_search_live("added_one", &origin);
+        assert_ne!(
+            app.cursor, cursor_before,
+            "sanity: the incremental jump actually moved the cursor"
+        );
+
+        app.cancel_search(&origin);
+        assert_eq!(app.cursor, cursor_before);
+        assert_eq!(app.scroll_offset, scroll_before);
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn confirm_search_reports_no_matches_for_a_query_present_nowhere() {
+        let mut app = test_app();
+        let origin = refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
+        app.recompute_search_live("xyz_not_anywhere", &origin);
+
+        let note = app.confirm_search("xyz_not_anywhere", &origin);
+        assert_eq!(note.as_deref(), Some("no matches: xyz_not_anywhere"));
+        // The query stays confirmed (so a later fold/refresh recompute has
+        // something to re-check) even with zero matches right now.
+        assert!(app.search.is_some());
+    }
+
+    #[test]
+    fn confirm_search_with_matches_reports_no_note_and_keeps_the_highlight() {
+        let mut app = test_app();
+        let origin = refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
+        app.recompute_search_live("new_name", &origin);
+
+        let note = app.confirm_search("new_name", &origin);
+        assert_eq!(note, None);
+        assert!(app.search.is_some());
+    }
+
+    #[test]
+    fn confirm_search_with_an_empty_query_cancels_instead_of_confirming() {
+        let mut app = test_app();
+        app.update(Action::Top);
+        let cursor_before = app.cursor;
+        let origin = refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
+
+        let note = app.confirm_search("", &origin);
+        assert_eq!(note, None);
+        assert!(app.search.is_none());
+        assert_eq!(app.cursor, cursor_before);
+    }
+
+    /// The regression this signature is for: `confirm_search` must decide
+    /// "was anything typed this prompt session" from the prompt's own text,
+    /// not from `self.search.is_none()` — reopening `/` and hitting `Enter`
+    /// immediately (nothing typed) must cancel, exactly like `Esc`, even
+    /// though `self.search` still holds a completely unrelated *prior*
+    /// confirmed search from before this `/` press (see
+    /// `Self::confirm_search`'s docs for why `self.search.is_none()` alone
+    /// can't tell the two cases apart).
+    #[test]
+    fn confirm_search_with_an_empty_query_cancels_even_with_a_prior_confirmed_search() {
+        let mut app = test_app();
+        app.update(Action::Top);
+        let origin1 = refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
+        app.recompute_search_live("new_name", &origin1);
+        app.confirm_search("new_name", &origin1);
+        assert!(app.search.is_some(), "sanity: a search is confirmed");
+
+        // Reopening `/` and pressing Enter with nothing typed this time —
+        // `self.search` is still `Some("new_name")` at this point, exactly
+        // as it would be through the real event loop (see
+        // `ui::mod`'s `Action::OpenSearch`/`SearchPromptOutcome::Confirm`
+        // handling, which never touches `app.search` before Enter).
+        let cursor_before = app.cursor;
+        let origin2 = refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
+        let note = app.confirm_search("", &origin2);
+
+        assert_eq!(note, None);
+        assert!(
+            app.search.is_none(),
+            "an empty query must cancel, not silently reconfirm the stale prior search"
+        );
+        assert_eq!(app.cursor, cursor_before);
+    }
+
+    #[test]
+    fn next_and_prev_match_cycle_and_wrap_moving_the_cursor_each_time() {
+        let mut app = test_app();
+        let origin = refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
+        // "fn " matches every function definition in the fixture — several
+        // hits across several files, plenty to exercise wraparound.
+        app.recompute_search_live("fn ", &origin);
+        let total = app.search.as_ref().unwrap().matches.len();
+        assert!(total > 2, "sanity: enough matches to exercise wraparound");
+        assert_eq!(
+            app.search.as_ref().unwrap().current,
+            0,
+            "sanity: origin at the top lands on the first match"
+        );
+
+        for step in 0..total - 1 {
+            let wrapped = app.next_match();
+            assert_eq!(wrapped, Some(false), "step {step} should not wrap yet");
+            assert_eq!(app.search.as_ref().unwrap().current, step + 1);
+        }
+        // One more step returns to the first match, wrapping — and the
+        // cursor jumps right along with it.
+        assert_eq!(app.next_match(), Some(true));
+        assert_eq!(app.search.as_ref().unwrap().current, 0);
+        let first_match_row = app.search.as_ref().unwrap().matches[0].row_idx;
+        assert_eq!(app.cursor, first_match_row);
+
+        // `prev_match` immediately after wraps the other way, back to the
+        // last match.
+        assert_eq!(app.prev_match(), Some(true));
+        assert_eq!(app.search.as_ref().unwrap().current, total - 1);
+    }
+
+    #[test]
+    fn next_match_with_no_confirmed_search_is_a_no_op() {
+        let mut app = test_app();
+        assert_eq!(app.next_match(), None);
+        assert_eq!(app.prev_match(), None);
+    }
+
+    #[test]
+    fn search_status_note_distinguishes_no_search_from_zero_matches() {
+        let mut app = test_app();
+        assert_eq!(app.search_status_note(), "search: nothing to repeat");
+
+        let origin = refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
+        app.recompute_search_live("xyz_not_anywhere", &origin);
+        assert_eq!(app.search_status_note(), "no matches: xyz_not_anywhere");
+    }
+
+    #[test]
+    fn apply_scope_swap_clears_an_active_confirmed_search() {
+        let mut app = test_app();
+        let origin = refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
+        app.recompute_search_live("new_name", &origin);
+        assert!(app.search.is_some(), "sanity: a search is active");
+
+        let files = parse_unified_diff(FIXTURE);
+        app.apply_scope_swap(files, true, true, None);
+
+        assert!(
+            app.search.is_none(),
+            "a scope swap has no relationship to the old scope's search"
+        );
+    }
+
+    #[test]
+    fn apply_refresh_recomputes_a_confirmed_searchs_matches_against_the_new_rows() {
+        let mut app = test_app();
+        let origin = refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
+        app.recompute_search_live("new_name", &origin);
+        let before = app.search.as_ref().unwrap().matches.len();
+        assert_eq!(before, 2, "sanity: \"new_name\" and \"new_name2\"'s prefix");
+
+        // A refreshed diff that adds a third occurrence — the confirmed
+        // query survives the rebuild and its match count grows to match.
+        // Continuation lines start at column 0 (not indented to match the
+        // surrounding Rust code): a `\`-newline strips leading whitespace
+        // on the following line too, which would otherwise eat a context
+        // line's own leading-space marker — see `main.rs`'s `GAP_FIXTURE`
+        // for the same convention.
+        const REFRESHED: &str = "diff --git a/src/lib.rs b/src/lib.rs\n\
+index 1111111..2222222 100644\n\
+--- a/src/lib.rs\n\
++++ b/src/lib.rs\n\
+@@ -1,4 +1,6 @@\n\
+ fn helper() {}\n\
+-fn old_name() {}\n\
++fn new_name() {}\n\
++fn new_name2() {}\n\
++fn new_name3() {}\n\
+ fn tail() {}\n\
+ fn unchanged() {}\n";
+        app.apply_refresh(parse_unified_diff(REFRESHED));
+
+        let after = app.search.as_ref().expect("query survives a refresh");
+        assert_eq!(after.query, "new_name");
+        assert_eq!(after.matches.len(), 3);
+    }
+
     // -- Fold rows: expand/collapse, validation, refresh reapply --------
 
     /// One file, two hunks (new 1..=3, new 10..=12), every row `Context`
@@ -1455,6 +2048,32 @@ mod tests {
         );
         assert_eq!(app.cursor, 5, "cursor lands back on the reappeared gap row");
         assert!(matches!(app.rows[app.cursor], RenderRow::Gap { .. }));
+    }
+
+    /// Issue #5's fold interplay: a confirmed search over content that only
+    /// exists inside a *collapsed* fold finds nothing until `z o` reveals
+    /// it — `App::expand_gap`'s own [`Self::recompute_search`] call is what
+    /// makes the match appear with no need to search again. Mirrors the
+    /// e2e suite's `tests/e2e/search.rs` negative-assertion test, at the
+    /// `App` level.
+    #[test]
+    fn expand_gap_recomputes_a_confirmed_search_over_the_newly_revealed_rows() {
+        let mut app = gap_fixture_app();
+        // "line 5" only exists inside the collapsed gap (new 4..=9) —
+        // nowhere in the three visible rows on either side of it.
+        let origin = refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
+        app.recompute_search_live("line 5", &origin);
+        assert!(app.search.as_ref().unwrap().matches.is_empty());
+
+        app.cursor = 5; // the Between gap
+        let disk = gap_fixture_disk_lines();
+        let refs: Vec<&str> = disk.iter().map(String::as_str).collect();
+        assert_eq!(app.expand_gap(0, 0, &refs), ExpandOutcome::Revealed);
+
+        let highlight = app.search.as_ref().expect("the query is still confirmed");
+        assert_eq!(highlight.query, "line 5");
+        assert_eq!(highlight.matches.len(), 1);
+        assert_eq!(line_text_at(&app, highlight.matches[0].row_idx), "line 5");
     }
 
     #[test]

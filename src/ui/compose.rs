@@ -141,6 +141,68 @@ pub(super) fn char_byte_index(s: &str, char_idx: usize) -> usize {
         .map_or(s.len(), |(byte_idx, _)| byte_idx)
 }
 
+/// A single-line, `char`-indexed text-editing buffer: insert/backspace/
+/// move-left/move-right over one line of free-form text, cursor addressed
+/// by `char` index (never byte — see [`char_byte_index`]'s own docs on why
+/// that matters for anything beyond ASCII). The shared shape behind
+/// [`crate::ui::scope_menu::RevisionInput`] and
+/// [`crate::ui::search::SearchInput`] — both are just `pub type` aliases
+/// for this — since neither prompt needs anything more specific to its own
+/// domain than "a user is typing one line of text." Lives here, alongside
+/// [`char_byte_index`] (every method below leans on it) rather than in
+/// either alias's own module: before this was extracted, the two aliases'
+/// modules each carried a byte-for-byte identical copy of this same struct
+/// and its five methods, with nothing tying the copies together to catch
+/// them drifting apart on a future fix (a boundary bug, a new Home/End key)
+/// applied to one and not the other. Not [`ComposeBuffer`] itself: that
+/// type is multi-line, with `Enter` meaning "insert a newline" — exactly
+/// wrong for a field where `Enter` means "submit this one line" and there's
+/// no second line to navigate to.
+#[derive(Debug, Default)]
+pub(crate) struct LineInput {
+    text: String,
+    /// `char` index into `text` — not a byte offset.
+    cursor: usize,
+}
+
+impl LineInput {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn insert_char(&mut self, c: char) {
+        let byte_idx = char_byte_index(&self.text, self.cursor);
+        self.text.insert(byte_idx, c);
+        self.cursor += 1;
+    }
+
+    pub fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let start = char_byte_index(&self.text, self.cursor - 1);
+        let end = char_byte_index(&self.text, self.cursor);
+        self.text.replace_range(start..end, "");
+        self.cursor -= 1;
+    }
+
+    pub fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.text.chars().count());
+    }
+}
+
 /// What [`handle_key`] decided one key press should do to the overlay as a
 /// whole, beyond editing the buffer itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

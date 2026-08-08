@@ -33,6 +33,8 @@ mod navigation;
 mod rendering;
 #[path = "e2e/scope_menu.rs"]
 mod scope_menu;
+#[path = "e2e/search.rs"]
+mod search;
 #[path = "e2e/show_keys.rs"]
 mod show_keys;
 #[path = "e2e/skill_install.rs"]

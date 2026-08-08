@@ -230,6 +230,14 @@ pub fn diff_view_items(keymap: &Keymap) -> Vec<HintItem> {
             "diag",
         ),
         HintItem::for_actions(keymap, &[Action::OpenScopeMenu], "scope"),
+        // Moderate priority: below `help`'s deliberately-early placement,
+        // but well ahead of the lower-traffic toggles further down. `n`/`N`
+        // get no hint item of their own — they only mean anything once a
+        // search is already confirmed, at which point the prompt echo (and
+        // the "search wrapped"/"no matches" notes) are the discoverability
+        // signal, not the status bar's hint row; `?`'s help window is where
+        // they're documented (see `ui::help::describe`).
+        HintItem::for_actions(keymap, &[Action::OpenSearch], "search"),
         HintItem::for_actions(keymap, &[Action::AddComment], "comment"),
         HintItem::for_actions(keymap, &[Action::ToggleSidebar], "sidebar"),
         HintItem::for_actions(keymap, &[Action::ToggleLayout], "layout"),
@@ -506,13 +514,13 @@ mod tests {
 
     /// `diff_view_items` was already close to filling [`MAX_HINT_LINES`] at
     /// a realistic 100-column pane before the fold hint existed — this
-    /// pins down that adding it (and, later, the `?` help hint) didn't
-    /// quietly push a lower-priority item (here, `quit`, the last-listed
-    /// and therefore first-dropped one per [`wrap_items`]'s policy) off the
-    /// status bar entirely. `help` itself is listed early (see
-    /// `diff_view_items`'s own item list) specifically so it isn't the one
-    /// that goes missing here instead — discoverability is the entire
-    /// point of `?`.
+    /// pins down that adding it (then the `?` help hint, then Issue #5's
+    /// `/ search` hint) didn't quietly push a lower-priority item (here,
+    /// `quit`, the last-listed and therefore first-dropped one per
+    /// [`wrap_items`]'s policy) off the status bar entirely. `help` itself
+    /// is listed early (see `diff_view_items`'s own item list)
+    /// specifically so it isn't the one that goes missing here instead —
+    /// discoverability is the entire point of `?`.
     #[test]
     fn fold_and_help_hints_do_not_push_quit_off_the_status_bar_at_a_realistic_width() {
         let keymap = Keymap::from_bindings(&vim_preset(false));
@@ -525,6 +533,10 @@ mod tests {
             items.iter().any(|i| i.display() == "? help"),
             "the help hint should be present in the curated list"
         );
+        assert!(
+            items.iter().any(|i| i.display() == "/ search"),
+            "the search hint should be present in the curated list"
+        );
         let wrapped = wrap_for_area(&items, 100);
         assert!(
             wrapped.len() <= MAX_HINT_LINES,
@@ -533,6 +545,10 @@ mod tests {
         assert!(
             wrapped.iter().any(|line| line.contains("? help")),
             "help must be visible at a realistic width; wrapped:\n{wrapped:?}"
+        );
+        assert!(
+            wrapped.iter().any(|line| line.contains("/ search")),
+            "search must be visible at a realistic width; wrapped:\n{wrapped:?}"
         );
         assert!(
             wrapped.iter().any(|line| line.contains("quit")),

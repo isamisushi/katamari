@@ -15,12 +15,18 @@
 
 use crate::comments::{CommentAnnotation, CommentIndex, Status as CommentStatus};
 use crate::diff::{
-    DiffFile, DiffLineKind, DiffRow, RenderRow, SideBySideRow, SideCell, lsp_target,
+    ColumnMap, DiffFile, DiffLineKind, DiffRow, RenderRow, SideBySideRow, SideCell, lsp_target,
     side_by_side_scroll_start,
 };
 use crate::highlight::{HighlightKind, Language, LineHighlighter, Span as HlSpan};
 use crate::lsp::DiagnosticsStore;
 use crate::ui::app::{App, Layout};
+// Only the tests below construct a `search::SearchHighlight`/call
+// `search::compute_matches` directly — `content_line`'s own render path
+// reaches `search::Match`/`SearchHighlight` only through `App::search`'s
+// field type, never by naming the module itself.
+#[cfg(test)]
+use crate::ui::search;
 use crate::ui::symbols;
 use crate::ui::text::{
     display_width, expand_tabs_in_spans, highlight_color, mark_range, truncate_spans_to_width,
@@ -135,6 +141,7 @@ fn render_unified(
         for line in render_row(
             app,
             row,
+            idx,
             idx == app.cursor,
             content_width,
             highlighter,
@@ -270,6 +277,7 @@ fn side_by_side_row_line(
         SideBySideRow::Full { flat_idx } => render_row(
             app,
             app.rows[flat_idx],
+            flat_idx,
             flat_idx == app.cursor,
             left_width + 1 + right_width,
             highlighter,
@@ -334,6 +342,7 @@ fn side_cell_lines(
         SideCell::Line { flat_idx } => render_row(
             app,
             app.rows[flat_idx],
+            flat_idx,
             flat_idx == app.cursor,
             width,
             highlighter,
@@ -351,10 +360,19 @@ fn side_cell_lines(
 /// [`file_header_line`]/[`hunk_header_line`] already do, reads better than
 /// spending a second terminal row on it), or [`content_line`]'s wrapped
 /// output for an actual diff line.
+///
+/// `flat_idx` is `row`'s own position in `app.rows` — not derivable from
+/// `row` itself (a [`RenderRow`] carries no notion of its own flat
+/// position), so every call site threads it through separately from its
+/// own loop variable or the [`SideCell`]/[`SideBySideRow`] it already had
+/// on hand. The only thing it's for is keying a search match back to the
+/// row it belongs to (see [`content_line`]'s search-mark handling) — every
+/// other piece of this function ignores it entirely.
 #[allow(clippy::too_many_arguments)] // see `content_line`'s comment
 fn render_row(
     app: &App,
     row: RenderRow,
+    flat_idx: usize,
     is_cursor: bool,
     width: usize,
     highlighter: &mut LineHighlighter,
@@ -381,6 +399,7 @@ fn render_row(
             file_idx,
             hunk_idx,
             row_idx,
+            flat_idx,
             width,
             is_cursor,
             highlighter,
@@ -654,16 +673,17 @@ fn continuation_gutter(bg: Option<Color>) -> Vec<Span<'static>> {
 }
 
 #[allow(clippy::too_many_arguments)] // every parameter is a distinct piece
-// of what one content row needs to render (which row, whether it's under
-// the cursor, how wide it can be, and the lookaside tables — highlighter,
-// diagnostics, comment annotations, active-symbol state via `app` — it
-// draws from); bundling them into a struct would just move the same fields
-// one level down.
+// of what one content row needs to render (which row, its flat position,
+// whether it's under the cursor, how wide it can be, and the lookaside
+// tables — highlighter, diagnostics, comment annotations, active-symbol/
+// active-search state via `app` — it draws from); bundling them into a
+// struct would just move the same fields one level down.
 fn content_line(
     app: &App,
     file_idx: usize,
     hunk_idx: usize,
     row_idx: usize,
+    flat_idx: usize,
     width: usize,
     is_cursor: bool,
     highlighter: &mut LineHighlighter,
@@ -719,6 +739,56 @@ fn content_line(
         .then(|| symbols::scan(&row.text).get(app.active_symbol).copied())
         .flatten();
 
+    // Issue #5's active search matches on this row, converted from
+    // `search::Match`'s byte offsets into display columns via `ColumnMap` —
+    // the byte→display leg `search::Match`'s own docs describe (mirroring
+    // `location_to_target`'s LSP-position conversion, not `active_symbol`
+    // above, which computes display columns directly since `symbols::scan`
+    // is tab-aware itself and never dealt in bytes to begin with). Resolved
+    // once per logical line, same reasoning as `active_symbol`: clipped
+    // down to each visual row inside the loop below, since a match can
+    // itself straddle a wrap point. The `ColumnMap` is only ever built when
+    // this row actually has a match — every other row (the overwhelming
+    // majority, even with a search active) skips it entirely. Nothing is
+    // drawn at all when `highlight_visible` is off (a bare `Esc`'s `:noh`
+    // — see `App::clear_search`'s docs) even though `matches`/`current`
+    // are still sitting right there, ready for `n`/`N` to jump through
+    // without a mark ever appearing on screen.
+    let search_marks: Vec<(usize, usize, bool)> = match &app.search {
+        Some(highlight) if highlight.highlight_visible => {
+            // `matches` is guaranteed sorted ascending by `row_idx` (file →
+            // hunk → line order, with no per-row re-sort needed — see
+            // `search::compute_matches`'s own doc comment), so this row's
+            // run is a single contiguous slice found by binary search
+            // rather than a linear scan over every match in the confirmed
+            // search. That matters here specifically because this runs
+            // once per *visible* row on every redraw, and `ui::mod::run`'s
+            // event loop redraws on a ~100ms idle tick even with no input
+            // at all — a linear scan would re-cost O(total matches) per row
+            // indefinitely for as long as a many-match search stays
+            // confirmed, not just while the reviewer is actively typing.
+            let start = highlight.matches.partition_point(|m| m.row_idx < flat_idx);
+            let end = start + highlight.matches[start..].partition_point(|m| m.row_idx == flat_idx);
+            if start == end {
+                Vec::new()
+            } else {
+                let columns = ColumnMap::new(&row.text);
+                highlight.matches[start..end]
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, m)| {
+                        (
+                            columns.utf8_to_display(m.start),
+                            columns.utf8_to_display(m.end),
+                            start + offset == highlight.current,
+                        )
+                    })
+                    .collect()
+            }
+        }
+        _ => Vec::new(),
+    };
+
     let mut out = Vec::with_capacity(visual_rows.len());
     let mut col_offset = 0usize;
     for (i, row_spans) in visual_rows.into_iter().enumerate() {
@@ -738,6 +808,23 @@ fn content_line(
                     local_end,
                     Style::default().add_modifier(Modifier::UNDERLINED),
                 );
+            }
+        }
+        // Applied after the active-symbol mark, so a match that happens to
+        // land on the selected symbol gets both styles patched together
+        // (see `text::mark_range`'s docs — later calls only ever *add* to
+        // whatever style a span already carries) rather than one silently
+        // overwriting the other.
+        for &(start, end, is_current) in &search_marks {
+            if end > col_offset && start < col_offset + row_width {
+                let local_start = start.saturating_sub(col_offset);
+                let local_end = (end - col_offset).min(row_width);
+                let style = if is_current {
+                    current_match_style()
+                } else {
+                    other_match_style()
+                };
+                content_spans = mark_range(content_spans, local_start, local_end, style);
             }
         }
 
@@ -778,6 +865,37 @@ fn base_style(bg: Option<Color>) -> Style {
         Some(color) => Style::default().bg(color),
         None => Style::default(),
     }
+}
+
+/// Issue #5's non-current match style: a dim, saturated highlight visible
+/// against any of `content_line`'s add/del/context backgrounds. Never
+/// `Modifier::UNDERLINED` — that's the active-symbol highlight's own
+/// modifier (see `content_line`'s `active_symbol` handling) — reusing it
+/// here would make a search match sitting on the active symbol visually
+/// indistinguishable from the symbol selection itself.
+fn other_match_style() -> Style {
+    Style::default()
+        .bg(Color::Rgb(90, 74, 0))
+        .add_modifier(Modifier::DIM)
+}
+
+/// Issue #5's current-match style: bold plus an explicit, saturated
+/// background. The current match is *always* on the cursor's own row (see
+/// `App::jump_cursor_to`, which every search jump funnels through), and
+/// that whole row already gets `Modifier::REVERSED` patched on
+/// unconditionally at the bottom of this function — a style that only set a
+/// modifier with no color of its own would be invisible once reversed.
+/// Setting an explicit background here means the row still shows something
+/// clearly distinct at the match either way: `Modifier::REVERSED` swaps
+/// whatever's resolved for fg/bg at render time, so a deliberately
+/// saturated background reads as a deliberately saturated foreground once
+/// reversed, rather than blending into the rest of the reversed row the way
+/// an unstyled span would.
+fn current_match_style() -> Style {
+    Style::default()
+        .bg(Color::Yellow)
+        .fg(Color::Black)
+        .add_modifier(Modifier::BOLD)
 }
 
 fn format_line_number(n: Option<u32>) -> String {
@@ -834,6 +952,33 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    /// As [`app_with_rows`], but for a single-row file at a `.lock`
+    /// filename — [`DiffFile::skip_highlighting`] always returns `true` for
+    /// one (see `is_lockfile_ish`), which forces `content_line`'s plain,
+    /// single-`HlSpan` fallback rather than running the real (and, for
+    /// arbitrary test prose that isn't valid Rust, unpredictable)
+    /// tree-sitter highlighter over it. The search-mark tests below need
+    /// that determinism: they assert on an exact span's content and style
+    /// after [`mark_range`] slices it out, which only holds together
+    /// reliably against a known-single-span starting point.
+    fn app_with_plain_row(text: &str) -> App {
+        let file = DiffFile {
+            old_path: Some("Cargo.lock".to_owned()),
+            new_path: Some("Cargo.lock".to_owned()),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                known_eof: true,
+                rows: vec![row(DiffLineKind::Context, text, Some(1), Some(1))],
+            }],
+            ..Default::default()
+        };
+        App::new("repo".to_owned(), PathBuf::from("/repo"), vec![file])
+    }
+
     #[test]
     fn unified_content_width_subtracts_the_border_and_the_gutter() {
         assert_eq!(unified_content_width(100), 100 - 1 - gutter_width());
@@ -859,6 +1004,7 @@ mod tests {
             0,
             0,
             0,
+            2, // flat_idx — see `app_with_rows`'s docs: 0 FileHeader, 1 HunkHeader, 2 this row
             30,
             false,
             &mut highlighter,
@@ -888,6 +1034,7 @@ mod tests {
             0,
             0,
             0,
+            2, // flat_idx — see the previous test's comment
             30,
             false,
             &mut highlighter,
@@ -932,6 +1079,7 @@ mod tests {
             0,
             0,
             0,
+            2, // flat_idx — see the first `content_line` test's comment
             30,
             true, // is_cursor
             &mut highlighter,
@@ -1130,6 +1278,7 @@ mod tests {
                 file_idx: 0,
                 gap_idx: 0,
             },
+            5, // flat_idx — irrelevant here, a Gap row never reads it
             false,
             10, // deliberately narrow — a gap row must truncate, never wrap
             &mut highlighter,
@@ -1138,5 +1287,243 @@ mod tests {
             true,
         );
         assert_eq!(lines.len(), 1);
+    }
+
+    // -- Issue #5: search-match rendering -------------------------------
+
+    #[test]
+    fn content_line_marks_two_matches_with_the_current_one_styled_differently() {
+        let mut app = app_with_plain_row("alpha needle beta needle gamma");
+        let matches = search::compute_matches(&app.files, &app.rows, "needle");
+        assert_eq!(
+            matches.len(),
+            2,
+            "sanity: exactly two occurrences of \"needle\""
+        );
+        app.search = Some(search::SearchHighlight {
+            query: "needle".to_owned(),
+            matches,
+            current: 1, // the *second* occurrence is current
+            highlight_visible: true,
+        });
+
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let lines = content_line(
+            &app,
+            0,
+            0,
+            0,
+            2,   // flat_idx — see `app_with_rows`'s docs: 0 FileHeader, 1 HunkHeader, 2 this row
+            200, // wide enough that this line never wraps
+            false,
+            &mut highlighter,
+            &diagnostics,
+            &[],
+            true,
+        );
+        assert_eq!(lines.len(), 1);
+
+        let is_current = |s: &Span| {
+            s.style.add_modifier.contains(Modifier::BOLD) && s.style.bg == Some(Color::Yellow)
+        };
+        let is_other = |s: &Span| {
+            s.style.add_modifier.contains(Modifier::DIM) && s.style.bg != Some(Color::Yellow)
+        };
+        let current_spans: Vec<&str> = lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.content.as_ref() == "needle" && is_current(s))
+            .map(|s| s.content.as_ref())
+            .collect();
+        let other_spans: Vec<&str> = lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.content.as_ref() == "needle" && is_other(s))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(
+            current_spans.len(),
+            1,
+            "exactly the current match gets the bold/yellow style; spans: {:?}",
+            lines[0].spans
+        );
+        assert_eq!(
+            other_spans.len(),
+            1,
+            "exactly the other match gets the dim style; spans: {:?}",
+            lines[0].spans
+        );
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .all(|s| !s.style.add_modifier.contains(Modifier::UNDERLINED)),
+            "search marks must never collide with the active-symbol's UNDERLINED modifier"
+        );
+    }
+
+    /// `:noh` (`App::clear_search`) sets `highlight_visible: false` while
+    /// leaving `matches`/`current` untouched (see that field's docs) — so
+    /// nothing should be drawn on screen at all despite the highlight still
+    /// carrying two real matches, until `n`/`N` re-enables it.
+    #[test]
+    fn content_line_draws_no_marks_when_the_highlight_is_suppressed() {
+        let mut app = app_with_plain_row("alpha needle beta needle gamma");
+        let matches = search::compute_matches(&app.files, &app.rows, "needle");
+        assert_eq!(
+            matches.len(),
+            2,
+            "sanity: exactly two occurrences of \"needle\""
+        );
+        app.search = Some(search::SearchHighlight {
+            query: "needle".to_owned(),
+            matches,
+            current: 1,
+            highlight_visible: false,
+        });
+
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let lines = content_line(
+            &app,
+            0,
+            0,
+            0,
+            2,
+            200,
+            false,
+            &mut highlighter,
+            &diagnostics,
+            &[],
+            true,
+        );
+        assert_eq!(lines.len(), 1);
+
+        let is_current = |s: &Span| {
+            s.style.add_modifier.contains(Modifier::BOLD) && s.style.bg == Some(Color::Yellow)
+        };
+        let is_other = |s: &Span| {
+            s.style.add_modifier.contains(Modifier::DIM) && s.style.bg != Some(Color::Yellow)
+        };
+        let marked: Vec<&str> = lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.content.as_ref() == "needle" && (is_current(s) || is_other(s)))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            marked.is_empty(),
+            "a suppressed highlight must draw no search marks at all; spans: {:?}",
+            lines[0].spans
+        );
+    }
+
+    #[test]
+    fn content_line_search_mark_survives_a_wrap_boundary() {
+        // "needle" (6 columns) starts at column 20 — straddling a wrap
+        // point set at content-column 22, so its first two columns land on
+        // the first visual row and the remaining four on the second.
+        let text = format!("{}needle{}", "x".repeat(20), "y".repeat(20));
+        let mut app = app_with_plain_row(&text);
+        let matches = search::compute_matches(&app.files, &app.rows, "needle");
+        assert_eq!(matches.len(), 1);
+        app.search = Some(search::SearchHighlight {
+            query: "needle".to_owned(),
+            matches,
+            current: 0,
+            highlight_visible: true,
+        });
+
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let content_width = 22;
+        let lines = content_line(
+            &app,
+            0,
+            0,
+            0,
+            2, // flat_idx
+            content_width + gutter_width(),
+            false,
+            &mut highlighter,
+            &diagnostics,
+            &[],
+            true,
+        );
+        assert!(
+            lines.len() >= 2,
+            "the match itself straddles the wrap point, so this needs at least two visual rows"
+        );
+
+        let carries_current_mark = |line: &Line| {
+            line.spans.iter().any(|s| {
+                s.style.add_modifier.contains(Modifier::BOLD) && s.style.bg == Some(Color::Yellow)
+            })
+        };
+        assert!(
+            carries_current_mark(&lines[0]),
+            "the first visual row must carry the match's leading half; spans: {:?}",
+            lines[0].spans
+        );
+        assert!(
+            carries_current_mark(&lines[1]),
+            "the second visual row must carry the match's trailing half; spans: {:?}",
+            lines[1].spans
+        );
+    }
+
+    #[test]
+    fn side_by_side_row_line_marks_a_search_match_on_the_new_side_only() {
+        let mut app = app_with_plain_row("alpha needle beta");
+        let matches = search::compute_matches(&app.files, &app.rows, "needle");
+        assert_eq!(matches.len(), 1);
+        app.search = Some(search::SearchHighlight {
+            query: "needle".to_owned(),
+            matches,
+            current: 0,
+            highlight_visible: true,
+        });
+
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let comments = CommentIndex::default();
+
+        // app.rows: 0 FileHeader, 1 HunkHeader, 2 the one content row —
+        // placed on the *new* (right) side of a paired row, old side empty,
+        // the same shape a pure addition renders as in side-by-side.
+        let pair = SideBySideRow::Paired {
+            old: SideCell::Empty,
+            new: SideCell::Line { flat_idx: 2 },
+        };
+        // Wide enough on the new side that "alpha needle beta" never wraps
+        // (`gutter_width()` alone eats a fixed chunk of whatever width is
+        // requested — see that function's docs).
+        let lines = side_by_side_row_line(
+            &app,
+            pair,
+            20,
+            gutter_width() + 40,
+            &mut highlighter,
+            &diagnostics,
+            &comments,
+            true,
+        );
+        assert_eq!(lines.len(), 1);
+
+        let divider_idx = lines[0]
+            .spans
+            .iter()
+            .position(|s| s.content.as_ref() == "\u{2502}")
+            .expect("every paired row carries the old/new divider");
+        let is_marked = |s: &Span| s.style.bg == Some(Color::Yellow);
+        assert!(
+            lines[0].spans[divider_idx + 1..].iter().any(is_marked),
+            "the match must be marked on the new (right) side"
+        );
+        assert!(
+            !lines[0].spans[..divider_idx].iter().any(is_marked),
+            "the empty old side has nothing of its own to mark"
+        );
     }
 }

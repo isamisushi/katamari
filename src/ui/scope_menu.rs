@@ -19,7 +19,7 @@
 //! same split [`crate::ui::log_view::LogView`] draws between its own list
 //! and `ui::mod::handle_action`'s `Action::Confirm` handling for it.
 
-use crate::ui::compose::{char_byte_index, cursor_marked_line};
+use crate::ui::compose::cursor_marked_line;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -118,61 +118,17 @@ impl ScopeMenuList {
     }
 }
 
-/// A single-line text buffer for the "Revision…" entry's free-form input,
-/// indexed by `char` (not byte) offsets — the same convention
-/// [`crate::ui::compose::ComposeBuffer`] uses and for the same reason (safe
-/// against ever splitting a UTF-8 sequence mid-character). Deliberately not
-/// `ComposeBuffer` itself: that type is multi-line, with `Enter` meaning
-/// "insert a newline" — exactly wrong for a field where `Enter` means
-/// "submit this one line" (see [`handle_revision_key`]) and there is no
-/// second line to navigate to. Reuses [`crate::ui::compose::char_byte_index`]/
-/// [`crate::ui::compose::cursor_marked_line`] rather than re-deriving the
-/// same char/byte-index arithmetic and cursor rendering for what is, at the
-/// single-line level, the identical problem.
-#[derive(Debug, Default)]
-pub struct RevisionInput {
-    text: String,
-    /// `char` index into `text` — not a byte offset.
-    cursor: usize,
-}
-
-impl RevisionInput {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
-    pub fn cursor(&self) -> usize {
-        self.cursor
-    }
-
-    pub fn insert_char(&mut self, c: char) {
-        let byte_idx = char_byte_index(&self.text, self.cursor);
-        self.text.insert(byte_idx, c);
-        self.cursor += 1;
-    }
-
-    pub fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let start = char_byte_index(&self.text, self.cursor - 1);
-        let end = char_byte_index(&self.text, self.cursor);
-        self.text.replace_range(start..end, "");
-        self.cursor -= 1;
-    }
-
-    pub fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    pub fn move_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.text.chars().count());
-    }
-}
+/// A single-line text buffer for the "Revision…" entry's free-form input —
+/// [`crate::ui::compose::LineInput`] under its own name here rather than a
+/// redefinition: see that type's docs for why the buffer itself (char, not
+/// byte, indexed — safe against ever splitting a UTF-8 sequence
+/// mid-character) lives in `compose` and is shared with
+/// [`crate::ui::search::SearchInput`] rather than each prompt keeping its
+/// own copy. Deliberately not [`crate::ui::compose::ComposeBuffer`]: that
+/// type is multi-line, with `Enter` meaning "insert a newline" — exactly
+/// wrong for a field where `Enter` means "submit this one line" (see
+/// [`handle_revision_key`]) and there is no second line to navigate to.
+pub type RevisionInput = crate::ui::compose::LineInput;
 
 /// What [`handle_revision_key`] decided one key press should do, beyond
 /// editing the buffer itself — the single-line sibling of

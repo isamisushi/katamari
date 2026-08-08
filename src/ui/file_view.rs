@@ -245,7 +245,13 @@ impl FileView {
             // `handle_action`). `ExpandFold`/`CollapseFold` too: an opened
             // file is read whole (no hunks means no gaps — see
             // `crate::diff::file_gaps`), so there is never a fold row here
-            // to act on.
+            // to act on. `OpenSearch`/`NextMatch`/`PrevMatch` join the same
+            // bucket for the same reason as the rest of it: Issue #5's `/`
+            // search is a deliberately diff-view-only feature (see
+            // `ui::mod::handle_action`'s own `View::Diff`-only gate for
+            // these three), so a single opened file — which has no other
+            // files, hunks, or fold rows to search *across* the way a diff
+            // does — never gets a prompt of its own here either.
             Action::NextHunk
             | Action::PrevHunk
             | Action::NextFile
@@ -259,7 +265,10 @@ impl FileView {
             | Action::AddComment
             | Action::ToggleComments
             | Action::ExpandFold
-            | Action::CollapseFold => {}
+            | Action::CollapseFold
+            | Action::OpenSearch
+            | Action::NextMatch
+            | Action::PrevMatch => {}
             // `ui::mod` intercepts this before it reaches here, same as
             // every other action in the `Hover`/`Cancel`/... group above —
             // opening `ui::help`'s popup needs the live `Keymap`, which
