@@ -43,7 +43,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Show a diff in a full-screen TUI. Defaults to the working tree
-    /// against HEAD; `--staged` or a revision narrows the scope.
+    /// against HEAD with live refresh; `--no-watch`, `--staged`, or a
+    /// revision changes that default or narrows the scope.
     Diff {
         /// Print parsed render rows as plain text and exit, instead of
         /// launching the TUI. Useful for scripting and for verifying
@@ -66,25 +67,22 @@ enum Command {
         /// Diff a single jj change against its parent(s) — `jj diff -r
         /// <revset>`'s equivalent. Requires a colocated jj repository (see
         /// `ktmr timeline`'s docs on what "colocated" means here).
-        #[arg(short = 'r', long, value_name = "REVSET", conflicts_with_all = ["from", "to", "range", "staged", "watch"])]
+        #[arg(short = 'r', long, value_name = "REVSET", conflicts_with_all = ["from", "to", "range", "staged", "no_watch"])]
         revision: Option<String>,
         /// Diff between two jj revisions — `jj diff --from/--to`'s
         /// equivalent. Either side left unset defaults to `@` (the working
         /// copy), matching jj's own `jj diff --help` documented behavior.
         /// Requires a colocated jj repository.
-        #[arg(long, value_name = "REVSET", conflicts_with_all = ["revision", "range", "staged", "watch"])]
+        #[arg(long, value_name = "REVSET", conflicts_with_all = ["revision", "range", "staged", "no_watch"])]
         from: Option<String>,
         /// See `--from`.
-        #[arg(long, value_name = "REVSET", conflicts_with_all = ["revision", "range", "staged", "watch"])]
+        #[arg(long, value_name = "REVSET", conflicts_with_all = ["revision", "range", "staged", "no_watch"])]
         to: Option<String>,
-        /// Watch the repository for filesystem changes and refresh the
-        /// diff automatically. Working-tree scope only — combining this
-        /// with `--staged`, a revision range, or `-r`/`--from`/`--to` is
-        /// rejected, since none of those has a stable "current" version for
-        /// a filesystem watcher to refresh against the way the working tree
-        /// does.
-        #[arg(long, conflicts_with_all = ["revision", "from", "to"])]
-        watch: bool,
+        /// Disable automatic live refresh for an interactive working-tree
+        /// diff. Staged and historical scopes are already non-watching and
+        /// cannot be combined with this opt-out.
+        #[arg(long, conflicts_with_all = ["staged", "range", "revision", "from", "to"])]
+        no_watch: bool,
         /// Renders this many frames of the diff pane offscreen (a
         /// `ratatui::backend::TestBackend`, no real terminal involved) and
         /// prints timing, then exits — a headless way to measure
@@ -132,7 +130,7 @@ enum Command {
         /// same call `JjPreRefreshHook` makes before every watch-mode
         /// refresh — and prints whether it created a new operation, then
         /// exits. For headless E2E verification of the snapshot trigger
-        /// without a live `--watch` session.
+        /// without a live refresh session.
         #[arg(long, hide = true, conflicts_with = "dump")]
         snapshot: bool,
         /// See `Diff`'s `--show-keys`.
@@ -407,7 +405,7 @@ fn main() -> Result<()> {
         revision: None,
         from: None,
         to: None,
-        watch: false,
+        no_watch: false,
         bench_render: None,
         show_keys: false,
     }) {
@@ -419,7 +417,7 @@ fn main() -> Result<()> {
             revision,
             from,
             to,
-            watch,
+            no_watch,
             bench_render,
             show_keys,
         } => run_diff(
@@ -430,7 +428,7 @@ fn main() -> Result<()> {
             revision,
             from,
             to,
-            watch,
+            no_watch,
             bench_render,
             show_keys,
         ),
@@ -478,13 +476,15 @@ fn run_diff(
     revision: Option<String>,
     from: Option<String>,
     to: Option<String>,
-    watch: bool,
+    no_watch: bool,
     bench_render: Option<usize>,
     show_keys: bool,
 ) -> Result<()> {
-    if watch && (staged || range.is_some()) {
+    if no_watch
+        && (staged || range.is_some() || revision.is_some() || from.is_some() || to.is_some())
+    {
         bail!(
-            "--watch only supports the working tree; it cannot be combined with --staged or a revision range"
+            "--no-watch only supports the working tree; it cannot be combined with --staged or a revision range"
         );
     }
 
@@ -495,7 +495,7 @@ fn run_diff(
     config::install(&config);
 
     // `revision`/`from`/`to` are jj-only and mutually exclusive with
-    // `staged`/`range`/`watch` (see `Command::Diff`'s `conflicts_with_all`
+    // `staged`/`range`/`no_watch` (see `Command::Diff`'s `conflicts_with_all`
     // attributes) — resolving them first means the `(staged, range)` match
     // below only ever has to handle the git-only scopes it always has.
     // `interactive = false` for every jj revision diff, matching
@@ -568,9 +568,14 @@ fn run_diff(
         return run_bench_render(app, frames);
     }
 
+    // The working-tree diff is live by default unless the public opt-out was
+    // supplied. `disk_is_new_side` is the narrow scope predicate shared with
+    // fold expansion: unlike `interactive`, it excludes staged and
+    // historical diffs whose new side is not the file currently on disk.
+    let watch_enabled = app.disk_is_new_side && !no_watch;
     let mut stack = ViewStack::new(View::Diff(app));
     let pre_refresh_hook: Option<Box<dyn ui::PreRefreshHook>> =
-        watch.then(|| Box::new(ui::NoopPreRefreshHook) as Box<dyn ui::PreRefreshHook>);
+        watch_enabled.then(|| Box::new(ui::NoopPreRefreshHook) as Box<dyn ui::PreRefreshHook>);
     ui::run(
         &mut stack,
         pre_refresh_hook,
@@ -908,7 +913,7 @@ fn run_lsp_check(
 
 /// `ktmr watch-check --dir <dir> [--flushes N] [--timeout-secs S]` — an E2E
 /// smoke test for the whole `watch` module without a terminal: starts the
-/// same [`watch::spawn`] the TUI's `--watch` mode uses, prints each flushed
+/// same [`watch::spawn`] the TUI's live-refresh mode uses, prints each flushed
 /// batch as one line (change kind and path, one entry per change, sorted
 /// for deterministic output a test script can diff against), and exits
 /// once `flushes` have arrived or `timeout_secs` have passed without them.

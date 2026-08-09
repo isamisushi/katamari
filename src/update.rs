@@ -36,7 +36,7 @@ const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 /// spawning a background refresh — see [`is_stale`]. Chosen to match gh
 /// CLI's own interval: frequent enough that a reviewer hears about a new
 /// release within a workday, rare enough that `ktmr` run in a loop (a
-/// script, a `--watch` session restarted repeatedly) never spends it on
+/// script, a live-refresh session restarted repeatedly) never spends it on
 /// more than one request a day.
 const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 

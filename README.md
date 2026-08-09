@@ -11,7 +11,8 @@ back and address — all without leaving the terminal.
   live diagnostics on changed lines (Rust / TypeScript / Python / Go /
   Kotlin / Java; servers auto-install on first use; `[lsp.servers.<id>]`
   wires up a custom server for any other filetype)
-- **Watch mode** — the diff refreshes as an agent's edits land on disk
+- **Live refresh** — working-tree diffs refresh as an agent's edits land on
+  disk by default; pass `--no-watch` for a static session
 - **Any unit of change** — working tree, staged, one commit, a range, a jj
   change or revset; browse and pick from `ktmr log`, or switch mid-session
   with a popup (`o`)
@@ -41,9 +42,10 @@ compiler/type-checker diagnostics on the changed lines themselves.
 It also assumes the underlying workflow is "agent edits, you review, you
 leave comments, the agent addresses them" rather than "you edit." Review
 comments are stored as a plain file (`.katamari/comments.jsonl`) an agent
-reads and updates through `ktmr comments`, and `ktmr diff --watch`
-refreshes the diff live as the agent's edits land on disk — no restart, no
-re-running a command by hand.
+reads and updates through `ktmr comments`, and the working-tree diff refreshes
+live as the agent's edits land on disk — no restart, no re-running a command
+by hand. Pass `ktmr diff --no-watch` when you want a static working-tree
+snapshot instead.
 
 For repositories using [jj](https://github.com/jj-vcs/jj) colocated with
 git, katamari also keeps a timeline of jj's automatic working-copy
@@ -139,12 +141,15 @@ executable-bit handling — assume a Unix filesystem.)
 Run inside any git repository:
 
 ```
-ktmr diff              # working tree vs HEAD
+ktmr diff              # working tree vs HEAD, refreshed live by default
+ktmr diff --no-watch   # working tree vs HEAD, without live refresh
 ktmr diff --staged     # staged (index) changes vs HEAD
 ktmr diff <rev>        # one commit's own changes
 ktmr diff <a>..<b>     # a revision range
-ktmr diff --watch      # refresh automatically as files change on disk
 ```
+
+`--no-watch` is a working-tree-only opt-out; staged and historical diffs are
+already static.
 
 In a colocated jj repository (see [jj colocated setup](#jj-colocated-setup)),
 `ktmr diff` also takes jj revsets, matching `jj diff`'s own flags so jj
@@ -157,11 +162,11 @@ ktmr diff --from <a>           # --to defaults to @, like `jj diff` itself
 ```
 
 `-r`/`--from`/`--to` are mutually exclusive with each other, with the plain
-git revision/range argument, and with `--staged`/`--watch` — a revision diff
-shows historical content, not necessarily what's on disk right now, so
-hover/go-to-definition/find-references are unavailable on it (the status bar
-names the scope being shown, e.g. `r: <id>` or `<from>..<to>`, so this is
-never ambiguous on screen).
+git revision/range argument, and with `--staged`/`--no-watch` — a
+revision diff shows historical content, not necessarily what's on disk right
+now, so hover/go-to-definition/find-references are unavailable on it (the
+status bar names the scope being shown, e.g. `r: <id>` or `<from>..<to>`, so
+this is never ambiguous on screen).
 
 `ktmr log` opens a browsable revision history instead of a single diff: jj
 changes (including the working copy, `@`, as a real entry) in a colocated jj
@@ -267,7 +272,7 @@ session is reviewing without restarting `ktmr diff` with new CLI flags.
   invalid revision reports the VCS's own error in the status bar and
   leaves whatever was on screen untouched.
 
-Swapping to anything other than the working tree pauses `--watch`'s
+Swapping to anything other than the working tree pauses live refresh's
 refresh loop (the watcher itself keeps running) until you swap back;
 `.katamari/comments.jsonl`'s own watcher is unaffected either way.
 
@@ -434,7 +439,7 @@ wrap = true
 show_keys = false
 
 [watch]
-# Debounce window for `--watch`: how long a burst of filesystem changes
+# Debounce window for live refresh: how long a burst of filesystem changes
 # must go quiet before the diff refreshes. Milliseconds, default 200.
 debounce_ms = 200
 
@@ -647,7 +652,7 @@ jj git init --colocate
 
 That's it: jj now tracks the same working copy as git (a `.jj` directory
 appears alongside `.git`), and every save creates a new jj operation
-katamari's timeline can show. In watch mode, katamari itself triggers a
+katamari's timeline can show. During live refresh, katamari itself triggers a
 snapshot (`jj util snapshot`) after each burst of edits, so an agent
 session leaves one timeline entry per save even though the agent never
 runs a jj command. Nothing about `ktmr diff` changes if jj

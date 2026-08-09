@@ -116,8 +116,8 @@ enum AppEvent {
     JjSnapshot,
     /// `.katamari/comments.jsonl` changed on disk — forwarded by
     /// [`crate::watch::spawn_comments_watcher`], which runs for every
-    /// session with a root diff regardless of `--watch`. Triggers a
-    /// comments-only reload (re-read the log, rebuild the
+    /// session with a root diff regardless of root live-refresh mode.
+    /// Triggers a comments-only reload (re-read the log, rebuild the
     /// [`comments::CommentIndex`]) without re-running `git diff` — an
     /// agent resolving comments via `ktmr comments resolve` shouldn't need
     /// an unrelated file edit to make the reviewer's session notice.
@@ -184,8 +184,9 @@ fn detect_jj_repo(view: &View) -> Option<JjRepo> {
 /// watching the root diff's repository for changes and supplies the M5 seam
 /// (see [`PreRefreshHook`]) each refresh calls before re-running the diff;
 /// `None` is a plain, non-watching session and never spawns a watcher at
-/// all. `ktmr diff --watch` passes [`crate::ui::NoopPreRefreshHook`]; every
-/// other command passes `None`.
+/// all. Working-tree diffs pass [`crate::ui::NoopPreRefreshHook`] by default;
+/// `--no-watch` passes `None` explicitly. Staged and historical scopes also
+/// pass `None`.
 ///
 /// `config` selects the keymap preset (plus any `[keys]` rebinding — see
 /// [`config::apply_key_overrides`]), the LSP server command overrides
@@ -258,17 +259,17 @@ pub fn run(
     let startup_status = warm_up_root(stack.top(), &lsp_manager);
 
     // M5: detected once, regardless of watch mode — `Action::ToggleTimeline`
-    // needs this even in a plain (non-`--watch`) session, since existing jj
+    // needs this even when the root watcher isn't active, since existing jj
     // history is browsable any time, not just while katamari is actively
     // creating new snapshots. See `detect_jj_repo`'s docs.
     let jj_repo = detect_jj_repo(stack.top());
 
     // "Wire in ui::run when jj detected + watch mode" (the milestone plan's
-    // words): a `--watch` session's hook starts as whatever the caller
-    // passed (`NoopPreRefreshHook`, per `main.rs`'s docs) and is upgraded to
-    // a real `JjPreRefreshHook` here, the one place that already knows both
-    // "is this watching at all" (`pre_refresh_hook.is_some()`) and "is this
-    // a jj repo" (`jj_repo`) — callers don't need to know jj exists.
+    // words): a live session's hook starts as whatever the caller passed
+    // (`NoopPreRefreshHook`, per `main.rs`'s docs) and is upgraded to a real
+    // `JjPreRefreshHook` here, the one place that already knows both "is this
+    // watching at all" (`pre_refresh_hook.is_some()`) and "is this a jj
+    // repo" (`jj_repo`) — callers don't need to know jj exists.
     let pre_refresh_hook: Option<Box<dyn PreRefreshHook>> = match (&pre_refresh_hook, &jj_repo) {
         (Some(_), Some(repo)) => Some(Box::new(JjPreRefreshHook {
             jj_repo: repo.clone(),
@@ -285,8 +286,8 @@ pub fn run(
 
     // M6: a root diff's comments are loaded and watched unconditionally —
     // unlike the working-tree watcher above, this has nothing to do with
-    // `--watch`. See [`AppEvent::CommentsChanged`]'s docs and
-    // `watch::spawn_comments_watcher`.
+    // whether root live refresh is enabled. See
+    // [`AppEvent::CommentsChanged`]'s docs and `watch::spawn_comments_watcher`.
     let (comments_repo_root, initial_comments, comments_startup_status) =
         start_comments(stack.top(), app_tx);
     // Lowest priority of the three: an available-update notice is
@@ -341,15 +342,15 @@ pub fn run(
 /// Starts watching the root diff's repository and wires its events onto
 /// `app_tx`, marking the root [`App`] as being in watch mode along the way.
 /// Returns a status-bar note if the watcher itself failed to start (e.g.
-/// the platform's file-watching backend couldn't be initialized) — a
-/// session that asked for `--watch` and silently isn't watching would be a
-/// much worse failure mode than one that says so up front.
+/// the platform's file-watching backend couldn't be initialized) — a live
+/// session that silently isn't watching would be a much worse failure mode
+/// than one that says so up front.
 fn start_watch(stack: &mut ViewStack, app_tx: Sender<AppEvent>, quiet: Duration) -> Option<String> {
     let View::Diff(app) = stack.root_mut() else {
-        // `main.rs` only ever offers `--watch` alongside the plain diff
-        // view (not `ktmr open`'s single-file view), so this doesn't
-        // happen in practice — but reaching it silently, without a
-        // watcher, would be a worse failure than declining loudly.
+        // `main.rs` only ever offers live refresh alongside the plain diff
+        // view (not `ktmr open`'s single-file view), so this doesn't happen
+        // in practice — but reaching it silently, without a watcher, would
+        // be a worse failure than declining loudly.
         return Some("watch: not available for this view".to_owned());
     };
     app.watch_mode = true;
@@ -367,8 +368,8 @@ fn start_watch(stack: &mut ViewStack, app_tx: Sender<AppEvent>, quiet: Duration)
 /// view has no comments concept at all — see below) and starts the M6
 /// comments watcher against it, unconditionally, for every session with a
 /// [`View::Diff`] root — see [`AppEvent::CommentsChanged`]'s docs on why
-/// this doesn't gate on `--watch`. Returns the repo root comments are keyed
-/// against (`None` for a [`View::File`]/[`View::Timeline`] root, which have
+/// this doesn't gate on root live refresh. Returns the repo root comments are
+/// keyed against (`None` for a [`View::File`]/[`View::Timeline`] root, which have
 /// no working-tree diff for a comment to anchor into), the comments loaded
 /// so far, and a status-bar note if the watcher itself failed to start —
 /// the same "don't silently not-watch" principle [`start_watch`] follows.
