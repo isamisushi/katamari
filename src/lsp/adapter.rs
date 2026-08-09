@@ -515,10 +515,7 @@ fn diagnose_language(language: Language, workspace_root: &Path) -> (Option<Looku
 /// diagnosing is worse than useless.
 pub(crate) fn install_hint(language: Language, installable: bool) -> String {
     match language {
-        Language::Rust => "rust-analyzer not found on PATH, via `rustup which`, `mise which`, or \
-            katamari's managed install — install it with `rustup component add rust-analyzer`, \
-            or let katamari auto-install it (`ktmr lsp install rust`)"
-            .to_owned(),
+        Language::Rust => rust_analyzer_install_hint(),
         Language::TypeScript => "typescript-language-server not found on PATH, via `mise which`, \
             or katamari's managed install — install it with \
             `npm i -g typescript-language-server typescript`, or let katamari auto-install it \
@@ -1127,12 +1124,80 @@ fn lookup_in_order(
 /// always include rustup's shim directory even though `rustup` itself is
 /// reachable.
 fn lookup_rust_analyzer() -> Option<LookupHit> {
-    lookup_in_order(
+    if let Some(path) = which_on_path("rust-analyzer")
+        && !is_rustup_proxy(&path)
+    {
+        return Some(LookupHit::Path(path));
+    }
+    choose_rust_analyzer_lookup(
         None,
-        || which_on_path("rust-analyzer"),
-        || rustup_which("rust-analyzer"),
-        || mise_which("rust-analyzer"),
-        || install::installed_binary_path(&install::prefix_dir(), Language::Rust),
+        rustup_which("rust-analyzer"),
+        mise_which("rust-analyzer"),
+        install::installed_binary_path(&install::prefix_dir(), Language::Rust),
+    )
+}
+
+/// Rustup puts a proxy named `rust-analyzer` in its bin directory for every
+/// installed toolchain, whether or not that toolchain contains the optional
+/// `rust-analyzer` component. Treating that proxy as a server merely postpones
+/// the failure until LSP initialize, and worse, prevents auto-install from
+/// reaching katamari's standalone binary. Resolve a real rustup component (or
+/// a real standalone server) before accepting a proxy-shaped candidate.
+fn choose_rust_analyzer_lookup(
+    path: Option<PathBuf>,
+    rustup: Option<PathBuf>,
+    mise: Option<PathBuf>,
+    managed: Option<PathBuf>,
+) -> Option<LookupHit> {
+    path.filter(|path| !is_rustup_proxy(path))
+        .map(LookupHit::Path)
+        .or_else(|| rustup.map(LookupHit::ToolchainWhich))
+        .or_else(|| {
+            mise.filter(|path| !is_rustup_proxy(path))
+                .map(LookupHit::Mise)
+        })
+        .or_else(|| managed.map(LookupHit::KatamariManaged))
+}
+
+/// Whether `path` resolves to rustup's proxy executable rather than a
+/// language-server binary. Canonicalizing is intentional: on the supported
+/// Unix hosts rustup exposes this proxy as a symlink, and comparing the
+/// resolved file stem keeps the check independent of the user's `CARGO_HOME`
+/// location.
+fn is_rustup_proxy(path: &Path) -> bool {
+    std::fs::canonicalize(path)
+        .ok()
+        .map(|resolved| {
+            resolved
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .is_some_and(|stem| stem.eq_ignore_ascii_case("rustup"))
+        })
+        .unwrap_or(false)
+}
+
+/// A more useful Rust hint than the generic "not found" message when rustup
+/// has exposed a proxy but the active toolchain omitted the optional
+/// component. This remains a resolution-time check rather than a live spawn:
+/// `ktmr lsp doctor` promises to stay offline, while the full `ktmr doctor`
+/// uses the language-agnostic initialize probe for failures no static check
+/// can identify safely.
+fn rust_analyzer_install_hint() -> String {
+    let generic = "rust-analyzer not found on PATH, via `rustup which`, `mise which`, or \
+        katamari's managed install — install it with `rustup component add rust-analyzer`, \
+        or let katamari auto-install it (`ktmr lsp install rust`)"
+        .to_owned();
+    let Some(proxy) = which_on_path("rust-analyzer").or_else(|| mise_which("rust-analyzer")) else {
+        return generic;
+    };
+    if !is_rustup_proxy(&proxy) || rustup_which("rust-analyzer").is_some() {
+        return generic;
+    }
+    format!(
+        "rustup's rust-analyzer proxy at {} is present, but the active toolchain has no \
+         rust-analyzer component — run `rustup component add rust-analyzer`, or let katamari \
+         auto-install it (`ktmr lsp install rust`)",
+        proxy.display()
     )
 }
 
@@ -2131,6 +2196,44 @@ mod tests {
     fn lookup_in_order_is_none_when_every_tier_misses() {
         let hit = lookup_in_order(None, || None, || None, || None, || None);
         assert!(hit.is_none());
+    }
+
+    #[test]
+    fn rust_analyzer_lookup_skips_a_rustup_proxy_and_uses_the_managed_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let rustup = dir.path().join("rustup");
+        let proxy = dir.path().join("rust-analyzer");
+        std::fs::write(&rustup, b"proxy").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&rustup, &proxy).unwrap();
+        #[cfg(not(unix))]
+        {
+            // Rustup's proxy is a symlink on the platforms this resolver
+            // currently supports; keep this test meaningful on other hosts
+            // by skipping the platform-specific filesystem shape.
+            return;
+        }
+
+        let managed = PathBuf::from("/managed/rust-analyzer");
+        let hit = choose_rust_analyzer_lookup(
+            Some(proxy.clone()),
+            None,
+            Some(proxy),
+            Some(managed.clone()),
+        );
+        assert!(matches!(hit, Some(LookupHit::KatamariManaged(path)) if path == managed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_rustup_proxy_follows_the_proxy_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let rustup = dir.path().join("rustup");
+        let proxy = dir.path().join("rust-analyzer");
+        std::fs::write(&rustup, b"proxy").unwrap();
+        std::os::unix::fs::symlink(&rustup, &proxy).unwrap();
+
+        assert!(is_rustup_proxy(&proxy));
     }
 
     #[test]

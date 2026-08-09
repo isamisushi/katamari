@@ -311,10 +311,10 @@ enum Command {
 enum LspCommand {
     /// Prints, for each of the six supported languages, where its server
     /// would resolve from today (config override / project-local / PATH /
-    /// `mise which` / katamari-managed / not found) and — only when not
-    /// found — whether `[lsp] auto_install` would handle it. Also prints a
-    /// second table listing every `[lsp.servers.<id>]` entry that defines a
-    /// custom (non-built-in) server, reporting whether its `command`
+    /// `mise which` / katamari-managed / not found), with an actionable note
+    /// when resolution fails, and whether `[lsp] auto_install` would handle
+    /// it. Also prints a second table listing every `[lsp.servers.<id>]`
+    /// custom (non-built-in) entry, reporting whether its `command`
     /// resolves — and, where a claimed extension is actually shadowed by a
     /// built-in language, lost to another custom id, or ignored because
     /// `<id>` itself names a built-in language, a note saying so. Read-only:
@@ -1310,7 +1310,10 @@ fn run_lsp_doctor() -> Result<()> {
         let diagnosis = lsp::adapter::diagnose(language, &workspace_root, &overrides);
         let (source, detail) = match &diagnosis.found {
             Some((from, path)) => (resolved_from_label(*from), path.display().to_string()),
-            None => ("not found", String::new()),
+            None => (
+                "not found",
+                lsp::adapter::install_hint(diagnosis.language, diagnosis.installable_if_missing),
+            ),
         };
         let auto_install = if diagnosis.found.is_some() {
             "n/a"
