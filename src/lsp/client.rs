@@ -4,7 +4,7 @@
 //! speaks in [`lsp_types`] structures — [`crate::lsp::transport::Transport`]
 //! underneath knows nothing about LSP semantics, only JSON-RPC framing.
 
-use crate::lsp::transport::{LspError, Transport};
+use crate::lsp::transport::{LspError, StderrSink, Transport};
 use lsp_types::{
     ClientCapabilities, ClientInfo, DiagnosticClientCapabilities, DidChangeTextDocumentParams,
     DidChangeWatchedFilesParams, DidOpenTextDocumentParams, DocumentDiagnosticParams,
@@ -60,6 +60,8 @@ pub struct Client {
     transport: Transport,
     capabilities: ServerCapabilities,
     position_encoding: PositionEncodingKind,
+    server_name: Option<String>,
+    server_version: Option<String>,
 }
 
 impl Client {
@@ -73,12 +75,22 @@ impl Client {
     /// peer-installed `typescript` (see
     /// [`crate::lsp::adapter::ResolvedServer`]'s docs); every other server
     /// initializes exactly as before this parameter existed.
+    #[allow(dead_code)]
     pub fn start(
         command: Command,
         workspace_root: &Path,
         initialization_options: Option<serde_json::Value>,
     ) -> Result<Self, LspError> {
-        let transport = Transport::spawn(command)?;
+        Self::start_with_stderr_sink(command, workspace_root, initialization_options, None)
+    }
+
+    pub fn start_with_stderr_sink(
+        command: Command,
+        workspace_root: &Path,
+        initialization_options: Option<serde_json::Value>,
+        stderr_sink: Option<StderrSink>,
+    ) -> Result<Self, LspError> {
+        let transport = Transport::spawn_with_stderr(command, stderr_sink)?;
         let root_uri = file_uri(workspace_root)?;
         let workspace_name = workspace_root
             .file_name()
@@ -120,6 +132,8 @@ impl Client {
             transport,
             capabilities: result.capabilities,
             position_encoding,
+            server_name: result.server_info.as_ref().map(|info| info.name.clone()),
+            server_version: result.server_info.and_then(|info| info.version),
         })
     }
 
@@ -157,6 +171,18 @@ impl Client {
     /// [`crate::diff::ColumnMap`] using this encoding, not assumed.
     pub fn position_encoding(&self) -> &PositionEncodingKind {
         &self.position_encoding
+    }
+
+    pub fn server_name(&self) -> Option<&str> {
+        self.server_name.as_deref()
+    }
+
+    pub fn server_version(&self) -> Option<&str> {
+        self.server_version.as_deref()
+    }
+
+    pub fn supports_hover(&self) -> bool {
+        self.capabilities.hover_provider.is_some()
     }
 
     pub fn transport(&self) -> &Transport {

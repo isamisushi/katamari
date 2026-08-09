@@ -200,6 +200,8 @@ pub struct Transport {
     stderr_log: Arc<Mutex<String>>,
 }
 
+pub type StderrSink = Arc<dyn Fn(String) + Send + Sync + 'static>;
+
 const STDERR_LOG_CAP: usize = 16 * 1024;
 
 impl Transport {
@@ -208,7 +210,21 @@ impl Transport {
     /// starts the reader/stderr threads. Returns once the process is
     /// spawned; the LSP `initialize` handshake itself is
     /// [`crate::lsp::client::Client`]'s job, not the transport's.
-    pub fn spawn(mut command: Command) -> io::Result<Self> {
+    #[expect(
+        dead_code,
+        reason = "headless callers use the transport without observability"
+    )]
+    pub fn spawn(command: Command) -> io::Result<Self> {
+        Self::spawn_with_stderr(command, None)
+    }
+
+    /// As [`Self::spawn`], forwarding each complete stderr line to an
+    /// optional observer in addition to retaining the initialize-failure
+    /// tail. The callback runs on the drain thread and must be non-blocking.
+    pub fn spawn_with_stderr(
+        mut command: Command,
+        stderr_sink: Option<StderrSink>,
+    ) -> io::Result<Self> {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -229,7 +245,7 @@ impl Transport {
         let reader_handle = spawn_reader_thread(Arc::clone(&shared), stdout, events_tx);
 
         let stderr_log = Arc::new(Mutex::new(String::new()));
-        let stderr_handle = spawn_stderr_thread(stderr, Arc::clone(&stderr_log));
+        let stderr_handle = spawn_stderr_thread(stderr, Arc::clone(&stderr_log), stderr_sink);
 
         Ok(Self {
             shared,
@@ -364,6 +380,18 @@ impl Transport {
     pub fn has_exited(&self) -> bool {
         matches!(self.child.lock().map(|mut c| c.try_wait()), Ok(Ok(Some(_))))
     }
+
+    pub fn pid(&self) -> Option<u32> {
+        self.child.lock().ok().map(|child| child.id())
+    }
+
+    pub fn exit_status(&self) -> Option<String> {
+        self.child
+            .lock()
+            .ok()
+            .and_then(|mut child| child.try_wait().ok().flatten())
+            .map(|status| status.to_string())
+    }
 }
 
 impl Drop for Transport {
@@ -483,25 +511,78 @@ fn fail_all_pending(shared: &Arc<Shared>, error: LspError) {
 fn spawn_stderr_thread(
     stderr: impl Read + Send + 'static,
     log: Arc<Mutex<String>>,
+    sink: Option<StderrSink>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let mut log = log.lock().unwrap_or_else(|e| e.into_inner());
-                    log.push_str(&line);
-                    if log.len() > STDERR_LOG_CAP {
-                        let excess = log.len() - STDERR_LOG_CAP;
-                        log.drain(..excess);
-                    }
+        let mut chunk = [0_u8; 4096];
+        let mut line = Vec::with_capacity(4096);
+        let mut truncated = false;
+        while let Ok(read) = reader.read(&mut chunk) {
+            if read == 0 {
+                if !line.is_empty() || truncated {
+                    emit_stderr_line(&line, truncated, &log, &sink);
+                }
+                break;
+            }
+            for byte in &chunk[..read] {
+                if *byte == b'\n' {
+                    emit_stderr_line(&line, truncated, &log, &sink);
+                    line.clear();
+                    truncated = false;
+                } else if line.len() < STDERR_LOG_CAP {
+                    line.push(*byte);
+                } else {
+                    // Keep draining the pipe without retaining the rest of a
+                    // pathological line. The next newline starts a fresh,
+                    // independently bounded message.
+                    truncated = true;
                 }
             }
         }
     })
+}
+
+fn emit_stderr_line(
+    bytes: &[u8],
+    truncated: bool,
+    log: &Arc<Mutex<String>>,
+    sink: &Option<StderrSink>,
+) {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    text = truncate_stderr_line(&text, truncated);
+    let text = text.trim_end_matches('\r').to_owned();
+    if let Some(sink) = sink {
+        sink(text.clone());
+    }
+    let mut log = log.lock().unwrap_or_else(|e| e.into_inner());
+    log.push_str(&text);
+    log.push('\n');
+    trim_stderr_tail(&mut log);
+}
+
+fn truncate_stderr_line(line: &str, was_truncated: bool) -> String {
+    const MARKER: &str = " … [truncated]";
+    if !was_truncated && line.len() <= STDERR_LOG_CAP {
+        return line.to_owned();
+    }
+    let mut end = STDERR_LOG_CAP.saturating_sub(MARKER.len());
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &line[..end], MARKER)
+}
+
+fn trim_stderr_tail(log: &mut String) {
+    if log.len() <= STDERR_LOG_CAP {
+        return;
+    }
+    let excess = log.len() - STDERR_LOG_CAP;
+    let boundary = log
+        .char_indices()
+        .find(|(index, _)| *index >= excess)
+        .map_or(log.len(), |(index, _)| index);
+    log.drain(..boundary);
 }
 
 #[cfg(test)]
@@ -589,5 +670,74 @@ mod tests {
     fn read_framed_errors_on_missing_content_length() {
         let mut cursor = Cursor::new(b"Content-Type: text\r\n\r\n".to_vec());
         assert!(read_framed(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn stderr_capture_is_utf8_safe_and_forwards_complete_lines() {
+        let log = Arc::new(Mutex::new(String::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let handle = spawn_stderr_thread(
+            Cursor::new(vec![b'a', 0xff, b'\n', b'\xe6', b'\x97', b'\xa5', b'\n']),
+            Arc::clone(&log),
+            Some(Arc::new(move |line| {
+                sink_seen.lock().unwrap().push(line);
+            })),
+        );
+        handle.join().unwrap();
+        let captured = log.lock().unwrap().clone();
+        assert!(captured.contains("a�"));
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn stderr_tail_truncation_keeps_utf8_boundaries() {
+        let mut log = String::new();
+        log.push_str(&"界".repeat(STDERR_LOG_CAP));
+        trim_stderr_tail(&mut log);
+        assert!(log.len() <= STDERR_LOG_CAP);
+        assert!(std::str::from_utf8(log.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn ascii_stderr_line_that_reaches_the_cap_still_gets_a_marker() {
+        let log = Arc::new(Mutex::new(String::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let handle = spawn_stderr_thread(
+            Cursor::new(format!("{}\n", "x".repeat(STDERR_LOG_CAP + 1)).into_bytes()),
+            Arc::clone(&log),
+            Some(Arc::new(move |line| {
+                sink_seen.lock().unwrap().push(line);
+            })),
+        );
+        handle.join().unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].ends_with("… [truncated]"));
+        assert!(seen[0].len() <= STDERR_LOG_CAP);
+    }
+
+    #[test]
+    fn enormous_stderr_line_is_drained_and_capped_with_a_marker() {
+        let log = Arc::new(Mutex::new(String::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let input = format!("{}\nnext\n", "界".repeat(STDERR_LOG_CAP));
+        let handle = spawn_stderr_thread(
+            Cursor::new(input.into_bytes()),
+            Arc::clone(&log),
+            Some(Arc::new(move |line| {
+                sink_seen.lock().unwrap().push(line);
+            })),
+        );
+        handle.join().unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].ends_with("… [truncated]"));
+        assert!(seen[0].len() <= STDERR_LOG_CAP);
+        assert_eq!(seen[1], "next");
+        let captured = log.lock().unwrap().clone();
+        assert!(std::str::from_utf8(captured.as_bytes()).is_ok());
     }
 }

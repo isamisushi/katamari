@@ -22,7 +22,9 @@ pub mod hints;
 pub mod hover_popup;
 pub mod key_display;
 pub mod log_view;
+pub mod lsp_inspector;
 pub mod navigation;
+mod pane;
 pub mod refresh;
 pub mod refs_panel;
 pub mod scope_menu;
@@ -52,6 +54,7 @@ use crate::lsp::{
     DefinitionResult, DiagnosticsStore, HoverResult, LspError, LspManager, ReferencesResult,
     ServerEvent, parse_publish_diagnostics, progress_status_text,
 };
+use crate::lsp::{ObservationStore, ServerIdentity};
 use crate::skill;
 use crate::ui::compose::{ComposeOutcome, ComposeState};
 use crate::ui::help::{HelpOutcome, HelpState};
@@ -245,10 +248,14 @@ pub fn run(
 
     let (lsp_tx, lsp_rx) = mpsc::channel::<ServerEvent>();
     spawn_lsp_forwarder(lsp_rx, app_tx.clone());
-    let lsp_manager = LspManager::new(
+    // Runtime observability belongs to TUI sessions only. Headless doctor
+    // and lsp-check keep using the old constructor and create no journal.
+    let observer = ObservationStore::start(config.lsp_logging.clone());
+    let lsp_manager = LspManager::new_with_observer(
         lsp_tx,
         Arc::new(config.lsp_servers.clone()),
         config.auto_install,
+        Some(observer.clone()),
     );
 
     // Proactively `didOpen`s the files this session starts out looking at,
@@ -313,6 +320,7 @@ pub fn run(
         initial_comments,
         show_keys,
         config.offer_install,
+        observer.clone(),
     );
 
     restore_terminal(&mut terminal)?;
@@ -325,6 +333,7 @@ pub fn run(
     // this). Runs after the terminal is already restored so this brief,
     // bounded wait doesn't leave the user staring at a frozen screen.
     lsp_manager.shutdown_all();
+    observer.shutdown();
 
     // A normal quit only — a session that exited via an `Err` already has
     // something more important to report (and `main` prints that), and
@@ -435,7 +444,7 @@ fn warm_up_root(view: &View, lsp_manager: &LspManager) -> Option<String> {
         // / `LogView::hover_query`'s docs) — a timeline or log session,
         // whether reached via `ktmr timeline`/`ktmr log` or by toggling from
         // the root diff, has nothing for `LspManager` to warm up.
-        View::Timeline(_) | View::Log(_) => None,
+        View::Timeline(_) | View::Log(_) | View::LspInspector(_) => None,
     }
 }
 
@@ -486,9 +495,17 @@ fn spawn_watch_forwarder(rx: Receiver<WatchSignal>, tx: Sender<AppEvent>) {
 /// request was issued, since that's what a single-result definition (or a
 /// references-panel selection) jumps *from*, for the jump stack.
 enum PendingGoto {
-    Definition(Receiver<Result<DefinitionResult, LspError>>),
-    References(Receiver<Result<ReferencesResult, LspError>>),
+    Definition {
+        operation_id: u64,
+        rx: Receiver<Result<DefinitionResult, LspError>>,
+    },
+    References {
+        operation_id: u64,
+        rx: Receiver<Result<ReferencesResult, LspError>>,
+    },
 }
+
+type PendingHover = (u64, u64, Receiver<Result<HoverResult, LspError>>);
 
 /// An open references (or multi-result definitions) panel, plus the
 /// workspace root its entries' targets should be opened relative to —
@@ -499,6 +516,7 @@ enum PendingGoto {
 struct RefsPanelState {
     git_root: PathBuf,
     panel: RefsPanel,
+    operation_id: u64,
 }
 
 /// A transient status-bar note about watch-mode activity ("updated",
@@ -549,10 +567,11 @@ fn event_loop(
     initial_comments: Vec<Comment>,
     show_keys: bool,
     offer_skill_install: bool,
+    observer: crate::lsp::ObservationHandle,
 ) -> Result<()> {
     let mut key_display = key_display::KeyDisplayState::new(show_keys);
     let mut hover_state = hover_popup::HoverState::default();
-    let mut pending_hover: Option<(u64, Receiver<Result<HoverResult, LspError>>)> = None;
+    let mut pending_hover: Option<PendingHover> = None;
     let mut pending_goto: Option<(JumpEntry, PendingGoto)> = None;
     let mut refs_panel: Option<RefsPanelState> = None;
     let mut jump_stack = JumpStack::new();
@@ -646,22 +665,48 @@ fn event_loop(
                     hints::required_height(&hints::log_view_items(keymap), area.width);
                 (log_view::layout(area, status_height).list.height, 0)
             }
+            View::LspInspector(_) => (area.height.saturating_sub(2), area.width as usize),
         };
         stack.top_mut().set_viewport_height(content_height as usize);
         stack.top_mut().set_content_width(content_width);
 
-        if let Some((generation, rx)) = &pending_hover
+        if !matches!(stack.top(), View::LspInspector(_))
+            && let Some((generation, operation_id, rx)) = &pending_hover
             && let Ok(result) = rx.try_recv()
         {
+            let stale = *generation != hover_state.generation();
+            let outcome = if stale {
+                crate::lsp::EventOutcome::Superseded
+            } else {
+                match &result {
+                    Ok(Some(_)) => crate::lsp::EventOutcome::Result,
+                    Ok(None) => crate::lsp::EventOutcome::NoResult,
+                    Err(error) => request_error_outcome(error),
+                }
+            };
             hover_state.apply(*generation, result, highlighter);
+            observer.record_ui(
+                Some(*operation_id),
+                outcome,
+                match outcome {
+                    crate::lsp::EventOutcome::Result => "hover displayed",
+                    crate::lsp::EventOutcome::NoResult => "hover returned no result",
+                    crate::lsp::EventOutcome::Unsupported => "hover unsupported",
+                    crate::lsp::EventOutcome::Superseded => "hover result superseded",
+                    _ => "hover failed",
+                },
+            );
             pending_hover = None;
         }
 
-        if let Some((from, op)) = &pending_goto {
+        if !matches!(stack.top(), View::LspInspector(_))
+            && let Some((from, op)) = &pending_goto
+        {
             match op {
-                PendingGoto::Definition(rx) => {
+                PendingGoto::Definition { operation_id, rx } => {
                     if let Ok(result) = rx.try_recv() {
                         let from = from.clone();
+                        let operation_id = *operation_id;
                         pending_goto = None;
                         apply_definition_result(
                             result,
@@ -671,13 +716,16 @@ fn event_loop(
                             lsp_manager,
                             &mut refs_panel,
                             &mut goto_status,
+                            &observer,
+                            operation_id,
                         );
                         hover_state.invalidate();
                     }
                 }
-                PendingGoto::References(rx) => {
+                PendingGoto::References { operation_id, rx } => {
                     if let Ok(result) = rx.try_recv() {
                         let from = from.clone();
+                        let operation_id = *operation_id;
                         pending_goto = None;
                         apply_references_result(
                             result,
@@ -685,6 +733,8 @@ fn event_loop(
                             lsp_manager,
                             &mut refs_panel,
                             &mut goto_status,
+                            &observer,
+                            operation_id,
                         );
                     }
                 }
@@ -747,7 +797,7 @@ fn event_loop(
         terminal.draw(|frame| {
             draw(
                 frame,
-                stack.top(),
+                stack.top_mut(),
                 keymap,
                 highlighter,
                 &hover_state,
@@ -961,6 +1011,43 @@ fn event_loop(
                         }
                     }
                 } else {
+                    // `V` and `y` are inspector-local visual-line controls,
+                    // not global actions. Let the inspector consume them
+                    // before the resolver so an unbound `y` never becomes a
+                    // confusing no-op and a future global keymap cannot
+                    // accidentally yank content from the wrong view.
+                    let mut consumed_by_inspector = false;
+                    if let View::LspInspector(inspector) = stack.top_mut() {
+                        match inspector.handle_literal_key(key) {
+                            lsp_inspector::InspectorKeyOutcome::Unhandled => {}
+                            lsp_inspector::InspectorKeyOutcome::Handled => {
+                                consumed_by_inspector = true;
+                            }
+                            lsp_inspector::InspectorKeyOutcome::Copy(payload) => {
+                                consumed_by_inspector = true;
+                                let status = match lsp_inspector::write_osc52(&payload.text) {
+                                    Ok(()) => format!(
+                                        "sent {} journal record{} ({} bytes) via OSC 52; terminal support required",
+                                        payload.record_count,
+                                        if payload.record_count == 1 { "" } else { "s" },
+                                        payload.byte_count,
+                                    ),
+                                    Err(error) => format!("journal copy failed: {error}"),
+                                };
+                                inspector.set_copy_status(status);
+                            }
+                        }
+                    }
+                    if consumed_by_inspector {
+                        // A local visual key also terminates any half-entered
+                        // global sequence (for example a pending `g`), so a
+                        // stale resolver prefix cannot affect the next key.
+                        // Reset directly: feeding V/y through the trie would
+                        // be wrong when a config makes either key a prefix.
+                        resolver.clear_pending();
+                        stack.top_mut().clear_pending_keys();
+                    }
+
                     // M16's first-comment skill-install prompt consumes
                     // exactly the one keypress that follows it, resolved
                     // *before* the keymap even sees this key — same
@@ -977,7 +1064,7 @@ fn event_loop(
                     // one keypress, rather than needing a second, wasted
                     // press just to clear the prompt first.
                     let mut consumed_by_skill_prompt = false;
-                    if awaiting_skill_prompt_key {
+                    if !consumed_by_inspector && awaiting_skill_prompt_key {
                         awaiting_skill_prompt_key = false;
                         if key.code == KeyCode::Char('y') && key.modifiers.is_empty() {
                             consumed_by_skill_prompt = true;
@@ -986,7 +1073,7 @@ fn event_loop(
                         }
                     }
 
-                    if !consumed_by_skill_prompt {
+                    if !consumed_by_inspector && !consumed_by_skill_prompt {
                         let chord = KeyChord::from(key);
                         let step = resolver.feed(chord);
                         key_display.record_step(chord, step, Instant::now());
@@ -1014,6 +1101,7 @@ fn event_loop(
                                     &mut watch_paused,
                                     watch_active,
                                     &mut watch_status,
+                                    &observer,
                                 );
                             }
                             StepResult::Pending => {
@@ -1277,7 +1365,7 @@ fn handle_action(
     action: Action,
     stack: &mut ViewStack,
     hover_state: &mut hover_popup::HoverState,
-    pending_hover: &mut Option<(u64, Receiver<Result<HoverResult, LspError>>)>,
+    pending_hover: &mut Option<PendingHover>,
     pending_goto: &mut Option<(JumpEntry, PendingGoto)>,
     refs_panel: &mut Option<RefsPanelState>,
     jump_stack: &mut JumpStack,
@@ -1293,7 +1381,16 @@ fn handle_action(
     watch_paused: &mut bool,
     watch_active: bool,
     watch_status: &mut Option<WatchStatus>,
+    observer: &crate::lsp::ObservationHandle,
 ) {
+    // The inspector is a full-screen modal view.  Route every action to it
+    // before hover/references/scope overlays can consume Esc or navigation
+    // keys, so nothing beneath it can change while the user is inspecting.
+    if let View::LspInspector(inspector) = stack.top_mut() {
+        inspector.update(action);
+        return;
+    }
+
     // The scope-menu popup's *list* half intercepts its own navigation
     // keys the same way `refs_panel`/`hover_state` do below — `Revision`
     // input never reaches here at all (see `run`'s event loop: it bypasses
@@ -1373,7 +1470,19 @@ fn handle_action(
                         col: entry.match_range.0,
                     };
                     let from = stack.top().jump_entry();
-                    let _ = navigate_to(stack, jump_stack, lsp_manager, from, target, true);
+                    let panel_title = state.panel.title.clone();
+                    match navigate_to(stack, jump_stack, lsp_manager, from, target, true) {
+                        Ok(()) => observer.record_ui(
+                            Some(state.operation_id),
+                            crate::lsp::EventOutcome::Result,
+                            format!("{panel_title} navigation succeeded"),
+                        ),
+                        Err(error) => observer.record_ui(
+                            Some(state.operation_id),
+                            crate::lsp::EventOutcome::NavigationFailure,
+                            format!("{panel_title} navigation failed: {error}"),
+                        ),
+                    }
                     hover_state.invalidate();
                 }
                 *refs_panel = None;
@@ -1395,56 +1504,133 @@ fn handle_action(
     match action {
         Action::Hover => match stack.top().hover_query() {
             Some(query) => {
+                let operation_id = observer.next_operation_id();
+                observer.record_ui(
+                    Some(operation_id),
+                    crate::lsp::EventOutcome::Queued,
+                    "hover action: resolving target",
+                );
                 hover_state.invalidate();
                 let overlapping = diagnostics.diagnostics_on_line(&query.file, query.line);
                 hover_state.set_diagnostics_prefix(&overlapping);
                 hover_state.set_pending();
                 let generation = hover_state.generation();
-                let rx = lsp_manager.hover(
+                let rx = lsp_manager.hover_with_operation(
                     &query.file,
                     &query.git_root,
                     &query.line_text,
                     query.line,
                     query.display_col,
+                    operation_id,
                 );
-                *pending_hover = Some((generation, rx));
+                if let Some((_, superseded_id, _)) = pending_hover.take() {
+                    observer.record_ui(
+                        Some(superseded_id),
+                        crate::lsp::EventOutcome::Superseded,
+                        "hover request superseded by a newer hover action",
+                    );
+                }
+                *pending_hover = Some((generation, operation_id, rx));
             }
-            None => hover_state.set_message("nothing to hover here"),
+            None => {
+                observer.record_ui(
+                    Some(observer.next_operation_id()),
+                    crate::lsp::EventOutcome::NoResult,
+                    "hover action: no target under cursor",
+                );
+                hover_state.set_message("nothing to hover here");
+            }
         },
         Action::GotoDefinition => match stack.top().hover_query() {
             Some(query) => {
-                let rx = lsp_manager.definition(
+                let operation_id = observer.next_operation_id();
+                observer.record_ui(
+                    Some(operation_id),
+                    crate::lsp::EventOutcome::Queued,
+                    "definition action: resolving target",
+                );
+                let rx = lsp_manager.definition_with_operation(
                     &query.file,
                     &query.git_root,
                     &query.line_text,
                     query.line,
                     query.display_col,
+                    operation_id,
                 );
-                *pending_goto = Some((JumpEntry::from(&query), PendingGoto::Definition(rx)));
+                if let Some((_, pending)) = pending_goto.take() {
+                    let superseded_id = match pending {
+                        PendingGoto::Definition { operation_id, .. }
+                        | PendingGoto::References { operation_id, .. } => operation_id,
+                    };
+                    observer.record_ui(
+                        Some(superseded_id),
+                        crate::lsp::EventOutcome::Superseded,
+                        "navigation request superseded by a newer definition action",
+                    );
+                }
+                *pending_goto = Some((
+                    JumpEntry::from(&query),
+                    PendingGoto::Definition { operation_id, rx },
+                ));
                 *goto_status = Some("goto: \u{2026}".to_owned());
             }
-            None => *goto_status = Some("goto: nothing to jump from here".to_owned()),
+            None => {
+                observer.record_ui(
+                    Some(observer.next_operation_id()),
+                    crate::lsp::EventOutcome::NoResult,
+                    "definition action: no target under cursor",
+                );
+                *goto_status = Some("goto: nothing to jump from here".to_owned());
+            }
         },
         Action::FindReferences => match stack.top().hover_query() {
             Some(query) => {
-                let rx = lsp_manager.references(
+                let operation_id = observer.next_operation_id();
+                observer.record_ui(
+                    Some(operation_id),
+                    crate::lsp::EventOutcome::Queued,
+                    "references action: resolving target",
+                );
+                let rx = lsp_manager.references_with_operation(
                     &query.file,
                     &query.git_root,
                     &query.line_text,
                     query.line,
                     query.display_col,
+                    operation_id,
                 );
-                *pending_goto = Some((JumpEntry::from(&query), PendingGoto::References(rx)));
+                if let Some((_, pending)) = pending_goto.take() {
+                    let superseded_id = match pending {
+                        PendingGoto::Definition { operation_id, .. }
+                        | PendingGoto::References { operation_id, .. } => operation_id,
+                    };
+                    observer.record_ui(
+                        Some(superseded_id),
+                        crate::lsp::EventOutcome::Superseded,
+                        "navigation request superseded by a newer references action",
+                    );
+                }
+                *pending_goto = Some((
+                    JumpEntry::from(&query),
+                    PendingGoto::References { operation_id, rx },
+                ));
                 *goto_status = Some("references: \u{2026}".to_owned());
             }
-            None => *goto_status = Some("references: nothing to jump from here".to_owned()),
+            None => {
+                observer.record_ui(
+                    Some(observer.next_operation_id()),
+                    crate::lsp::EventOutcome::NoResult,
+                    "references action: no target under cursor",
+                );
+                *goto_status = Some("references: nothing to jump from here".to_owned());
+            }
         },
         Action::AddComment => match stack.top() {
             View::Diff(app) => match app.comment_target() {
                 Some((file, line)) => *compose = Some(ComposeState::new(file, line)),
                 None => *goto_status = Some("comment: nothing to annotate on this row".to_owned()),
             },
-            View::File(_) | View::Timeline(_) | View::Log(_) => {
+            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
                 *goto_status = Some("comment: only available in the diff view".to_owned());
             }
         },
@@ -1465,7 +1651,7 @@ fn handle_action(
                 }
                 _ => *goto_status = Some("fold: nothing to expand here".to_owned()),
             },
-            View::File(_) | View::Timeline(_) | View::Log(_) => {
+            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
                 *goto_status = Some("fold: only available in the diff view".to_owned());
             }
         },
@@ -1475,7 +1661,7 @@ fn handle_action(
                     *goto_status = Some("fold: nothing to collapse here".to_owned());
                 }
             }
-            View::File(_) | View::Timeline(_) | View::Log(_) => {
+            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
                 *goto_status = Some("fold: only available in the diff view".to_owned());
             }
         },
@@ -1499,7 +1685,7 @@ fn handle_action(
                     origin,
                 });
             }
-            View::File(_) | View::Timeline(_) | View::Log(_) => {
+            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
                 *goto_status = Some("search: only available in the diff view".to_owned());
             }
         },
@@ -1527,7 +1713,7 @@ fn handle_action(
                     hover_state.invalidate();
                 }
             }
-            View::File(_) | View::Timeline(_) | View::Log(_) => {
+            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
                 *goto_status = Some("search: only available in the diff view".to_owned());
             }
         },
@@ -1577,6 +1763,15 @@ fn handle_action(
         }
         Action::ToggleTimeline => open_or_close_timeline(stack, jj_repo, goto_status),
         Action::ToggleLogView => open_or_close_log(stack, goto_status),
+        Action::ToggleLspInspector => {
+            cancel_pending_lsp_requests_for_help(
+                hover_state,
+                pending_hover,
+                pending_goto,
+                observer,
+            );
+            open_or_close_lsp_inspector(stack, observer, lsp_manager);
+        }
         // Explicit, not folded into the `other` catch-all below on
         // purpose: unlike every action that bucket forwards to
         // `View::update`, this one has no view-level effect at all (see
@@ -1593,12 +1788,17 @@ fn handle_action(
         // mutate `stack`/`refs_panel` or draw a hover popup with the
         // reviewer unable to even see it happen, let alone react.
         Action::OpenHelp => {
-            cancel_pending_lsp_requests_for_help(hover_state, pending_goto);
+            cancel_pending_lsp_requests_for_help(
+                hover_state,
+                pending_hover,
+                pending_goto,
+                observer,
+            );
             *help = Some(HelpState::new());
         }
         Action::OpenScopeMenu => match stack.top() {
             View::Diff(_) => *scope_menu = Some(ScopeMenuState::new_list(jj_repo.is_some())),
-            View::File(_) | View::Timeline(_) | View::Log(_) => {
+            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
                 *goto_status = Some("scope: only available in the diff view".to_owned());
             }
         },
@@ -1639,22 +1839,35 @@ fn handle_action(
 /// arm) — the reviewer would have no way to even notice, let alone
 /// dismiss, whatever changed underneath.
 ///
-/// Mirrors what a cursor move already does to a pending hover, via
-/// [`hover_popup::HoverState::invalidate`]: its generation bump makes
-/// [`hover_popup::HoverState::apply`] a no-op for a response tagged with
-/// the now-stale generation, so `pending_hover` itself is left alone here,
-/// same as at every other `invalidate()` call site in this file — no need
-/// to also drop its `Receiver`. `pending_goto` has no generation to lean
-/// on (`apply_definition_result`/`apply_references_result` run
-/// unconditionally on whatever they're given), so it's dropped outright
-/// instead, discarding the `Receiver` along with whatever answer the
-/// request eventually produces.
+/// The manager keeps working after a receiver is dropped, so each discarded
+/// operation gets an explicit cancellation event while its eventual server
+/// response can still be recorded independently. Dropping the receivers is
+/// what prevents a late answer from mutating the view when the modal closes.
 fn cancel_pending_lsp_requests_for_help(
     hover_state: &mut hover_popup::HoverState,
+    pending_hover: &mut Option<PendingHover>,
     pending_goto: &mut Option<(JumpEntry, PendingGoto)>,
+    observer: &crate::lsp::ObservationHandle,
 ) {
     hover_state.invalidate();
-    *pending_goto = None;
+    if let Some((_, operation_id, _)) = pending_hover.take() {
+        observer.record_ui(
+            Some(operation_id),
+            crate::lsp::EventOutcome::Cancellation,
+            "hover result discarded by modal view",
+        );
+    }
+    if let Some((_, pending)) = pending_goto.take() {
+        let operation_id = match pending {
+            PendingGoto::Definition { operation_id, .. }
+            | PendingGoto::References { operation_id, .. } => operation_id,
+        };
+        observer.record_ui(
+            Some(operation_id),
+            crate::lsp::EventOutcome::Cancellation,
+            "navigation result discarded by modal view",
+        );
+    }
 }
 
 /// `Action::ToggleTimeline`'s handling, factored out so the scope-menu
@@ -1683,7 +1896,7 @@ fn open_or_close_timeline(
         // The timeline only relates to the root diff; a `FileView`/
         // `LogView` pushed on top of it (via goto-definition or `L`) has
         // nothing for `t` to open.
-        View::File(_) | View::Log(_) => {}
+        View::File(_) | View::Log(_) | View::LspInspector(_) => {}
     }
 }
 
@@ -1700,8 +1913,28 @@ fn open_or_close_log(stack: &mut ViewStack, goto_status: &mut Option<String>) {
                 Err(e) => *goto_status = Some(format!("log: {e}")),
             }
         }
-        View::File(_) | View::Timeline(_) => {}
+        View::File(_) | View::Timeline(_) | View::LspInspector(_) => {}
     }
+}
+
+fn open_or_close_lsp_inspector(
+    stack: &mut ViewStack,
+    observer: &crate::lsp::ObservationHandle,
+    lsp_manager: &LspManager,
+) {
+    if let View::LspInspector(inspector) = stack.top_mut() {
+        inspector.should_quit = true;
+        return;
+    }
+    let preferred = stack
+        .top()
+        .hover_query()
+        .and_then(|query| lsp_manager.server_identity(&query.file, &query.git_root))
+        .map(|(language, root)| ServerIdentity::new(language, root));
+    stack.push(View::LspInspector(lsp_inspector::LspInspectorView::new(
+        observer.clone(),
+        preferred,
+    )));
 }
 
 /// What the scope-menu popup can swap the current [`View::Diff`]'s content
@@ -2005,10 +2238,24 @@ fn response_encoding(lsp_manager: &LspManager, from: &JumpEntry) -> PositionEnco
         .unwrap_or(PositionEncodingKind::UTF16)
 }
 
+fn request_error_outcome(error: &LspError) -> crate::lsp::EventOutcome {
+    match error {
+        LspError::Server { .. } => crate::lsp::EventOutcome::ServerError,
+        LspError::Io(message) if message.contains("does not advertise") => {
+            crate::lsp::EventOutcome::Unsupported
+        }
+        LspError::Io(message) if message.contains("timed out") => crate::lsp::EventOutcome::Timeout,
+        LspError::Closed | LspError::Io(_) | LspError::Json(_) => {
+            crate::lsp::EventOutcome::TransportFailure
+        }
+    }
+}
+
 /// Applies a `textDocument/definition` result: navigates straight there for
 /// a single candidate (the common case), opens the references panel
 /// (labeled "Definitions") for several, or leaves a status-bar note for
 /// "none"/an error.
+#[allow(clippy::too_many_arguments)]
 fn apply_definition_result(
     result: Result<DefinitionResult, LspError>,
     from: JumpEntry,
@@ -2017,20 +2264,37 @@ fn apply_definition_result(
     lsp_manager: &LspManager,
     refs_panel: &mut Option<RefsPanelState>,
     goto_status: &mut Option<String>,
+    observer: &crate::lsp::ObservationHandle,
+    operation_id: u64,
 ) {
     let response = match result {
         Ok(Some(response)) => response,
         Ok(None) => {
+            observer.record_ui(
+                Some(operation_id),
+                crate::lsp::EventOutcome::NoResult,
+                "definition returned no result",
+            );
             *goto_status = Some("goto: no definition found".to_owned());
             return;
         }
         Err(e) => {
+            observer.record_ui(
+                Some(operation_id),
+                request_error_outcome(&e),
+                format!("definition failed: {e}"),
+            );
             *goto_status = Some(format!("goto: {e}"));
             return;
         }
     };
     let locations = navigation::definition_locations(response);
     if locations.is_empty() {
+        observer.record_ui(
+            Some(operation_id),
+            crate::lsp::EventOutcome::NoResult,
+            "definition returned zero locations",
+        );
         *goto_status = Some("goto: no definition found".to_owned());
         return;
     }
@@ -2038,9 +2302,30 @@ fn apply_definition_result(
     if locations.len() == 1 {
         match navigation::location_to_target(&locations[0], &from.git_root, &encoding) {
             Some(target) => {
-                let _ = navigate_to(stack, jump_stack, lsp_manager, Some(from), target, true);
+                let navigation =
+                    navigate_to(stack, jump_stack, lsp_manager, Some(from), target, true);
+                if let Err(error) = navigation {
+                    observer.record_ui(
+                        Some(operation_id),
+                        crate::lsp::EventOutcome::NavigationFailure,
+                        format!("definition navigation failed: {error}"),
+                    );
+                } else {
+                    observer.record_ui(
+                        Some(operation_id),
+                        crate::lsp::EventOutcome::Result,
+                        "definition navigated (1 location)",
+                    );
+                }
             }
-            None => *goto_status = Some("goto: definition points at an unreadable file".to_owned()),
+            None => {
+                observer.record_ui(
+                    Some(operation_id),
+                    crate::lsp::EventOutcome::NavigationFailure,
+                    "definition points at an unreadable file",
+                );
+                *goto_status = Some("goto: definition points at an unreadable file".to_owned())
+            }
         }
         return;
     }
@@ -2048,7 +2333,13 @@ fn apply_definition_result(
     *refs_panel = Some(RefsPanelState {
         git_root: from.git_root,
         panel: RefsPanel::new("Definitions", entries, truncated),
+        operation_id,
     });
+    observer.record_ui(
+        Some(operation_id),
+        crate::lsp::EventOutcome::Result,
+        format!("definition returned {} locations", locations.len()),
+    );
 }
 
 /// As [`apply_definition_result`], for `textDocument/references` — always
@@ -2061,6 +2352,8 @@ fn apply_references_result(
     lsp_manager: &LspManager,
     refs_panel: &mut Option<RefsPanelState>,
     goto_status: &mut Option<String>,
+    observer: &crate::lsp::ObservationHandle,
+    operation_id: u64,
 ) {
     match result {
         Ok(Some(locations)) if !locations.is_empty() => {
@@ -2070,10 +2363,30 @@ fn apply_references_result(
             *refs_panel = Some(RefsPanelState {
                 git_root: from.git_root,
                 panel: RefsPanel::new("References", entries, truncated),
+                operation_id,
             });
+            observer.record_ui(
+                Some(operation_id),
+                crate::lsp::EventOutcome::Result,
+                format!("references returned {} locations", locations.len()),
+            );
         }
-        Ok(_) => *goto_status = Some("references: none found".to_owned()),
-        Err(e) => *goto_status = Some(format!("references: {e}")),
+        Ok(_) => {
+            observer.record_ui(
+                Some(operation_id),
+                crate::lsp::EventOutcome::NoResult,
+                "references returned no locations",
+            );
+            *goto_status = Some("references: none found".to_owned())
+        }
+        Err(e) => {
+            observer.record_ui(
+                Some(operation_id),
+                request_error_outcome(&e),
+                format!("references failed: {e}"),
+            );
+            *goto_status = Some(format!("references: {e}"))
+        }
     }
 }
 
@@ -2082,7 +2395,7 @@ fn apply_references_result(
 // `handle_action`'s comment for why a struct wouldn't reduce this.
 fn draw(
     frame: &mut Frame,
-    view: &View,
+    view: &mut View,
     keymap: &Keymap,
     highlighter: &mut LineHighlighter,
     hover_state: &hover_popup::HoverState,
@@ -2161,6 +2474,9 @@ fn draw(
         View::Log(log) => {
             let area = frame.area();
             log_view::render(frame, area, log, keymap, key_display);
+        }
+        View::LspInspector(inspector) => {
+            inspector.render(frame, frame.area());
         }
     }
 
@@ -2339,6 +2655,7 @@ mod tests {
         let generation_before = hover_state.generation();
 
         let (_tx, rx) = mpsc::channel();
+        let mut pending_hover: Option<PendingHover> = None;
         let mut pending_goto: Option<(JumpEntry, PendingGoto)> = Some((
             JumpEntry {
                 file: PathBuf::from("a.rs"),
@@ -2346,10 +2663,18 @@ mod tests {
                 line: 0,
                 col: 0,
             },
-            PendingGoto::Definition(rx),
+            PendingGoto::Definition {
+                operation_id: 1,
+                rx,
+            },
         ));
 
-        cancel_pending_lsp_requests_for_help(&mut hover_state, &mut pending_goto);
+        cancel_pending_lsp_requests_for_help(
+            &mut hover_state,
+            &mut pending_hover,
+            &mut pending_goto,
+            &crate::lsp::ObservationStore::in_memory(),
+        );
 
         // The pending hover is discarded by bumping the generation
         // (mirroring a cursor move), not by touching `Status::Pending`

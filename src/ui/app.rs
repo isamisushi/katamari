@@ -734,6 +734,7 @@ impl App {
             // something inside `TimelineView`/`LogView` themselves.
             Action::ToggleTimeline
             | Action::ToggleLogView
+            | Action::ToggleLspInspector
             | Action::OpenScopeMenu
             | Action::ToggleRangeSelect => {}
             // `ui::mod` intercepts this before it reaches here too, same

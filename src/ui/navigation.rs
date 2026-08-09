@@ -203,7 +203,7 @@ pub fn navigate_to(
         // timeline`/`ktmr log`'s root is one of those, but neither entry
         // point ever calls `navigate_to` (no LSP, no jumps) — and `File`
         // has no diff rows to target either way.
-        View::File(_) | View::Timeline(_) | View::Log(_) => None,
+        View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => None,
     };
     if let Some(row_idx) = root_row {
         stack.pop_to_root();
@@ -312,7 +312,7 @@ impl View {
             // Read-only, LSP-free — see `TimelineView::hover_query`'s /
             // `LogView::hover_query`'s docs — so there's nowhere a jump
             // could return to.
-            View::Timeline(_) | View::Log(_) => None,
+            View::Timeline(_) | View::Log(_) | View::LspInspector(_) => None,
         }
     }
 }

@@ -15,6 +15,10 @@ use crate::lsp::adapter::{self, LangKey};
 use crate::lsp::client::{Client, DefinitionResult, HoverResult, ReferencesResult, file_uri};
 use crate::lsp::diagnostics::{PulledDocument, fold_pull_result};
 use crate::lsp::install;
+use crate::lsp::observe::{
+    CapabilitySnapshot, EventLevel, EventOutcome, EventSource, ObservationHandle, ServerIdentity,
+    ServerPhase,
+};
 use crate::lsp::transport::{LspError, LspEvent};
 use lsp_types::{
     FileChangeType, FileEvent, Position, PositionEncodingKind, PublishDiagnosticsParams, Uri,
@@ -145,6 +149,8 @@ impl Op {
 }
 
 struct QueuedRequest {
+    operation_id: u64,
+    submitted_at: Instant,
     file: PathBuf,
     line_text: String,
     line: u32,
@@ -198,6 +204,11 @@ struct ServerEntry {
     /// `Starting` (never yet dispatched anything) has a well-defined, if
     /// stale-looking, timestamp rather than needing an `Option`.
     last_touched: Instant,
+    /// Monotonically increasing process generation. Supervisor threads carry
+    /// the generation they started with; stale exits from an evicted process
+    /// are ignored rather than overwriting a replacement.
+    generation: u64,
+    expected_stop: bool,
 }
 
 impl ServerEntry {
@@ -210,6 +221,8 @@ impl ServerEntry {
             diagnostic_result_ids: HashMap::new(),
             push_seen: false,
             last_touched: Instant::now(),
+            generation: 0,
+            expected_stop: false,
         }
     }
 }
@@ -254,6 +267,7 @@ pub struct LspManager {
     /// says it could be installed. `false` restores exactly M8a's behavior:
     /// a missing server just fails with its manual-install hint.
     auto_install: bool,
+    observer: Option<ObservationHandle>,
 }
 
 impl LspManager {
@@ -262,6 +276,15 @@ impl LspManager {
         overrides: Arc<HashMap<String, crate::config::ServerOverride>>,
         auto_install: bool,
     ) -> Self {
+        Self::new_with_observer(events_tx, overrides, auto_install, None)
+    }
+
+    pub fn new_with_observer(
+        events_tx: Sender<ServerEvent>,
+        overrides: Arc<HashMap<String, crate::config::ServerOverride>>,
+        auto_install: bool,
+        observer: Option<ObservationHandle>,
+    ) -> Self {
         let custom_extensions = Arc::new(adapter::custom_extension_map(&overrides));
         Self {
             events_tx,
@@ -269,7 +292,14 @@ impl LspManager {
             overrides,
             custom_extensions,
             auto_install,
+            observer,
         }
+    }
+
+    fn next_operation_id(&self) -> u64 {
+        self.observer
+            .as_ref()
+            .map_or(0, |observer| observer.next_operation_id())
     }
 
     /// Routes `path` to the [`LangKey`] that would handle it — built-in
@@ -346,6 +376,25 @@ impl LspManager {
         line: u32,
         display_col: usize,
     ) -> Receiver<Result<HoverResult, LspError>> {
+        self.hover_with_operation(
+            file,
+            git_root,
+            line_text,
+            line,
+            display_col,
+            self.next_operation_id(),
+        )
+    }
+
+    pub fn hover_with_operation(
+        &self,
+        file: &Path,
+        git_root: &Path,
+        line_text: &str,
+        line: u32,
+        display_col: usize,
+        operation_id: u64,
+    ) -> Receiver<Result<HoverResult, LspError>> {
         let (tx, rx) = channel();
         self.submit(
             file,
@@ -354,6 +403,7 @@ impl LspManager {
             line,
             Some(display_col),
             Op::Hover(tx),
+            operation_id,
         );
         rx
     }
@@ -367,6 +417,25 @@ impl LspManager {
         line: u32,
         display_col: usize,
     ) -> Receiver<Result<DefinitionResult, LspError>> {
+        self.definition_with_operation(
+            file,
+            git_root,
+            line_text,
+            line,
+            display_col,
+            self.next_operation_id(),
+        )
+    }
+
+    pub fn definition_with_operation(
+        &self,
+        file: &Path,
+        git_root: &Path,
+        line_text: &str,
+        line: u32,
+        display_col: usize,
+        operation_id: u64,
+    ) -> Receiver<Result<DefinitionResult, LspError>> {
         let (tx, rx) = channel();
         self.submit(
             file,
@@ -375,6 +444,7 @@ impl LspManager {
             line,
             Some(display_col),
             Op::Definition(tx),
+            operation_id,
         );
         rx
     }
@@ -388,6 +458,25 @@ impl LspManager {
         line: u32,
         display_col: usize,
     ) -> Receiver<Result<ReferencesResult, LspError>> {
+        self.references_with_operation(
+            file,
+            git_root,
+            line_text,
+            line,
+            display_col,
+            self.next_operation_id(),
+        )
+    }
+
+    pub fn references_with_operation(
+        &self,
+        file: &Path,
+        git_root: &Path,
+        line_text: &str,
+        line: u32,
+        display_col: usize,
+        operation_id: u64,
+    ) -> Receiver<Result<ReferencesResult, LspError>> {
         let (tx, rx) = channel();
         self.submit(
             file,
@@ -396,6 +485,7 @@ impl LspManager {
             line,
             Some(display_col),
             Op::References(tx),
+            operation_id,
         );
         rx
     }
@@ -417,7 +507,15 @@ impl LspManager {
         let mut opened = 0;
         for file in eligible.into_iter().take(WARM_UP_CAP) {
             let (tx, _rx) = channel();
-            self.submit(file, git_root, "", 0, None, Op::WarmUp(tx));
+            self.submit(
+                file,
+                git_root,
+                "",
+                0,
+                None,
+                Op::WarmUp(tx),
+                self.next_operation_id(),
+            );
             opened += 1;
         }
         WarmUpSummary {
@@ -449,15 +547,25 @@ impl LspManager {
                 let Some(client) = entry.client.clone() else {
                     continue;
                 };
+                if !dispatch_generation_is_current(
+                    entry.generation,
+                    entry.generation,
+                    matches!(entry.state, ServerState::Ready),
+                    entry.expected_stop,
+                    true,
+                ) {
+                    continue;
+                }
                 let Some(version) = bump_version(&mut entry.versions, file) else {
                     continue; // no server has this file open; nothing to resync
                 };
-                (client, version)
+                (client, version, entry.generation)
             };
-            let (client, version) = next;
+            let (client, version, generation) = next;
             let file = file.clone();
             let servers = Arc::clone(&self.servers);
             let events_tx = self.events_tx.clone();
+            let observer = self.observer.clone();
             std::thread::spawn(move || {
                 // A file a watch batch reported as changed may have been
                 // deleted again (or be mid-write) by the time this thread
@@ -469,12 +577,17 @@ impl LspManager {
                     return;
                 };
                 let Ok(uri) = file_uri(&file) else { return };
+                if !is_dispatch_current(&servers, &key, generation, &client) {
+                    return;
+                }
                 client.did_change(uri.clone(), version, &content);
                 // `sync_changed_files` runs once per debounced watch flush
                 // (see `watch::debounce`), never per raw filesystem event, so
                 // this pull is already naturally rate-limited — no separate
                 // debounce needed here.
-                maybe_pull_diagnostics(&client, &file, uri, version, &servers, &key, &events_tx);
+                maybe_pull_diagnostics(
+                    &client, &file, uri, version, &servers, &key, &events_tx, observer, generation,
+                );
             });
         }
     }
@@ -516,15 +629,38 @@ impl LspManager {
     /// something actually drops it, and nothing does on a detached
     /// supervisor thread when the process itself exits.
     pub fn shutdown_all(&self) {
-        let clients: Vec<Arc<Client>> = self
-            .servers
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .values()
-            .filter_map(|entry| entry.client.clone())
-            .collect();
-        for client in clients {
+        let clients: Vec<(ServerKey, u64, Arc<Client>)> = {
+            let mut servers = self.servers.lock().unwrap_or_else(|e| e.into_inner());
+            servers
+                .iter_mut()
+                .filter_map(|(key, entry)| {
+                    entry.expected_stop = true;
+                    entry
+                        .client
+                        .clone()
+                        .map(|client| (key.clone(), entry.generation, client))
+                })
+                .collect()
+        };
+        for (key, generation, client) in clients {
+            if let Some(observer) = &self.observer {
+                observer.transition(
+                    &ServerIdentity::new(key.0.clone(), key.1.clone()),
+                    generation,
+                    ServerPhase::Stopped,
+                    "session shutdown",
+                );
+            }
             client.shutdown();
+            if let Some(observer) = &self.observer
+                && let Some(status) = client.transport().exit_status()
+            {
+                observer.set_exit_status(
+                    &ServerIdentity::new(key.0.clone(), key.1.clone()),
+                    generation,
+                    status,
+                );
+            }
         }
     }
 
@@ -559,6 +695,7 @@ impl LspManager {
     /// request for this key), or fail immediately if the server is known
     /// not to work. `submit` itself decides none of the request semantics;
     /// that's entirely `op`'s job (via [`dispatch`]) once a client exists.
+    #[allow(clippy::too_many_arguments)]
     fn submit(
         &self,
         file: &Path,
@@ -567,8 +704,16 @@ impl LspManager {
         line: u32,
         display_col: Option<usize>,
         op: Op,
+        operation_id: u64,
     ) {
         let Some(key) = self.key_for(file, git_root) else {
+            if let Some(observer) = &self.observer {
+                observer.record_ui(
+                    Some(operation_id),
+                    EventOutcome::Unsupported,
+                    "target has no configured language-server adapter",
+                );
+            }
             op.fail(LspError::Io(
                 "no language server configured for this file type".to_owned(),
             ));
@@ -577,9 +722,39 @@ impl LspManager {
 
         let mut servers = self.servers.lock().unwrap_or_else(|e| e.into_inner());
         let entry = servers.entry(key.clone()).or_insert_with(ServerEntry::new);
+        if let Some(observer) = &self.observer {
+            let method = op_method(&op);
+            let relative = file.strip_prefix(&key.1).unwrap_or(file).display();
+            let generation = if matches!(entry.state, ServerState::NotStarted) {
+                entry.generation.saturating_add(1)
+            } else {
+                entry.generation
+            };
+            observer.record_request(
+                ServerIdentity::new(key.0.clone(), key.1.clone()),
+                generation,
+                operation_id,
+                method,
+                match &entry.state {
+                    ServerState::Ready => EventOutcome::None,
+                    ServerState::Unavailable { .. } | ServerState::Crashed { .. } => {
+                        EventOutcome::TransportFailure
+                    }
+                    ServerState::NotStarted
+                    | ServerState::Starting
+                    | ServerState::Installing { .. } => EventOutcome::Queued,
+                },
+                format!(
+                    "target {relative}:{}:{}",
+                    line.saturating_add(1),
+                    display_col.unwrap_or(0).saturating_add(1)
+                ),
+            );
+        }
 
         match entry.state.clone() {
             ServerState::Ready => {
+                let generation = entry.generation;
                 let client = entry
                     .client
                     .clone()
@@ -588,6 +763,8 @@ impl LspManager {
                 dispatch(
                     client,
                     QueuedRequest {
+                        operation_id,
+                        submitted_at: Instant::now(),
                         file: file.to_path_buf(),
                         line_text: line_text.to_owned(),
                         line,
@@ -598,9 +775,15 @@ impl LspManager {
                     key,
                     self.events_tx.clone(),
                     Arc::clone(&self.overrides),
+                    self.observer.clone(),
+                    generation,
                 );
             }
             ServerState::Unavailable { reason } | ServerState::Crashed { reason } => {
+                // Preserve the manager's original fail-fast semantics. A
+                // failed server is not implicitly retried by every hover/gd/
+                // gr action; an explicit restart design can decide when to
+                // create a new generation later.
                 op.fail(LspError::Io(reason));
             }
             ServerState::NotStarted | ServerState::Starting | ServerState::Installing { .. } => {
@@ -611,11 +794,38 @@ impl LspManager {
                 // callback is actively updating.
                 if starting_now {
                     entry.state = ServerState::Starting;
+                    entry.generation = entry.generation.saturating_add(1);
+                    entry.expected_stop = false;
+                    entry.versions.clear();
+                    entry.diagnostic_result_ids.clear();
+                    entry.push_seen = false;
                 }
-                enqueue(entry, file, line_text, line, display_col, op);
+                let generation = entry.generation;
+                if starting_now && let Some(observer) = &self.observer {
+                    let identity = ServerIdentity::new(key.0.clone(), key.1.clone());
+                    observer.begin_generation_at(identity.clone(), generation, None, Vec::new());
+                    observer.transition(
+                        &identity,
+                        generation,
+                        ServerPhase::Resolving,
+                        "resolving server",
+                    );
+                }
+                enqueue(
+                    entry,
+                    file,
+                    line_text,
+                    line,
+                    display_col,
+                    op,
+                    operation_id,
+                    self.observer.as_ref(),
+                    &key,
+                    generation,
+                );
                 drop(servers);
                 if starting_now {
-                    self.spawn_server(key);
+                    self.spawn_server(key, generation);
                 }
             }
         }
@@ -626,14 +836,24 @@ impl LspManager {
     /// pumping its notifications onto `events_tx` until it closes. Called
     /// exactly once per key, from [`Self::submit`], the moment a key's
     /// state first moves out of `NotStarted`.
-    fn spawn_server(&self, key: ServerKey) {
+    fn spawn_server(&self, key: ServerKey, generation: u64) {
         let servers = Arc::clone(&self.servers);
         let events_tx = self.events_tx.clone();
         let overrides = Arc::clone(&self.overrides);
         let auto_install = self.auto_install;
+        let observer = self.observer.clone();
 
         std::thread::spawn(move || {
             let (language, workspace_root) = key.clone();
+            let identity = ServerIdentity::new(language.clone(), workspace_root.clone());
+            if let Some(observer) = &observer
+                && !observer.begin_generation_at(identity.clone(), generation, None, Vec::new())
+            {
+                return;
+            }
+            if !is_active_generation(&servers, &key, generation) {
+                return;
+            }
 
             // Off the caller of `hover`/`definition`/`references`, which
             // must return immediately — eviction can block for as long as
@@ -642,47 +862,142 @@ impl LspManager {
             // before a new server is usable. The same reasoning is why an
             // auto-install (see `resolve_or_install`, below) belongs here
             // too, not behind `submit`.
-            evict_lru_if_at_capacity(&servers, &key);
+            evict_lru_if_at_capacity(&servers, &key, observer.as_ref());
 
-            let mut resolved = match resolve_or_install(&servers, &key, &overrides, auto_install) {
+            let mut resolved = match resolve_or_install(
+                &servers,
+                &key,
+                &overrides,
+                auto_install,
+                generation,
+                observer.as_ref(),
+            ) {
                 Ok(resolved) => resolved,
                 Err(unavailable) => {
+                    if let Some(observer) = &observer {
+                        observer.record_server_text(
+                            identity.clone(),
+                            generation,
+                            EventSource::Adapter,
+                            EventLevel::Warn,
+                            unavailable.reason.clone(),
+                        );
+                    }
                     fail_entry(
                         &servers,
                         &key,
+                        generation,
                         ServerState::Unavailable {
                             reason: unavailable.reason,
                         },
+                        observer.as_ref(),
                     );
                     return;
                 }
             };
+            if !is_active_generation(&servers, &key, generation) {
+                return;
+            }
+            let program = Some(
+                resolved
+                    .command
+                    .get_program()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            let args = resolved
+                .command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
             resolved.command.current_dir(&workspace_root);
+            if let Some(observer) = &observer {
+                observer.set_command(&identity, generation, program, args);
+                observer.transition(
+                    &identity,
+                    generation,
+                    ServerPhase::Initializing,
+                    "initializing",
+                );
+            }
 
-            let client = match Client::start(
+            let stderr_observer = observer.clone();
+            let stderr_identity = identity.clone();
+            let stderr_sink = observer.as_ref().map(|_| {
+                Arc::new(move |line: String| {
+                    if let Some(observer) = &stderr_observer {
+                        observer.record_server_text(
+                            stderr_identity.clone(),
+                            generation,
+                            EventSource::Stderr,
+                            EventLevel::Info,
+                            line,
+                        );
+                    }
+                }) as crate::lsp::transport::StderrSink
+            });
+
+            let client = match Client::start_with_stderr_sink(
                 resolved.command,
                 &workspace_root,
                 resolved.initialization_options,
+                stderr_sink,
             ) {
                 Ok(client) => Arc::new(client),
                 Err(e) => {
+                    if let Some(observer) = &observer {
+                        observer.record_server_text(
+                            identity.clone(),
+                            generation,
+                            EventSource::Transport,
+                            EventLevel::Error,
+                            e.to_string(),
+                        );
+                    }
                     fail_entry(
                         &servers,
                         &key,
+                        generation,
                         ServerState::Unavailable {
                             reason: e.to_string(),
                         },
+                        observer.as_ref(),
                     );
                     return;
                 }
             };
+
+            if let Some(observer) = &observer {
+                if let Some(pid) = client.transport().pid() {
+                    observer.set_process(&identity, generation, pid);
+                }
+                observer.set_capabilities(
+                    &identity,
+                    generation,
+                    client.server_name().map(str::to_owned),
+                    client.server_version().map(str::to_owned),
+                    CapabilitySnapshot {
+                        hover: client.supports_hover(),
+                        definition: client.supports_definition(),
+                        references: client.supports_references(),
+                        diagnostics: client.supports_diagnostic_pull(),
+                    },
+                    Some(client.position_encoding().as_str().to_owned()),
+                );
+            }
 
             let transport_events = client
                 .transport()
                 .take_events()
                 .expect("Transport::take_events is only ever called here, once");
 
-            let queued = mark_ready(&servers, &key, Arc::clone(&client));
+            let queued = mark_ready(
+                &servers,
+                &key,
+                generation,
+                Arc::clone(&client),
+                observer.as_ref(),
+            );
             for request in queued {
                 dispatch(
                     Arc::clone(&client),
@@ -691,16 +1006,122 @@ impl LspManager {
                     key.clone(),
                     events_tx.clone(),
                     Arc::clone(&overrides),
+                    observer.clone(),
+                    generation,
                 );
             }
 
             for event in transport_events {
+                if !is_current_generation(&servers, &key, generation) {
+                    if let Some(observer) = &observer {
+                        let expected_stop = servers
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&key)
+                            .is_some_and(|entry| {
+                                entry.generation == generation && entry.expected_stop
+                            });
+                        match &event {
+                            LspEvent::Closed { reason: _ } => observer.record_server_text(
+                                identity.clone(),
+                                generation,
+                                EventSource::Transport,
+                                if expected_stop {
+                                    EventLevel::Info
+                                } else {
+                                    EventLevel::Error
+                                },
+                                "stale transport generation closed",
+                            ),
+                            LspEvent::Notification { method, .. } => observer.record_server_text(
+                                identity.clone(),
+                                generation,
+                                EventSource::Server,
+                                EventLevel::Debug,
+                                format!("stale notification {method}"),
+                            ),
+                        }
+                    }
+                    break;
+                }
                 let closed_reason = match &event {
                     LspEvent::Closed { reason } => Some(reason.clone()),
                     LspEvent::Notification { .. } => None,
                 };
                 if let LspEvent::Notification { method, params } = &event {
+                    if let Some(observer) = &observer {
+                        match method.as_str() {
+                            "$/progress" => {
+                                let token = params
+                                    .get("token")
+                                    .map(|token| match token {
+                                        serde_json::Value::String(text) => text.clone(),
+                                        other => other.to_string(),
+                                    })
+                                    .unwrap_or_else(|| "unknown".to_owned());
+                                observer.progress(&identity, generation, token, params);
+                            }
+                            "window/logMessage" => {
+                                let message = params
+                                    .get("message")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("server log");
+                                observer.record_server_text(
+                                    identity.clone(),
+                                    generation,
+                                    EventSource::LogMessage,
+                                    lsp_message_level(params),
+                                    message,
+                                );
+                            }
+                            "window/showMessage" => {
+                                let message = params
+                                    .get("message")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("server message");
+                                observer.record_server_text(
+                                    identity.clone(),
+                                    generation,
+                                    EventSource::ShowMessage,
+                                    lsp_message_level(params),
+                                    message,
+                                );
+                            }
+                            "$/logTrace" => {
+                                let mut message = params
+                                    .get("message")
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("server trace")
+                                    .to_owned();
+                                if let Some(verbose) =
+                                    params.get("verbose").and_then(serde_json::Value::as_str)
+                                {
+                                    message.push_str(" — ");
+                                    message.push_str(verbose);
+                                }
+                                observer.record_server_text(
+                                    identity.clone(),
+                                    generation,
+                                    EventSource::Trace,
+                                    EventLevel::Debug,
+                                    message,
+                                );
+                            }
+                            _ => {
+                                observer.record_server_text(
+                                    identity.clone(),
+                                    generation,
+                                    EventSource::Server,
+                                    EventLevel::Debug,
+                                    format!("notification {method}"),
+                                );
+                            }
+                        }
+                    }
                     if method == "textDocument/publishDiagnostics" {
+                        if let Some(observer) = &observer {
+                            observer.mark_diagnostics_capability(&identity, generation);
+                        }
                         // A *real* push notification, straight off the
                         // transport — as opposed to the synthetic
                         // notifications of the same shape
@@ -710,7 +1131,7 @@ impl LspManager {
                         // one here means this server pushes, so
                         // `maybe_pull_diagnostics` stops pulling it — see
                         // that function's docs for the full policy.
-                        mark_push_seen(&servers, &key);
+                        mark_push_seen(&servers, &key, generation);
                     } else if method == "$/progress" && progress_is_end(params) {
                         // kotlin-lsp's project indexing can leave an early
                         // pull answering empty (or wrong) simply because the
@@ -721,7 +1142,14 @@ impl LspManager {
                         // manager isn't pulling for (checked first, before
                         // any lock, since `$/progress end` is routine chatter
                         // from push-model servers too).
-                        repull_open_documents(&client, &servers, &key, &events_tx);
+                        repull_open_documents(
+                            &client,
+                            &servers,
+                            &key,
+                            &events_tx,
+                            observer.clone(),
+                            generation,
+                        );
                     }
                 }
                 let _ = events_tx.send(ServerEvent {
@@ -735,12 +1163,40 @@ impl LspManager {
                     event,
                 });
                 if let Some(reason) = closed_reason {
+                    let exit_status = client
+                        .transport()
+                        .exit_status()
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    let expected_stop = servers
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&key)
+                        .is_some_and(|entry| entry.generation == generation && entry.expected_stop);
+                    if let Some(observer) = &observer {
+                        observer.set_exit_status(&identity, generation, exit_status.clone());
+                        observer.record_server_text(
+                            identity.clone(),
+                            generation,
+                            EventSource::Transport,
+                            if expected_stop {
+                                EventLevel::Info
+                            } else {
+                                EventLevel::Error
+                            },
+                            format!(
+                                "transport closed (exit: {exit_status}): {}",
+                                reason.as_deref().unwrap_or("stdout closed")
+                            ),
+                        );
+                    }
                     fail_entry(
                         &servers,
                         &key,
+                        generation,
                         ServerState::Crashed {
                             reason: reason.unwrap_or_else(|| "server process exited".to_owned()),
                         },
+                        observer.as_ref(),
                     );
                     break;
                 }
@@ -761,6 +1217,7 @@ fn bump_version(versions: &mut HashMap<PathBuf, i32>, file: &Path) -> Option<i32
     Some(*version)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn enqueue(
     entry: &mut ServerEntry,
     file: &Path,
@@ -768,36 +1225,203 @@ fn enqueue(
     line: u32,
     display_col: Option<usize>,
     op: Op,
+    operation_id: u64,
+    observer: Option<&ObservationHandle>,
+    key: &ServerKey,
+    generation: u64,
 ) {
     if entry.queue.len() >= MAX_QUEUED_PER_SERVER
         && let Some(evicted) = entry.queue.pop_front()
     {
+        let method = op_method(&evicted.op);
         evicted.op.fail(LspError::Io(
             "superseded by a newer request before the server was ready".to_owned(),
         ));
+        if let Some(observer) = observer {
+            observer.record_request(
+                ServerIdentity::new(key.0.clone(), key.1.clone()),
+                generation,
+                evicted.operation_id,
+                method,
+                EventOutcome::Superseded,
+                "request superseded before server startup",
+            );
+        }
     }
     entry.queue.push_back(QueuedRequest {
+        operation_id,
+        submitted_at: Instant::now(),
         file: file.to_path_buf(),
         line_text: line_text.to_owned(),
         line,
         display_col,
         op,
     });
+    if let Some(observer) = observer {
+        observer.set_queue_count(
+            &ServerIdentity::new(key.0.clone(), key.1.clone()),
+            generation,
+            entry.queue.len(),
+        );
+    }
+}
+
+fn op_method(op: &Op) -> &'static str {
+    match op {
+        Op::Hover(_) => "textDocument/hover",
+        Op::Definition(_) => "textDocument/definition",
+        Op::References(_) => "textDocument/references",
+        Op::WarmUp(_) => "textDocument/didOpen",
+    }
+}
+
+fn is_current_generation(
+    servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
+    key: &ServerKey,
+    generation: u64,
+) -> bool {
+    servers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .is_some_and(|entry| entry.generation == generation && !entry.expected_stop)
+}
+
+fn is_active_generation(
+    servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
+    key: &ServerKey,
+    generation: u64,
+) -> bool {
+    servers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .is_some_and(|entry| entry.generation == generation && !entry.expected_stop)
+}
+
+/// A dispatch thread owns an `Arc<Client>` captured from the generation that
+/// queued it.  Checking only the numeric generation is insufficient when a
+/// replacement has installed a new client under the same key; pointer
+/// identity prevents an old thread from opening documents or sending a
+/// request through the replacement's bookkeeping.
+fn dispatch_generation_is_current(
+    entry_generation: u64,
+    expected_generation: u64,
+    ready: bool,
+    expected_stop: bool,
+    client_matches: bool,
+) -> bool {
+    entry_generation == expected_generation && ready && !expected_stop && client_matches
+}
+
+fn is_dispatch_current(
+    servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
+    key: &ServerKey,
+    generation: u64,
+    client: &Arc<Client>,
+) -> bool {
+    servers
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(key)
+        .is_some_and(|entry| {
+            dispatch_generation_is_current(
+                entry.generation,
+                generation,
+                matches!(entry.state, ServerState::Ready),
+                entry.expected_stop,
+                entry
+                    .client
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, client)),
+            )
+        })
+}
+
+fn fail_stale_dispatch(
+    request: Op,
+    observer: &Option<ObservationHandle>,
+    identity: ServerIdentity,
+    generation: u64,
+    operation_id: u64,
+) {
+    let method = op_method(&request);
+    if let Some(observer) = observer {
+        observer.record_request(
+            identity,
+            generation,
+            operation_id,
+            method,
+            EventOutcome::Superseded,
+            "request superseded by a newer server generation",
+        );
+    }
+    request.fail(LspError::Io(
+        "request superseded by a newer server generation".to_owned(),
+    ));
 }
 
 fn fail_entry(
     servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
     key: &ServerKey,
+    generation: u64,
     state: ServerState,
+    observer: Option<&ObservationHandle>,
 ) {
     let mut servers = servers.lock().unwrap_or_else(|e| e.into_inner());
     let entry = servers.entry(key.clone()).or_insert_with(ServerEntry::new);
-    entry.state = state;
+    if entry.generation != generation {
+        return;
+    }
+    let expected_stop = entry.expected_stop;
+    entry.state = if expected_stop {
+        ServerState::NotStarted
+    } else {
+        state.clone()
+    };
     entry.client = None;
+    let failed_operations: Vec<(u64, &'static str)> = entry
+        .queue
+        .iter()
+        .map(|queued| (queued.operation_id, op_method(&queued.op)))
+        .collect();
     for queued in entry.queue.drain(..) {
         queued.op.fail(LspError::Io(
             "language server became unavailable".to_owned(),
         ));
+    }
+    drop(servers);
+    if let Some(observer) = observer {
+        let identity = ServerIdentity::new(key.0.clone(), key.1.clone());
+        let phase = if expected_stop {
+            ServerPhase::Stopped
+        } else {
+            match state {
+                ServerState::Crashed { .. } => ServerPhase::Crashed,
+                _ => ServerPhase::Unavailable,
+            }
+        };
+        let message = match &state {
+            ServerState::Unavailable { reason } | ServerState::Crashed { reason } => reason.clone(),
+            _ => "language server became unavailable".to_owned(),
+        };
+        observer.set_queue_count(&identity, generation, 0);
+        observer.transition(&identity, generation, phase, message);
+        let outcome = if expected_stop {
+            EventOutcome::Cancellation
+        } else {
+            EventOutcome::TransportFailure
+        };
+        for (operation_id, method) in failed_operations {
+            observer.record_request(
+                identity.clone(),
+                generation,
+                operation_id,
+                method,
+                outcome,
+                "queued request failed before server became ready",
+            );
+        }
     }
 }
 
@@ -828,12 +1452,14 @@ fn resolve_or_install(
     key: &ServerKey,
     overrides: &HashMap<String, crate::config::ServerOverride>,
     auto_install: bool,
+    generation: u64,
+    observer: Option<&ObservationHandle>,
 ) -> Result<adapter::ResolvedServer, adapter::Unavailable> {
     let (lang_key, workspace_root) = key.clone();
     let language = match lang_key {
         LangKey::Builtin(language) => language,
         LangKey::Custom(id) => {
-            return match overrides.get(&id) {
+            let result = match overrides.get(&id) {
                 Some(over) => adapter::resolve_custom_server(&id, over),
                 None => Err(adapter::unavailable(
                     &id,
@@ -841,14 +1467,56 @@ fn resolve_or_install(
                     false,
                 )),
             };
+            if result.is_ok()
+                && let Some(observer) = observer
+            {
+                observer.record_server_text(
+                    ServerIdentity::new(key.0.clone(), key.1.clone()),
+                    generation,
+                    EventSource::Adapter,
+                    EventLevel::Info,
+                    "custom language-server adapter resolved a command",
+                );
+            }
+            return result;
         }
     };
     match adapter::resolve_server(language, &workspace_root, overrides) {
-        Ok(resolved) => Ok(resolved),
+        Ok(resolved) => {
+            if let Some(observer) = observer {
+                observer.record_server_text(
+                    ServerIdentity::new(key.0.clone(), key.1.clone()),
+                    generation,
+                    EventSource::Adapter,
+                    EventLevel::Info,
+                    "language-server adapter resolved a command",
+                );
+            }
+            Ok(resolved)
+        }
         Err(unavailable) if unavailable.installable && auto_install => {
-            set_installing(servers, key, format!("installing {}…", language.lsp_id()));
-            match install::ensure(language, |message| set_installing(servers, key, message)) {
-                Ok(_path) => adapter::resolve_server(language, &workspace_root, overrides),
+            set_installing(
+                servers,
+                key,
+                generation,
+                format!("installing {}…", language.lsp_id()),
+                observer,
+            );
+            match install::ensure(language, |message| {
+                set_installing(servers, key, generation, message, observer)
+            }) {
+                Ok(_path) => {
+                    if let Some(observer) = observer {
+                        observer.record_server_text(
+                            ServerIdentity::new(key.0.clone(), key.1.clone()),
+                            generation,
+                            EventSource::Install,
+                            EventLevel::Info,
+                            "language-server installation completed",
+                        );
+                    }
+                    adapter::resolve_server(language, &workspace_root, overrides)
+                }
                 Err(install_err) => Err(adapter::Unavailable {
                     reason: format!(
                         "{} (auto-install failed: {install_err})",
@@ -869,11 +1537,34 @@ fn resolve_or_install(
 fn set_installing(
     servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
     key: &ServerKey,
+    generation: u64,
     message: String,
+    observer: Option<&ObservationHandle>,
 ) {
     let mut servers = servers.lock().unwrap_or_else(|e| e.into_inner());
     let entry = servers.entry(key.clone()).or_insert_with(ServerEntry::new);
-    entry.state = ServerState::Installing { message };
+    if entry.generation != generation || entry.expected_stop {
+        return;
+    }
+    entry.state = ServerState::Installing {
+        message: message.clone(),
+    };
+    drop(servers);
+    if let Some(observer) = observer {
+        observer.transition(
+            &ServerIdentity::new(key.0.clone(), key.1.clone()),
+            generation,
+            ServerPhase::Installing,
+            "installing language server",
+        );
+        observer.record_server_text(
+            ServerIdentity::new(key.0.clone(), key.1.clone()),
+            generation,
+            EventSource::Install,
+            EventLevel::Info,
+            message,
+        );
+    }
 }
 
 /// If [`MAX_LIVE_SERVERS`] servers other than `new_key` are already
@@ -895,6 +1586,7 @@ fn set_installing(
 fn evict_lru_if_at_capacity(
     servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
     new_key: &ServerKey,
+    observer: Option<&ObservationHandle>,
 ) {
     let victim_key = {
         let guard = servers.lock().unwrap_or_else(|e| e.into_inner());
@@ -912,15 +1604,38 @@ fn evict_lru_if_at_capacity(
     let Some(victim_key) = victim_key else {
         return;
     };
-    let client = {
+    let Some((client, generation)) = ({
         let mut guard = servers.lock().unwrap_or_else(|e| e.into_inner());
-        guard.get_mut(&victim_key).and_then(|entry| {
+        guard.get_mut(&victim_key).map(|entry| {
             entry.state = ServerState::NotStarted;
-            entry.client.take()
+            entry.expected_stop = true;
+            entry.versions.clear();
+            entry.diagnostic_result_ids.clear();
+            entry.push_seen = false;
+            (entry.client.take(), entry.generation)
         })
+    }) else {
+        return;
     };
+    if let Some(observer) = observer {
+        observer.transition(
+            &ServerIdentity::new(victim_key.0.clone(), victim_key.1.clone()),
+            generation,
+            ServerPhase::Stopped,
+            "evicted to keep live-server limit",
+        );
+    }
     if let Some(client) = client {
         client.shutdown();
+        if let Some(observer) = observer
+            && let Some(status) = client.transport().exit_status()
+        {
+            observer.set_exit_status(
+                &ServerIdentity::new(victim_key.0.clone(), victim_key.1.clone()),
+                generation,
+                status,
+            );
+        }
     }
 }
 
@@ -944,13 +1659,33 @@ fn select_lru_victim<'a>(
 fn mark_ready(
     servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
     key: &ServerKey,
+    generation: u64,
     client: Arc<Client>,
+    observer: Option<&ObservationHandle>,
 ) -> Vec<QueuedRequest> {
     let mut servers = servers.lock().unwrap_or_else(|e| e.into_inner());
     let entry = servers.entry(key.clone()).or_insert_with(ServerEntry::new);
+    if entry.generation != generation || entry.expected_stop {
+        return Vec::new();
+    }
     entry.state = ServerState::Ready;
     entry.client = Some(client);
-    entry.queue.drain(..).collect()
+    let queued: Vec<_> = entry.queue.drain(..).collect();
+    drop(servers);
+    if let Some(observer) = observer {
+        observer.set_queue_count(
+            &ServerIdentity::new(key.0.clone(), key.1.clone()),
+            generation,
+            0,
+        );
+        observer.transition(
+            &ServerIdentity::new(key.0.clone(), key.1.clone()),
+            generation,
+            ServerPhase::Running,
+            "initialized; running (project indexing may still be active)",
+        );
+    }
+    queued
 }
 
 /// Runs one request to completion on a dedicated short-lived thread: reads
@@ -959,6 +1694,7 @@ fn mark_ready(
 /// entirely for [`Op::WarmUp`], which has none to convert), and forwards
 /// the result. Off the manager's supervisor thread so a slow request never
 /// delays draining that server's `$/progress`/diagnostics notifications.
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     client: Arc<Client>,
     request: QueuedRequest,
@@ -966,11 +1702,24 @@ fn dispatch(
     key: ServerKey,
     events_tx: Sender<ServerEvent>,
     overrides: Arc<HashMap<String, crate::config::ServerOverride>>,
+    observer: Option<ObservationHandle>,
+    generation: u64,
 ) {
     std::thread::spawn(move || {
+        let identity = ServerIdentity::new(key.0.clone(), key.1.clone());
         let content = match std::fs::read_to_string(&request.file) {
             Ok(content) => content,
             Err(e) => {
+                if let Some(observer) = &observer {
+                    observer.record_request(
+                        identity.clone(),
+                        generation,
+                        request.operation_id,
+                        op_method(&request.op),
+                        EventOutcome::TransportFailure,
+                        format!("could not read target ({})", e),
+                    );
+                }
                 request.op.fail(LspError::Io(format!(
                     "reading {}: {e}",
                     request.file.display()
@@ -981,17 +1730,80 @@ fn dispatch(
         let uri = match file_uri(&request.file) {
             Ok(uri) => uri,
             Err(e) => {
+                if let Some(observer) = &observer {
+                    observer.record_request(
+                        identity.clone(),
+                        generation,
+                        request.operation_id,
+                        op_method(&request.op),
+                        EventOutcome::TransportFailure,
+                        "could not form target URI",
+                    );
+                }
                 request.op.fail(e);
                 return;
             }
         };
 
-        let needs_open = {
+        if !is_dispatch_current(&servers, &key, generation, &client) {
+            fail_stale_dispatch(
+                request.op,
+                &observer,
+                identity,
+                generation,
+                request.operation_id,
+            );
+            return;
+        }
+        let Some(needs_open) = ({
             let mut servers = servers.lock().unwrap_or_else(|e| e.into_inner());
             let entry = servers.entry(key.clone()).or_insert_with(ServerEntry::new);
-            entry.last_touched = Instant::now();
-            entry.versions.insert(request.file.clone(), 1).is_none()
+            if !dispatch_generation_is_current(
+                entry.generation,
+                generation,
+                matches!(entry.state, ServerState::Ready),
+                entry.expected_stop,
+                entry
+                    .client
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, &client)),
+            ) {
+                None
+            } else {
+                entry.last_touched = Instant::now();
+                let needs_open = entry.versions.insert(request.file.clone(), 1).is_none();
+                Some(needs_open)
+            }
+        }) else {
+            fail_stale_dispatch(
+                request.op,
+                &observer,
+                identity,
+                generation,
+                request.operation_id,
+            );
+            return;
         };
+        if !is_dispatch_current(&servers, &key, generation, &client) {
+            fail_stale_dispatch(
+                request.op,
+                &observer,
+                identity,
+                generation,
+                request.operation_id,
+            );
+            return;
+        }
+        if let Some(observer) = &observer {
+            let (open, queued) = {
+                let guard = servers.lock().unwrap_or_else(|e| e.into_inner());
+                guard
+                    .get(&key)
+                    .map_or((0, 0), |entry| (entry.versions.len(), entry.queue.len()))
+            };
+            observer.set_document_counts(&identity, generation, open, queued);
+            observer.increment_in_flight(&identity, generation);
+        }
         if needs_open {
             // `key.0` is a `LangKey`, not `Copy` (unlike the old bare
             // `Language`) — borrowing it here rather than moving it out of
@@ -1000,6 +1812,16 @@ fn dispatch(
             // `Language` -> `LangKey` retype otherwise introduces here.
             let language_id = adapter::lsp_language_id_for(&key.0, &request.file, &overrides);
             client.did_open(uri.clone(), &language_id, 1, &content);
+            if !is_dispatch_current(&servers, &key, generation, &client) {
+                fail_stale_dispatch(
+                    request.op,
+                    &observer,
+                    identity,
+                    generation,
+                    request.operation_id,
+                );
+                return;
+            }
             maybe_pull_diagnostics(
                 &client,
                 &request.file,
@@ -1008,11 +1830,34 @@ fn dispatch(
                 &servers,
                 &key,
                 &events_tx,
+                observer.clone(),
+                generation,
             );
         }
 
         let Some(display_col) = request.display_col else {
             if let Op::WarmUp(tx) = request.op {
+                if !is_dispatch_current(&servers, &key, generation, &client) {
+                    fail_stale_dispatch(
+                        Op::WarmUp(tx),
+                        &observer,
+                        identity,
+                        generation,
+                        request.operation_id,
+                    );
+                    return;
+                }
+                if let Some(observer) = &observer {
+                    observer.decrement_in_flight(&identity, generation);
+                    observer.record_request(
+                        identity.clone(),
+                        generation,
+                        request.operation_id,
+                        "textDocument/didOpen",
+                        EventOutcome::Result,
+                        "document opened for diagnostics",
+                    );
+                }
                 let _ = tx.send(Ok(()));
             }
             return;
@@ -1029,12 +1874,84 @@ fn dispatch(
             character: character as u32,
         };
 
+        let method = op_method(&request.op);
+        let operation_id = request.operation_id;
+        let submitted_at = request.submitted_at;
+
         match request.op {
-            Op::Hover(tx) => forward(client.hover(uri, position), tx),
+            Op::Hover(tx) => {
+                if client.supports_hover() {
+                    if !is_dispatch_current(&servers, &key, generation, &client) {
+                        fail_stale_dispatch(
+                            Op::Hover(tx),
+                            &observer,
+                            identity,
+                            generation,
+                            operation_id,
+                        );
+                        return;
+                    }
+                    forward_observed(
+                        client.hover(uri, position),
+                        tx,
+                        observer.clone(),
+                        identity.clone(),
+                        generation,
+                        operation_id,
+                        method,
+                        submitted_at,
+                    );
+                } else {
+                    if let Some(observer) = &observer {
+                        observer.decrement_in_flight(&identity, generation);
+                        observer.record_request(
+                            identity.clone(),
+                            generation,
+                            operation_id,
+                            method,
+                            EventOutcome::Unsupported,
+                            "server does not advertise hover support",
+                        );
+                    }
+                    let _ = tx.send(Err(LspError::Io(
+                        "server does not advertise hover support".to_owned(),
+                    )));
+                }
+            }
             Op::Definition(tx) => {
                 if client.supports_definition() {
-                    forward(client.definition(uri, position), tx);
+                    if !is_dispatch_current(&servers, &key, generation, &client) {
+                        fail_stale_dispatch(
+                            Op::Definition(tx),
+                            &observer,
+                            identity,
+                            generation,
+                            operation_id,
+                        );
+                        return;
+                    }
+                    forward_observed(
+                        client.definition(uri, position),
+                        tx,
+                        observer.clone(),
+                        identity.clone(),
+                        generation,
+                        operation_id,
+                        method,
+                        submitted_at,
+                    );
                 } else {
+                    if let Some(observer) = &observer {
+                        observer.decrement_in_flight(&identity, generation);
+                        observer.record_request(
+                            identity.clone(),
+                            generation,
+                            operation_id,
+                            method,
+                            EventOutcome::Unsupported,
+                            "server does not advertise definition support",
+                        );
+                    }
                     let _ = tx.send(Err(LspError::Io(
                         "server does not advertise textDocument/definition support".to_owned(),
                     )));
@@ -1042,8 +1959,38 @@ fn dispatch(
             }
             Op::References(tx) => {
                 if client.supports_references() {
-                    forward(client.references(uri, position), tx);
+                    if !is_dispatch_current(&servers, &key, generation, &client) {
+                        fail_stale_dispatch(
+                            Op::References(tx),
+                            &observer,
+                            identity,
+                            generation,
+                            operation_id,
+                        );
+                        return;
+                    }
+                    forward_observed(
+                        client.references(uri, position),
+                        tx,
+                        observer.clone(),
+                        identity.clone(),
+                        generation,
+                        operation_id,
+                        method,
+                        submitted_at,
+                    );
                 } else {
+                    if let Some(observer) = &observer {
+                        observer.decrement_in_flight(&identity, generation);
+                        observer.record_request(
+                            identity.clone(),
+                            generation,
+                            operation_id,
+                            method,
+                            EventOutcome::Unsupported,
+                            "server does not advertise references support",
+                        );
+                    }
                     let _ = tx.send(Err(LspError::Io(
                         "server does not advertise textDocument/references support".to_owned(),
                     )));
@@ -1081,6 +2028,7 @@ fn dispatch(
 /// document version just announced via that `didOpen`/`didChange` — stored
 /// so the eventual response can be checked for staleness (see
 /// [`apply_pulled_diagnostics`]) before it's applied.
+#[allow(clippy::too_many_arguments)]
 fn maybe_pull_diagnostics(
     client: &Arc<Client>,
     file: &Path,
@@ -1089,6 +2037,8 @@ fn maybe_pull_diagnostics(
     servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
     key: &ServerKey,
     events_tx: &Sender<ServerEvent>,
+    observer: Option<ObservationHandle>,
+    generation: u64,
 ) {
     if !client.supports_diagnostic_pull() {
         return;
@@ -1096,7 +2046,7 @@ fn maybe_pull_diagnostics(
     let previous_result_id = {
         let mut guard = servers.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard.entry(key.clone()).or_insert_with(ServerEntry::new);
-        if entry.push_seen {
+        if entry.generation != generation || entry.push_seen {
             return;
         }
         entry.diagnostic_result_ids.get(file).cloned()
@@ -1107,16 +2057,85 @@ fn maybe_pull_diagnostics(
     let servers = Arc::clone(servers);
     let key = key.clone();
     let events_tx = events_tx.clone();
+    let identity = ServerIdentity::new(key.0.clone(), key.1.clone());
+    let operation_id = observer
+        .as_ref()
+        .map(|observer| observer.next_operation_id())
+        .unwrap_or(0);
+    if let Some(observer) = &observer {
+        let relative = file
+            .strip_prefix(&key.1)
+            .unwrap_or(file.as_path())
+            .display();
+        observer.record_request(
+            identity.clone(),
+            generation,
+            operation_id,
+            "textDocument/diagnostic",
+            EventOutcome::Queued,
+            format!("diagnostic pull queued for {relative}"),
+        );
+        observer.increment_in_flight(&identity, generation);
+    }
     std::thread::spawn(move || {
         let rx = client.pull_diagnostics(uri.clone(), previous_result_id);
-        let Ok(Ok(result)) = rx.recv_timeout(REQUEST_TIMEOUT) else {
-            // Timeout, transport error, or a JSON-RPC error from the
-            // server — nothing to apply. Not worth surfacing as a status
-            // note: the next `didOpen`/`didChange`, or the next
-            // `$/progress end` (see `repull_open_documents`), tries again.
-            return;
+        match rx.recv_timeout(REQUEST_TIMEOUT) {
+            Ok(Ok(result)) => {
+                let applied = apply_pulled_diagnostics(
+                    uri, result, version, &file, &servers, &key, &events_tx, generation,
+                );
+                if let Some(observer) = observer {
+                    observer.decrement_in_flight(&identity, generation);
+                    observer.record_request(
+                        identity,
+                        generation,
+                        operation_id,
+                        "textDocument/diagnostic",
+                        if applied {
+                            EventOutcome::Result
+                        } else {
+                            EventOutcome::Superseded
+                        },
+                        if applied {
+                            "diagnostic pull completed"
+                        } else {
+                            "diagnostic pull response superseded by newer document state"
+                        },
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                if let Some(observer) = observer {
+                    observer.decrement_in_flight(&identity, generation);
+                    let outcome = if matches!(error, LspError::Server { .. }) {
+                        EventOutcome::ServerError
+                    } else {
+                        EventOutcome::TransportFailure
+                    };
+                    observer.record_request(
+                        identity,
+                        generation,
+                        operation_id,
+                        "textDocument/diagnostic",
+                        outcome,
+                        format!("diagnostic pull failed: {error}"),
+                    );
+                }
+            }
+            Err(_) => {
+                if let Some(observer) = observer {
+                    observer.decrement_in_flight(&identity, generation);
+                    observer.record_request(
+                        identity,
+                        generation,
+                        operation_id,
+                        "textDocument/diagnostic",
+                        EventOutcome::Timeout,
+                        "diagnostic pull timed out",
+                    );
+                }
+            }
         };
-        apply_pulled_diagnostics(uri, result, version, &file, &servers, &key, &events_tx);
     });
 }
 
@@ -1139,6 +2158,7 @@ fn maybe_pull_diagnostics(
 /// gutter or `]d`/`[d` — it only needs to arrive looking like a push did. An
 /// `Unchanged` report updates the stored `resultId` without publishing
 /// anything, since by definition nothing in the store needs to change.
+#[allow(clippy::too_many_arguments)]
 fn apply_pulled_diagnostics(
     primary_uri: Uri,
     result: lsp_types::DocumentDiagnosticReportResult,
@@ -1147,11 +2167,12 @@ fn apply_pulled_diagnostics(
     servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
     key: &ServerKey,
     events_tx: &Sender<ServerEvent>,
-) {
+    generation: u64,
+) -> bool {
     {
         let guard = servers.lock().unwrap_or_else(|e| e.into_inner());
         let Some(entry) = guard.get(key) else {
-            return;
+            return false;
         };
         // Discard if the document moved on since this pull was issued
         // (`version` no longer matches — a newer `didChange` landed while
@@ -1161,40 +2182,54 @@ fn apply_pulled_diagnostics(
         // own pre-dispatch check can't catch): either way, applying this
         // response now would risk overwriting newer state with older,
         // exactly what version-tagging exists to prevent.
-        if entry.push_seen || entry.versions.get(file) != Some(&version) {
-            return;
+        if entry.generation != generation
+            || entry.push_seen
+            || entry.versions.get(file) != Some(&version)
+        {
+            return false;
         }
     }
 
+    let mut applied = false;
     for (doc_uri, pulled) in fold_pull_result(primary_uri, result) {
         let Some(path) = crate::lsp::client::uri_to_path(&doc_uri) else {
             continue;
         };
         let result_id = match pulled {
             PulledDocument::Full { items, result_id } => {
-                let _ = events_tx.send(ServerEvent {
-                    // `key: &ServerKey` here — `key.0` is a `LangKey`, not
-                    // `Copy`, so it can't be moved out of a borrow the way
-                    // the old `Language` could; `.clone()` it instead, same
-                    // as `key.1` (the `PathBuf`) right below always has.
-                    language: key.0.clone(),
-                    root: key.1.clone(),
-                    event: LspEvent::Notification {
-                        method: "textDocument/publishDiagnostics".to_owned(),
-                        params: serde_json::to_value(PublishDiagnosticsParams {
-                            uri: doc_uri,
-                            diagnostics: items,
-                            version: None,
-                        })
-                        .unwrap_or(serde_json::Value::Null),
-                    },
-                });
+                if events_tx
+                    .send(ServerEvent {
+                        // `key: &ServerKey` here — `key.0` is a `LangKey`, not
+                        // `Copy`, so it can't be moved out of a borrow the way
+                        // the old `Language` could; `.clone()` it instead, same
+                        // as `key.1` (the `PathBuf`) right below always has.
+                        language: key.0.clone(),
+                        root: key.1.clone(),
+                        event: LspEvent::Notification {
+                            method: "textDocument/publishDiagnostics".to_owned(),
+                            params: serde_json::to_value(PublishDiagnosticsParams {
+                                uri: doc_uri,
+                                diagnostics: items,
+                                version: None,
+                            })
+                            .unwrap_or(serde_json::Value::Null),
+                        },
+                    })
+                    .is_err()
+                {
+                    return false;
+                }
                 result_id
             }
             PulledDocument::Unchanged { result_id } => Some(result_id),
         };
         let mut guard = servers.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = guard.entry(key.clone()).or_insert_with(ServerEntry::new);
+        let Some(entry) = guard.get_mut(key) else {
+            return false;
+        };
+        if entry.generation != generation || entry.push_seen {
+            return false;
+        }
         match result_id {
             Some(id) => {
                 entry.diagnostic_result_ids.insert(path, id);
@@ -1203,17 +2238,24 @@ fn apply_pulled_diagnostics(
                 entry.diagnostic_result_ids.remove(&path);
             }
         }
+        applied = true;
     }
+    applied
 }
 
 /// Marks `key`'s server as having proven it pushes diagnostics — see
 /// [`maybe_pull_diagnostics`]'s docs for what this gates.
-fn mark_push_seen(servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>, key: &ServerKey) {
+fn mark_push_seen(
+    servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
+    key: &ServerKey,
+    generation: u64,
+) {
     let mut guard = servers.lock().unwrap_or_else(|e| e.into_inner());
-    guard
-        .entry(key.clone())
-        .or_insert_with(ServerEntry::new)
-        .push_seen = true;
+    if let Some(entry) = guard.get_mut(key)
+        && entry.generation == generation
+    {
+        entry.push_seen = true;
+    }
 }
 
 /// Whether a `$/progress` notification's params represent the end of a work
@@ -1226,6 +2268,15 @@ fn progress_is_end(params: &serde_json::Value) -> bool {
         .and_then(|v| v.get("kind"))
         .and_then(serde_json::Value::as_str)
         == Some("end")
+}
+
+fn lsp_message_level(params: &serde_json::Value) -> EventLevel {
+    match params.get("type").and_then(serde_json::Value::as_u64) {
+        Some(1) => EventLevel::Error,
+        Some(2) => EventLevel::Warn,
+        Some(4) => EventLevel::Debug,
+        _ => EventLevel::Info,
+    }
 }
 
 /// Re-pulls diagnostics for every document `key`'s server already has open,
@@ -1244,6 +2295,8 @@ fn repull_open_documents(
     servers: &Arc<Mutex<HashMap<ServerKey, ServerEntry>>>,
     key: &ServerKey,
     events_tx: &Sender<ServerEvent>,
+    observer: Option<ObservationHandle>,
+    generation: u64,
 ) {
     if !client.supports_diagnostic_pull() {
         return;
@@ -1253,7 +2306,7 @@ fn repull_open_documents(
         let Some(entry) = guard.get(key) else {
             return;
         };
-        if entry.push_seen {
+        if entry.generation != generation || entry.push_seen {
             return;
         }
         entry
@@ -1264,7 +2317,17 @@ fn repull_open_documents(
     };
     for (file, version) in files {
         let Ok(uri) = file_uri(&file) else { continue };
-        maybe_pull_diagnostics(client, &file, uri, version, servers, key, events_tx);
+        maybe_pull_diagnostics(
+            client,
+            &file,
+            uri,
+            version,
+            servers,
+            key,
+            events_tx,
+            observer.clone(),
+            generation,
+        );
     }
 }
 
@@ -1273,10 +2336,48 @@ fn repull_open_documents(
 /// transport failure would produce — generic over the result type so
 /// [`dispatch`]'s three real request kinds share this one relay instead of
 /// each writing its own timeout/forward boilerplate.
-fn forward<T>(rx: Receiver<Result<T, LspError>>, tx: Sender<Result<T, LspError>>) {
+#[allow(clippy::too_many_arguments)]
+fn forward_observed<T: serde::Serialize + Send + 'static>(
+    rx: Receiver<Result<T, LspError>>,
+    tx: Sender<Result<T, LspError>>,
+    observer: Option<ObservationHandle>,
+    identity: ServerIdentity,
+    generation: u64,
+    operation_id: u64,
+    method: &str,
+    submitted_at: Instant,
+) {
     let result = rx
         .recv_timeout(REQUEST_TIMEOUT)
         .unwrap_or(Err(LspError::Io("request timed out".to_owned())));
+    if let Some(observer) = observer {
+        let outcome = match &result {
+            Ok(value) => {
+                let empty = serde_json::to_value(value).ok().is_some_and(|value| {
+                    value.is_null() || value.as_array().is_some_and(|array| array.is_empty())
+                });
+                if empty {
+                    EventOutcome::NoResult
+                } else {
+                    EventOutcome::Result
+                }
+            }
+            Err(LspError::Server { .. }) => EventOutcome::ServerError,
+            Err(LspError::Io(message)) if message.contains("timed out") => EventOutcome::Timeout,
+            Err(LspError::Closed) | Err(LspError::Io(_)) | Err(LspError::Json(_)) => {
+                EventOutcome::TransportFailure
+            }
+        };
+        observer.record_request(
+            identity.clone(),
+            generation,
+            operation_id,
+            method,
+            outcome,
+            format!("completed in {}ms", submitted_at.elapsed().as_millis()),
+        );
+        observer.decrement_in_flight(&identity, generation);
+    }
     let _ = tx.send(result);
 }
 
@@ -1319,6 +2420,15 @@ mod tests {
             .map(|_| bump_version(&mut versions, Path::new("/repo/a.rs")).unwrap())
             .collect();
         assert_eq!(seen, vec![2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn dispatch_generation_guard_rejects_old_or_stopped_clients() {
+        assert!(dispatch_generation_is_current(3, 3, true, false, true));
+        assert!(!dispatch_generation_is_current(2, 3, true, false, true));
+        assert!(!dispatch_generation_is_current(3, 3, false, false, true));
+        assert!(!dispatch_generation_is_current(3, 3, true, true, true));
+        assert!(!dispatch_generation_is_current(3, 3, true, false, false));
     }
 
     #[test]

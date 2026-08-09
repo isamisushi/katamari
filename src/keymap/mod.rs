@@ -98,6 +98,9 @@ pub enum Action {
     /// something to open: every repository `ktmr diff` can start in has
     /// git history, jj or not.
     ToggleLogView,
+    /// Opens the live read-only language-server inspector on any view, or
+    /// closes it when it is already on top of the view stack.
+    ToggleLspInspector,
     /// Opens [`crate::ui::scope_menu`]'s popup — a keyboard-driven menu for
     /// switching what a live [`crate::ui::view::View::Diff`] session is
     /// reviewing (working tree, staged, a free-form revision, or straight
@@ -475,6 +478,14 @@ impl<'a> Resolver<'a> {
         self.pending.clear();
     }
 
+    /// Drops a partially entered key sequence without feeding a synthetic key
+    /// through the trie. Modal views use this when they consume a literal key
+    /// that may also be configured as a global sequence prefix; feeding that
+    /// key would risk leaving the resolver pending again.
+    pub fn clear_pending(&mut self) {
+        self.reset();
+    }
+
     /// The keys matched so far, in notation form, for display in the status
     /// bar (e.g. `"g"` while waiting for a second `g` to complete `gg`).
     pub fn pending_display(&self) -> String {
@@ -532,6 +543,7 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("Esc", Action::Cancel),
         ("t", Action::ToggleTimeline),
         ("L", Action::ToggleLogView),
+        ("I", Action::ToggleLspInspector),
         ("o", Action::OpenScopeMenu),
         ("v", Action::ToggleRangeSelect),
         ("c", Action::AddComment),
@@ -605,6 +617,7 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("Esc", Action::Cancel),
         ("t", Action::ToggleTimeline),
         ("L", Action::ToggleLogView),
+        ("I", Action::ToggleLspInspector),
         ("o", Action::OpenScopeMenu),
         ("C-Space", Action::ToggleRangeSelect),
         ("C-c C-c", Action::AddComment),
@@ -681,6 +694,7 @@ pub fn action_name(action: Action) -> &'static str {
         Action::ToggleTimeline => "toggle-timeline",
         Action::ToggleRangeSelect => "toggle-range-select",
         Action::ToggleLogView => "toggle-log-view",
+        Action::ToggleLspInspector => "toggle-lsp-inspector",
         Action::OpenScopeMenu => "open-scope-menu",
         Action::AddComment => "add-comment",
         Action::ToggleComments => "toggle-comments",
@@ -726,6 +740,7 @@ pub fn action_by_name(name: &str) -> Option<Action> {
         "toggle-timeline" => Action::ToggleTimeline,
         "toggle-range-select" => Action::ToggleRangeSelect,
         "toggle-log-view" => Action::ToggleLogView,
+        "toggle-lsp-inspector" => Action::ToggleLspInspector,
         "open-scope-menu" => Action::OpenScopeMenu,
         "add-comment" => Action::AddComment,
         "toggle-comments" => Action::ToggleComments,
@@ -781,6 +796,22 @@ mod tests {
         assert_eq!(resolver.feed(chord('x')), StepResult::Cancelled);
         assert_eq!(resolver.pending_display(), "");
         // Resolver is usable again after a cancellation.
+        assert_eq!(resolver.feed(chord('q')), StepResult::Matched(Action::Quit));
+    }
+
+    #[test]
+    fn clear_pending_resets_without_feeding_a_consumed_modal_key() {
+        let bindings = [
+            (KeySeq::parse("g V"), Action::Top),
+            (KeySeq::parse("q"), Action::Quit),
+        ];
+        let keymap = Keymap::from_bindings(&bindings);
+        let mut resolver = keymap.resolver();
+        assert_eq!(resolver.feed(chord('g')), StepResult::Pending);
+        resolver.clear_pending();
+        assert_eq!(resolver.pending_display(), "");
+        // A modal view may consume V itself; it must not leave `g V` pending
+        // or accidentally dispatch the configured action afterward.
         assert_eq!(resolver.feed(chord('q')), StepResult::Matched(Action::Quit));
     }
 
@@ -1066,6 +1097,7 @@ mod tests {
             Action::ToggleTimeline,
             Action::ToggleRangeSelect,
             Action::ToggleLogView,
+            Action::ToggleLspInspector,
             Action::OpenScopeMenu,
             Action::AddComment,
             Action::ToggleComments,
@@ -1209,12 +1241,12 @@ mod tests {
         assert_eq!(KeySeq::parse("q").compact_notation(), "q");
     }
 
-    /// The 36 actions (see the `action_name_and_action_by_name_round_trip…`
+    /// The 37 actions (see the `action_name_and_action_by_name_round_trip…`
     /// test's `all` list) each get exactly one binding — except
     /// `JumpForward`, which gets a *second* one (`C-i`) precisely when
     /// `ci_distinguishable` is set, per [`vim_preset`]/[`emacs_preset`]'s
     /// docs. So this checks two things per preset: every action is still
-    /// reachable (`actions.len() == 36` after dedup), and the raw entry
+    /// reachable (`actions.len() == 37` after dedup), and the raw entry
     /// count is exactly one more than that when the extra `C-i` alias is
     /// present, exactly equal otherwise. As a side effect, this also forces
     /// `?`/`/`/`n`/`N` to be bound in both presets the moment `ACTION_COUNT`
@@ -1225,7 +1257,7 @@ mod tests {
     /// test.
     #[test]
     fn every_vim_and_emacs_binding_covers_every_action_exactly_once() {
-        const ACTION_COUNT: usize = 36;
+        const ACTION_COUNT: usize = 37;
         for ci_distinguishable in [false, true] {
             for preset in [
                 vim_preset(ci_distinguishable),
