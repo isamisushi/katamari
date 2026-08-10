@@ -777,15 +777,11 @@ impl App {
     /// inside [`Self::visual_bounds`] must be skipped rather than treated
     /// as selected. Indices only, never text or file/line numbers, per the
     /// issue's "State guidance" — a caller that needs more looks each index
-    /// up in `self.rows`/`self.files` itself.
+    /// up in `self.rows`/`self.files` itself, which is exactly what
+    /// `ui::clipboard::resolve_selection` does for issue #17's `y`.
     ///
-    /// No production caller yet in issue #16 — this module's own tests are
-    /// the only thing exercising it until #17 (yank) and #19 (range
-    /// comment) land and actually consume the list. Same convention as
-    /// `ColumnMap::display_len` in `diff::coords`: kept now rather than
-    /// deleted and re-derived later, since it's exactly the shape both of
-    /// those issues need.
-    #[allow(dead_code)]
+    /// #19 (range comment) still has no production caller — this module's
+    /// own tests exercised it alone until #17 landed.
     pub fn selected_rows(&self) -> Vec<usize> {
         let Some((lo, hi)) = self.visual_bounds() else {
             return Vec::new();
@@ -1314,6 +1310,13 @@ impl App {
             // all), but `ui::mod::handle_action` needs to turn its
             // `VisualToggleOutcome` into a status-bar note this `()` return
             // type has no way to carry — see that arm's docs.
+            //
+            // `YankSelection` (issue #17) joins it too: `Self::selected_rows`
+            // is a real, pure `App` query, but formatting the selection,
+            // writing OSC 52, and reporting success/failure all need
+            // `ui::clipboard` plus this `()` return type still can't carry
+            // a status note — so, like `ToggleVisualLine`, the actual work
+            // happens in `ui::mod::handle_action`'s own arm instead.
             Action::Hover
             | Action::Cancel
             | Action::GotoDefinition
@@ -1329,6 +1332,7 @@ impl App {
             | Action::NextMatch
             | Action::PrevMatch
             | Action::ToggleVisualLine
+            | Action::YankSelection
             | Action::Confirm => {}
             // `ui::mod` intercepts `ToggleTimeline`/`ToggleLogView`/
             // `OpenScopeMenu` before they reach here (constructing/tearing

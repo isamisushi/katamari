@@ -14,6 +14,7 @@
 //! to wait, with a short timeout, for "anything worth redrawing for."
 
 pub mod app;
+pub mod clipboard;
 pub mod compose;
 pub mod diff_view;
 pub mod file_tree;
@@ -1119,52 +1120,18 @@ fn event_loop(
                         }
                     }
                 } else {
-                    // `V` and `y` are inspector-local visual-line controls,
-                    // not global actions. Let the inspector consume them
-                    // before the resolver so an unbound `y` never becomes a
-                    // confusing no-op and a future global keymap cannot
-                    // accidentally yank content from the wrong view.
-                    let mut consumed_by_inspector = false;
-                    if let View::LspInspector(inspector) = stack.top_mut() {
-                        match inspector.handle_literal_key(key) {
-                            lsp_inspector::InspectorKeyOutcome::Unhandled => {}
-                            lsp_inspector::InspectorKeyOutcome::Handled => {
-                                consumed_by_inspector = true;
-                            }
-                            lsp_inspector::InspectorKeyOutcome::Copy(payload) => {
-                                consumed_by_inspector = true;
-                                let status = match lsp_inspector::write_osc52(&payload.text) {
-                                    Ok(()) => format!(
-                                        "sent {} journal record{} ({} bytes) via OSC 52; terminal support required",
-                                        payload.record_count,
-                                        if payload.record_count == 1 { "" } else { "s" },
-                                        payload.byte_count,
-                                    ),
-                                    Err(error) => format!("journal copy failed: {error}"),
-                                };
-                                inspector.set_copy_status(status);
-                            }
-                        }
-                    }
-                    if consumed_by_inspector {
-                        // A local visual key also terminates any half-entered
-                        // global sequence (for example a pending `g`), so a
-                        // stale resolver prefix cannot affect the next key.
-                        // Reset directly: feeding V/y through the trie would
-                        // be wrong when a config makes either key a prefix.
-                        resolver.clear_pending();
-                        stack.top_mut().clear_pending_keys();
-                    }
-
                     // M16's first-comment skill-install prompt consumes
                     // exactly the one keypress that follows it, resolved
                     // *before* the keymap even sees this key — same
                     // bypass-the-resolver idea `compose`/the revision input
                     // use above, but only for this single key rather than a
                     // whole overlay's lifetime. `y` means "install now" and
-                    // is swallowed entirely (there's nothing sensible for
-                    // the keymap to additionally do with a bare `y` — it has
-                    // no default binding). Any other key means "dismiss" —
+                    // is swallowed entirely here, before the resolver ever
+                    // gets a chance to match it against
+                    // `Action::YankSelection` (issue #17): a reviewer who
+                    // just saved their first comment sees the skill-install
+                    // offer, not a yank status, even though `y` is a bound
+                    // key everywhere else. Any other key means "dismiss" —
                     // deliberately *not* swallowed: falling through to the
                     // ordinary resolver below means a reviewer who, say,
                     // presses `j` to keep scrolling right after saving a
@@ -1172,7 +1139,7 @@ fn event_loop(
                     // one keypress, rather than needing a second, wasted
                     // press just to clear the prompt first.
                     let mut consumed_by_skill_prompt = false;
-                    if !consumed_by_inspector && awaiting_skill_prompt_key {
+                    if awaiting_skill_prompt_key {
                         awaiting_skill_prompt_key = false;
                         if key.code == KeyCode::Char('y') && key.modifiers.is_empty() {
                             consumed_by_skill_prompt = true;
@@ -1181,7 +1148,7 @@ fn event_loop(
                         }
                     }
 
-                    if !consumed_by_inspector && !consumed_by_skill_prompt {
+                    if !consumed_by_skill_prompt {
                         let chord = KeyChord::from(key);
                         let step = resolver.feed(chord);
                         key_display.record_step(chord, step, Instant::now());
@@ -1588,6 +1555,7 @@ fn files_focus_blocked_message(action: Action) -> Option<&'static str> {
         }
         Action::NextDiagnostic | Action::PrevDiagnostic => "diagnostic: focus the diff pane first",
         Action::ToggleVisualLine => "visual: focus the diff pane first",
+        Action::YankSelection => "yank: focus the diff pane first",
         _ => return None,
     })
 }
@@ -1636,14 +1604,45 @@ fn handle_action(
     // The inspector is a full-screen modal view.  Route every action to it
     // before hover/references/scope overlays can consume Esc or navigation
     // keys, so nothing beneath it can change while the user is inspecting.
-    // `OpenHelp` is the one exception: help mutates nothing beneath the
-    // inspector and its "opens from any view" contract (see the arm below)
-    // would be silently broken by the catch-all `_ => {}` in the
-    // inspector's own `update`.
-    if !matches!(action, Action::OpenHelp)
+    // `OpenHelp`/`YankSelection` are the two exceptions: help mutates
+    // nothing beneath the inspector and its "opens from any view" contract
+    // (see the arm below) would be silently broken by the catch-all
+    // `_ => {}` in the inspector's own `update`; `YankSelection` (issue
+    // #17) needs its own special case just below instead, since — unlike
+    // every other action `update` handles — copying is I/O (`write_osc52`)
+    // that `update`'s `()` return type has nowhere to report the outcome
+    // of, the same reason `ui::mod` (not `App::update`) owns the main
+    // diff's own `YankSelection` arm further down.
+    if !matches!(action, Action::OpenHelp | Action::YankSelection)
         && let View::LspInspector(inspector) = stack.top_mut()
     {
         inspector.update(action);
+        return;
+    }
+
+    // Issue #17: the inspector's Journal-focus `y` — formerly a raw-key
+    // bypass (`LspInspectorView::handle_literal_key`), now this action's
+    // one inspector-specific special case. `copy_selection` does its own
+    // Journal-focus/empty-selection/bounds checks and sets its own status
+    // message on every `None` outcome, so there is nothing left to report
+    // here beyond turning a `Some` payload into the actual OSC 52 write —
+    // byte-for-byte the same status wording `handle_literal_key` used to
+    // produce.
+    if action == Action::YankSelection
+        && let View::LspInspector(inspector) = stack.top_mut()
+    {
+        if let Some(payload) = inspector.copy_selection() {
+            let status = match clipboard::write_osc52(&payload.text) {
+                Ok(()) => format!(
+                    "sent {} journal record{} ({} bytes) via OSC 52; terminal support required",
+                    payload.record_count,
+                    if payload.record_count == 1 { "" } else { "s" },
+                    payload.byte_count,
+                ),
+                Err(error) => format!("journal copy failed: {error}"),
+            };
+            inspector.set_copy_status(status);
+        }
         return;
     }
 
@@ -2071,11 +2070,10 @@ fn handle_action(
         // three-way `VisualToggleOutcome` into the status-bar note
         // `App::update`'s `()` return type has no room for, the same
         // reason `ExpandFold`/`CollapseFold` above call their real `App`
-        // method directly rather than routing through `update`. `y`/`c`
-        // are named in the `Started` note ahead of #17/#19 actually
-        // landing them — a reviewer who presses `V` today sees the whole
-        // intended workflow, not just the one third of it this issue
-        // implements.
+        // method directly rather than routing through `update`. `y` is
+        // named in the `Started` note ahead of `c` (#19) actually landing
+        // it — a reviewer who presses `V` today sees the whole intended
+        // workflow, not just the two-thirds of it issues #16/#17 implement.
         Action::ToggleVisualLine => match stack.top_mut() {
             View::Diff(app) => {
                 *goto_status = match app.toggle_visual() {
@@ -2092,6 +2090,51 @@ fn handle_action(
             }
             View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
                 *goto_status = Some("visual: only available in the diff view".to_owned());
+            }
+        },
+        // Issue #17: `y`. Requires an active selection first (req 3) —
+        // everything else here only makes sense once `App::selected_rows`
+        // has something in it. `clipboard::resolve_selection` maps those
+        // indices back to real diff content while `app.rows`/`app.files`
+        // are still borrowed; `clipboard::format_diff_selection` then
+        // *consumes* the resulting `Vec<SelectedLine>` (see its own docs
+        // on why), which ends that borrow before `App::cancel_visual`
+        // needs `&mut app` again on a successful write below.
+        Action::YankSelection => match stack.top_mut() {
+            View::Diff(app) => {
+                if !app.visual_active() {
+                    *goto_status = Some("yank: press V to select lines first".to_owned());
+                } else {
+                    let selected = app.selected_rows();
+                    let lines = clipboard::resolve_selection(&app.rows, &app.files, &selected);
+                    *goto_status = Some(match clipboard::format_diff_selection(lines) {
+                        Err(clipboard::YankError::Empty) => {
+                            "yank: selection has no diff lines to copy".to_owned()
+                        }
+                        Err(clipboard::YankError::TooLarge { byte_count }) => format!(
+                            "yank selection is {byte_count} bytes; copy limit is {}",
+                            clipboard::OSC52_MAX_BYTES
+                        ),
+                        Ok(formatted) => match clipboard::write_osc52(&formatted.text) {
+                            Ok(()) => {
+                                app.cancel_visual();
+                                format!(
+                                    "yanked {} line(s) across {} file(s) ({} bytes) via OSC 52; terminal support required",
+                                    formatted.line_count,
+                                    formatted.file_count,
+                                    formatted.byte_count
+                                )
+                            }
+                            // Keep the selection on failure (req 8): nothing
+                            // was actually copied, so there's nothing to
+                            // clear — the reviewer can retry or trim it.
+                            Err(error) => format!("yank failed: {error}"),
+                        },
+                    });
+                }
+            }
+            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+                *goto_status = Some("yank: only available in the diff view".to_owned());
             }
         },
         // Opens the prompt (see `search::SearchPromptState`'s docs); the
@@ -3815,6 +3858,7 @@ mod tests {
             Action::NextDiagnostic,
             Action::PrevDiagnostic,
             Action::ToggleVisualLine,
+            Action::YankSelection,
         ] {
             let message = files_focus_blocked_message(action)
                 .unwrap_or_else(|| panic!("{action:?} must be blocked while Files is focused"));

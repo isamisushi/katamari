@@ -285,8 +285,10 @@ impl FileView {
             // Issue #16: visual-line selection is a diff-view-only concept
             // too, same reasoning as `ExpandFold`/`OpenSearch` above — a
             // single opened file has no logical `RenderRow`s of its own to
-            // select over.
-            | Action::ToggleVisualLine => {}
+            // select over. Issue #17's `YankSelection` joins it for the
+            // same reason: nothing to yank without a selection to yank.
+            | Action::ToggleVisualLine
+            | Action::YankSelection => {}
             // `ui::mod` intercepts this before it reaches here, same as
             // every other action in the `Hover`/`Cancel`/... group above —
             // opening `ui::help`'s popup needs the live `Keymap`, which

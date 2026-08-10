@@ -355,8 +355,12 @@ pub fn diff_view_items(keymap: &Keymap, expanded: bool) -> Vec<HintItem> {
         // Low-priority tail on purpose (issue #16): a reviewer who already
         // knows `V` doesn't need reminding every frame, and one who doesn't
         // discovers it via `?` the same way `n`/`N` are documented above —
-        // see `ui::help::describe`.
+        // see `ui::help::describe`. `y` (issue #17) sits right next to it
+        // for the same reason: it only means anything once a selection
+        // already exists, exactly like `n`/`N` only meaning something once
+        // a search is confirmed.
         HintItem::for_actions(keymap, &[Action::ToggleVisualLine], "visual"),
+        HintItem::for_actions(keymap, &[Action::YankSelection], "yank"),
         HintItem::for_actions(keymap, &[Action::Quit], "quit"),
         toggle_item(keymap, true),
     ]

@@ -364,6 +364,7 @@ between.
 | Open help | `?` | `?` |
 | Toggle range-select (timeline/log) | `v` | `C-Space` |
 | Visual-line select (diff) | `V` | `V` |
+| Yank visual selection (diff) | `y` | `y` |
 | Add comment | `c` | `C-c C-c` |
 | (in comment compose) newline / save / cancel | `Enter` / `C-s` / `Esc` | same |
 | Toggle inline comment bodies | `C` | `C` |
@@ -382,6 +383,17 @@ itself is simply left unbound when the terminal can't distinguish it from
 Tab. `Ctrl-]` and `Ctrl-t` have no default binding at all: katamari has one
 general jump history rather than a separate vim-style tag stack, so there's
 no second "go back" key to bind.
+
+With a visual selection active (`V`, above), `y` copies it to the terminal
+clipboard via OSC 52: each selected line's repo-relative path, old/new line
+numbers, and diff marker (` `/`+`/`-`), grouped by file in selection order —
+a path re-entered after the selection has moved on gets its header repeated
+rather than merged into the earlier group. Structural rows (file/hunk
+headers, fold rows) inside the selection are skipped silently. An empty
+result or a payload over the 64 KiB pre-encoding bound (the same limit the
+LSP inspector's own `V`/`y` uses) is refused with a status message that
+leaves the selection in place to trim and retry; a successful copy clears it,
+same as pressing `V` again.
 
 `?` from any view opens a floating help window listing every command,
 grouped, with its actual key next to it — the bindings shown are live

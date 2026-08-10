@@ -1265,6 +1265,24 @@ mod tests {
         );
     }
 
+    /// Issue #17's `yank-selection` round-trips through `[keys]` overrides
+    /// too — same one-off sanity check as `toggle-visual-line` above,
+    /// against the live preset/override path rather than just the name/
+    /// `Action` mapping the keymap round-trip test already proves.
+    #[test]
+    fn apply_key_overrides_rebinds_yank_selection() {
+        let bindings = keymap::vim_preset(false);
+        let overrides = HashMap::from([("yank-selection".to_owned(), "g y".to_owned())]);
+        let rebound = apply_key_overrides(bindings, &overrides).unwrap();
+        let live = keymap::Keymap::from_bindings(&rebound);
+        assert_eq!(
+            live.binding_for(Action::YankSelection)
+                .unwrap()
+                .compact_notation(),
+            "gy"
+        );
+    }
+
     #[test]
     fn apply_key_overrides_reports_an_unknown_action_name() {
         let overrides = HashMap::from([("not-a-real-action".to_owned(), "q".to_owned())]);

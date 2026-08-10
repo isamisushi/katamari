@@ -3,17 +3,16 @@
 
 use crate::keymap::Action;
 use crate::lsp::{EventLevel, ObservationHandle, ServerIdentity, ServerPhase, ServerSnapshot};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph, Wrap};
-use std::io::{self, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use super::clipboard;
 use super::pane::{Hint as PaneHint, PaneChrome, cycle_focus};
 
 const SERVER_LIST_WIDTH: u16 = 34;
@@ -22,11 +21,6 @@ const SERVER_LIST_WIDTH: u16 = 34;
 // handles vertical overflow in small panes.
 const DETAIL_ROWS: u16 = 14;
 const DETAIL_LABEL_WIDTH: usize = 12;
-/// OSC 52 is sent through a terminal escape sequence, so refusing oversized
-/// selections before encoding them keeps a keypress from flooding a
-/// terminal/multiplexer and makes the copy operation's privacy boundary
-/// explicit. Journal records themselves are already bounded by the observer.
-const OSC52_MAX_BYTES: usize = 64 * 1024;
 
 /// Which of this view's three panes `j`/`k`/half-page/`gg`/`G` currently
 /// act on — cycled by `Action::FocusNextPane`/`FocusPrevPane` (Tab/BackTab)
@@ -55,24 +49,14 @@ struct JournalRow {
 }
 
 /// A copy request produced by the inspector after the selection has been
-/// cleared. The terminal write lives in `ui::mod`'s event loop, where a
-/// failed stdout write can be turned into an in-inspector status message.
+/// cleared. The terminal write lives in `ui::mod::handle_action`'s
+/// `Action::YankSelection` special case for the inspector, where a failed
+/// stdout write can be turned into an in-inspector status message.
 #[derive(Debug, PartialEq, Eq)]
 pub struct CopyPayload {
     pub text: String,
     pub record_count: usize,
     pub byte_count: usize,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum InspectorKeyOutcome {
-    /// The key belongs to the ordinary keymap and must continue through the
-    /// resolver.
-    Unhandled,
-    /// The inspector consumed a literal `y` key without a copy write.
-    Handled,
-    /// The inspector consumed `y` and asks the event loop to emit OSC 52.
-    Copy(CopyPayload),
 }
 
 pub struct LspInspectorView {
@@ -387,14 +371,16 @@ impl LspInspectorView {
                     self.move_journal_cursor_to(self.log_rows.len().saturating_sub(1))
                 }
             },
-            // Issue #16: `V` moved from a raw-key bypass (see
-            // `Self::handle_literal_key`'s docs) onto the same named action
-            // every other view now uses, so help/config semantics don't
-            // differ by view. `y` stays a literal key — #17 owns migrating
-            // it, and it has no natural `Action` of its own yet (yanking a
-            // main-diff selection and yanking a journal selection are
-            // different enough operations that sharing one action would be
-            // premature).
+            // Issue #16: `V` moved from a raw-key bypass onto the same
+            // named action every other view now uses, so help/config
+            // semantics don't differ by view. Issue #17 does the same for
+            // `y`: `Action::YankSelection` reaches `Self::copy_selection`
+            // through `ui::mod::handle_action`'s inspector special case
+            // (mirroring `OpenHelp`'s), never through this `update` match
+            // at all — see that special case's docs for why one shared
+            // action still makes sense even though yanking a main-diff
+            // selection and a journal selection format completely
+            // differently.
             Action::ToggleVisualLine => {
                 if self.focus == Focus::Journal {
                     self.toggle_journal_selection();
@@ -403,35 +389,6 @@ impl LspInspectorView {
                 }
             }
             _ => {}
-        }
-    }
-
-    /// Handles `y`, the one literal key intentionally not a global action:
-    /// copies the active journal selection. Keeping this small bypass in
-    /// the event loop avoids assigning a yank action that would
-    /// unexpectedly change the keymap outside the inspector — unlike `V`
-    /// (issue #16), which moved onto `Action::ToggleVisualLine` because
-    /// starting/cancelling a selection has an obvious, view-independent
-    /// meaning `y`'s "copy *what*, *where*" doesn't share.
-    pub fn handle_literal_key(&mut self, key: KeyEvent) -> InspectorKeyOutcome {
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
-        {
-            return InspectorKeyOutcome::Unhandled;
-        }
-        match key.code {
-            KeyCode::Char('y') => {
-                if self.focus != Focus::Journal {
-                    self.status_message = Some("V/y are available in Journal focus".to_owned());
-                    return InspectorKeyOutcome::Handled;
-                }
-                match self.copy_selection() {
-                    Some(payload) => InspectorKeyOutcome::Copy(payload),
-                    None => InspectorKeyOutcome::Handled,
-                }
-            }
-            _ => InspectorKeyOutcome::Unhandled,
         }
     }
 
@@ -515,7 +472,21 @@ impl LspInspectorView {
         ))
     }
 
-    fn copy_selection(&mut self) -> Option<CopyPayload> {
+    /// Issue #17: the real implementation behind `Action::YankSelection`
+    /// when the inspector is on top — `ui::mod::handle_action`'s inspector
+    /// special case is the only caller, so this needs to be visible
+    /// crate-wide, but no further (nothing outside `ui` should be reaching
+    /// into inspector internals). The Journal-focus gate is the *first*
+    /// check, not a wrapper around this function the way it was in the
+    /// deleted `handle_literal_key`: `Action::YankSelection` can now arrive
+    /// while any of the inspector's three panes has focus (unlike the old
+    /// bypass, which only ever ran while it already knew the raw key was a
+    /// `y`), so the gate has to live here to still cover every case.
+    pub(crate) fn copy_selection(&mut self) -> Option<CopyPayload> {
+        if self.focus != Focus::Journal {
+            self.status_message = Some("V/y are available in Journal focus".to_owned());
+            return None;
+        }
         if self.log_rows.is_empty() {
             self.status_message = Some("journal: no entries to copy".to_owned());
             return None;
@@ -546,9 +517,10 @@ impl LspInspectorView {
             .collect::<Vec<_>>()
             .join("\n");
         let byte_count = text.len();
-        if byte_count > OSC52_MAX_BYTES {
+        if byte_count > clipboard::OSC52_MAX_BYTES {
             self.status_message = Some(format!(
-                "journal selection is {byte_count} bytes; copy limit is {OSC52_MAX_BYTES}"
+                "journal selection is {byte_count} bytes; copy limit is {}",
+                clipboard::OSC52_MAX_BYTES
             ));
             return None;
         }
@@ -996,56 +968,6 @@ fn capability_style(snapshot: &ServerSnapshot) -> Style {
     }
 }
 
-/// Emits a terminal-native clipboard update. OSC 52 avoids invoking a
-/// platform-specific clipboard process and can work over SSH or a configured
-/// multiplexer; terminal support and policy determine whether the sequence is
-/// actually accepted. The caller has already applied the inspector's byte
-/// bound and selected-record mapping.
-///
-/// Hand-rolled on purpose: crossterm 0.29 ships a byte-identical
-/// `clipboard::CopyToClipboard`, but only behind its non-default `osc52`
-/// feature, which drags in the `base64` crate — a new dependency to replace
-/// forty tested lines isn't a trade this repo makes.
-pub fn write_osc52(text: &str) -> io::Result<()> {
-    if text.len() > OSC52_MAX_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "OSC 52 payload exceeds the inspector copy limit",
-        ));
-    }
-    let encoded = base64_encode(text.as_bytes());
-    let mut stdout = io::stdout().lock();
-    write!(stdout, "\x1b]52;c;{encoded}\x1b\\")?;
-    stdout.flush()
-}
-
-fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let first = chunk[0];
-        encoded.push(ALPHABET[(first >> 2) as usize] as char);
-        let second = chunk.get(1).copied();
-        encoded.push(
-            ALPHABET[((first & 0x03) << 4 | second.map_or(0, |byte| byte >> 4)) as usize] as char,
-        );
-        if let Some(second) = second {
-            encoded.push(
-                ALPHABET[((second & 0x0f) << 2 | chunk.get(2).copied().map_or(0, |byte| byte >> 6))
-                    as usize] as char,
-            );
-        } else {
-            encoded.push('=');
-        }
-        if let Some(third) = chunk.get(2).copied() {
-            encoded.push(ALPHABET[(third & 0x3f) as usize] as char);
-        } else {
-            encoded.push('=');
-        }
-    }
-    encoded
-}
-
 /// Hard-wrap a journal record instead of relying on word boundaries. Server
 /// messages commonly contain paths, identifiers, and JSON with no spaces;
 /// soft word wrapping would still clip exactly the diagnostic material this
@@ -1101,10 +1023,6 @@ mod tests {
         ServerIdentity::new(LangKey::Custom("rust".to_owned()), root)
     }
 
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
     fn rendered_journal_cursor_offset(view: &mut LspInspectorView, area: Rect) -> usize {
         let backend = ratatui::backend::TestBackend::new(area.width, area.height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1143,10 +1061,7 @@ mod tests {
 
         view.update(Action::ToggleVisualLine);
         assert!(view.journal_selection_anchor.is_none());
-        assert_eq!(
-            view.handle_literal_key(key(KeyCode::Char('y'))),
-            InspectorKeyOutcome::Handled
-        );
+        assert_eq!(view.copy_selection(), None);
         assert!(view.journal_selection_anchor.is_none());
         assert_eq!(
             view.status_message.as_deref(),
@@ -1418,8 +1333,7 @@ mod tests {
         view.update(Action::ToggleVisualLine);
         assert!(view.journal_selection_anchor.is_some());
         view.update(Action::Bottom);
-        let InspectorKeyOutcome::Copy(payload) = view.handle_literal_key(key(KeyCode::Char('y')))
-        else {
+        let Some(payload) = view.copy_selection() else {
             panic!("visual selection should yield an OSC 52 copy payload");
         };
         assert_eq!(payload.record_count, 2);
@@ -1469,8 +1383,7 @@ mod tests {
         assert_eq!(view.events.len(), 1);
         assert_eq!(view.log_rows.len(), rows_before);
 
-        let InspectorKeyOutcome::Copy(payload) = view.handle_literal_key(key(KeyCode::Char('y')))
-        else {
+        let Some(payload) = view.copy_selection() else {
             panic!("selection should still be copyable after a deferred event");
         };
         assert_eq!(payload.record_count, 1);
@@ -1500,17 +1413,6 @@ mod tests {
         assert!(!view.should_quit);
         view.update(Action::Cancel);
         assert!(view.should_quit);
-    }
-
-    #[test]
-    fn base64_encoding_is_terminal_safe() {
-        assert_eq!(base64_encode(b"Katamari"), "S2F0YW1hcmk=");
-        assert_eq!(base64_encode(b"\x00\xff"), "AP8=");
-        let too_large = "x".repeat(OSC52_MAX_BYTES + 1);
-        assert_eq!(
-            write_osc52(&too_large).unwrap_err().kind(),
-            io::ErrorKind::InvalidInput
-        );
     }
 
     #[test]

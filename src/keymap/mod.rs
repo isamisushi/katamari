@@ -247,6 +247,21 @@ pub enum Action {
     /// method's docs. A no-op outside [`crate::ui::view::View::Diff`],
     /// mirroring `AddComment`/`ExpandFold`.
     ToggleVisualLine,
+    /// Issue #17: copies the active visual selection ([`ToggleVisualLine`](Action::ToggleVisualLine))
+    /// to the terminal clipboard via OSC 52 — [`crate::ui::clipboard`] owns
+    /// both the transport and the paste-ready formatting (repo-relative
+    /// path, old/new line numbers, diff marker, one group per file in
+    /// selection order). A named action rather than another view-specific
+    /// literal key, unlike the LSP inspector's pre-#17 `y`: the inspector's
+    /// Journal pane reuses this same action (see
+    /// `ui::mod::handle_action`'s inspector interception) even though its
+    /// copy shape is completely different (whole journal records, not
+    /// diff lines) — one shared keypress the reviewer only has to learn
+    /// once, not two independent `y`s that happen to collide. Requires an
+    /// active selection first (req 3); a no-op outside
+    /// [`crate::ui::view::View::Diff`]/the inspector's Journal focus,
+    /// mirroring `ToggleVisualLine`.
+    YankSelection,
 }
 
 /// One key press, normalized for matching: the SHIFT modifier is dropped
@@ -557,14 +572,6 @@ impl<'a> Resolver<'a> {
         self.pending.clear();
     }
 
-    /// Drops a partially entered key sequence without feeding a synthetic key
-    /// through the trie. Modal views use this when they consume a literal key
-    /// that may also be configured as a global sequence prefix; feeding that
-    /// key would risk leaving the resolver pending again.
-    pub fn clear_pending(&mut self) {
-        self.reset();
-    }
-
     /// The keys matched so far, in notation form, for display in the status
     /// bar (e.g. `"g"` while waiting for a second `g` to complete `gg`).
     pub fn pending_display(&self) -> String {
@@ -642,6 +649,7 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         (".", Action::ToggleHints),
         ("v", Action::ToggleRangeSelect),
         ("V", Action::ToggleVisualLine),
+        ("y", Action::YankSelection),
         ("c", Action::AddComment),
         ("C", Action::ToggleComments),
         ("/", Action::OpenSearch),
@@ -743,6 +751,12 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         // enough to be worth a distinct binding), so this reuses vim's `V`
         // verbatim.
         ("V", Action::ToggleVisualLine),
+        // Same vim-keys-for-things-with-no-emacs-identity rule as `V`
+        // itself just above: yanking a visual selection has no emacs
+        // convention of its own to defer to either (emacs's own `M-w`/
+        // `C-w` operate on the region a mark sets, not a terminal-native
+        // OSC 52 clipboard write), so this reuses vim's `y` verbatim.
+        ("y", Action::YankSelection),
         ("C-c C-c", Action::AddComment),
         ("C", Action::ToggleComments),
         // Same vim-keys-for-things-with-no-emacs-identity rule this preset
@@ -835,6 +849,7 @@ pub fn action_name(action: Action) -> &'static str {
         Action::PrevMatch => "prev-match",
         Action::ToggleDirectory => "toggle-directory",
         Action::ToggleVisualLine => "toggle-visual-line",
+        Action::YankSelection => "yank-selection",
     }
 }
 
@@ -888,6 +903,7 @@ pub fn action_by_name(name: &str) -> Option<Action> {
         "prev-match" => Action::PrevMatch,
         "toggle-directory" => Action::ToggleDirectory,
         "toggle-visual-line" => Action::ToggleVisualLine,
+        "yank-selection" => Action::YankSelection,
         _ => return None,
     })
 }
@@ -933,22 +949,6 @@ mod tests {
         assert_eq!(resolver.feed(chord('x')), StepResult::Cancelled);
         assert_eq!(resolver.pending_display(), "");
         // Resolver is usable again after a cancellation.
-        assert_eq!(resolver.feed(chord('q')), StepResult::Matched(Action::Quit));
-    }
-
-    #[test]
-    fn clear_pending_resets_without_feeding_a_consumed_modal_key() {
-        let bindings = [
-            (KeySeq::parse("g V"), Action::Top),
-            (KeySeq::parse("q"), Action::Quit),
-        ];
-        let keymap = Keymap::from_bindings(&bindings);
-        let mut resolver = keymap.resolver();
-        assert_eq!(resolver.feed(chord('g')), StepResult::Pending);
-        resolver.clear_pending();
-        assert_eq!(resolver.pending_display(), "");
-        // A modal view may consume V itself; it must not leave `g V` pending
-        // or accidentally dispatch the configured action afterward.
         assert_eq!(resolver.feed(chord('q')), StepResult::Matched(Action::Quit));
     }
 
@@ -1316,6 +1316,7 @@ mod tests {
             Action::ToggleHints,
             Action::ToggleDirectory,
             Action::ToggleVisualLine,
+            Action::YankSelection,
         ];
         for action in all {
             let name = action_name(action);
@@ -1474,15 +1475,18 @@ mod tests {
         assert_eq!(KeySeq::parse("q").compact_notation(), "q");
     }
 
-    /// The 43 actions (see the `action_name_and_action_by_name_round_trip…`
-    /// test's `all` list) each get exactly one binding — except `JumpBack`,
-    /// which always gets a second one (`M-Left`), and `JumpForward`, which
-    /// gets a second one (`C-i`) precisely when `ci_distinguishable` is set
-    /// (per [`vim_preset`]/[`emacs_preset`]'s docs, `M-Right` *replaces* the
+    /// The `ACTION_COUNT` actions (see the
+    /// `action_name_and_action_by_name_round_trip…` test's `all` list) each
+    /// get exactly one binding — except `JumpBack`, which always gets a
+    /// second one (`M-Left`), and `JumpForward`, which gets a second one
+    /// (`C-i`) precisely when `ci_distinguishable` is set (per
+    /// [`vim_preset`]/[`emacs_preset`]'s docs, `M-Right` *replaces* the
     /// pre-#12 `C-t` as `JumpForward`'s own single baseline binding rather
     /// than adding to it). So this checks two things per preset: every
-    /// action is still reachable (`actions.len() == 43` after dedup), and
-    /// the raw entry count is exactly one more than that (`JumpBack`'s
+    /// action is still reachable (`actions.len() == ACTION_COUNT` after
+    /// dedup — spelled out below rather than here, so this comment stops
+    /// drifting out of sync with it the way it once did), and the raw
+    /// entry count is exactly one more than that (`JumpBack`'s
     /// unconditional `M-Left` alias) plus one more still when the extra
     /// `C-i` alias is present. As a side effect, this also forces
     /// `?`/`/`/`n`/`N` to be bound in both presets the moment `ACTION_COUNT`
@@ -1493,7 +1497,7 @@ mod tests {
     /// `open_help_binds_to_plain_question_mark_in_both_presets` test.
     #[test]
     fn every_vim_and_emacs_binding_covers_every_action_exactly_once() {
-        const ACTION_COUNT: usize = 44;
+        const ACTION_COUNT: usize = 45;
         for ci_distinguishable in [false, true] {
             for preset in [
                 vim_preset(ci_distinguishable),

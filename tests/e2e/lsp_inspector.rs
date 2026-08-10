@@ -12,10 +12,13 @@
 //! message names the required focus by name, so this test never has to
 //! reach into private view state the way the unit tests can. As of issue
 //! #16, `V` resolves through the ordinary keymap to `Action::ToggleVisualLine`
-//! (see `LspInspectorView::update`'s arm for it) rather than
-//! `handle_literal_key`'s literal bypass — only `y` still goes through that
-//! bypass (see its docs) — but the observable behavior below is unchanged
-//! either way, so this test is unmodified other than this comment.
+//! (see `LspInspectorView::update`'s arm for it); issue #17 does the same
+//! for `y` (`Action::YankSelection`, handled by `ui::mod::handle_action`'s
+//! inspector special case rather than `LspInspectorView::update` itself —
+//! see that special case's docs), replacing the raw-key
+//! `handle_literal_key` bypass `y` used to go through alone. The observable
+//! behavior below is unchanged either way, so this test is unmodified other
+//! than this comment.
 
 use crate::support::{Harness, Key, SpawnOptions, fixture};
 use std::time::Duration;

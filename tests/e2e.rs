@@ -55,3 +55,5 @@ mod visual;
 mod watch;
 #[path = "e2e/wrap.rs"]
 mod wrap;
+#[path = "e2e/yank.rs"]
+mod yank;

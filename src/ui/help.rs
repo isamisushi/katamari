@@ -71,6 +71,10 @@ pub fn describe(action: Action) -> (&'static str, &'static str) {
         Action::CollapseFold => ("Diff", "Collapse an expanded context gap"),
         Action::OpenScopeMenu => ("Diff", "Open the scope-picker popup"),
         Action::ToggleVisualLine => ("Diff", "Start, extend, or cancel visual-line selection"),
+        Action::YankSelection => (
+            "Diff",
+            "Copy the visual selection with paths & line numbers",
+        ),
         Action::Hover => ("LSP", "Show docs for symbol (again: close)"),
         Action::GotoDefinition => ("LSP", "Go to definition"),
         Action::FindReferences => ("LSP", "Find references"),
@@ -133,6 +137,7 @@ const ALL_ACTIONS: &[Action] = &[
     Action::CollapseFold,
     Action::OpenScopeMenu,
     Action::ToggleVisualLine,
+    Action::YankSelection,
     Action::Hover,
     Action::GotoDefinition,
     Action::FindReferences,
