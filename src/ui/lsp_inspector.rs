@@ -69,7 +69,7 @@ pub enum InspectorKeyOutcome {
     /// The key belongs to the ordinary keymap and must continue through the
     /// resolver.
     Unhandled,
-    /// The inspector consumed a literal `V`/`y` key without a copy write.
+    /// The inspector consumed a literal `y` key without a copy write.
     Handled,
     /// The inspector consumed `y` and asks the event loop to emit OSC 52.
     Copy(CopyPayload),
@@ -387,14 +387,32 @@ impl LspInspectorView {
                     self.move_journal_cursor_to(self.log_rows.len().saturating_sub(1))
                 }
             },
+            // Issue #16: `V` moved from a raw-key bypass (see
+            // `Self::handle_literal_key`'s docs) onto the same named action
+            // every other view now uses, so help/config semantics don't
+            // differ by view. `y` stays a literal key — #17 owns migrating
+            // it, and it has no natural `Action` of its own yet (yanking a
+            // main-diff selection and yanking a journal selection are
+            // different enough operations that sharing one action would be
+            // premature).
+            Action::ToggleVisualLine => {
+                if self.focus == Focus::Journal {
+                    self.toggle_journal_selection();
+                } else {
+                    self.status_message = Some("V/y are available in Journal focus".to_owned());
+                }
+            }
             _ => {}
         }
     }
 
-    /// Handles the two literal keys that are intentionally not global
-    /// actions: `V` starts/toggles visual-line mode and `y` copies it. Keeping
-    /// this small bypass in the event loop avoids assigning a yank action that
-    /// would unexpectedly change the keymap outside the inspector.
+    /// Handles `y`, the one literal key intentionally not a global action:
+    /// copies the active journal selection. Keeping this small bypass in
+    /// the event loop avoids assigning a yank action that would
+    /// unexpectedly change the keymap outside the inspector — unlike `V`
+    /// (issue #16), which moved onto `Action::ToggleVisualLine` because
+    /// starting/cancelling a selection has an obvious, view-independent
+    /// meaning `y`'s "copy *what*, *where*" doesn't share.
     pub fn handle_literal_key(&mut self, key: KeyEvent) -> InspectorKeyOutcome {
         if key
             .modifiers
@@ -403,14 +421,6 @@ impl LspInspectorView {
             return InspectorKeyOutcome::Unhandled;
         }
         match key.code {
-            KeyCode::Char('V') => {
-                if self.focus == Focus::Journal {
-                    self.toggle_journal_selection();
-                } else {
-                    self.status_message = Some("V/y are available in Journal focus".to_owned());
-                }
-                InspectorKeyOutcome::Handled
-            }
             KeyCode::Char('y') => {
                 if self.focus != Focus::Journal {
                     self.status_message = Some("V/y are available in Journal focus".to_owned());
@@ -1131,10 +1141,7 @@ mod tests {
         view.update(Action::FocusNextPane);
         view.update(Action::FocusNextPane);
 
-        assert_eq!(
-            view.handle_literal_key(key(KeyCode::Char('V'))),
-            InspectorKeyOutcome::Handled
-        );
+        view.update(Action::ToggleVisualLine);
         assert!(view.journal_selection_anchor.is_none());
         assert_eq!(
             view.handle_literal_key(key(KeyCode::Char('y'))),
@@ -1408,10 +1415,8 @@ mod tests {
         view.update(Action::FocusNextPane);
         view.update(Action::Top);
 
-        assert_eq!(
-            view.handle_literal_key(key(KeyCode::Char('V'))),
-            InspectorKeyOutcome::Handled
-        );
+        view.update(Action::ToggleVisualLine);
+        assert!(view.journal_selection_anchor.is_some());
         view.update(Action::Bottom);
         let InspectorKeyOutcome::Copy(payload) = view.handle_literal_key(key(KeyCode::Char('y')))
         else {
@@ -1450,10 +1455,7 @@ mod tests {
         view.update(Action::FocusNextPane);
         view.update(Action::FocusNextPane);
         view.update(Action::Top);
-        assert_eq!(
-            view.handle_literal_key(key(KeyCode::Char('V'))),
-            InspectorKeyOutcome::Handled
-        );
+        view.update(Action::ToggleVisualLine);
         let rows_before = view.log_rows.len();
         assert!(view.journal_selection_anchor.is_some());
 
@@ -1492,10 +1494,8 @@ mod tests {
         let mut view = LspInspectorView::new(store, None);
         view.update(Action::FocusNextPane);
         view.update(Action::FocusNextPane);
-        assert_eq!(
-            view.handle_literal_key(key(KeyCode::Char('V'))),
-            InspectorKeyOutcome::Handled
-        );
+        view.update(Action::ToggleVisualLine);
+        assert!(view.journal_selection_anchor.is_some());
         view.update(Action::Cancel);
         assert!(!view.should_quit);
         view.update(Action::Cancel);

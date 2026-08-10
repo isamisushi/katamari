@@ -235,6 +235,18 @@ pub enum Action {
     /// actions, there's no LSP/IO/overlay concern here, just a pure state
     /// flip over `App`'s own tree/collapse state.
     ToggleDirectory,
+    /// Issue #16: starts/cancels visual-line selection over logical diff
+    /// rows in the main [`crate::ui::view::View::Diff`] pane — Vim's `V`,
+    /// selecting whole (soft-wrap-independent) rows rather than characters.
+    /// A named action rather than another raw-key bypass so help/config
+    /// semantics don't differ by view, unlike the LSP inspector's
+    /// pre-#16 `V`, which stayed a `handle_literal_key` literal because
+    /// binding it globally would have collided with every other view's
+    /// keymap; `App::toggle_visual`'s real cancel-first/start-only-on-a-
+    /// selectable-row semantics live in `ui::app`, not here — see that
+    /// method's docs. A no-op outside [`crate::ui::view::View::Diff`],
+    /// mirroring `AddComment`/`ExpandFold`.
+    ToggleVisualLine,
 }
 
 /// One key press, normalized for matching: the SHIFT modifier is dropped
@@ -629,6 +641,7 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("U", Action::RegenerateUnits),
         (".", Action::ToggleHints),
         ("v", Action::ToggleRangeSelect),
+        ("V", Action::ToggleVisualLine),
         ("c", Action::AddComment),
         ("C", Action::ToggleComments),
         ("/", Action::OpenSearch),
@@ -722,6 +735,14 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("U", Action::RegenerateUnits),
         (".", Action::ToggleHints),
         ("C-Space", Action::ToggleRangeSelect),
+        // Same vim-keys-for-things-with-no-emacs-identity rule as `q`/`b`/
+        // `s`/`z o`/`z c` above: visual-line selection has no emacs
+        // convention of its own (`C-Space` already means
+        // `set-mark-command`/`ToggleRangeSelect`, and this app's own
+        // selection semantics don't match `transient-mark-mode` closely
+        // enough to be worth a distinct binding), so this reuses vim's `V`
+        // verbatim.
+        ("V", Action::ToggleVisualLine),
         ("C-c C-c", Action::AddComment),
         ("C", Action::ToggleComments),
         // Same vim-keys-for-things-with-no-emacs-identity rule this preset
@@ -813,6 +834,7 @@ pub fn action_name(action: Action) -> &'static str {
         Action::NextMatch => "next-match",
         Action::PrevMatch => "prev-match",
         Action::ToggleDirectory => "toggle-directory",
+        Action::ToggleVisualLine => "toggle-visual-line",
     }
 }
 
@@ -865,6 +887,7 @@ pub fn action_by_name(name: &str) -> Option<Action> {
         "next-match" => Action::NextMatch,
         "prev-match" => Action::PrevMatch,
         "toggle-directory" => Action::ToggleDirectory,
+        "toggle-visual-line" => Action::ToggleVisualLine,
         _ => return None,
     })
 }
@@ -1292,6 +1315,7 @@ mod tests {
             Action::RegenerateUnits,
             Action::ToggleHints,
             Action::ToggleDirectory,
+            Action::ToggleVisualLine,
         ];
         for action in all {
             let name = action_name(action);
@@ -1469,7 +1493,7 @@ mod tests {
     /// `open_help_binds_to_plain_question_mark_in_both_presets` test.
     #[test]
     fn every_vim_and_emacs_binding_covers_every_action_exactly_once() {
-        const ACTION_COUNT: usize = 43;
+        const ACTION_COUNT: usize = 44;
         for ci_distinguishable in [false, true] {
             for preset in [
                 vim_preset(ci_distinguishable),

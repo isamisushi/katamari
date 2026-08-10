@@ -1587,6 +1587,7 @@ fn files_focus_blocked_message(action: Action) -> Option<&'static str> {
             "search: focus the diff pane first"
         }
         Action::NextDiagnostic | Action::PrevDiagnostic => "diagnostic: focus the diff pane first",
+        Action::ToggleVisualLine => "visual: focus the diff pane first",
         _ => return None,
     })
 }
@@ -2065,6 +2066,34 @@ fn handle_action(
                 *goto_status = Some("fold: only available in the diff view".to_owned());
             }
         },
+        // Issue #16: `V`. `App::toggle_visual` is the real, pure state
+        // transition (see its docs) — this arm exists only to turn its
+        // three-way `VisualToggleOutcome` into the status-bar note
+        // `App::update`'s `()` return type has no room for, the same
+        // reason `ExpandFold`/`CollapseFold` above call their real `App`
+        // method directly rather than routing through `update`. `y`/`c`
+        // are named in the `Started` note ahead of #17/#19 actually
+        // landing them — a reviewer who presses `V` today sees the whole
+        // intended workflow, not just the one third of it this issue
+        // implements.
+        Action::ToggleVisualLine => match stack.top_mut() {
+            View::Diff(app) => {
+                *goto_status = match app.toggle_visual() {
+                    app::VisualToggleOutcome::Started => {
+                        Some("visual: j/k extend · y copy · c comment · Esc cancel".to_owned())
+                    }
+                    app::VisualToggleOutcome::Cancelled => {
+                        Some("visual selection cancelled".to_owned())
+                    }
+                    app::VisualToggleOutcome::NotSelectable => {
+                        Some("visual: no selectable source line here".to_owned())
+                    }
+                };
+            }
+            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+                *goto_status = Some("visual: only available in the diff view".to_owned());
+            }
+        },
         // Opens the prompt (see `search::SearchPromptState`'s docs); the
         // origin `Anchor` is captured *here*, from the cursor/scroll `/`
         // was actually pressed at, rather than inside `App` itself — `App`
@@ -2178,9 +2207,14 @@ fn handle_action(
         // own (cancel-and-restore-the-cursor, handled entirely inside
         // `run`'s raw-key bypass arm before an `Action` is ever resolved)
         // — this one only ever fires once the prompt has already closed.
-        Action::Cancel => {
-            cancel_diff_view(stack, hover_state, pending_hover, pending_goto, observer)
-        }
+        Action::Cancel => cancel_diff_view(
+            stack,
+            hover_state,
+            pending_hover,
+            pending_goto,
+            observer,
+            goto_status,
+        ),
         Action::ToggleTimeline => open_or_close_timeline(stack, jj_repo, goto_status),
         Action::ToggleLogView => open_or_close_log(stack, goto_status),
         Action::ToggleLspInspector => {
@@ -2351,21 +2385,31 @@ fn handle_action(
 /// (compose/search/help/hover/references panel/scope menu/units picker —
 /// all intercepted above in `handle_action`, and the LSP inspector earlier
 /// still, via its own local `Cancel` handling) has already had first
-/// refusal and declined to consume it. Two outcomes, chosen by whether the
-/// stack is already at its root:
+/// refusal and declined to consume it. Three outcomes:
 ///
-/// - At the root, on the root [`View::Diff`]: clears an active unit scope
-///   first (widening back to the full diff), or failing that clears a
-///   confirmed search's highlight (vim's `:noh`) — unchanged from before
-///   this issue. Every other root view (`File`/`Timeline`/`Log` reached via
-///   `ktmr open`/`ktmr timeline`/`ktmr log`) has nothing local left to
-///   cancel, so `Esc` there is simply a no-op (tier 6 of the issue's
-///   precedence list) — [`ViewStack::pop`]'s own refusal to pop the last
-///   view makes that fall out for free rather than needing a separate
-///   check here.
+/// - On *any* [`View::Diff`], root or pushed: an active issue #16 visual
+///   selection cancels first, ahead of even the at-root checks below —
+///   see [`crate::ui::app::App::cancel_visual`]'s docs. It's the most
+///   local transient state a diff view can carry (a handful of rows the
+///   reviewer was mid-selection over, versus an active unit scope or
+///   search, both of which describe the *whole* diff), and a pushed
+///   `Diff` (opened via [`crate::ui::log_view::LogView::confirm`]) can
+///   have its own selection exactly as easily as the root one can — this
+///   must cancel it in place, not also pop the view out from under the
+///   reviewer.
+/// - At the root, on the root [`View::Diff`], once no selection remained to
+///   cancel: clears an active unit scope first (widening back to the full
+///   diff), or failing that clears a confirmed search's highlight (vim's
+///   `:noh`) — unchanged from before this issue. Every other root view
+///   (`File`/`Timeline`/`Log` reached via `ktmr open`/`ktmr timeline`/`ktmr
+///   log`) has nothing local left to cancel, so `Esc` there is simply a
+///   no-op (tier 6 of the issue's precedence list) — [`ViewStack::pop`]'s
+///   own refusal to pop the last view makes that fall out for free rather
+///   than needing a separate check here.
 /// - Anywhere else — a pushed `File`/nested `Diff`/`Timeline`/`Log`,
 ///   *including* a pushed `Diff` that itself has an active search or unit
-///   scope — pops exactly that one view, revealing whatever was
+///   scope (a selection, if any, was already handled by the first arm
+///   above) — pops exactly that one view, revealing whatever was
 ///   underneath. A pushed diff's own search/unit-filter state is
 ///   deliberately *not* cleared first: the issue's precedence list reserves
 ///   that clearing role for "at the root," and popping already discards the
@@ -2381,7 +2425,18 @@ fn cancel_diff_view(
     pending_hover: &mut Option<PendingHover>,
     pending_goto: &mut Option<(JumpEntry, PendingGoto)>,
     observer: &crate::lsp::ObservationHandle,
+    goto_status: &mut Option<String>,
 ) {
+    // Checked ahead of the match below, not as a guard on its first arm —
+    // a pattern guard only ever gets a shared borrow of what it matched
+    // (`app.cancel_visual()` needs `&mut`), so this has to be its own
+    // statement rather than folded into the `match`.
+    if let View::Diff(app) = stack.top_mut()
+        && app.cancel_visual()
+    {
+        *goto_status = Some("visual selection cancelled".to_owned());
+        return;
+    }
     let at_root = stack.is_at_root();
     match stack.top_mut() {
         View::Diff(app) if at_root => {
@@ -3301,8 +3356,104 @@ mod tests {
         App::new("test-repo".to_owned(), PathBuf::from("/repo"), Vec::new())
     }
 
+    /// One context row (`flat_idx` 2 after the file/hunk headers) with the
+    /// cursor already on it — the minimum an `App` needs for
+    /// `toggle_visual` to start a selection in a `cancel_diff_view` test.
+    fn selectable_diff_app() -> App {
+        let file = crate::diff::DiffFile {
+            old_path: Some("a.rs".to_owned()),
+            new_path: Some("a.rs".to_owned()),
+            hunks: vec![crate::diff::DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                known_eof: true,
+                rows: vec![crate::diff::DiffRow {
+                    kind: crate::diff::DiffLineKind::Context,
+                    text: "one".to_owned(),
+                    old_line: Some(1),
+                    new_line: Some(1),
+                }],
+            }],
+            ..Default::default()
+        };
+        let mut app = App::new("test-repo".to_owned(), PathBuf::from("/repo"), vec![file]);
+        app.cursor = 2;
+        app
+    }
+
     fn empty_file_view() -> FileView {
         FileView::with_hover_target("f.txt".to_owned(), "hello\n", None)
+    }
+
+    #[test]
+    fn cancel_clears_an_active_selection_at_root_before_anything_else() {
+        let mut app = selectable_diff_app();
+        assert_eq!(app.toggle_visual(), app::VisualToggleOutcome::Started);
+        let mut stack = ViewStack::new(View::Diff(app));
+        let mut hover_state = hover_popup::HoverState::default();
+        let mut pending_hover: Option<PendingHover> = None;
+        let mut pending_goto: Option<(JumpEntry, PendingGoto)> = None;
+        let mut goto_status: Option<String> = None;
+
+        cancel_diff_view(
+            &mut stack,
+            &mut hover_state,
+            &mut pending_hover,
+            &mut pending_goto,
+            &crate::lsp::ObservationStore::in_memory(),
+            &mut goto_status,
+        );
+
+        let View::Diff(app) = stack.top() else {
+            panic!("still the root diff");
+        };
+        assert!(!app.visual_active(), "the first Esc spends itself here");
+        assert_eq!(goto_status.as_deref(), Some("visual selection cancelled"));
+    }
+
+    #[test]
+    fn cancel_clears_a_selection_on_a_pushed_diff_instead_of_popping() {
+        // The selection is the most local transient layer, so one Esc must
+        // consume it and leave the pushed view in place; only the *next*
+        // Esc pops — exactly one layer per press.
+        let mut pushed = selectable_diff_app();
+        assert_eq!(pushed.toggle_visual(), app::VisualToggleOutcome::Started);
+        let mut stack = ViewStack::new(View::Diff(empty_diff_app()));
+        stack.push(View::Diff(pushed));
+        let mut hover_state = hover_popup::HoverState::default();
+        let mut pending_hover: Option<PendingHover> = None;
+        let mut pending_goto: Option<(JumpEntry, PendingGoto)> = None;
+        let mut goto_status: Option<String> = None;
+
+        cancel_diff_view(
+            &mut stack,
+            &mut hover_state,
+            &mut pending_hover,
+            &mut pending_goto,
+            &crate::lsp::ObservationStore::in_memory(),
+            &mut goto_status,
+        );
+        assert!(
+            !stack.is_at_root(),
+            "the first Esc cancels the selection, not the view"
+        );
+        let View::Diff(app) = stack.top() else {
+            panic!("the pushed diff is still on top");
+        };
+        assert!(!app.visual_active());
+
+        cancel_diff_view(
+            &mut stack,
+            &mut hover_state,
+            &mut pending_hover,
+            &mut pending_goto,
+            &crate::lsp::ObservationStore::in_memory(),
+            &mut goto_status,
+        );
+        assert!(stack.is_at_root(), "the second Esc pops the pushed diff");
     }
 
     #[test]
@@ -3312,6 +3463,7 @@ mod tests {
         let mut hover_state = hover_popup::HoverState::default();
         let mut pending_hover: Option<PendingHover> = None;
         let mut pending_goto: Option<(JumpEntry, PendingGoto)> = None;
+        let mut goto_status: Option<String> = None;
 
         cancel_diff_view(
             &mut stack,
@@ -3319,6 +3471,7 @@ mod tests {
             &mut pending_hover,
             &mut pending_goto,
             &crate::lsp::ObservationStore::in_memory(),
+            &mut goto_status,
         );
 
         assert!(stack.is_at_root(), "exactly one view must be popped");
@@ -3337,6 +3490,7 @@ mod tests {
         let mut hover_state = hover_popup::HoverState::default();
         let mut pending_hover: Option<PendingHover> = None;
         let mut pending_goto: Option<(JumpEntry, PendingGoto)> = None;
+        let mut goto_status: Option<String> = None;
 
         cancel_diff_view(
             &mut stack,
@@ -3344,6 +3498,7 @@ mod tests {
             &mut pending_hover,
             &mut pending_goto,
             &crate::lsp::ObservationStore::in_memory(),
+            &mut goto_status,
         );
 
         assert!(stack.is_at_root());
@@ -3355,6 +3510,7 @@ mod tests {
         let mut hover_state = hover_popup::HoverState::default();
         let mut pending_hover: Option<PendingHover> = None;
         let mut pending_goto: Option<(JumpEntry, PendingGoto)> = None;
+        let mut goto_status: Option<String> = None;
 
         cancel_diff_view(
             &mut stack,
@@ -3362,6 +3518,7 @@ mod tests {
             &mut pending_hover,
             &mut pending_goto,
             &crate::lsp::ObservationStore::in_memory(),
+            &mut goto_status,
         );
 
         // `ViewStack::pop` refuses to pop the last remaining view — the
@@ -3387,6 +3544,7 @@ mod tests {
         let mut hover_state = hover_popup::HoverState::default();
         let mut pending_hover: Option<PendingHover> = None;
         let mut pending_goto: Option<(JumpEntry, PendingGoto)> = None;
+        let mut goto_status: Option<String> = None;
 
         cancel_diff_view(
             &mut stack,
@@ -3394,6 +3552,7 @@ mod tests {
             &mut pending_hover,
             &mut pending_goto,
             &crate::lsp::ObservationStore::in_memory(),
+            &mut goto_status,
         );
 
         assert!(stack.is_at_root(), "the root view is never popped");
@@ -3430,12 +3589,14 @@ mod tests {
             },
         ));
 
+        let mut goto_status: Option<String> = None;
         cancel_diff_view(
             &mut stack,
             &mut hover_state,
             &mut pending_hover,
             &mut pending_goto,
             &crate::lsp::ObservationStore::in_memory(),
+            &mut goto_status,
         );
 
         assert!(stack.is_at_root(), "the pushed FileView must have popped");
@@ -3653,6 +3814,7 @@ mod tests {
             Action::PrevMatch,
             Action::NextDiagnostic,
             Action::PrevDiagnostic,
+            Action::ToggleVisualLine,
         ] {
             let message = files_focus_blocked_message(action)
                 .unwrap_or_else(|| panic!("{action:?} must be blocked while Files is focused"));

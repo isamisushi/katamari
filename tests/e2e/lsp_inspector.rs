@@ -7,12 +7,15 @@
 //! reaches `Running` — and starts producing real journal records — quickly,
 //! rather than needing a fixed sleep to guess how long that takes.
 //!
-//! The inspector's own `V`/`y` Journal-focus gate (see
-//! `LspInspectorView::handle_literal_key`'s docs on why those two stay a
-//! literal-key bypass rather than becoming `Action`s) makes an ideal
-//! observable witness for *which* pane Tab/BackTab actually landed on: its
-//! status message names the required focus by name, so this test never has
-//! to reach into private view state the way the unit tests can.
+//! The inspector's own `V`/`y` Journal-focus gate makes an ideal observable
+//! witness for *which* pane Tab/BackTab actually landed on: its status
+//! message names the required focus by name, so this test never has to
+//! reach into private view state the way the unit tests can. As of issue
+//! #16, `V` resolves through the ordinary keymap to `Action::ToggleVisualLine`
+//! (see `LspInspectorView::update`'s arm for it) rather than
+//! `handle_literal_key`'s literal bypass — only `y` still goes through that
+//! bypass (see its docs) — but the observable behavior below is unchanged
+//! either way, so this test is unmodified other than this comment.
 
 use crate::support::{Harness, Key, SpawnOptions, fixture};
 use std::time::Duration;

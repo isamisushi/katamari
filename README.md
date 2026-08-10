@@ -363,6 +363,7 @@ between.
 | Open scope menu | `o` | `o` |
 | Open help | `?` | `?` |
 | Toggle range-select (timeline/log) | `v` | `C-Space` |
+| Visual-line select (diff) | `V` | `V` |
 | Add comment | `c` | `C-c C-c` |
 | (in comment compose) newline / save / cancel | `Enter` / `C-s` / `Esc` | same |
 | Toggle inline comment bodies | `C` | `C` |

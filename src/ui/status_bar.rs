@@ -71,6 +71,20 @@ pub fn render(
         ));
     }
 
+    // Issue #16: a persistent reminder that `V`'s selection is still live —
+    // same slot family as `watch_mode`/`unit_filter` below (a standing
+    // session state the reviewer could otherwise forget about mid-scroll),
+    // placed ahead of them since a visual selection is the more local,
+    // more likely-to-be-actively-worked-with state of the two.
+    if app.visual_active() {
+        spans.push(Span::styled(
+            "· VISUAL ",
+            Style::default()
+                .fg(Color::LightMagenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     if let Some(label) = &app.scope_label {
         spans.push(Span::styled(
             format!("· {label} "),

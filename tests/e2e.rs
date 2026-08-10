@@ -49,6 +49,8 @@ mod show_keys;
 mod skill_install;
 #[path = "e2e/update_check.rs"]
 mod update_check;
+#[path = "e2e/visual.rs"]
+mod visual;
 #[path = "e2e/watch.rs"]
 mod watch;
 #[path = "e2e/wrap.rs"]

@@ -352,6 +352,11 @@ pub fn diff_view_items(keymap: &Keymap, expanded: bool) -> Vec<HintItem> {
         HintItem::for_actions(keymap, &[Action::ToggleLayout], "layout"),
         HintItem::for_actions(keymap, &[Action::NextSymbol], "symbol"),
         HintItem::for_actions(keymap, &[Action::ToggleComments], "toggle"),
+        // Low-priority tail on purpose (issue #16): a reviewer who already
+        // knows `V` doesn't need reminding every frame, and one who doesn't
+        // discovers it via `?` the same way `n`/`N` are documented above —
+        // see `ui::help::describe`.
+        HintItem::for_actions(keymap, &[Action::ToggleVisualLine], "visual"),
         HintItem::for_actions(keymap, &[Action::Quit], "quit"),
         toggle_item(keymap, true),
     ]

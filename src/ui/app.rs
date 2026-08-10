@@ -61,6 +61,22 @@ pub enum ExpandOutcome {
     Rejected,
 }
 
+/// [`App::toggle_visual`]'s three-way result — issue #16's `V`, the same
+/// "a plain `bool` can't distinguish the cases a caller needs to report"
+/// shape [`ExpandOutcome`] already uses for `z o`.
+/// `ui::mod::handle_action`'s `Action::ToggleVisualLine` arm turns each
+/// variant into its own status-bar note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualToggleOutcome {
+    /// A new selection started at the cursor's current logical row.
+    Started,
+    /// An active selection was cancelled, without moving the cursor.
+    Cancelled,
+    /// The cursor isn't on a [`RenderRow::Line`] — nothing here to start a
+    /// selection from.
+    NotSelectable,
+}
+
 /// Which of the two diff layouts the diff pane renders. Toggled by
 /// [`Action::ToggleLayout`]; [`crate::ui::diff_view`] may still render
 /// unified even when this is [`Layout::SideBySide`] if the pane is too
@@ -252,6 +268,22 @@ pub struct App {
     /// Representation-free by design (a set of paths, not a splice): there
     /// is nothing to cache, since an empty gap has no lines.
     trailing_probed_empty: HashSet<String>,
+    /// Issue #16: the logical row [`Self::cursor`] sat on when `V` started
+    /// visual-line selection, or `None` when no selection is active. Bare
+    /// `RenderRow` index, not anything content-keyed — contrast
+    /// `expanded_folds`, which keys off `display_path` precisely so it
+    /// *can* survive a rederive: visual selection is explicitly out of
+    /// scope for surviving one (see the issue's "Out of scope" list), so
+    /// [`Self::rederive`] clears this unconditionally on every call rather
+    /// than trying to re-anchor it the way `files_selection`/
+    /// `expanded_folds` do. Private for the same reason those two are: the
+    /// only doors in are [`Self::toggle_visual`]/[`Self::cancel_visual`],
+    /// the only doors out the read-only [`Self::visual_active`]/
+    /// [`Self::visual_bounds`]/[`Self::is_row_selected`]/
+    /// [`Self::selected_rows`] queries — matching the issue's "State
+    /// guidance": no terminal coordinates or duplicated line text, just
+    /// this one logical index plus whatever `self.cursor` already is.
+    visual_anchor: Option<usize>,
     viewport_height: usize,
     /// The unified layout's per-row wrap width — display columns left for a
     /// content row's highlighted text after the pane border and gutter are
@@ -379,6 +411,7 @@ impl App {
             expanded_folds: HashMap::new(),
             unit_filter: None,
             trailing_probed_empty: HashSet::new(),
+            visual_anchor: None,
             viewport_height: 1,
             // Unbounded until the first frame reports a real pane width
             // (see `set_content_width`) — `row_visual_height` then treats
@@ -463,6 +496,18 @@ impl App {
     /// never a patch to the previous `files`, always a fresh, structurally
     /// consistent recomputation from the one source of truth.
     fn rederive(&mut self) {
+        // Issue #16: every path into this function can shuffle, insert, or
+        // remove flat row indices out from under a stored anchor (a watch
+        // refresh, a scope swap, a unit-filter change, a fold toggle) — one
+        // unconditional clear here, ahead of every other branch, covers
+        // all of them at once rather than each of `Self::apply_refresh`/
+        // `Self::apply_scope_swap`/`Self::set_unit_filter`/
+        // `Self::clear_unit_filter`/`Self::expand_gap`/
+        // `Self::collapse_fold_at_cursor` remembering to clear it
+        // individually — see `Self::visual_anchor`'s own docs for why a
+        // coarse, no-exceptions clear is the right call here (persisting
+        // selection through any of these is explicitly out of scope).
+        self.visual_anchor = None;
         let has_derived_state = !self.expanded_folds.is_empty()
             || !self.trailing_probed_empty.is_empty()
             || self.unit_filter.is_some();
@@ -645,6 +690,109 @@ impl App {
         let row = &file.hunks[*hunk_idx].rows[*row_idx];
         let (relative_path, line0) = lsp_target(row, file)?;
         Some((relative_path.to_string_lossy().into_owned(), line0 + 1))
+    }
+
+    /// `V`'s effect. Cancel-first — checked via `.take()` *before* the
+    /// row-eligibility check below — so a second `V` always cancels an
+    /// active selection, even if the cursor has since wandered onto a
+    /// header/gap/binary row a fresh `V` could never have started a
+    /// selection from (req 3). Starting a *new* selection only happens on
+    /// a [`RenderRow::Line`] (req 5); every other row reports
+    /// `NotSelectable` and leaves `visual_anchor` untouched — already
+    /// `None` at that point, since cancellation took priority above, so
+    /// there's nothing to leave alone that wasn't already there.
+    ///
+    /// Deliberately does *not* gate on [`Self::interactive`]: a historical/
+    /// read-only diff can still select and later copy lines (req 11) — the
+    /// interactivity gate belongs only to what visual selection eventually
+    /// feeds (hover stays gated at [`Self::hover_query`]; a range comment
+    /// will need its own gate — see [`Self::comment_target`]'s docs on the
+    /// pre-existing gap there).
+    pub fn toggle_visual(&mut self) -> VisualToggleOutcome {
+        if self.visual_anchor.take().is_some() {
+            return VisualToggleOutcome::Cancelled;
+        }
+        if !matches!(self.rows.get(self.cursor), Some(RenderRow::Line { .. })) {
+            return VisualToggleOutcome::NotSelectable;
+        }
+        self.visual_anchor = Some(self.cursor);
+        VisualToggleOutcome::Started
+    }
+
+    /// `Esc`'s half of visual cancellation — a `bool` outcome mirroring
+    /// [`Self::clear_unit_filter`]'s shape, since `ui::mod`'s `Action::Cancel`
+    /// handling only needs to know whether *something* was cancelled here,
+    /// to decide whether to keep unwinding through the rest of the Esc
+    /// precedence chain (see that arm's own docs). Unlike
+    /// [`Self::toggle_visual`], never needs to check row eligibility —
+    /// cancelling never starts anything, so there's nothing to validate
+    /// beyond "was a selection active."
+    pub fn cancel_visual(&mut self) -> bool {
+        self.visual_anchor.take().is_some()
+    }
+
+    /// Whether visual-line selection is currently active.
+    pub fn visual_active(&self) -> bool {
+        self.visual_anchor.is_some()
+    }
+
+    /// The inclusive logical-row interval visual selection currently
+    /// covers: `(min, max)` of the anchor and wherever the cursor has
+    /// moved to since — recomputed fresh from `self.cursor` on every call
+    /// rather than stored alongside the anchor at start time (req 4). That
+    /// is what makes every cursor-moving action — paging, top/bottom,
+    /// hunk/file jumps, search/diagnostic jumps, a future mouse click —
+    /// extend the selection for free: none of those call sites need to
+    /// know visual mode exists. `None` when no selection is active.
+    pub fn visual_bounds(&self) -> Option<(usize, usize)> {
+        self.visual_anchor.map(|anchor| {
+            if anchor <= self.cursor {
+                (anchor, self.cursor)
+            } else {
+                (self.cursor, anchor)
+            }
+        })
+    }
+
+    /// Whether `flat_idx` is a selected *source* line — inside
+    /// [`Self::visual_bounds`] **and** a [`RenderRow::Line`] (req 6). A
+    /// file/hunk header or fold row can sit inside the inclusive interval
+    /// (the selection spans a hunk or file boundary) without itself being
+    /// selectable content — `diff_view::render_row` only ever calls
+    /// `diff_view::content_line` (the only renderer that consults this) for
+    /// a `Line` row in the first place, so structural rows are excluded by
+    /// construction as much as by this check.
+    pub fn is_row_selected(&self, flat_idx: usize) -> bool {
+        let Some((lo, hi)) = self.visual_bounds() else {
+            return false;
+        };
+        lo <= flat_idx
+            && flat_idx <= hi
+            && matches!(self.rows.get(flat_idx), Some(RenderRow::Line { .. }))
+    }
+
+    /// Every selected content row's flat index, ascending screen order —
+    /// the #17/#19 handoff: yanking and range-commenting both need the
+    /// concrete row list, not just the interval, since structural rows
+    /// inside [`Self::visual_bounds`] must be skipped rather than treated
+    /// as selected. Indices only, never text or file/line numbers, per the
+    /// issue's "State guidance" — a caller that needs more looks each index
+    /// up in `self.rows`/`self.files` itself.
+    ///
+    /// No production caller yet in issue #16 — this module's own tests are
+    /// the only thing exercising it until #17 (yank) and #19 (range
+    /// comment) land and actually consume the list. Same convention as
+    /// `ColumnMap::display_len` in `diff::coords`: kept now rather than
+    /// deleted and re-derived later, since it's exactly the shape both of
+    /// those issues need.
+    #[allow(dead_code)]
+    pub fn selected_rows(&self) -> Vec<usize> {
+        let Some((lo, hi)) = self.visual_bounds() else {
+            return Vec::new();
+        };
+        (lo..=hi)
+            .filter(|&idx| matches!(self.rows.get(idx), Some(RenderRow::Line { .. })))
+            .collect()
     }
 
     /// The diff pane's visible row count changes on terminal resize; the
@@ -1112,10 +1260,25 @@ impl App {
             Action::FocusNextPane => {
                 self.focus =
                     pane::cycle_focus(&FOCUS_ORDER, self.focus, true, |p| self.pane_visible(p));
+                // Issue #16's 7th invalidation trigger: a visual selection
+                // makes no sense once the diff pane no longer has focus (a
+                // reviewer browsing `Files` has no logical row on screen to
+                // extend it from), so leaving `Diff` cancels it the same
+                // way every `Self::rederive` call already does for the
+                // other six. Entering `Diff` never needs the opposite
+                // treatment — there's nothing stale to inherit, since a
+                // selection can only ever have started while `Diff` already
+                // had focus.
+                if self.focus != MainPaneFocus::Diff {
+                    self.visual_anchor = None;
+                }
             }
             Action::FocusPrevPane => {
                 self.focus =
                     pane::cycle_focus(&FOCUS_ORDER, self.focus, false, |p| self.pane_visible(p));
+                if self.focus != MainPaneFocus::Diff {
+                    self.visual_anchor = None;
+                }
             }
             // `ui::mod`'s event loop intercepts all of these before they
             // reach here — each needs either the LSP manager, the
@@ -1144,6 +1307,13 @@ impl App {
             // pane even if it were ever reached for these actions — see
             // `ui::mod::handle_action`'s `NextMatch`/`PrevMatch` arm for
             // the primary guard (a `View::Diff`-only gate) this backs up.
+            //
+            // `ToggleVisualLine` joins the bucket for the same reason as
+            // `OpenSearch`/`NextMatch`/`PrevMatch`: `Self::toggle_visual`
+            // is a real, pure `App` method (no LSP/IO/overlay concern at
+            // all), but `ui::mod::handle_action` needs to turn its
+            // `VisualToggleOutcome` into a status-bar note this `()` return
+            // type has no way to carry — see that arm's docs.
             Action::Hover
             | Action::Cancel
             | Action::GotoDefinition
@@ -1158,6 +1328,7 @@ impl App {
             | Action::OpenSearch
             | Action::NextMatch
             | Action::PrevMatch
+            | Action::ToggleVisualLine
             | Action::Confirm => {}
             // `ui::mod` intercepts `ToggleTimeline`/`ToggleLogView`/
             // `OpenScopeMenu` before they reach here (constructing/tearing
@@ -3879,5 +4050,334 @@ index 1111111..2222222 100644\n\
         };
         assert_eq!(app.files[file_idx].display_path(), "src/renamed_to.rs");
         assert_eq!(app.focus, MainPaneFocus::Diff);
+    }
+
+    // -- Issue #16: visual-line selection --------------------------------
+
+    /// Advances the cursor to the first `RenderRow::Line` in `app.rows`,
+    /// via ordinary `CursorDown` movement — the same navigation a reviewer
+    /// would actually use, rather than poking `app.cursor` directly, so
+    /// these tests stay honest about starting from a state `App::update`
+    /// itself could produce. `FIXTURE`'s first content row is `src/lib.rs`'s
+    /// `"fn helper() {}"` context line, two rows past the file/hunk
+    /// headers.
+    fn move_cursor_to_first_line_row(app: &mut App) {
+        app.update(Action::Top);
+        while !matches!(app.rows[app.cursor], RenderRow::Line { .. }) {
+            app.update(Action::CursorDown);
+        }
+    }
+
+    #[test]
+    fn v_on_a_line_row_starts_a_selection_at_the_cursor() {
+        let mut app = test_app();
+        move_cursor_to_first_line_row(&mut app);
+        let anchor = app.cursor;
+
+        assert!(!app.visual_active());
+        assert_eq!(app.toggle_visual(), VisualToggleOutcome::Started);
+        assert!(app.visual_active());
+        assert_eq!(app.visual_bounds(), Some((anchor, anchor)));
+        assert_eq!(
+            app.cursor, anchor,
+            "starting a selection never moves the cursor"
+        );
+    }
+
+    #[test]
+    fn v_off_a_header_gap_or_binary_row_reports_not_selectable() {
+        // Header/gap rows, via the fold fixture's shape (see
+        // `gap_fixture_app`'s docs): `[FileHeader, HunkHeader, .., Gap(5),
+        // .., Gap(10)]`.
+        let mut app = gap_fixture_app();
+        for idx in [0usize, 1, 5, 10] {
+            app.cursor = idx;
+            assert!(
+                !app.visual_active(),
+                "sanity: no selection carried over between cases"
+            );
+            assert_eq!(
+                app.toggle_visual(),
+                VisualToggleOutcome::NotSelectable,
+                "row {idx} ({:?}) must refuse to start a selection",
+                app.rows[idx]
+            );
+            assert!(!app.visual_active());
+        }
+
+        // A binary file has only a `FileHeader`/`BinaryNotice` pair — no
+        // `RenderRow::Line` at all to select.
+        let binary_file = DiffFile {
+            old_path: Some("image.png".to_owned()),
+            new_path: Some("image.png".to_owned()),
+            is_binary: true,
+            ..Default::default()
+        };
+        let mut binary_app = App::new("repo".to_owned(), PathBuf::from("/repo"), vec![binary_file]);
+        binary_app.cursor = 1; // the BinaryNotice row
+        assert!(matches!(binary_app.rows[1], RenderRow::BinaryNotice { .. }));
+        assert_eq!(
+            binary_app.toggle_visual(),
+            VisualToggleOutcome::NotSelectable
+        );
+    }
+
+    #[test]
+    fn v_again_cancels_the_selection_without_moving_the_cursor() {
+        let mut app = test_app();
+        move_cursor_to_first_line_row(&mut app);
+        app.toggle_visual();
+        assert!(app.visual_active());
+        app.update(Action::CursorDown);
+        app.update(Action::CursorDown);
+        let cursor_before = app.cursor;
+
+        assert_eq!(app.toggle_visual(), VisualToggleOutcome::Cancelled);
+        assert!(!app.visual_active());
+        assert_eq!(
+            app.cursor, cursor_before,
+            "cancelling a selection never moves the cursor"
+        );
+    }
+
+    #[test]
+    fn v_again_cancels_even_from_a_structural_row_the_cursor_wandered_onto() {
+        // req 3: cancellation checks the anchor before row eligibility, so
+        // a selection started on a `Line` row can still be cancelled after
+        // the cursor moves onto a header/gap row a *fresh* `V` could never
+        // have started from.
+        let mut app = gap_fixture_app();
+        app.cursor = 2; // "line 1" — a selectable Line row
+        assert_eq!(app.toggle_visual(), VisualToggleOutcome::Started);
+        app.cursor = 5; // the Between gap row
+        assert!(matches!(app.rows[app.cursor], RenderRow::Gap { .. }));
+
+        assert_eq!(app.toggle_visual(), VisualToggleOutcome::Cancelled);
+        assert!(!app.visual_active());
+    }
+
+    #[test]
+    fn cancel_visual_reports_whether_a_selection_was_active() {
+        let mut app = test_app();
+        assert!(!app.cancel_visual(), "nothing to cancel yet");
+
+        move_cursor_to_first_line_row(&mut app);
+        app.toggle_visual();
+        assert!(app.cancel_visual());
+        assert!(!app.visual_active());
+        assert!(!app.cancel_visual(), "already cancelled once");
+    }
+
+    #[test]
+    fn visual_bounds_are_the_inclusive_min_max_of_anchor_and_cursor_either_direction() {
+        let mut app = test_app();
+        move_cursor_to_first_line_row(&mut app);
+        let anchor = app.cursor;
+        app.toggle_visual();
+
+        app.update(Action::CursorDown);
+        app.update(Action::CursorDown);
+        assert_eq!(app.visual_bounds(), Some((anchor, anchor + 2)));
+
+        // Reverse direction: move the cursor back above the anchor.
+        app.update(Action::CursorUp);
+        app.update(Action::CursorUp);
+        app.update(Action::CursorUp);
+        assert_eq!(
+            app.visual_bounds(),
+            Some((anchor.saturating_sub(1), anchor))
+        );
+    }
+
+    #[test]
+    fn is_row_selected_skips_structural_rows_inside_the_bounds_but_the_cursor_still_crosses_them() {
+        // The fold fixture's Between gap (row 5) sits inside a selection
+        // spanning from "line 3" (row 4) to "line 10" (row 7) — the gap
+        // itself must never read as selected, but the cursor must still be
+        // able to land on it and extend the interval past it (req 6).
+        let mut app = gap_fixture_app();
+        app.cursor = 4; // "line 3"
+        app.toggle_visual();
+        app.cursor = 7; // "line 10", the other side of the gap
+        assert!(matches!(app.rows[5], RenderRow::Gap { .. }));
+
+        assert!(app.is_row_selected(4));
+        assert!(
+            !app.is_row_selected(5),
+            "a Gap row is never itself selected"
+        );
+        assert!(app.is_row_selected(7));
+        assert_eq!(app.visual_bounds(), Some((4, 7)));
+    }
+
+    #[test]
+    fn selection_extends_across_hunks_and_files_in_screen_order() {
+        let mut app = test_app();
+        move_cursor_to_first_line_row(&mut app);
+        let anchor = app.cursor;
+        app.toggle_visual();
+        // Walk to the far side of the multi-file fixture.
+        app.update(Action::Bottom);
+
+        let selected = app.selected_rows();
+        assert!(!selected.is_empty());
+        assert_eq!(
+            selected.first().copied(),
+            Some(anchor),
+            "the first selected row is the anchor, screen order ascending"
+        );
+        // Every selected index is ascending and strictly increasing.
+        assert!(selected.windows(2).all(|w| w[0] < w[1]));
+        // Spans more than one file's worth of content — the fixture's
+        // files are far enough apart that a same-hunk-only selection could
+        // never reach `Bottom`.
+        assert!(app.rows.len() - anchor > 10);
+    }
+
+    #[test]
+    fn selected_rows_returns_only_lines_ascending() {
+        let mut app = gap_fixture_app();
+        app.cursor = 2; // "line 1"
+        app.toggle_visual();
+        app.cursor = 7; // "line 10" — spans the Between gap (row 5) and the
+        // second hunk's own HunkHeader (row 6), both structural
+        assert_eq!(app.selected_rows(), vec![2, 3, 4, 7]);
+    }
+
+    /// Every one of the seven [`App::rederive`] call sites must clear a
+    /// live anchor — the single `self.visual_anchor = None;` line at the
+    /// top of `rederive` covers all of them at once (see that method's
+    /// docs), so this test drives each real caller in turn (not
+    /// `rederive` directly, which is private) and asserts the anchor is
+    /// gone afterward. `App::new` is the eighth call but isn't listed
+    /// separately: a selection cannot exist before construction finishes,
+    /// so there's nothing for it to clear.
+    #[test]
+    fn a_live_selection_is_cleared_by_every_rederive_call_site() {
+        // 1. apply_refresh
+        {
+            let mut app = test_app();
+            move_cursor_to_first_line_row(&mut app);
+            app.toggle_visual();
+            assert!(app.visual_active());
+            app.apply_refresh(parse_unified_diff(FIXTURE));
+            assert!(
+                !app.visual_active(),
+                "apply_refresh must clear a live selection"
+            );
+        }
+        // 2. apply_scope_swap
+        {
+            let mut app = test_app();
+            move_cursor_to_first_line_row(&mut app);
+            app.toggle_visual();
+            app.apply_scope_swap(parse_unified_diff(FIXTURE), true, false, None);
+            assert!(
+                !app.visual_active(),
+                "apply_scope_swap must clear a live selection"
+            );
+        }
+        // 3. set_unit_filter
+        {
+            let mut app = test_app();
+            move_cursor_to_first_line_row(&mut app);
+            app.toggle_visual();
+            let id = crate::groups::enumerate_hunks(&app.files)[0].id.clone();
+            app.set_unit_filter(UnitFilter {
+                label: "unit".to_owned(),
+                description: String::new(),
+                index: 1,
+                total: 1,
+                hunk_ids: HashSet::from([id]),
+            });
+            assert!(
+                !app.visual_active(),
+                "set_unit_filter must clear a live selection"
+            );
+        }
+        // 4. clear_unit_filter
+        {
+            let mut app = test_app();
+            let id = crate::groups::enumerate_hunks(&app.files)[0].id.clone();
+            app.set_unit_filter(UnitFilter {
+                label: "unit".to_owned(),
+                description: String::new(),
+                index: 1,
+                total: 1,
+                hunk_ids: HashSet::from([id]),
+            });
+            move_cursor_to_first_line_row(&mut app);
+            app.toggle_visual();
+            assert!(app.clear_unit_filter());
+            assert!(
+                !app.visual_active(),
+                "clear_unit_filter must clear a live selection"
+            );
+        }
+        // 5. expand_gap
+        {
+            let mut app = gap_fixture_app();
+            app.cursor = 2; // "line 1" — a selectable Line row
+            app.toggle_visual();
+            assert!(app.visual_active());
+            let disk = gap_fixture_disk_lines();
+            let refs: Vec<&str> = disk.iter().map(String::as_str).collect();
+            assert_eq!(app.expand_gap(0, 0, &refs), ExpandOutcome::Revealed);
+            assert!(
+                !app.visual_active(),
+                "expand_gap must clear a live selection"
+            );
+        }
+        // 6. collapse_fold_at_cursor
+        {
+            let mut app = gap_fixture_app();
+            app.cursor = 5; // the Between gap
+            let disk = gap_fixture_disk_lines();
+            let refs: Vec<&str> = disk.iter().map(String::as_str).collect();
+            app.expand_gap(0, 0, &refs);
+            // `expand_gap` leaves the cursor exactly where the gap row
+            // stood (see `expand_then_collapse_round_trips_the_cursor_back_to_the_gap_row`) —
+            // now one of the revealed `Line` rows, so `V` here starts a
+            // selection `z c` can then fold back over.
+            assert!(matches!(app.rows[app.cursor], RenderRow::Line { .. }));
+            app.toggle_visual();
+            assert!(app.visual_active());
+            assert!(app.collapse_fold_at_cursor());
+            assert!(
+                !app.visual_active(),
+                "collapse_fold_at_cursor must clear a live selection"
+            );
+        }
+    }
+
+    #[test]
+    fn a_selection_survives_toggle_layout_and_a_resize() {
+        let mut app = test_app();
+        move_cursor_to_first_line_row(&mut app);
+        app.toggle_visual();
+        assert!(app.visual_active());
+
+        app.update(Action::ToggleLayout);
+        assert!(app.visual_active(), "ToggleLayout calls no rederive");
+        app.set_viewport_height(40);
+        app.set_content_width(120);
+        assert!(app.visual_active(), "a resize calls no rederive");
+    }
+
+    #[test]
+    fn visual_selection_works_the_same_on_a_non_interactive_historical_app() {
+        let mut app = test_app();
+        app.interactive = false;
+        move_cursor_to_first_line_row(&mut app);
+        let anchor = app.cursor;
+
+        assert_eq!(app.toggle_visual(), VisualToggleOutcome::Started);
+        app.update(Action::CursorDown);
+        assert!(app.is_row_selected(anchor));
+        assert!(!app.selected_rows().is_empty());
+        assert!(
+            app.cancel_visual(),
+            "select-and-later-cancel/copy must work on a read-only historical diff"
+        );
     }
 }

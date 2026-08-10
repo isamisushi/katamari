@@ -281,7 +281,12 @@ impl FileView {
             | Action::CollapseFold
             | Action::OpenSearch
             | Action::NextMatch
-            | Action::PrevMatch => {}
+            | Action::PrevMatch
+            // Issue #16: visual-line selection is a diff-view-only concept
+            // too, same reasoning as `ExpandFold`/`OpenSearch` above — a
+            // single opened file has no logical `RenderRow`s of its own to
+            // select over.
+            | Action::ToggleVisualLine => {}
             // `ui::mod` intercepts this before it reaches here, same as
             // every other action in the `Hover`/`Cancel`/... group above —
             // opening `ui::help`'s popup needs the live `Keymap`, which

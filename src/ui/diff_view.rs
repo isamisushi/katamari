@@ -867,6 +867,14 @@ fn content_line(
         _ => Vec::new(),
     };
 
+    // Issue #16: constant for every visual row of this logical line (it
+    // depends only on `flat_idx`, never on wrap position), so resolved once
+    // here rather than inside the loop below — the same "per logical line,
+    // not per visual row" shape `active_symbol`/`search_marks` above already
+    // use, and for the same reason: whichever wrap row(s) this line ends up
+    // producing, all of them belong to the same selected-or-not source line.
+    let selected = app.is_row_selected(flat_idx);
+
     let mut out = Vec::with_capacity(visual_rows.len());
     let mut col_offset = 0usize;
     for (i, row_spans) in visual_rows.into_iter().enumerate() {
@@ -875,6 +883,17 @@ fn content_line(
             .into_iter()
             .map(|span| Span::styled(span.text, base_style(bg).fg(highlight_color(span.kind))))
             .collect();
+        // Applied before the active-symbol/search marks below (see
+        // `visual_selection_style`'s doc for the full precedence order) so
+        // both later marks still patch cleanly over it rather than being
+        // hidden underneath — every visual row of a selected wrapped line
+        // gets the full-width background (req 7); on side-by-side a
+        // selected `Del`/`Add` cell highlights only because it's *this*
+        // `flat_idx`'s own cell that resolved `selected`, never its
+        // unselected pair (req 8) — see `is_row_selected`'s docs.
+        if selected {
+            content_spans = mark_range(content_spans, 0, row_width, visual_selection_style());
+        }
         if let Some(active) = active_symbol {
             let (start, end) = (active.display_start, active.display_end);
             if end > col_offset && start < col_offset + row_width {
@@ -922,10 +941,20 @@ fn content_line(
 
         let rendered_width: usize = line_spans.iter().map(ratatui::text::Span::width).sum();
         if rendered_width < width {
-            line_spans.push(Span::styled(
-                " ".repeat(width - rendered_width),
-                base_style(bg),
-            ));
+            // The trailing fill carries the selection background too, or a
+            // selected row's highlight would cut off at its last character
+            // — and a selected *blank* line (whose only visual row is all
+            // padding, `row_width == 0`, so the `mark_range` above had
+            // nothing to mark) would show no selection at all, a visible
+            // hole in the middle of a contiguous range (req 7). The cursor
+            // still wins: its whole-`Line` `REVERSED` patch below lands on
+            // this span like any other.
+            let pad_style = if selected {
+                visual_selection_style()
+            } else {
+                base_style(bg)
+            };
+            line_spans.push(Span::styled(" ".repeat(width - rendered_width), pad_style));
         }
 
         let mut line = Line::from(line_spans);
@@ -955,6 +984,37 @@ fn other_match_style() -> Style {
     Style::default()
         .bg(Color::Rgb(90, 74, 0))
         .add_modifier(Modifier::DIM)
+}
+
+/// Issue #16's visual-line selection background — a cool, low-saturation
+/// indigo chosen to sit apart from every other tint `content_line` can
+/// paint on the same row (the warm add/del greens/reds, the yellow search
+/// highlight, the diagnostic gutter glyphs) without fighting any of them for
+/// attention. The full deterministic precedence a selected row's style is
+/// built up out of, applied in this order (each later step patches over,
+/// rather than replaces, whatever the earlier ones left — see
+/// `text::mark_range`'s docs):
+///
+/// 1. add/del background (baked into `content_spans` at span-build time,
+///    before any mark is ever applied — a `Context` row has none).
+/// 2. syntax highlight foreground (also baked in at span-build time).
+/// 3. this visual-selection background — applied first among the marks, so
+///    every later one still shows through it.
+/// 4. the active-symbol underline (additive; never a background, so it
+///    always stays visible over this).
+/// 5. a search match's background — `current_match_style`/`other_match_style`
+///    — but *only* across its own matched range, not the row: outside that
+///    range this selection's background is the last thing painted, so a
+///    selected-but-unmatched row still reads as selected.
+/// 6. the gutter — diagnostic glyph, comment marker, line-number field —
+///    built as separate prepended spans (see `content_line`'s
+///    `line_spans` assembly) that no mark ever touches, selection included:
+///    a selected row's gutter looks exactly like an unselected one's.
+/// 7. the cursor's reverse-video, applied last, to the whole rendered line
+///    (`Line::patch_style` with `Modifier::REVERSED`) — always wins, since
+///    the cursor's own row must stay unambiguous even mid-selection.
+fn visual_selection_style() -> Style {
+    Style::default().bg(Color::Rgb(25, 25, 70))
 }
 
 /// Issue #5's current-match style: bold plus an explicit, saturated
@@ -1684,6 +1744,310 @@ mod tests {
         assert!(
             !lines[0].spans[..divider_idx].iter().any(is_marked),
             "the empty old side has nothing of its own to mark"
+        );
+    }
+
+    // -- Issue #16: visual-line selection rendering ---------------------
+
+    fn is_visual_selected(s: &Span) -> bool {
+        s.style.bg == Some(Color::Rgb(25, 25, 70))
+    }
+
+    #[test]
+    fn content_line_marks_every_visual_row_of_a_selected_wrapped_line() {
+        let app_rows = vec![row(
+            DiffLineKind::Context,
+            &"x".repeat(50),
+            Some(1),
+            Some(1),
+        )];
+        let mut app = app_with_rows(app_rows);
+        app.cursor = 2; // the one content row — see `app_with_rows`'s flat-idx convention
+        app.toggle_visual();
+        assert!(
+            app.visual_active(),
+            "sanity: V on a Line row must start a selection"
+        );
+
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let lines = content_line(
+            &app,
+            0,
+            0,
+            0,
+            2,
+            30,
+            false,
+            &mut highlighter,
+            &diagnostics,
+            &[],
+            true,
+        );
+        assert!(lines.len() > 1, "sanity: this line must wrap at width 30");
+        for (i, line) in lines.iter().enumerate() {
+            assert!(
+                line.spans.iter().any(is_visual_selected),
+                "visual row {i} of a selected wrapped line must carry the selection \
+                 background; spans: {:?}",
+                line.spans
+            );
+        }
+    }
+
+    #[test]
+    fn content_line_paints_a_selected_blank_line_and_the_trailing_padding() {
+        let app_rows = vec![
+            row(DiffLineKind::Context, "fn a() {}", Some(1), Some(1)),
+            row(DiffLineKind::Context, "", Some(2), Some(2)),
+        ];
+        let mut app = app_with_rows(app_rows);
+        app.cursor = 2; // first content row
+        app.toggle_visual();
+        app.cursor = 3; // extend across the blank row
+
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+
+        // The blank row's only visual row is entirely trailing padding
+        // (`row_width == 0`, so `mark_range` has nothing to mark) — the
+        // padding itself must carry the selection background, or a
+        // contiguous selection shows a hole in the middle (req 7).
+        let blank = content_line(
+            &app,
+            0,
+            0,
+            1,
+            3,
+            30,
+            false,
+            &mut highlighter,
+            &diagnostics,
+            &[],
+            true,
+        );
+        assert_eq!(blank.len(), 1, "an empty line renders one visual row");
+        assert!(
+            blank[0].spans.iter().any(is_visual_selected),
+            "a selected blank line must still show the selection; spans: {:?}",
+            blank[0].spans
+        );
+
+        // A short selected row: the fill past its last character continues
+        // the selection bar to the pane edge instead of cutting it off.
+        let short = content_line(
+            &app,
+            0,
+            0,
+            0,
+            2,
+            30,
+            false,
+            &mut highlighter,
+            &diagnostics,
+            &[],
+            true,
+        );
+        let pad = short[0].spans.last().expect("trailing pad span exists");
+        assert!(
+            is_visual_selected(pad),
+            "trailing padding must extend the selection bar; spans: {:?}",
+            short[0].spans
+        );
+    }
+
+    /// Precedence test (see `visual_selection_style`'s doc): a search match
+    /// on a selected row still shows its own style exactly where it
+    /// matches, while the rest of the selected row keeps the selection
+    /// background — the "partial override" property.
+    #[test]
+    fn content_line_selection_yields_to_a_search_match_only_inside_the_match() {
+        let mut app = app_with_plain_row("alpha needle beta");
+        let matches = search::compute_matches(&app.files, &app.rows, "needle");
+        assert_eq!(matches.len(), 1);
+        app.search = Some(search::SearchHighlight {
+            query: "needle".to_owned(),
+            matches,
+            current: 0,
+            highlight_visible: true,
+        });
+        app.cursor = 2; // the one content row
+        app.toggle_visual();
+        assert!(app.visual_active());
+
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let lines = content_line(
+            &app,
+            0,
+            0,
+            0,
+            2,
+            200,
+            false,
+            &mut highlighter,
+            &diagnostics,
+            &[],
+            true,
+        );
+        assert_eq!(lines.len(), 1);
+
+        let needle_span = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content.as_ref() == "needle")
+            .expect("needle span present");
+        assert_eq!(
+            needle_span.style.bg,
+            Some(Color::Yellow),
+            "the match itself must show the search style, not the selection background"
+        );
+        let beta_span = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("beta"))
+            .expect("beta span present");
+        assert_eq!(
+            beta_span.style.bg,
+            Some(Color::Rgb(25, 25, 70)),
+            "text outside the match keeps the selection background"
+        );
+    }
+
+    #[test]
+    fn content_line_cursor_reverses_a_selected_row_too() {
+        let mut app = app_with_plain_row("selected and also the cursor");
+        app.cursor = 2; // the one content row
+        app.toggle_visual();
+        assert!(app.visual_active());
+
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let lines = content_line(
+            &app,
+            0,
+            0,
+            0,
+            2,
+            200,
+            true, // is_cursor
+            &mut highlighter,
+            &diagnostics,
+            &[],
+            true,
+        );
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].style.add_modifier.contains(Modifier::REVERSED),
+            "the cursor's own row must still reverse-video even while selected — \
+             req 9's deterministic precedence puts the cursor last, always winning"
+        );
+    }
+
+    #[test]
+    fn side_by_side_selection_marks_only_the_selected_del_cell_not_its_paired_add() {
+        let app_rows = vec![
+            row(DiffLineKind::Del, "removed", Some(1), None),
+            row(DiffLineKind::Add, "added", None, Some(1)),
+        ];
+        let mut app = app_with_rows(app_rows);
+        // app.rows: 0 FileHeader, 1 HunkHeader, 2 the Del row, 3 the Add row.
+        app.cursor = 2;
+        app.toggle_visual(); // selects only the Del row (anchor == cursor == 2)
+        assert!(app.visual_active());
+
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let comments = CommentIndex::default();
+        let pair = SideBySideRow::Paired {
+            old: SideCell::Line { flat_idx: 2 },
+            new: SideCell::Line { flat_idx: 3 },
+        };
+        // Wide enough on both sides that neither "removed" nor "added" wraps
+        // — `gutter_width()` alone eats a fixed chunk of whatever width is
+        // requested (see `side_by_side_row_line_marks_a_search_match_on_the_new_side_only`'s
+        // own comment for the same margin).
+        let lines = side_by_side_row_line(
+            &app,
+            pair,
+            gutter_width() + 20,
+            gutter_width() + 20,
+            &mut highlighter,
+            &diagnostics,
+            &comments,
+            true,
+        );
+        assert_eq!(lines.len(), 1);
+        let divider_idx = lines[0]
+            .spans
+            .iter()
+            .position(|s| s.content.as_ref() == "\u{2502}")
+            .expect("every paired row carries the old/new divider");
+        assert!(
+            lines[0].spans[..divider_idx].iter().any(is_visual_selected),
+            "the selected Del row must mark the old cell; spans: {:?}",
+            lines[0].spans
+        );
+        assert!(
+            !lines[0].spans[divider_idx + 1..]
+                .iter()
+                .any(is_visual_selected),
+            "the Add row's new cell shares no `flat_idx` with the selected Del row and \
+             must stay unmarked; spans: {:?}",
+            lines[0].spans
+        );
+    }
+
+    #[test]
+    fn side_by_side_selection_marks_both_cells_of_a_selected_context_row() {
+        let app_rows = vec![row(
+            DiffLineKind::Context,
+            "same both sides",
+            Some(1),
+            Some(1),
+        )];
+        let mut app = app_with_rows(app_rows);
+        app.cursor = 2; // the one content row
+        app.toggle_visual();
+        assert!(app.visual_active());
+
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let comments = CommentIndex::default();
+        // A `Context` row's old and new cells share the same `flat_idx`
+        // (see `flatten_side_by_side`) — the same logical line rendered
+        // twice, so selecting it must mark both.
+        let pair = SideBySideRow::Paired {
+            old: SideCell::Line { flat_idx: 2 },
+            new: SideCell::Line { flat_idx: 2 },
+        };
+        let lines = side_by_side_row_line(
+            &app,
+            pair,
+            gutter_width() + 20,
+            gutter_width() + 20,
+            &mut highlighter,
+            &diagnostics,
+            &comments,
+            true,
+        );
+        assert_eq!(lines.len(), 1);
+        let divider_idx = lines[0]
+            .spans
+            .iter()
+            .position(|s| s.content.as_ref() == "\u{2502}")
+            .expect("every paired row carries the old/new divider");
+        assert!(
+            lines[0].spans[..divider_idx].iter().any(is_visual_selected),
+            "a selected context row must mark the old cell; spans: {:?}",
+            lines[0].spans
+        );
+        assert!(
+            lines[0].spans[divider_idx + 1..]
+                .iter()
+                .any(is_visual_selected),
+            "a selected context row must mark the new cell too; spans: {:?}",
+            lines[0].spans
         );
     }
 }

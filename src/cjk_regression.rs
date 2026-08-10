@@ -389,4 +389,138 @@ mod tests {
         // "前" starts at display column 6.
         assert_eq!(columns.utf8_to_display(1 + "名".len()), 6);
     }
+
+    /// Issue #16's visual-line selection, combined with M13's wrapping and
+    /// M7.3's tab-stop handling: a selected logical line that opens with a
+    /// tab and then wraps several times over a run of wide Japanese
+    /// characters must mark *every* one of its visual rows (not just the
+    /// first), and must not lose or misalign a single character in doing
+    /// so — the same "several pieces wired together" property every other
+    /// test in this module exists to catch, applied to this milestone's own
+    /// rendering path (`ui::diff_view::content_line`, reached here only
+    /// through the public `ui::diff_view::render`, since `content_line`
+    /// itself is private to that module).
+    #[test]
+    fn a_selected_wrapped_line_with_a_tab_and_japanese_text_marks_every_visual_row() {
+        use crate::comments::CommentIndex;
+        use crate::diff::{DiffFile, DiffHunk, DiffLineKind, DiffRow};
+        use crate::keymap::Action;
+        use crate::lsp::DiagnosticsStore;
+        use crate::ui::app::{App, Layout};
+        use crate::ui::diff_view;
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Color;
+        use std::path::PathBuf;
+
+        // A leading tab (advances to the configured stop), then 40 wide
+        // characters (80 display columns) — comfortably wraps into several
+        // rows at a narrow pane.
+        let line = format!("\t{}", "名前".repeat(20));
+
+        let file = DiffFile {
+            old_path: Some("f.rs".to_owned()),
+            new_path: Some("f.rs".to_owned()),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                known_eof: true,
+                rows: vec![DiffRow {
+                    kind: DiffLineKind::Context,
+                    text: line,
+                    old_line: Some(1),
+                    new_line: Some(1),
+                }],
+            }],
+            ..Default::default()
+        };
+        let mut app = App::new("repo".to_owned(), PathBuf::from("/repo"), vec![file]);
+        app.set_viewport_height(30);
+        app.update(Action::Top);
+        app.update(Action::CursorDown); // the hunk header
+        app.update(Action::CursorDown); // the one content row
+        assert_eq!(app.cursor, 2, "sanity: cursor is on the content row");
+        app.toggle_visual();
+        assert!(
+            app.visual_active(),
+            "sanity: V on a Line row must start a selection"
+        );
+
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let comments = CommentIndex::default();
+        let backend = TestBackend::new(30, 20); // narrow enough to wrap the line repeatedly
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                diff_view::render(
+                    frame,
+                    frame.area(),
+                    &app,
+                    &mut highlighter,
+                    Layout::Unified,
+                    &diagnostics,
+                    &comments,
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let selection_bg = Color::Rgb(25, 25, 70);
+        let mut marked_rows = 0;
+        let mut unmarked_content_rows = Vec::new();
+        let mut name_count = 0;
+        let mut mae_count = 0;
+        // Row 0 is `render`'s own " diff " title/border row, rows 1/2 the
+        // file/hunk headers (never wrapped, never selected — this file has
+        // only one content row); every row from 3 onward is either a
+        // visual row this one selected line wrapped into, or blank filler
+        // once the wrapped content runs out. Column 0 is skipped in the
+        // inner loop too: `Borders::LEFT` draws a `│` there on *every* row
+        // (title, headers, content, and blank filler alike), which would
+        // otherwise register as "content" on rows that have none.
+        for y in 3..buffer.area.height {
+            let mut row_marked = false;
+            let mut row_has_content = false;
+            for x in 1..buffer.area.width {
+                let cell = buffer.cell((x, y)).expect("cell in bounds");
+                if cell.bg == selection_bg {
+                    row_marked = true;
+                }
+                match cell.symbol() {
+                    "名" => name_count += 1,
+                    "前" => mae_count += 1,
+                    s if !s.trim().is_empty() => row_has_content = true,
+                    _ => {}
+                }
+            }
+            if row_has_content {
+                if row_marked {
+                    marked_rows += 1;
+                } else {
+                    unmarked_content_rows.push(y);
+                }
+            }
+        }
+
+        assert!(
+            marked_rows >= 3,
+            "the line must wrap into several visible rows (got {marked_rows} marked)"
+        );
+        assert!(
+            unmarked_content_rows.is_empty(),
+            "every visual row carrying this selected line's content must be marked; \
+             unmarked rows: {unmarked_content_rows:?}"
+        );
+        assert_eq!(
+            name_count, 20,
+            "every \u{540d} must survive tab+wrap+selection"
+        );
+        assert_eq!(
+            mae_count, 20,
+            "every \u{524d} must survive tab+wrap+selection"
+        );
+    }
 }

@@ -1246,6 +1246,25 @@ mod tests {
         );
     }
 
+    /// Issue #16's `toggle-visual-line` round-trips through `[keys]`
+    /// overrides the same as any other action — a one-off sanity check
+    /// against the live preset/override path, complementing
+    /// `keymap::tests::action_name_and_action_by_name_round_trip_every_variant`,
+    /// which only proves the name/`Action` mapping itself round-trips.
+    #[test]
+    fn apply_key_overrides_rebinds_toggle_visual_line() {
+        let bindings = keymap::vim_preset(false);
+        let overrides = HashMap::from([("toggle-visual-line".to_owned(), "g v".to_owned())]);
+        let rebound = apply_key_overrides(bindings, &overrides).unwrap();
+        let live = keymap::Keymap::from_bindings(&rebound);
+        assert_eq!(
+            live.binding_for(Action::ToggleVisualLine)
+                .unwrap()
+                .compact_notation(),
+            "gv"
+        );
+    }
+
     #[test]
     fn apply_key_overrides_reports_an_unknown_action_name() {
         let overrides = HashMap::from([("not-a-real-action".to_owned(), "q".to_owned())]);
