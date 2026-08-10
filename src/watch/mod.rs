@@ -210,10 +210,10 @@ fn is_excluded(repo_root: &Path, path: &Path, ignore: &Gitignore) -> bool {
 /// milestone spec calls for: independent of [`spawn`] (which excludes all
 /// of `.katamari/` from the *diff*-refresh watch — see
 /// [`HARDCODED_EXCLUDES`] — since a comment being added or resolved is
-/// never a reason to re-run `git diff`) and independent of `--watch` mode
-/// entirely. `ui::run` starts this unconditionally for any session with a
-/// root diff, so live comment reload works in a plain `ktmr diff` just as
-/// much as `ktmr diff --watch`.
+/// never a reason to re-run `git diff`) and independent of root live-refresh
+/// mode entirely. `ui::run` starts this unconditionally for any session with
+/// a root diff, so live comment reload works in a plain `ktmr diff` just as
+/// much as it does in any other diff session.
 ///
 /// Creates `.katamari/` if it doesn't exist yet (nobody has written a
 /// comment in this repo before) so there's always a directory to watch —

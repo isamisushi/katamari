@@ -145,12 +145,12 @@ pub struct App {
     pub layout: Layout,
     pub pending_keys: String,
     pub should_quit: bool,
-    /// Whether this session is running `ktmr diff --watch` — purely a
-    /// display flag for the status bar's "⦿ watch" indicator; `ui::mod`'s
-    /// event loop decides independently (via whether it was handed a
-    /// [`crate::ui::PreRefreshHook`]) whether to actually spawn a watcher,
-    /// so this field can never drift into claiming watch mode is on when
-    /// nothing is watching.
+    /// Whether this session's root diff has live filesystem refresh enabled —
+    /// purely a display flag for the status bar's "⦿ watch" indicator;
+    /// `ui::mod`'s event loop decides independently (via whether it was
+    /// handed a [`crate::ui::PreRefreshHook`]) whether to actually spawn a
+    /// watcher, so this field can never drift into claiming watch mode is on
+    /// when nothing is watching.
     pub watch_mode: bool,
     /// Whether a commented row's body renders as an inline block underneath
     /// it — `Action::ToggleComments`, default on. The gutter marker itself

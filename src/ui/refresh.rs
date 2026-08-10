@@ -245,7 +245,7 @@ pub trait PreRefreshHook: Send {
 }
 
 /// The default hook: a plain git working tree needs no pre-refresh step,
-/// since `git diff` always reads it directly. Every `--watch` session uses
+/// since `git diff` always reads it directly. Every live-refresh session uses
 /// this until M5 supplies a real jj-backed implementation.
 pub struct NoopPreRefreshHook;
 
