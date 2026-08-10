@@ -1160,12 +1160,16 @@ fn choose_rust_analyzer_lookup(
 }
 
 /// Whether `path` resolves to rustup's proxy executable rather than a
-/// language-server binary. Canonicalizing is intentional: on the supported
-/// Unix hosts rustup exposes this proxy as a symlink, and comparing the
-/// resolved file stem keeps the check independent of the user's `CARGO_HOME`
-/// location.
+/// language-server binary. Two shapes cover the rustup versions in the
+/// wild: modern rustup installs proxies as symlinks back to `rustup`
+/// (canonicalize + compare the resolved stem, independent of the user's
+/// `CARGO_HOME` location), while older rustup hardlinked them — invisible
+/// to canonicalize, but detectable as the same inode as the sibling
+/// `rustup` binary in the same directory. Either miss fails open to the
+/// pre-detection behavior (the proxy is accepted and errors at LSP
+/// initialize), never to a false positive on a real server binary.
 fn is_rustup_proxy(path: &Path) -> bool {
-    std::fs::canonicalize(path)
+    let symlink_to_rustup = std::fs::canonicalize(path)
         .ok()
         .map(|resolved| {
             resolved
@@ -1173,7 +1177,32 @@ fn is_rustup_proxy(path: &Path) -> bool {
                 .and_then(|name| name.to_str())
                 .is_some_and(|stem| stem.eq_ignore_ascii_case("rustup"))
         })
-        .unwrap_or(false)
+        .unwrap_or(false);
+    symlink_to_rustup || is_hardlink_of_sibling_rustup(path)
+}
+
+/// The hardlink half of [`is_rustup_proxy`]: same device and inode as a
+/// `rustup` file sitting next to `path` (rustup only ever links proxies
+/// into its own bin directory, so the sibling check is not a heuristic).
+#[cfg(unix)]
+fn is_hardlink_of_sibling_rustup(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(sibling) = path.parent().map(|dir| dir.join("rustup")) else {
+        return false;
+    };
+    match (std::fs::metadata(path), std::fs::metadata(&sibling)) {
+        (Ok(this), Ok(rustup)) => {
+            // nlink > 1 keeps a copied (not linked) rust-analyzer that
+            // merely lives beside a rustup binary from being misjudged.
+            this.dev() == rustup.dev() && this.ino() == rustup.ino() && this.nlink() > 1
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn is_hardlink_of_sibling_rustup(_path: &Path) -> bool {
+    false
 }
 
 /// A more useful Rust hint than the generic "not found" message when rustup
@@ -2234,6 +2263,29 @@ mod tests {
         std::os::unix::fs::symlink(&rustup, &proxy).unwrap();
 
         assert!(is_rustup_proxy(&proxy));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_rustup_proxy_detects_an_old_rustup_hardlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let rustup = dir.path().join("rustup");
+        let proxy = dir.path().join("rust-analyzer");
+        std::fs::write(&rustup, b"proxy").unwrap();
+        std::fs::hard_link(&rustup, &proxy).unwrap();
+
+        assert!(is_rustup_proxy(&proxy));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_binary_beside_a_rustup_file_is_not_a_proxy() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("rustup"), b"rustup").unwrap();
+        let server = dir.path().join("rust-analyzer");
+        std::fs::write(&server, b"real server").unwrap();
+
+        assert!(!is_rustup_proxy(&server));
     }
 
     #[test]
