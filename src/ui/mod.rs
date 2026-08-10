@@ -566,6 +566,10 @@ fn event_loop(
     // against the live diff when the result lands, not by racing counters.
     let mut units_panel: Option<UnitsPanel> = None;
     let mut units_setup: Option<UnitsSetupState> = None;
+    // `.` — whether the status bar shows every curated hint or just the
+    // minimal always-on subset (the default). Session-local chrome, reset
+    // each launch on purpose: a collapsed-by-default bar is the feature.
+    let mut hints_expanded = false;
     let mut pending_units: Option<Receiver<Result<crate::groups::Grouping, String>>> = None;
     let mut units_status: Option<String> = None;
     let mut jump_stack = JumpStack::new();
@@ -632,8 +636,10 @@ fn event_loop(
         // why side-by-side is a deliberately separate concern from this).
         let (content_height, content_width) = match stack.top() {
             View::Diff(app) => {
-                let status_height =
-                    hints::required_height(&hints::diff_view_items(keymap), area.width);
+                let status_height = hints::required_height(
+                    &hints::diff_view_items(keymap, hints_expanded),
+                    area.width,
+                );
                 let diff_area = diff_layout(area, app.sidebar_visible, status_height).diff;
                 // Mirrors `draw`'s banner split exactly — viewport height
                 // fed to scroll math must equal the rows content actually
@@ -650,8 +656,10 @@ fn event_loop(
                 )
             }
             View::File(_) => {
-                let status_height =
-                    hints::required_height(&hints::file_view_items(keymap), area.width);
+                let status_height = hints::required_height(
+                    &hints::file_view_items(keymap, hints_expanded),
+                    area.width,
+                );
                 let content_area = file_view::layout(area, status_height).content;
                 (
                     content_area.height,
@@ -659,13 +667,17 @@ fn event_loop(
                 )
             }
             View::Timeline(_) => {
-                let status_height =
-                    hints::required_height(&hints::timeline_view_items(keymap), area.width);
+                let status_height = hints::required_height(
+                    &hints::timeline_view_items(keymap, hints_expanded),
+                    area.width,
+                );
                 (timeline_view::layout(area, status_height).diff.height, 0)
             }
             View::Log(_) => {
-                let status_height =
-                    hints::required_height(&hints::log_view_items(keymap), area.width);
+                let status_height = hints::required_height(
+                    &hints::log_view_items(keymap, hints_expanded),
+                    area.width,
+                );
                 (log_view::layout(area, status_height).list.height, 0)
             }
         };
@@ -816,6 +828,7 @@ fn event_loop(
                 search_prompt.as_ref(),
                 jj_repo.is_some(),
                 &key_display,
+                hints_expanded,
             )
         })?;
 
@@ -1073,6 +1086,7 @@ fn event_loop(
                                     &mut watch_paused,
                                     watch_active,
                                     &mut watch_status,
+                                    &mut hints_expanded,
                                 );
                             }
                             StepResult::Pending => {
@@ -1356,6 +1370,7 @@ fn handle_action(
     watch_paused: &mut bool,
     watch_active: bool,
     watch_status: &mut Option<WatchStatus>,
+    hints_expanded: &mut bool,
 ) {
     // The scope-menu popup's *list* half intercepts its own navigation
     // keys the same way `refs_panel`/`hover_state` do below — `Revision`
@@ -1737,6 +1752,9 @@ fn handle_action(
         }
         Action::ToggleTimeline => open_or_close_timeline(stack, jj_repo, goto_status),
         Action::ToggleLogView => open_or_close_log(stack, goto_status),
+        // Pure chrome: works identically in every view, which is why it
+        // lives on the event loop rather than any `View::update`.
+        Action::ToggleHints => *hints_expanded = !*hints_expanded,
         // Open (reaching here means the panel isn't open — the
         // interception block above closes it otherwise): a cached grouping
         // for this exact diff shows instantly; a miss spawns the agent CLI
@@ -2348,10 +2366,11 @@ fn draw(
     search_prompt: Option<&search::SearchPromptState>,
     jj_available: bool,
     key_display: &key_display::KeyDisplayState,
+    hints_expanded: bool,
 ) {
     match view {
         View::Diff(app) => {
-            let hint_items = hints::diff_view_items(keymap);
+            let hint_items = hints::diff_view_items(keymap, hints_expanded);
             let status_height = hints::required_height(&hint_items, frame.area().width);
             let areas = diff_layout(frame.area(), app.sidebar_visible, status_height);
             if let Some(sidebar_area) = areas.sidebar {
@@ -2414,7 +2433,7 @@ fn draw(
             key_display::render(frame, diff_area, key_display);
         }
         View::File(file) => {
-            let hint_items = hints::file_view_items(keymap);
+            let hint_items = hints::file_view_items(keymap, hints_expanded);
             let status_height = hints::required_height(&hint_items, frame.area().width);
             let areas = file_view::layout(frame.area(), status_height);
             file_view::render(frame, areas.content, file, diagnostics);
@@ -2429,11 +2448,19 @@ fn draw(
         }
         View::Timeline(timeline) => {
             let area = frame.area();
-            timeline_view::render(frame, area, timeline, highlighter, keymap, key_display);
+            timeline_view::render(
+                frame,
+                area,
+                timeline,
+                highlighter,
+                keymap,
+                key_display,
+                hints_expanded,
+            );
         }
         View::Log(log) => {
             let area = frame.area();
-            log_view::render(frame, area, log, keymap, key_display);
+            log_view::render(frame, area, log, keymap, key_display, hints_expanded);
         }
     }
 

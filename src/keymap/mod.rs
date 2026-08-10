@@ -130,6 +130,14 @@ pub enum Action {
     /// last-record-wins fold. A no-op outside
     /// [`crate::ui::view::View::Diff`].
     RegenerateUnits,
+    /// Expands the status bar's hint rows from the minimal always-shown
+    /// subset to the full curated list, and back — see
+    /// [`crate::ui::hints`]'s collapsed/expanded split. Intercepted by
+    /// `ui::mod`'s event loop (the expanded flag is event-loop chrome
+    /// state shared by every view, not something any one `App`/`FileView`
+    /// owns), and deliberately view-independent: the hint bar exists on
+    /// all of them.
+    ToggleHints,
     /// Opens the M6 comment-compose overlay, anchored to the cursor's
     /// current row — `ui::mod`'s event loop intercepts this rather than
     /// forwarding it through `App::update`, since it needs the repo root
@@ -554,6 +562,7 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("o", Action::OpenScopeMenu),
         ("u", Action::ToggleUnits),
         ("U", Action::RegenerateUnits),
+        (".", Action::ToggleHints),
         ("v", Action::ToggleRangeSelect),
         ("c", Action::AddComment),
         ("C", Action::ToggleComments),
@@ -631,6 +640,7 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         // `s`: semantic units have no emacs convention to defer to.
         ("u", Action::ToggleUnits),
         ("U", Action::RegenerateUnits),
+        (".", Action::ToggleHints),
         ("C-Space", Action::ToggleRangeSelect),
         ("C-c C-c", Action::AddComment),
         ("C", Action::ToggleComments),
@@ -709,6 +719,7 @@ pub fn action_name(action: Action) -> &'static str {
         Action::OpenScopeMenu => "open-scope-menu",
         Action::ToggleUnits => "toggle-units",
         Action::RegenerateUnits => "regenerate-units",
+        Action::ToggleHints => "toggle-hints",
         Action::AddComment => "add-comment",
         Action::ToggleComments => "toggle-comments",
         Action::ExpandFold => "expand-fold",
@@ -756,6 +767,7 @@ pub fn action_by_name(name: &str) -> Option<Action> {
         "open-scope-menu" => Action::OpenScopeMenu,
         "toggle-units" => Action::ToggleUnits,
         "regenerate-units" => Action::RegenerateUnits,
+        "toggle-hints" => Action::ToggleHints,
         "add-comment" => Action::AddComment,
         "toggle-comments" => Action::ToggleComments,
         "expand-fold" => Action::ExpandFold,
@@ -1107,6 +1119,7 @@ mod tests {
             Action::PrevMatch,
             Action::ToggleUnits,
             Action::RegenerateUnits,
+            Action::ToggleHints,
         ];
         for action in all {
             let name = action_name(action);
@@ -1256,7 +1269,7 @@ mod tests {
     /// test.
     #[test]
     fn every_vim_and_emacs_binding_covers_every_action_exactly_once() {
-        const ACTION_COUNT: usize = 38;
+        const ACTION_COUNT: usize = 39;
         for ci_distinguishable in [false, true] {
             for preset in [
                 vim_preset(ci_distinguishable),

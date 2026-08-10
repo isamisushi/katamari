@@ -379,8 +379,9 @@ pub fn render(
     highlighter: &mut crate::highlight::LineHighlighter,
     keymap: &Keymap,
     key_display: &crate::ui::key_display::KeyDisplayState,
+    hints_expanded: bool,
 ) {
-    let hint_items = hints::timeline_view_items(keymap);
+    let hint_items = hints::timeline_view_items(keymap, hints_expanded);
     let status_height = hints::required_height(&hint_items, area.width);
     let areas = layout(area, status_height);
     render_list(frame, areas.list, view);

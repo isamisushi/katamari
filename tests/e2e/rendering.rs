@@ -53,11 +53,16 @@ fn narrow_terminal_wraps_hints() {
 
     h.wait_for_text("README.md");
 
+    // The collapsed default fits one line even at 60 columns — wrapping
+    // only has something to wrap once the full list is expanded with `.`.
+    h.send(Key::Char('.'));
+    h.wait_for_text("hunk");
+
     let contents = h.screen_contents();
     let wrapped = hint_line_count(&contents);
     assert!(
         wrapped > 1,
-        "expected the hint bar to wrap onto more than one line at 60 columns, got {wrapped}\nscreen:\n{contents}"
+        "expected the expanded hint bar to wrap onto more than one line at 60 columns, got {wrapped}\nscreen:\n{contents}"
     );
 
     // The M9 bug this guards against: an item pushed past the first hint

@@ -262,6 +262,7 @@ impl FileView {
             | Action::ToggleLogView
             | Action::ToggleUnits
             | Action::RegenerateUnits
+            | Action::ToggleHints
             | Action::ToggleRangeSelect
             | Action::OpenScopeMenu
             | Action::AddComment

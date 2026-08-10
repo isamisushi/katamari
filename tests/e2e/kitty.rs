@@ -33,9 +33,12 @@ fn kitty_supported() {
 
     // M9b's discoverability fix, observed for real: a kitty-capable
     // terminal's hint bar names `C-i` as the jump-forward alias, matching
-    // neovim.
-    h.wait_for_text("C-o/C-i");
+    // neovim. The jump hint only appears in the *expanded* hint bar (the
+    // collapsed default shows the minimal subset — see
+    // `hints::diff_view_items`), so expand it first with `.`.
     h.wait_for_text("README.md");
+    h.send(Key::Char('.'));
+    h.wait_for_text("C-o/C-i");
 
     // `Ctrl-o` (0x0f, unambiguous in either mode) with an empty back-stack.
     h.send(Key::CtrlO);
@@ -81,9 +84,10 @@ fn kitty_unsupported() {
     );
 
     // The fallback hint: no kitty protocol, so jump-forward's only bound
-    // key is `C-t`.
-    h.wait_for_text("C-o/C-t");
+    // key is `C-t`. Expanded-bar-only, same as the supported case above.
     h.wait_for_text("README.md");
+    h.send(Key::Char('.'));
+    h.wait_for_text("C-o/C-t");
 
     h.send(Key::CtrlO);
     h.wait_for_text("jump: no earlier position");

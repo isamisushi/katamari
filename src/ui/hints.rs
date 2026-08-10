@@ -193,14 +193,50 @@ pub fn render_lines(wrapped: &[String]) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// The trailing fold/unfold item every view's list ends with: `". more"`
+/// when collapsed (there is more to see), `". less"` when expanded (there
+/// is a way back). Always last so it reads as the bar's own control, not
+/// one of the view's hints — and always *present*, because a collapsed bar
+/// whose expansion key is invisible would make the hidden hints
+/// undiscoverable, defeating the entire hint bar.
+fn toggle_item(keymap: &Keymap, expanded: bool) -> Option<HintItem> {
+    HintItem::for_actions(
+        keymap,
+        &[Action::ToggleHints],
+        if expanded { "less" } else { "more" },
+    )
+}
+
 /// [`View::Diff`](crate::ui::View::Diff)'s curated hints, most-useful-first.
-/// Jump back/forward (`Ctrl-o`/`Ctrl-t`) sits second, right after basic
-/// cursor movement — this is the M9 discoverability fix: the binding always
-/// existed, but the old fixed-width, non-wrapping status bar buried it
-/// eleventh out of sixteen items, past where most terminals cut the line
-/// off. Everything below is the same set the pre-M9 hardcoded `HINTS`
-/// constant listed, just reordered.
-pub fn diff_view_items(keymap: &Keymap) -> Vec<HintItem> {
+///
+/// Collapsed (`expanded == false`, every session's default) shows only the
+/// keys a reviewer needs constantly or couldn't otherwise discover —
+/// movement, the units view, help, quit — plus the `". more"` toggle;
+/// one calm line instead of three busy ones. Expanded shows the full
+/// curated list. Jump back/forward (`Ctrl-o`/`Ctrl-t`) sits second there,
+/// right after basic cursor movement — the M9 discoverability fix: the
+/// binding always existed, but the old fixed-width, non-wrapping status
+/// bar buried it eleventh out of sixteen items, past where most terminals
+/// cut the line off.
+pub fn diff_view_items(keymap: &Keymap, expanded: bool) -> Vec<HintItem> {
+    let units = HintItem::for_actions(
+        keymap,
+        &[Action::ToggleUnits, Action::RegenerateUnits],
+        "units",
+    );
+    if !expanded {
+        return [
+            HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "move"),
+            units,
+            HintItem::for_actions(keymap, &[Action::AddComment], "comment"),
+            HintItem::for_actions(keymap, &[Action::OpenHelp], "help"),
+            HintItem::for_actions(keymap, &[Action::Quit], "quit"),
+            toggle_item(keymap, false),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+    }
     [
         HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "move"),
         HintItem::for_actions(keymap, &[Action::JumpBack, Action::JumpForward], "jump"),
@@ -212,6 +248,7 @@ pub fn diff_view_items(keymap: &Keymap) -> Vec<HintItem> {
         // below) rather than being the kind of low-priority entry that
         // policy is designed to drop first.
         HintItem::for_actions(keymap, &[Action::OpenHelp], "help"),
+        units,
         HintItem::for_actions(keymap, &[Action::GotoDefinition], "def"),
         HintItem::for_actions(keymap, &[Action::FindReferences], "refs"),
         HintItem::for_actions(keymap, &[Action::Top, Action::Bottom], "top/bottom"),
@@ -244,6 +281,7 @@ pub fn diff_view_items(keymap: &Keymap) -> Vec<HintItem> {
         HintItem::for_actions(keymap, &[Action::NextSymbol], "symbol"),
         HintItem::for_actions(keymap, &[Action::ToggleComments], "toggle"),
         HintItem::for_actions(keymap, &[Action::Quit], "quit"),
+        toggle_item(keymap, true),
     ]
     .into_iter()
     .flatten()
@@ -253,8 +291,21 @@ pub fn diff_view_items(keymap: &Keymap) -> Vec<HintItem> {
 /// [`View::File`](crate::ui::View::File)'s curated hints — the same
 /// reordering rationale as [`diff_view_items`] (jump promoted to second),
 /// trimmed to the subset that applies outside a diff (no hunk/file
-/// navigation, no comments, no sidebar/layout toggles).
-pub fn file_view_items(keymap: &Keymap) -> Vec<HintItem> {
+/// navigation, no comments, no sidebar/layout toggles). The same
+/// collapsed/expanded split too — see [`diff_view_items`].
+pub fn file_view_items(keymap: &Keymap, expanded: bool) -> Vec<HintItem> {
+    if !expanded {
+        return [
+            HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "move"),
+            HintItem::for_actions(keymap, &[Action::JumpBack, Action::JumpForward], "jump"),
+            HintItem::for_actions(keymap, &[Action::OpenHelp], "help"),
+            HintItem::for_actions(keymap, &[Action::Quit], "quit"),
+            toggle_item(keymap, false),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+    }
     [
         HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "move"),
         HintItem::for_actions(keymap, &[Action::JumpBack, Action::JumpForward], "jump"),
@@ -275,6 +326,7 @@ pub fn file_view_items(keymap: &Keymap) -> Vec<HintItem> {
         HintItem::for_actions(keymap, &[Action::Hover], "hover"),
         HintItem::for_actions(keymap, &[Action::NextSymbol], "symbol"),
         HintItem::for_actions(keymap, &[Action::Quit], "quit"),
+        toggle_item(keymap, true),
     ]
     .into_iter()
     .flatten()
@@ -284,8 +336,24 @@ pub fn file_view_items(keymap: &Keymap) -> Vec<HintItem> {
 /// [`View::Timeline`](crate::ui::View::Timeline)'s curated hints. No jump
 /// item here — unlike the diff/file views, `Ctrl-o`/`Ctrl-t` have nothing to
 /// retrace from a read-only timeline (see `View::jump_entry`'s docs on why
-/// it always returns `None` for this view).
-pub fn timeline_view_items(keymap: &Keymap) -> Vec<HintItem> {
+/// it always returns `None` for this view). Same collapsed/expanded split
+/// as [`diff_view_items`].
+pub fn timeline_view_items(keymap: &Keymap, expanded: bool) -> Vec<HintItem> {
+    if !expanded {
+        return [
+            HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "select"),
+            HintItem::for_actions(keymap, &[Action::OpenHelp], "help"),
+            HintItem::for_actions(
+                keymap,
+                &[Action::Quit, Action::Cancel, Action::ToggleTimeline],
+                "close",
+            ),
+            toggle_item(keymap, false),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+    }
     [
         HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "select"),
         HintItem::for_actions(keymap, &[Action::OpenHelp], "help"),
@@ -297,6 +365,7 @@ pub fn timeline_view_items(keymap: &Keymap) -> Vec<HintItem> {
             &[Action::Quit, Action::Cancel, Action::ToggleTimeline],
             "close",
         ),
+        toggle_item(keymap, true),
     ]
     .into_iter()
     .flatten()
@@ -306,8 +375,25 @@ pub fn timeline_view_items(keymap: &Keymap) -> Vec<HintItem> {
 /// [`View::Log`](crate::ui::View::Log)'s curated hints. No jump item, the
 /// same reason [`timeline_view_items`] has none — a read-only history list
 /// has nowhere for `Ctrl-o`/`Ctrl-i` to retrace from (see
-/// `View::jump_entry`'s docs).
-pub fn log_view_items(keymap: &Keymap) -> Vec<HintItem> {
+/// `View::jump_entry`'s docs). Same collapsed/expanded split as
+/// [`diff_view_items`].
+pub fn log_view_items(keymap: &Keymap, expanded: bool) -> Vec<HintItem> {
+    if !expanded {
+        return [
+            HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "select"),
+            HintItem::for_actions(keymap, &[Action::Confirm], "open diff"),
+            HintItem::for_actions(keymap, &[Action::OpenHelp], "help"),
+            HintItem::for_actions(
+                keymap,
+                &[Action::Quit, Action::Cancel, Action::ToggleLogView],
+                "close",
+            ),
+            toggle_item(keymap, false),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+    }
     [
         HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "select"),
         HintItem::for_actions(keymap, &[Action::OpenHelp], "help"),
@@ -318,6 +404,7 @@ pub fn log_view_items(keymap: &Keymap) -> Vec<HintItem> {
             &[Action::Quit, Action::Cancel, Action::ToggleLogView],
             "close",
         ),
+        toggle_item(keymap, true),
     ]
     .into_iter()
     .flatten()
@@ -489,7 +576,7 @@ mod tests {
     #[test]
     fn diff_view_items_lists_jump_back_forward_second() {
         let keymap = Keymap::from_bindings(&vim_preset(false));
-        let items = diff_view_items(&keymap);
+        let items = diff_view_items(&keymap, true);
         assert_eq!(items[0].display(), "j/k move");
         assert_eq!(items[1].display(), "C-o/C-t jump");
     }
@@ -497,7 +584,7 @@ mod tests {
     #[test]
     fn file_view_items_lists_jump_back_forward_second() {
         let keymap = Keymap::from_bindings(&vim_preset(false));
-        let items = file_view_items(&keymap);
+        let items = file_view_items(&keymap, true);
         assert_eq!(items[0].display(), "j/k move");
         assert_eq!(items[1].display(), "C-o/C-t jump");
     }
@@ -505,7 +592,7 @@ mod tests {
     #[test]
     fn diff_view_items_show_emacs_notation_under_the_emacs_preset() {
         let keymap = Keymap::from_bindings(&emacs_preset(false));
-        let items = diff_view_items(&keymap);
+        let items = diff_view_items(&keymap, true);
         let def = items.iter().find(|i| i.label == "def").unwrap();
         assert_eq!(def.display(), "M-. def");
         let refs = items.iter().find(|i| i.label == "refs").unwrap();
@@ -524,7 +611,7 @@ mod tests {
     #[test]
     fn fold_and_help_hints_do_not_push_quit_off_the_status_bar_at_a_realistic_width() {
         let keymap = Keymap::from_bindings(&vim_preset(false));
-        let items = diff_view_items(&keymap);
+        let items = diff_view_items(&keymap, true);
         assert!(
             items.iter().any(|i| i.display().starts_with("zo/zc")),
             "the fold hint should be present in the curated list"
@@ -567,29 +654,83 @@ mod tests {
     fn help_hint_is_visible_in_file_timeline_and_log_lists_at_a_realistic_width() {
         let keymap = Keymap::from_bindings(&vim_preset(false));
 
-        let file_items = file_view_items(&keymap);
+        let file_items = file_view_items(&keymap, true);
         let file_wrapped = wrap_for_area(&file_items, 100);
         assert!(file_wrapped.len() <= MAX_HINT_LINES);
         assert!(file_wrapped.iter().any(|l| l.contains("? help")));
         assert!(file_wrapped.iter().any(|l| l.contains("quit")));
 
-        let timeline_items = timeline_view_items(&keymap);
+        let timeline_items = timeline_view_items(&keymap, true);
         let timeline_wrapped = wrap_for_area(&timeline_items, 100);
         assert!(timeline_wrapped.len() <= MAX_HINT_LINES);
         assert!(timeline_wrapped.iter().any(|l| l.contains("? help")));
         assert!(timeline_wrapped.iter().any(|l| l.contains("close")));
 
-        let log_items = log_view_items(&keymap);
+        let log_items = log_view_items(&keymap, true);
         let log_wrapped = wrap_for_area(&log_items, 100);
         assert!(log_wrapped.len() <= MAX_HINT_LINES);
         assert!(log_wrapped.iter().any(|l| l.contains("? help")));
         assert!(log_wrapped.iter().any(|l| l.contains("close")));
     }
 
+    /// The collapsed default must be genuinely minimal — a single calm
+    /// line at any realistic width — while still carrying the three
+    /// things that make the rest discoverable: the units view (`u`, the
+    /// headline feature), `?` help, and the `.` toggle that reveals
+    /// everything else.
+    #[test]
+    fn collapsed_diff_hints_fit_one_line_and_keep_units_help_and_the_toggle() {
+        let keymap = Keymap::from_bindings(&vim_preset(false));
+        let items = diff_view_items(&keymap, false);
+        let wrapped = wrap_for_area(&items, 100);
+        assert_eq!(
+            wrapped.len(),
+            1,
+            "collapsed hints must be one line; got:\n{wrapped:?}"
+        );
+        let line = &wrapped[0];
+        assert!(line.contains("u/U units"), "{line}");
+        assert!(line.contains("? help"), "{line}");
+        assert!(line.contains(". more"), "{line}");
+        assert!(line.contains("q quit"), "{line}");
+    }
+
+    #[test]
+    fn expanded_diff_hints_show_units_and_end_with_the_less_toggle() {
+        let keymap = Keymap::from_bindings(&vim_preset(false));
+        let items = diff_view_items(&keymap, true);
+        assert!(items.iter().any(|i| i.display() == "u/U units"));
+        assert_eq!(
+            items.last().unwrap().display(),
+            ". less",
+            "the way back must be the last thing the expanded bar says"
+        );
+    }
+
+    #[test]
+    fn every_view_keeps_the_toggle_visible_in_both_states() {
+        let keymap = Keymap::from_bindings(&vim_preset(false));
+        for expanded in [false, true] {
+            let expected = if expanded { ". less" } else { ". more" };
+            for (label, items) in [
+                ("diff", diff_view_items(&keymap, expanded)),
+                ("file", file_view_items(&keymap, expanded)),
+                ("timeline", timeline_view_items(&keymap, expanded)),
+                ("log", log_view_items(&keymap, expanded)),
+            ] {
+                let wrapped = wrap_for_area(&items, 100);
+                assert!(
+                    wrapped.iter().any(|l| l.contains(expected)),
+                    "{label} (expanded={expanded}) must show {expected:?}; got:\n{wrapped:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn timeline_view_items_has_no_jump_item() {
         let keymap = Keymap::from_bindings(&vim_preset(false));
-        let items = timeline_view_items(&keymap);
+        let items = timeline_view_items(&keymap, true);
         assert!(items.iter().all(|i| i.label != "jump"));
     }
 
@@ -609,14 +750,14 @@ mod tests {
     #[test]
     fn diff_view_items_jump_hint_shows_c_i_when_ci_distinguishable() {
         let keymap = Keymap::from_bindings(&vim_preset(true));
-        let items = diff_view_items(&keymap);
+        let items = diff_view_items(&keymap, true);
         assert_eq!(items[1].display(), "C-o/C-i jump");
     }
 
     #[test]
     fn diff_view_items_jump_hint_shows_c_t_when_not_ci_distinguishable() {
         let keymap = Keymap::from_bindings(&vim_preset(false));
-        let items = diff_view_items(&keymap);
+        let items = diff_view_items(&keymap, true);
         assert_eq!(items[1].display(), "C-o/C-t jump");
     }
 
@@ -625,7 +766,7 @@ mod tests {
         // Not diff-view-specific: `file_view_items` builds its jump hint the
         // same way, off the same live keymap.
         let keymap = Keymap::from_bindings(&emacs_preset(true));
-        let items = file_view_items(&keymap);
+        let items = file_view_items(&keymap, true);
         assert_eq!(items[1].display(), "C-o/C-i jump");
     }
 }

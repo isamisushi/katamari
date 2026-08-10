@@ -860,6 +860,7 @@ impl App {
             | Action::OpenScopeMenu
             | Action::ToggleUnits
             | Action::RegenerateUnits
+            | Action::ToggleHints
             | Action::ToggleRangeSelect => {}
             // `ui::mod` intercepts this before it reaches here too, same
             // bucket as `ToggleTimeline`/`ToggleLogView`/`OpenScopeMenu`
