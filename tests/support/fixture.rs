@@ -6,6 +6,17 @@
 //! An E2E suite that accidentally depended on network access (an
 //! auto-install) or a locally installed toolchain would be flaky in exactly
 //! the ways this milestone is trying to eliminate.
+//!
+//! [`lsp_readiness_repo`] is the one deliberate exception: issue #11's
+//! readiness coverage needs a real, controllable server lifecycle to press
+//! hover/definition/references against while it's still starting, which no
+//! built-in language could give this suite without an auto-install,
+//! network access, or a locally installed toolchain — exactly what every
+//! other fixture here exists to avoid. It stays safe the same way a custom
+//! `[lsp.servers.<id>]` entry always is: a fabricated file extension no
+//! built-in [`katamari`'s `Language::detect`] has ever heard of, routed to
+//! a small script this repository controls end to end (see
+//! `support::fake_lsp_server`'s docs) rather than a real language server.
 
 use std::path::Path;
 use std::process::Command;
@@ -229,6 +240,69 @@ pub fn search_repo() -> FixtureRepo {
         appended.join("\n")
     );
     std::fs::write(root.join("search.txt"), content).unwrap();
+
+    FixtureRepo { dir }
+}
+
+/// A repo whose sole working-tree edit adds `main.stub` — an extension
+/// nothing built into katamari has ever heard of — paired with a
+/// `.katamari/config.toml` `[lsp.servers.stubls]` entry that claims `.stub`
+/// and points at `support::fake_lsp_server`'s script (see the module docs
+/// above for why this is the one fixture allowed to make katamari actually
+/// spawn something). The committed and working-tree content share the
+/// first two lines (`alpha`/`beta`, both `Context` rows once diffed) with
+/// `GOTO_TARGET_TOKEN` added as a third — any of the three is a valid
+/// hover/goto target (katamari's `App::hover_query` accepts `Context` and
+/// `Add` rows alike), so a test can press an action from wherever `j`/`k`
+/// lands the cursor without needing to know the diff's exact row layout.
+///
+/// `init_delay_secs` is how long the fake server waits before answering
+/// `initialize` — the window a test presses actions during to prove they
+/// report "not ready" instead of queuing. `definition_delay_secs` is how
+/// long it waits before answering `textDocument/definition` once `Ready` —
+/// for a test that wants to prove movement stays responsive while a
+/// *ready* server is still slow to answer the request itself.
+/// Whether the fake-LSP fixture can run at all: `fake_lsp_server.py` needs
+/// a `python3` on `$PATH`, the one external dependency this otherwise
+/// hermetic support module has (see the module doc). Tests that spawn
+/// [`lsp_readiness_repo`] should skip (with an eprintln, so the skip is
+/// visible in `--nocapture` runs) rather than fail when it's missing —
+/// a contributor without python3 would otherwise see the spawn collapse
+/// into `Unavailable: command not found` and the test time out waiting
+/// for "is starting" text that can never appear, which reads like a
+/// katamari regression instead of a missing tool.
+pub fn python3_available() -> bool {
+    std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+pub fn lsp_readiness_repo(init_delay_secs: f64, definition_delay_secs: f64) -> FixtureRepo {
+    let dir = init_repo();
+    let root = dir.path();
+
+    std::fs::write(root.join("main.stub"), "alpha\nbeta\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "initial commit"]);
+
+    std::fs::write(root.join("main.stub"), "alpha\nbeta\nGOTO_TARGET_TOKEN\n").unwrap();
+
+    let server_script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/fake_lsp_server.py"
+    );
+    std::fs::create_dir_all(root.join(".katamari")).unwrap();
+    std::fs::write(
+        root.join(".katamari").join("config.toml"),
+        format!(
+            "[lsp.servers.stubls]\n\
+             command = \"python3\"\n\
+             args = [\"{server_script}\", \"{init_delay_secs}\", \"{definition_delay_secs}\"]\n\
+             extensions = [\"stub\"]\n"
+        ),
+    )
+    .unwrap();
 
     FixtureRepo { dir }
 }

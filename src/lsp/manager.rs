@@ -85,6 +85,55 @@ pub enum ServerState {
     },
 }
 
+/// What a hover/definition/references press should do given the state of
+/// the server that would handle it — see [`classify_action_readiness`].
+/// One classification, used by every one of `ui::mod`'s three action arms,
+/// so "not ready" reads consistently regardless of which of the three
+/// fired it (issue #11), instead of three matches on [`ServerState`] that
+/// could quietly drift apart. Every non-`Ready` case here means the same
+/// thing downstream: explain, don't dispatch — a not-ready action must
+/// never queue the reviewer's actual hover/goto/references request behind
+/// a server that might not finish starting until long after they've moved
+/// on (see [`LspManager::ensure_started`]'s docs for the one exception
+/// that's still allowed to start the server itself).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionReadiness {
+    /// Dispatch the request now, exactly as before this milestone.
+    Ready,
+    /// No server has ever been asked to start for this target. The caller
+    /// should start one (see [`LspManager::ensure_started`]) without
+    /// attaching the action itself to it.
+    NotStarted,
+    /// Already starting (resolving/spawning/handshaking); nothing new to
+    /// kick off, just tell the reviewer to retry once it's up.
+    Starting,
+    /// Auto-install is downloading/building this server; `message` is the
+    /// live progress line [`ServerState::Installing`] already carries.
+    Installing { message: String },
+    /// Unavailable or crashed, with the existing actionable reason —
+    /// [`ServerState::Unavailable`] and [`ServerState::Crashed`] collapse
+    /// to this one case since both mean the same thing to a reviewer
+    /// pressing an action right now: nothing will answer without outside
+    /// intervention, and `reason` already says what that intervention is.
+    Unavailable { reason: String },
+}
+
+/// The classification [`ActionReadiness`] is built from — a plain function
+/// over [`ServerState`] (not a method on [`LspManager`]) so every variant
+/// is testable in isolation, with no manager, lock, or spawned server in
+/// the picture.
+pub fn classify_action_readiness(state: ServerState) -> ActionReadiness {
+    match state {
+        ServerState::Ready => ActionReadiness::Ready,
+        ServerState::NotStarted => ActionReadiness::NotStarted,
+        ServerState::Starting => ActionReadiness::Starting,
+        ServerState::Installing { message } => ActionReadiness::Installing { message },
+        ServerState::Unavailable { reason } | ServerState::Crashed { reason } => {
+            ActionReadiness::Unavailable { reason }
+        }
+    }
+}
+
 type ServerKey = (LangKey, PathBuf);
 
 /// One spawned server's events, tagged with which server sent them —
@@ -787,30 +836,16 @@ impl LspManager {
                 op.fail(LspError::Io(reason));
             }
             ServerState::NotStarted | ServerState::Starting | ServerState::Installing { .. } => {
-                let starting_now = matches!(entry.state, ServerState::NotStarted);
                 // Only actually move to `Starting` from `NotStarted` — a
                 // request arriving mid-install must not clobber the
                 // `Installing` message `resolve_or_install`'s progress
                 // callback is actively updating.
-                if starting_now {
-                    entry.state = ServerState::Starting;
-                    entry.generation = entry.generation.saturating_add(1);
-                    entry.expected_stop = false;
-                    entry.versions.clear();
-                    entry.diagnostic_result_ids.clear();
-                    entry.push_seen = false;
-                }
-                let generation = entry.generation;
-                if starting_now && let Some(observer) = &self.observer {
-                    let identity = ServerIdentity::new(key.0.clone(), key.1.clone());
-                    observer.begin_generation_at(identity.clone(), generation, None, Vec::new());
-                    observer.transition(
-                        &identity,
-                        generation,
-                        ServerPhase::Resolving,
-                        "resolving server",
-                    );
-                }
+                let starting_now = matches!(entry.state, ServerState::NotStarted);
+                let generation = if starting_now {
+                    self.begin_starting(entry, &key)
+                } else {
+                    entry.generation
+                };
                 enqueue(
                     entry,
                     file,
@@ -831,11 +866,75 @@ impl LspManager {
         }
     }
 
+    /// Transitions `entry` from `NotStarted` to `Starting`: bumps the
+    /// generation counter, clears the previous generation's per-server
+    /// bookkeeping (open documents, pull `resultId`s, the push-seen latch),
+    /// and tells the observer a new generation began resolving. Returns the
+    /// new generation. Shared by [`Self::submit`] (which enqueues the
+    /// caller's request right after this returns) and
+    /// [`Self::ensure_started`] (which deliberately enqueues nothing) so
+    /// the two ways a server can first leave `NotStarted` can never drift
+    /// out of sync with each other. Callers must have already checked
+    /// `entry.state` is actually `NotStarted` — this unconditionally resets
+    /// bookkeeping, which would be wrong to do a second time to an
+    /// already-starting entry.
+    fn begin_starting(&self, entry: &mut ServerEntry, key: &ServerKey) -> u64 {
+        entry.state = ServerState::Starting;
+        entry.generation = entry.generation.saturating_add(1);
+        entry.expected_stop = false;
+        entry.versions.clear();
+        entry.diagnostic_result_ids.clear();
+        entry.push_seen = false;
+        let generation = entry.generation;
+        if let Some(observer) = &self.observer {
+            let identity = ServerIdentity::new(key.0.clone(), key.1.clone());
+            observer.begin_generation_at(identity.clone(), generation, None, Vec::new());
+            observer.transition(
+                &identity,
+                generation,
+                ServerPhase::Resolving,
+                "resolving server",
+            );
+        }
+        generation
+    }
+
+    /// The "not ready yet" half of issue #11's action-readiness contract:
+    /// starts the server for `file` if nothing has asked it to start yet,
+    /// but attaches nothing for it to answer once it comes up. Every
+    /// existing entry point that can start a server
+    /// (`hover`/`definition`/`references`/`warm_up`, all via [`Self::submit`])
+    /// also wants its own op answered — exactly what a not-ready UI action
+    /// must not do: queuing the reviewer's `gd` here and firing it once the
+    /// server finally initializes, maybe long after they've moved to
+    /// another file, is the surprise jump this milestone exists to
+    /// prevent. A no-op once the server has left `NotStarted` (starting,
+    /// installing, ready, or already known unavailable/crashed) — a
+    /// repeated not-ready press on the same slow server must not spawn a
+    /// second generation out from under the first, and must never resurrect
+    /// a server this session already gave up on. Also a no-op for a file
+    /// with no configured adapter at all, the same as every other read this
+    /// manager offers for such a file.
+    pub fn ensure_started(&self, file: &Path, git_root: &Path) {
+        let Some(key) = self.key_for(file, git_root) else {
+            return;
+        };
+        let mut servers = self.servers.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = servers.entry(key.clone()).or_insert_with(ServerEntry::new);
+        if !matches!(entry.state, ServerState::NotStarted) {
+            return;
+        }
+        let generation = self.begin_starting(entry, &key);
+        drop(servers);
+        self.spawn_server(key, generation);
+    }
+
     /// Spawns and initializes the server for `key` on a background thread,
     /// then keeps that thread alive for the connection's whole lifetime,
     /// pumping its notifications onto `events_tx` until it closes. Called
-    /// exactly once per key, from [`Self::submit`], the moment a key's
-    /// state first moves out of `NotStarted`.
+    /// exactly once per key, from [`Self::submit`] or
+    /// [`Self::ensure_started`], the moment a key's state first moves out
+    /// of `NotStarted`.
     fn spawn_server(&self, key: ServerKey, generation: u64) {
         let servers = Arc::clone(&self.servers);
         let events_tx = self.events_tx.clone();
@@ -2643,5 +2742,134 @@ mod tests {
         let entry = ServerEntry::new();
         assert!(!entry.push_seen);
         assert!(entry.diagnostic_result_ids.is_empty());
+    }
+
+    #[test]
+    fn classify_action_readiness_maps_ready_straight_to_dispatch() {
+        assert_eq!(
+            classify_action_readiness(ServerState::Ready),
+            ActionReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn classify_action_readiness_keeps_not_started_and_starting_distinct() {
+        // Both are "explain, don't dispatch," but only `NotStarted` should
+        // ever make a caller call `ensure_started` — collapsing the two
+        // into one variant would lose exactly the bit `ui::mod` needs to
+        // decide that.
+        assert_eq!(
+            classify_action_readiness(ServerState::NotStarted),
+            ActionReadiness::NotStarted
+        );
+        assert_eq!(
+            classify_action_readiness(ServerState::Starting),
+            ActionReadiness::Starting
+        );
+    }
+
+    #[test]
+    fn classify_action_readiness_preserves_the_installing_progress_message() {
+        let state = ServerState::Installing {
+            message: "downloading rust-analyzer 2026-08-03".to_owned(),
+        };
+        assert_eq!(
+            classify_action_readiness(state),
+            ActionReadiness::Installing {
+                message: "downloading rust-analyzer 2026-08-03".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn classify_action_readiness_collapses_unavailable_and_crashed_onto_one_reason_carrying_variant()
+     {
+        let reason = "LSP: rust \u{2715} \u{2014} rust-analyzer not found".to_owned();
+        assert_eq!(
+            classify_action_readiness(ServerState::Unavailable {
+                reason: reason.clone(),
+            }),
+            ActionReadiness::Unavailable {
+                reason: reason.clone(),
+            }
+        );
+        assert_eq!(
+            classify_action_readiness(ServerState::Crashed {
+                reason: reason.clone(),
+            }),
+            ActionReadiness::Unavailable { reason }
+        );
+    }
+
+    #[test]
+    fn ensure_started_moves_a_fresh_server_off_not_started_without_queuing_anything() {
+        let (events_tx, _events_rx) = channel();
+        let manager = LspManager::new(events_tx, Arc::new(HashMap::new()), false);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        let file = dir.path().join("main.rs");
+        let key = manager.server_identity(&file, dir.path()).unwrap();
+
+        assert_eq!(manager.state(&file, dir.path()), ServerState::NotStarted);
+        manager.ensure_started(&file, dir.path());
+
+        // The transition happens synchronously, inside the same lock
+        // `ensure_started` takes, before `spawn_server`'s background thread
+        // is even started — no race with that thread to worry about here.
+        assert_ne!(manager.state(&file, dir.path()), ServerState::NotStarted);
+        // And unlike `submit`, nothing was ever enqueued for the caller to
+        // answer — `ensure_started` never touches the queue, and neither
+        // does `spawn_server` until it either fails the entry or marks it
+        // ready (both of which only ever *drain* it).
+        let servers = manager.servers.lock().unwrap();
+        assert!(
+            servers.get(&key).unwrap().queue.is_empty(),
+            "ensure_started must never queue a request of its own"
+        );
+    }
+
+    #[test]
+    fn ensure_started_is_a_no_op_once_the_server_has_left_not_started() {
+        let (events_tx, _events_rx) = channel();
+        let manager = LspManager::new(events_tx, Arc::new(HashMap::new()), false);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        let file = dir.path().join("main.rs");
+        let key = manager.server_identity(&file, dir.path()).unwrap();
+
+        manager.ensure_started(&file, dir.path());
+        let generation_after_first_call = manager
+            .servers
+            .lock()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .generation;
+        assert_eq!(generation_after_first_call, 1);
+
+        // Whether the background spawn thread has already run to
+        // `Unavailable`/`Crashed` or is still `Starting`, the entry has
+        // definitely left `NotStarted` — so a second not-ready press must
+        // be a pure no-op, not a second generation racing the first.
+        manager.ensure_started(&file, dir.path());
+        let generation_after_second_call = manager
+            .servers
+            .lock()
+            .unwrap()
+            .get(&key)
+            .unwrap()
+            .generation;
+        assert_eq!(
+            generation_after_second_call, generation_after_first_call,
+            "a repeated not-ready press on an already-starting server must not spawn a second generation"
+        );
+    }
+
+    #[test]
+    fn ensure_started_does_nothing_for_a_file_with_no_configured_language() {
+        let (events_tx, _events_rx) = channel();
+        let manager = LspManager::new(events_tx, Arc::new(HashMap::new()), false);
+        manager.ensure_started(Path::new("/repo/README.md"), Path::new("/repo"));
+        assert!(manager.servers.lock().unwrap().is_empty());
     }
 }

@@ -262,6 +262,14 @@ pub enum EventOutcome {
     Cancellation,
     NavigationFailure,
     Dropped,
+    /// A hover/definition/references press was rejected because the server
+    /// that would handle it isn't `Ready` yet (issue #11) — recorded
+    /// instead of `Queued` precisely because nothing *was* queued: a
+    /// not-ready action must be honest in the journal that it was deferred
+    /// back to the reviewer (go retry), not silently folded into the
+    /// "queued, will answer later" bucket a real queued request already
+    /// means.
+    NotReady,
 }
 
 impl fmt::Display for EventOutcome {
@@ -279,6 +287,7 @@ impl fmt::Display for EventOutcome {
             Self::Cancellation => "cancelled",
             Self::NavigationFailure => "navigation failure",
             Self::Dropped => "dropped",
+            Self::NotReady => "not ready",
         })
     }
 }
@@ -1594,7 +1603,8 @@ fn level_for_outcome(outcome: EventOutcome) -> EventLevel {
         | EventOutcome::NoResult
         | EventOutcome::Superseded
         | EventOutcome::Cancellation
-        | EventOutcome::Dropped => EventLevel::Warn,
+        | EventOutcome::Dropped
+        | EventOutcome::NotReady => EventLevel::Warn,
         EventOutcome::None | EventOutcome::Result | EventOutcome::Queued => EventLevel::Info,
     }
 }

@@ -51,7 +51,7 @@ use crate::highlight::LineHighlighter;
 use crate::keymap::{Action, KeyChord, Keymap, Resolver, StepResult, emacs_preset, vim_preset};
 use crate::lsp::adapter::LangKey;
 use crate::lsp::client::uri_to_path;
-use crate::lsp::manager::ServerState;
+use crate::lsp::manager::{ActionReadiness, ServerState, classify_action_readiness};
 use crate::lsp::{
     DefinitionResult, DiagnosticsStore, HoverResult, LspError, LspManager, ReferencesResult,
     ServerEvent, parse_publish_diagnostics, progress_status_text,
@@ -1421,6 +1421,87 @@ fn try_expand_fold(
     Ok(app.expand_gap(file_idx, gap_idx, &lines))
 }
 
+/// The shared "not ready" half of `Action::Hover`/`GotoDefinition`/
+/// `FindReferences` (issue #11): classifies the server backing `query`'s
+/// target via [`classify_action_readiness`] and, for anything but `Ready`,
+/// returns the status line to show *instead of* dispatching — kicking off
+/// [`LspManager::ensure_started`] first when nothing has asked the server
+/// to start yet. `None` means `Ready`: the caller should proceed with its
+/// normal dispatch exactly as it did before this milestone.
+///
+/// A file with no configured adapter at all (`server_identity` returns
+/// `None`) is deliberately left alone here, returning `None` just like
+/// `Ready` does — that's the pre-existing "unsupported file type" path,
+/// which already runs all the way through `LspManager::submit` itself (see
+/// its `key_for`-`None` arm) and reports `EventOutcome::Unsupported`; this
+/// is a readiness question about a server that *is* configured, not a
+/// substitute for that path, so the caller's ordinary dispatch is left to
+/// surface it exactly as it always has.
+fn check_action_readiness(
+    lsp_manager: &LspManager,
+    query: &hover_popup::HoverQuery,
+    action_name: &str,
+) -> Option<String> {
+    let (lang, _root) = lsp_manager.server_identity(&query.file, &query.git_root)?;
+    let readiness = classify_action_readiness(lsp_manager.state(&query.file, &query.git_root));
+    if readiness == ActionReadiness::NotStarted {
+        lsp_manager.ensure_started(&query.file, &query.git_root);
+    }
+    readiness_status_message(readiness, &lang, action_name)
+}
+
+/// The status line for each [`ActionReadiness`] — split out of
+/// [`check_action_readiness`] as a pure function so every message shape
+/// (notably `Installing`'s live progress pass-through and `Unavailable`'s
+/// verbatim reason) is testable without contriving a manager whose server
+/// is actually mid-install or crashed, which no unit test can do reliably.
+fn readiness_status_message(
+    readiness: ActionReadiness,
+    lang: &LangKey,
+    action_name: &str,
+) -> Option<String> {
+    match readiness {
+        ActionReadiness::Ready => None,
+        // `NotStarted` and `Starting` read identically on purpose: by the
+        // time the reviewer sees either message, `check_action_readiness`
+        // has already kicked the not-started server off, so from their
+        // seat both mean the same thing — it's coming up, retry shortly.
+        ActionReadiness::NotStarted | ActionReadiness::Starting => Some(format!(
+            "LSP: {lang} is starting; {action_name} is not ready yet"
+        )),
+        ActionReadiness::Installing { message } => Some(format!(
+            "LSP: {message}; {action_name} unavailable until ready"
+        )),
+        ActionReadiness::Unavailable { reason } => Some(reason),
+    }
+}
+
+/// Drops whichever definition/references request is still in flight,
+/// recording it `Superseded` in the journal. Every explicit gd/gr press
+/// must do this — dispatching or not: `pending_goto` has no generation
+/// check the way `pending_hover` does (taking the receiver *is* the
+/// invalidation), so a not-ready press that merely set `goto_status` and
+/// left the old receiver alive would let that stale response resolve
+/// later, navigate the view, and overwrite the very "not ready" message
+/// the reviewer just read.
+fn supersede_pending_goto(
+    pending_goto: &mut Option<(JumpEntry, PendingGoto)>,
+    observer: &crate::lsp::ObservationHandle,
+    reason: &str,
+) {
+    if let Some((_, pending)) = pending_goto.take() {
+        let superseded_id = match pending {
+            PendingGoto::Definition { operation_id, .. }
+            | PendingGoto::References { operation_id, .. } => operation_id,
+        };
+        observer.record_ui(
+            Some(superseded_id),
+            crate::lsp::EventOutcome::Superseded,
+            reason,
+        );
+    }
+}
+
 /// Applies one matched [`Action`], handling every concern the pure
 /// `App`/`FileView::update` methods can't: issuing LSP requests
 /// (`Hover`/`GotoDefinition`/`FindReferences`), navigating on their
@@ -1678,33 +1759,51 @@ fn handle_action(
     match action {
         Action::Hover => match stack.top().hover_query() {
             Some(query) => {
-                let operation_id = observer.next_operation_id();
-                observer.record_ui(
-                    Some(operation_id),
-                    crate::lsp::EventOutcome::Queued,
-                    "hover action: resolving target",
-                );
-                hover_state.invalidate();
-                let overlapping = diagnostics.diagnostics_on_line(&query.file, query.line);
-                hover_state.set_diagnostics_prefix(&overlapping);
-                hover_state.set_pending();
-                let generation = hover_state.generation();
-                let rx = lsp_manager.hover_with_operation(
-                    &query.file,
-                    &query.git_root,
-                    &query.line_text,
-                    query.line,
-                    query.display_col,
-                    operation_id,
-                );
-                if let Some((_, superseded_id, _)) = pending_hover.take() {
+                if let Some(message) = check_action_readiness(lsp_manager, &query, "hover") {
+                    // Not `Queued`: nothing was queued for this press to
+                    // ever answer — see `EventOutcome::NotReady`'s docs.
                     observer.record_ui(
-                        Some(superseded_id),
-                        crate::lsp::EventOutcome::Superseded,
-                        "hover request superseded by a newer hover action",
+                        Some(observer.next_operation_id()),
+                        crate::lsp::EventOutcome::NotReady,
+                        "hover action: server not ready",
                     );
+                    hover_state.invalidate();
+                    // Through `goto_status`, not `hover_state.set_message`:
+                    // `status_hint` prefixes popup messages with "hover: ",
+                    // which would render this line as "hover: LSP: …; hover
+                    // is not ready yet". The readiness message already names
+                    // the action, so it uses the same unprefixed sink gd/gr
+                    // use.
+                    *goto_status = Some(message);
+                } else {
+                    let operation_id = observer.next_operation_id();
+                    observer.record_ui(
+                        Some(operation_id),
+                        crate::lsp::EventOutcome::Queued,
+                        "hover action: resolving target",
+                    );
+                    hover_state.invalidate();
+                    let overlapping = diagnostics.diagnostics_on_line(&query.file, query.line);
+                    hover_state.set_diagnostics_prefix(&overlapping);
+                    hover_state.set_pending();
+                    let generation = hover_state.generation();
+                    let rx = lsp_manager.hover_with_operation(
+                        &query.file,
+                        &query.git_root,
+                        &query.line_text,
+                        query.line,
+                        query.display_col,
+                        operation_id,
+                    );
+                    if let Some((_, superseded_id, _)) = pending_hover.take() {
+                        observer.record_ui(
+                            Some(superseded_id),
+                            crate::lsp::EventOutcome::Superseded,
+                            "hover request superseded by a newer hover action",
+                        );
+                    }
+                    *pending_hover = Some((generation, operation_id, rx));
                 }
-                *pending_hover = Some((generation, operation_id, rx));
             }
             None => {
                 observer.record_ui(
@@ -1717,36 +1816,46 @@ fn handle_action(
         },
         Action::GotoDefinition => match stack.top().hover_query() {
             Some(query) => {
-                let operation_id = observer.next_operation_id();
-                observer.record_ui(
-                    Some(operation_id),
-                    crate::lsp::EventOutcome::Queued,
-                    "definition action: resolving target",
-                );
-                let rx = lsp_manager.definition_with_operation(
-                    &query.file,
-                    &query.git_root,
-                    &query.line_text,
-                    query.line,
-                    query.display_col,
-                    operation_id,
-                );
-                if let Some((_, pending)) = pending_goto.take() {
-                    let superseded_id = match pending {
-                        PendingGoto::Definition { operation_id, .. }
-                        | PendingGoto::References { operation_id, .. } => operation_id,
-                    };
+                if let Some(message) =
+                    check_action_readiness(lsp_manager, &query, "go to definition")
+                {
                     observer.record_ui(
-                        Some(superseded_id),
-                        crate::lsp::EventOutcome::Superseded,
+                        Some(observer.next_operation_id()),
+                        crate::lsp::EventOutcome::NotReady,
+                        "definition action: server not ready",
+                    );
+                    supersede_pending_goto(
+                        pending_goto,
+                        observer,
                         "navigation request superseded by a newer definition action",
                     );
+                    *goto_status = Some(message);
+                } else {
+                    let operation_id = observer.next_operation_id();
+                    observer.record_ui(
+                        Some(operation_id),
+                        crate::lsp::EventOutcome::Queued,
+                        "definition action: resolving target",
+                    );
+                    let rx = lsp_manager.definition_with_operation(
+                        &query.file,
+                        &query.git_root,
+                        &query.line_text,
+                        query.line,
+                        query.display_col,
+                        operation_id,
+                    );
+                    supersede_pending_goto(
+                        pending_goto,
+                        observer,
+                        "navigation request superseded by a newer definition action",
+                    );
+                    *pending_goto = Some((
+                        JumpEntry::from(&query),
+                        PendingGoto::Definition { operation_id, rx },
+                    ));
+                    *goto_status = Some("goto: \u{2026}".to_owned());
                 }
-                *pending_goto = Some((
-                    JumpEntry::from(&query),
-                    PendingGoto::Definition { operation_id, rx },
-                ));
-                *goto_status = Some("goto: \u{2026}".to_owned());
             }
             None => {
                 observer.record_ui(
@@ -1759,36 +1868,46 @@ fn handle_action(
         },
         Action::FindReferences => match stack.top().hover_query() {
             Some(query) => {
-                let operation_id = observer.next_operation_id();
-                observer.record_ui(
-                    Some(operation_id),
-                    crate::lsp::EventOutcome::Queued,
-                    "references action: resolving target",
-                );
-                let rx = lsp_manager.references_with_operation(
-                    &query.file,
-                    &query.git_root,
-                    &query.line_text,
-                    query.line,
-                    query.display_col,
-                    operation_id,
-                );
-                if let Some((_, pending)) = pending_goto.take() {
-                    let superseded_id = match pending {
-                        PendingGoto::Definition { operation_id, .. }
-                        | PendingGoto::References { operation_id, .. } => operation_id,
-                    };
+                if let Some(message) =
+                    check_action_readiness(lsp_manager, &query, "find references")
+                {
                     observer.record_ui(
-                        Some(superseded_id),
-                        crate::lsp::EventOutcome::Superseded,
+                        Some(observer.next_operation_id()),
+                        crate::lsp::EventOutcome::NotReady,
+                        "references action: server not ready",
+                    );
+                    supersede_pending_goto(
+                        pending_goto,
+                        observer,
                         "navigation request superseded by a newer references action",
                     );
+                    *goto_status = Some(message);
+                } else {
+                    let operation_id = observer.next_operation_id();
+                    observer.record_ui(
+                        Some(operation_id),
+                        crate::lsp::EventOutcome::Queued,
+                        "references action: resolving target",
+                    );
+                    let rx = lsp_manager.references_with_operation(
+                        &query.file,
+                        &query.git_root,
+                        &query.line_text,
+                        query.line,
+                        query.display_col,
+                        operation_id,
+                    );
+                    supersede_pending_goto(
+                        pending_goto,
+                        observer,
+                        "navigation request superseded by a newer references action",
+                    );
+                    *pending_goto = Some((
+                        JumpEntry::from(&query),
+                        PendingGoto::References { operation_id, rx },
+                    ));
+                    *goto_status = Some("references: \u{2026}".to_owned());
                 }
-                *pending_goto = Some((
-                    JumpEntry::from(&query),
-                    PendingGoto::References { operation_id, rx },
-                ));
-                *goto_status = Some("references: \u{2026}".to_owned());
             }
             None => {
                 observer.record_ui(
@@ -2994,6 +3113,158 @@ mod tests {
         // `pending_goto` has no generation to lean on, so it's dropped
         // outright — its `Receiver` (and whatever answer arrives on it)
         // goes with it.
+        assert!(pending_goto.is_none());
+    }
+
+    // ---- check_action_readiness --------------------------------------------
+
+    #[test]
+    fn check_action_readiness_leaves_an_unconfigured_file_type_alone() {
+        let (events_tx, _events_rx) = mpsc::channel();
+        let lsp_manager =
+            LspManager::new(events_tx, Arc::new(std::collections::HashMap::new()), false);
+        let query = hover_popup::HoverQuery {
+            file: PathBuf::from("/repo/README.md"),
+            git_root: PathBuf::from("/repo"),
+            line: 0,
+            line_text: "hello".to_owned(),
+            display_col: 0,
+        };
+        // No adapter claims `.md` — this is the pre-existing "unsupported
+        // file type" path through `LspManager::submit` itself (see
+        // `check_action_readiness`'s docs), not a readiness question, so
+        // it must return `None` here and let the caller's ordinary
+        // dispatch surface that the same way it always has.
+        assert_eq!(check_action_readiness(&lsp_manager, &query, "hover"), None);
+    }
+
+    #[test]
+    fn check_action_readiness_reports_starting_and_kicks_off_a_not_started_server() {
+        let (events_tx, _events_rx) = mpsc::channel();
+        let lsp_manager =
+            LspManager::new(events_tx, Arc::new(std::collections::HashMap::new()), false);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        let file = dir.path().join("main.rs");
+        let query = hover_popup::HoverQuery {
+            file: file.clone(),
+            git_root: dir.path().to_path_buf(),
+            line: 0,
+            line_text: "fn main() {}".to_owned(),
+            display_col: 3,
+        };
+
+        assert_eq!(
+            lsp_manager.state(&file, dir.path()),
+            ServerState::NotStarted
+        );
+
+        let message = check_action_readiness(&lsp_manager, &query, "go to definition")
+            .expect("a NotStarted server must never dispatch");
+        assert!(message.contains("is starting"), "{message}");
+        assert!(
+            message.contains("go to definition is not ready yet"),
+            "{message}"
+        );
+
+        // The whole point of routing `NotStarted` through here: the server
+        // actually got kicked off (via `ensure_started`), even though
+        // nothing was dispatched for it to answer.
+        assert_ne!(
+            lsp_manager.state(&file, dir.path()),
+            ServerState::NotStarted
+        );
+    }
+
+    // ---- readiness_status_message ------------------------------------------
+
+    #[test]
+    fn readiness_status_message_is_none_only_for_ready() {
+        let lang = LangKey::Custom("stubls".to_owned());
+        assert_eq!(
+            readiness_status_message(ActionReadiness::Ready, &lang, "hover"),
+            None
+        );
+    }
+
+    #[test]
+    fn readiness_status_message_names_the_language_and_action_while_starting() {
+        let lang = LangKey::Custom("stubls".to_owned());
+        for readiness in [ActionReadiness::NotStarted, ActionReadiness::Starting] {
+            assert_eq!(
+                readiness_status_message(readiness, &lang, "go to definition").as_deref(),
+                Some("LSP: stubls is starting; go to definition is not ready yet")
+            );
+        }
+    }
+
+    #[test]
+    fn readiness_status_message_preserves_the_live_install_progress_line() {
+        // The `Installing` message is the auto-installer's own live
+        // progress line — swallowing it here would replace real progress
+        // ("npm install …") with a generic shrug, exactly what issue #11's
+        // "not overwritten by a generic ellipsis" criterion forbids.
+        let lang = LangKey::Custom("stubls".to_owned());
+        assert_eq!(
+            readiness_status_message(
+                ActionReadiness::Installing {
+                    message: "npm install pyright@1.1.411".to_owned(),
+                },
+                &lang,
+                "hover",
+            )
+            .as_deref(),
+            Some("LSP: npm install pyright@1.1.411; hover unavailable until ready")
+        );
+    }
+
+    #[test]
+    fn readiness_status_message_passes_an_unavailable_reason_through_verbatim() {
+        // `Unavailable`/`Crashed` reasons already read like actionable
+        // status-bar hints ("LSP: typescript ✕ — npm i -g …"), so any
+        // decoration here would just bury the fix instruction.
+        let lang = LangKey::Custom("stubls".to_owned());
+        let reason = "LSP: rust \u{2715} \u{2014} rust-analyzer not found".to_owned();
+        assert_eq!(
+            readiness_status_message(
+                ActionReadiness::Unavailable {
+                    reason: reason.clone(),
+                },
+                &lang,
+                "hover",
+            ),
+            Some(reason)
+        );
+    }
+
+    // ---- supersede_pending_goto --------------------------------------------
+
+    #[test]
+    fn supersede_pending_goto_drops_the_in_flight_request_outright() {
+        // Regression guard for the not-ready path specifically: a gd/gr
+        // press that can't dispatch still must drop an older in-flight
+        // navigation, or that stale response would fire later and jump the
+        // view / overwrite the "not ready" status the press just showed.
+        let (_tx, rx) = mpsc::channel();
+        let mut pending_goto: Option<(JumpEntry, PendingGoto)> = Some((
+            JumpEntry {
+                file: PathBuf::from("a.rs"),
+                git_root: PathBuf::from("."),
+                line: 0,
+                col: 0,
+            },
+            PendingGoto::Definition {
+                operation_id: 7,
+                rx,
+            },
+        ));
+
+        supersede_pending_goto(
+            &mut pending_goto,
+            &crate::lsp::ObservationStore::in_memory(),
+            "navigation request superseded by a newer definition action",
+        );
+
         assert!(pending_goto.is_none());
     }
 }

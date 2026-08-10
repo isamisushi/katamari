@@ -179,7 +179,15 @@ reachable mid-session from `ktmr diff` with `L`.
 
 Inside the diff: `K` hovers the identifier under the cursor, `gd`/`gr` go
 to its definition/references, `]d`/`[d` jump between diagnostics, and `I`
-opens the live, read-only LSP Inspector. The inspector keeps one entry per
+opens the live, read-only LSP Inspector. The diff and file views stay fully
+interactive while a server resolves, installs, or initializes — cursor
+movement, paging, search, comments, help, and quit are never gated on LSP.
+Pressing hover/`gd`/`gr` before the relevant server is ready reports that
+immediately in the status bar (e.g. "LSP: rust is starting; go to
+definition is not ready yet", or the live install/error detail once one
+exists) instead of queuing the request — nothing pops a hover or jumps the
+view later on its own; press the key again once the status clears. The
+inspector keeps one entry per
 actual `(language, workspace root)` server, shows lifecycle state (running
 means only that `initialize` completed; it does not mean project indexing is
 ready), capabilities, progress tokens, process details, stderr, server log
