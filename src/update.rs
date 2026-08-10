@@ -335,11 +335,15 @@ pub fn state_dir() -> PathBuf {
 }
 
 fn state_dir_from_env(xdg_state_home: Option<OsString>, home: Option<OsString>) -> PathBuf {
-    let base = match xdg_state_home {
-        Some(xdg) if !xdg.is_empty() => PathBuf::from(xdg),
-        _ => PathBuf::from(home.unwrap_or_else(|| OsString::from(".")))
-            .join(".local")
-            .join("state"),
+    let base = match (xdg_state_home, home) {
+        (Some(xdg), _) if !xdg.is_empty() => PathBuf::from(xdg),
+        (_, Some(home)) if !home.is_empty() => PathBuf::from(home).join(".local").join("state"),
+        // No `$HOME` at all (a bare container, a stripped CI env): fall
+        // back to the tempdir rather than `.` — a relative fallback would
+        // plant `./.local/state/katamari/` inside whatever repository is
+        // being reviewed, and state written where the litter lands beats
+        // state written into someone's project.
+        _ => std::env::temp_dir().join(".local").join("state"),
     };
     base.join("katamari")
 }
@@ -563,6 +567,17 @@ mod tests {
     fn state_dir_from_env_ignores_an_empty_xdg_state_home() {
         let path = state_dir_from_env(Some(OsString::new()), Some(OsString::from("/home/x")));
         assert_eq!(path, PathBuf::from("/home/x/.local/state/katamari"));
+    }
+
+    #[test]
+    fn state_dir_from_env_without_home_lands_in_the_tempdir_not_the_cwd() {
+        let path = state_dir_from_env(None, None);
+        assert!(
+            path.is_absolute(),
+            "a relative fallback would litter the reviewed repository: {}",
+            path.display()
+        );
+        assert!(path.starts_with(std::env::temp_dir()));
     }
 
     // --- on_startup / status_bar_notice / print_exit_notice ------------------
