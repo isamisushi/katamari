@@ -33,6 +33,8 @@ pub mod status_bar;
 pub mod symbols;
 pub mod text;
 pub mod timeline_view;
+pub mod units_panel;
+pub mod units_setup;
 pub mod view;
 
 pub use app::App;
@@ -62,6 +64,8 @@ use crate::ui::scope_menu::{
     RevisionInputOutcome, ScopeMenuEntry, ScopeMenuState, handle_revision_key,
 };
 use crate::ui::timeline_view::TimelineView;
+use crate::ui::units_panel::UnitsPanel;
+use crate::ui::units_setup::{SetupOutcome, UnitsSetupState};
 use crate::update;
 use crate::vcs::DiffSource;
 use crate::vcs::LogBackend;
@@ -555,6 +559,15 @@ fn event_loop(
     let mut pending_hover: Option<(u64, Receiver<Result<HoverResult, LspError>>)> = None;
     let mut pending_goto: Option<(JumpEntry, PendingGoto)> = None;
     let mut refs_panel: Option<RefsPanelState> = None;
+    // The semantic-units overlay and its in-flight computation. Unlike
+    // `pending_hover` there's no generation counter: at most one grouping
+    // request runs at a time (`ToggleUnits` refuses to start a second),
+    // and staleness is handled by re-checking the grouping's `diff_key`
+    // against the live diff when the result lands, not by racing counters.
+    let mut units_panel: Option<UnitsPanel> = None;
+    let mut units_setup: Option<UnitsSetupState> = None;
+    let mut pending_units: Option<Receiver<Result<crate::groups::Grouping, String>>> = None;
+    let mut units_status: Option<String> = None;
     let mut jump_stack = JumpStack::new();
     let mut diagnostics = DiagnosticsStore::new();
     let mut lsp_status: Option<String> = startup_status;
@@ -622,8 +635,17 @@ fn event_loop(
                 let status_height =
                     hints::required_height(&hints::diff_view_items(keymap), area.width);
                 let diff_area = diff_layout(area, app.sidebar_visible, status_height).diff;
+                // Mirrors `draw`'s banner split exactly — viewport height
+                // fed to scroll math must equal the rows content actually
+                // gets, or the cursor could sit "visible" one banner-height
+                // below the pane's real bottom edge.
+                let banner_height = if app.unit_filter().is_some() {
+                    units_panel::BANNER_HEIGHT.min(diff_area.height)
+                } else {
+                    0
+                };
                 (
-                    diff_area.height,
+                    diff_area.height - banner_height,
                     diff_view::unified_content_width(diff_area.width),
                 )
             }
@@ -655,6 +677,36 @@ fn event_loop(
         {
             hover_state.apply(*generation, result, highlighter);
             pending_hover = None;
+        }
+
+        if let Some(rx) = &pending_units
+            && let Ok(result) = rx.try_recv()
+        {
+            pending_units = None;
+            units_status = None;
+            match result {
+                Ok(grouping) => {
+                    if let View::Diff(app) = stack.top() {
+                        let live_key = crate::groups::diff_key(&crate::groups::enumerate_hunks(
+                            app.full_files(),
+                        ));
+                        if grouping.diff_key == live_key {
+                            units_panel = Some(UnitsPanel::build(&grouping, app.full_files()));
+                        } else {
+                            // The diff refreshed while the agent was
+                            // thinking (watch mode, a scope swap). The
+                            // stale grouping is already persisted, so
+                            // nothing is lost — but showing it against a
+                            // diff it doesn't describe would be worse
+                            // than asking for a re-run.
+                            goto_status = Some(
+                                "units: diff changed while grouping — press u again".to_owned(),
+                            );
+                        }
+                    }
+                }
+                Err(e) => goto_status = Some(format!("units: {e}")),
+            }
         }
 
         if let Some((from, op)) = &pending_goto {
@@ -742,6 +794,7 @@ fn event_loop(
         let status_note = hover_state
             .status_hint()
             .or_else(|| goto_status.clone())
+            .or_else(|| units_status.clone())
             .or_else(|| lsp_status.clone())
             .or_else(|| watch_status.as_ref().map(|s| s.text.clone()));
         terminal.draw(|frame| {
@@ -753,6 +806,8 @@ fn event_loop(
                 &hover_state,
                 &diagnostics,
                 refs_panel.as_ref().map(|s| &s.panel),
+                units_panel.as_ref(),
+                units_setup.as_ref(),
                 status_note.as_deref(),
                 &comment_index,
                 compose.as_ref(),
@@ -1001,6 +1056,10 @@ fn event_loop(
                                     &mut pending_hover,
                                     &mut pending_goto,
                                     &mut refs_panel,
+                                    &mut units_panel,
+                                    &mut units_setup,
+                                    &mut pending_units,
+                                    &mut units_status,
                                     &mut jump_stack,
                                     &diagnostics,
                                     &mut goto_status,
@@ -1280,6 +1339,10 @@ fn handle_action(
     pending_hover: &mut Option<(u64, Receiver<Result<HoverResult, LspError>>)>,
     pending_goto: &mut Option<(JumpEntry, PendingGoto)>,
     refs_panel: &mut Option<RefsPanelState>,
+    units_panel: &mut Option<UnitsPanel>,
+    units_setup: &mut Option<UnitsSetupState>,
+    pending_units: &mut Option<Receiver<Result<crate::groups::Grouping, String>>>,
+    units_status: &mut Option<String>,
     jump_stack: &mut JumpStack,
     diagnostics: &DiagnosticsStore,
     goto_status: &mut Option<String>,
@@ -1380,6 +1443,95 @@ fn handle_action(
                 return;
             }
             _ => *refs_panel = None, // any other key closes the panel, then falls through
+        }
+    }
+
+    // The first-use units picker is fully modal (it exists to stop a
+    // surprise CLI spawn, so no key may fall through past it to something
+    // that could spawn one) — intercepted ahead of every other overlay.
+    if let Some(setup) = units_setup {
+        match action {
+            Action::CursorDown => setup.move_down(),
+            Action::CursorUp => setup.move_up(),
+            Action::Confirm => match setup.confirm() {
+                SetupOutcome::Continue => {}
+                SetupOutcome::Done(selections) => {
+                    *units_setup = None;
+                    if let View::Diff(app) = stack.top_mut() {
+                        selections.apply(&mut app.units_config);
+                        app.units_prompt_needed = false;
+                        // Session config is already updated above, so a
+                        // failed write degrades to "asks again next
+                        // session", not a broken feature — surface it and
+                        // move on to the grouping the user actually asked
+                        // for.
+                        if let Err(e) =
+                            crate::config::append_to_home_config(&selections.toml_section())
+                        {
+                            *goto_status = Some(format!("units: config not saved: {e}"));
+                        }
+                        spawn_units_generation(app, pending_units, units_status);
+                    }
+                }
+            },
+            // Esc — or any other key — abandons the wizard without
+            // spawning anything and without persisting; the next `u`
+            // simply asks again.
+            _ => *units_setup = None,
+        }
+        return;
+    }
+
+    if units_panel.is_some() {
+        match action {
+            Action::CursorDown => {
+                if let Some(panel) = units_panel {
+                    panel.select_next();
+                }
+                return;
+            }
+            Action::CursorUp => {
+                if let Some(panel) = units_panel {
+                    panel.select_prev();
+                }
+                return;
+            }
+            Action::Cancel | Action::ToggleUnits => {
+                *units_panel = None;
+                return;
+            }
+            Action::Confirm => {
+                // Scope the diff itself to the selected unit — the
+                // stacked-PR reading: the unit *becomes* the diff (rows,
+                // sidebar, search all narrow with it) until `Esc` widens
+                // back, rather than merely jumping the cursor into the
+                // full diff and leaving the reviewer to guess where the
+                // unit ends.
+                let filter = units_panel.as_ref().and_then(|panel| {
+                    let entry = panel.selected_entry()?;
+                    (entry.hunk_count > 0).then(|| app::UnitFilter {
+                        label: entry.label.clone(),
+                        description: entry.description.clone(),
+                        index: panel.selected + 1,
+                        total: panel.entries.len(),
+                        hunk_ids: entry.hunk_ids.iter().cloned().collect(),
+                    })
+                });
+                *units_panel = None;
+                match filter {
+                    Some(filter) => {
+                        if let View::Diff(app) = stack.top_mut() {
+                            app.set_unit_filter(filter);
+                            hover_state.invalidate();
+                        }
+                    }
+                    None => {
+                        *goto_status = Some("units: no hunks in this unit anymore".to_owned());
+                    }
+                }
+                return;
+            }
+            _ => *units_panel = None, // any other key closes the panel, then falls through
         }
     }
 
@@ -1572,11 +1724,73 @@ fn handle_action(
         // active either way (`App::clear_search`'s own guard).
         Action::Cancel => {
             if let View::Diff(app) = stack.top_mut() {
-                app.clear_search();
+                // Two `Esc` meanings in the plain diff view, most-modal
+                // first: an active unit scope widens back to the full
+                // diff; only with none active does `Esc` fall through to
+                // its `:noh` role of clearing a search highlight.
+                if app.clear_unit_filter() {
+                    hover_state.invalidate();
+                } else {
+                    app.clear_search();
+                }
             }
         }
         Action::ToggleTimeline => open_or_close_timeline(stack, jj_repo, goto_status),
         Action::ToggleLogView => open_or_close_log(stack, goto_status),
+        // Open (reaching here means the panel isn't open — the
+        // interception block above closes it otherwise): a cached grouping
+        // for this exact diff shows instantly; a miss spawns the agent CLI
+        // on a background thread whose result the frame preamble picks up.
+        Action::ToggleUnits => match stack.top() {
+            View::Diff(app) => {
+                if pending_units.is_some() {
+                    *goto_status = Some("units: grouping already running".to_owned());
+                } else if let Some(grouping) =
+                    crate::groups::cached(&app.repo_root, app.full_files())
+                {
+                    let mut panel = UnitsPanel::build(&grouping, app.full_files());
+                    // Reopening the panel mid-scope starts on the unit
+                    // currently being read — the natural position to step
+                    // to the next/previous unit from.
+                    if let Some(filter) = app.unit_filter() {
+                        panel.selected =
+                            (filter.index - 1).min(panel.entries.len().saturating_sub(1));
+                    }
+                    *units_panel = Some(panel);
+                } else if app.units_prompt_needed {
+                    open_units_setup(units_setup, goto_status);
+                } else {
+                    spawn_units_generation(app, pending_units, units_status);
+                }
+            }
+            View::File(_) | View::Timeline(_) | View::Log(_) => {
+                *goto_status = Some("units: only available in the diff view".to_owned());
+            }
+        },
+        // A fresh take on the same diff — the cache-first `u` can never
+        // provide one (an unchanged diff always hits its cache), so this
+        // is the deliberate second key rather than a modifier on the
+        // first. The result lands through the same pending-units path and
+        // supersedes the cache via the store's last-record-wins fold.
+        Action::RegenerateUnits => match stack.top() {
+            View::Diff(app) => {
+                if pending_units.is_some() {
+                    *goto_status = Some("units: grouping already running".to_owned());
+                } else if app.units_prompt_needed {
+                    // Even a regenerate is still this session's first
+                    // spawn if nothing was ever configured — same gate as
+                    // `u`'s cache-miss path.
+                    *units_panel = None;
+                    open_units_setup(units_setup, goto_status);
+                } else {
+                    *units_panel = None;
+                    spawn_units_generation(app, pending_units, units_status);
+                }
+            }
+            View::File(_) | View::Timeline(_) | View::Log(_) => {
+                *goto_status = Some("units: only available in the diff view".to_owned());
+            }
+        },
         // Explicit, not folded into the `other` catch-all below on
         // purpose: unlike every action that bucket forwards to
         // `View::update`, this one has no view-level effect at all (see
@@ -2077,6 +2291,42 @@ fn apply_references_result(
     }
 }
 
+/// Opens the first-use setup wizard — or reports the one condition it
+/// can't help with (no agent CLI installed at all, where a picker with
+/// zero rows would just be a more confusing version of this message).
+fn open_units_setup(units_setup: &mut Option<UnitsSetupState>, goto_status: &mut Option<String>) {
+    let detected = crate::groups::agent::detect_all();
+    if detected.is_empty() {
+        *goto_status = Some(
+            "units: no agent CLI found — grouping needs `claude` or `codex` on PATH".to_owned(),
+        );
+    } else {
+        *units_setup = Some(UnitsSetupState::new(detected));
+    }
+}
+
+/// Kicks off one background grouping run against the *full* diff (see
+/// [`App::full_files`] — never the unit-filtered view) and parks its
+/// receiver in `pending_units` for the frame preamble to collect. Clones
+/// the inputs because the agent call outlives this frame by seconds to
+/// minutes; the diff it groups is pinned at request time and staleness is
+/// re-checked when the result arrives.
+fn spawn_units_generation(
+    app: &App,
+    pending_units: &mut Option<Receiver<Result<crate::groups::Grouping, String>>>,
+    units_status: &mut Option<String>,
+) {
+    let repo_root = app.repo_root.clone();
+    let files = app.full_files().to_vec();
+    let units_config = app.units_config.clone();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(crate::groups::generate(&repo_root, &files, &units_config));
+    });
+    *pending_units = Some(rx);
+    *units_status = Some("units: asking the agent CLI \u{2026}".to_owned());
+}
+
 #[allow(clippy::too_many_arguments)] // one render pass threading through
 // every overlay/lookaside table the frame might need to draw; see
 // `handle_action`'s comment for why a struct wouldn't reduce this.
@@ -2088,6 +2338,8 @@ fn draw(
     hover_state: &hover_popup::HoverState,
     diagnostics: &DiagnosticsStore,
     refs_panel: Option<&RefsPanel>,
+    units_panel: Option<&UnitsPanel>,
+    units_setup: Option<&UnitsSetupState>,
     status_note: Option<&str>,
     comments: &CommentIndex,
     compose: Option<&ComposeState>,
@@ -2105,10 +2357,25 @@ fn draw(
             if let Some(sidebar_area) = areas.sidebar {
                 sidebar::render(frame, sidebar_area, app);
             }
-            let effective_layout = diff_view::effective_layout(app.layout, areas.diff.width);
+            // While a unit scope is active, the top of the diff pane is
+            // given to its banner and everything else renders into what
+            // remains — the same subtraction the frame preamble's
+            // `content_height` applies, so scroll math and pixels agree
+            // (see `units_panel::BANNER_HEIGHT`'s docs).
+            let mut diff_area = areas.diff;
+            if let Some(filter) = app.unit_filter() {
+                let banner = Rect {
+                    height: units_panel::BANNER_HEIGHT.min(diff_area.height),
+                    ..diff_area
+                };
+                units_panel::render_banner(frame, banner, filter);
+                diff_area.y += banner.height;
+                diff_area.height -= banner.height;
+            }
+            let effective_layout = diff_view::effective_layout(app.layout, diff_area.width);
             diff_view::render(
                 frame,
-                areas.diff,
+                diff_area,
                 app,
                 highlighter,
                 effective_layout,
@@ -2125,20 +2392,26 @@ fn draw(
                 &hint_items,
             );
             if let Some(row) = view.cursor_screen_row() {
-                hover_popup::render(frame, areas.diff, row, hover_state);
+                hover_popup::render(frame, diff_area, row, hover_state);
             }
             if let Some(panel) = refs_panel {
-                refs_panel::render(frame, areas.diff, panel);
+                refs_panel::render(frame, diff_area, panel);
+            }
+            if let Some(panel) = units_panel {
+                units_panel::render(frame, diff_area, panel);
+            }
+            if let Some(state) = units_setup {
+                units_setup::render(frame, diff_area, state);
             }
             if let Some(state) = compose
                 && let Some(row) = view.cursor_screen_row()
             {
-                compose::render(frame, areas.diff, row, state);
+                compose::render(frame, diff_area, row, state);
             }
             if let Some(state) = scope_menu {
-                scope_menu::render(frame, areas.diff, state, jj_available);
+                scope_menu::render(frame, diff_area, state, jj_available);
             }
-            key_display::render(frame, areas.diff, key_display);
+            key_display::render(frame, diff_area, key_display);
         }
         View::File(file) => {
             let hint_items = hints::file_view_items(keymap);

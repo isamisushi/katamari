@@ -80,6 +80,21 @@ pub fn render(
         ));
     }
 
+    // Same slot family as `scope_label` (what subset of the repo's changes
+    // is on screen), rendered separately because the two compose: a
+    // revision diff scoped to one of its units shows both.
+    if let Some(filter) = app.unit_filter() {
+        spans.push(Span::styled(
+            format!(
+                "· unit {}/{}: {} ",
+                filter.index, filter.total, filter.label
+            ),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     if app.watch_mode {
         spans.push(Span::styled(
             "· \u{29BF} watch ", // ⦿ — BULLSEYE

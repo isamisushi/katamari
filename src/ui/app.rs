@@ -80,6 +80,29 @@ impl Layout {
     }
 }
 
+/// A semantic-unit scope on the diff — while set, [`App::rederive`] keeps
+/// only the hunks whose content-hash ids (see
+/// [`crate::groups::enumerate_hunks`]) appear in `hunk_ids`, so the whole
+/// view (rows, sidebar, search, navigation) reads as if the unit were the
+/// entire diff. Ids rather than `(file_idx, hunk_idx)` addresses because
+/// the filter must survive rederivation and watch refreshes, both of which
+/// can shift indices while leaving a hunk's *content* — and therefore its
+/// id — alone.
+#[derive(Debug, Clone)]
+pub struct UnitFilter {
+    pub label: String,
+    /// The unit's one-sentence rationale, carried into the scope so the
+    /// banner above the filtered diff (see
+    /// [`crate::ui::units_panel::render_banner`]) can keep answering "why
+    /// is this a unit" without the reviewer reopening the panel.
+    pub description: String,
+    /// 1-based position within the grouping, for the status bar's
+    /// "unit 2/5" — navigation context a bare label can't provide.
+    pub index: usize,
+    pub total: usize,
+    pub hunk_ids: HashSet<String>,
+}
+
 /// All state the UI needs to render a frame and respond to input.
 pub struct App {
     pub repo_name: String,
@@ -174,11 +197,30 @@ pub struct App {
     /// revision diff, where it's the only thing on screen that says which
     /// revision(s) are being compared.
     pub scope_label: Option<String>,
+    /// The merged `[units]` config (agent CLI preference, model/effort
+    /// tuning), carried on `App` the same way `layout`/`scope_label` are:
+    /// set once by `main.rs` after construction, read whenever `u`/`U`
+    /// spawns a grouping. Default (all-`None`) everywhere else an `App` is
+    /// built — nested diff panes never trigger grouping.
+    pub units_config: crate::config::UnitsConfig,
+    /// Whether the first `u`/`U` that would spawn an agent CLI should
+    /// open [`crate::ui::units_setup`]'s one-time picker instead — set by
+    /// `main.rs` from [`crate::config::Config::units_configured`]'s
+    /// negation, flipped off by the picker completing. Default `false`
+    /// (never prompt): every `App` built outside `main.rs` — tests,
+    /// nested diff panes — has no business prompting.
+    pub units_prompt_needed: bool,
     /// Every gap a `z o` has expanded and not yet folded back, keyed by
     /// [`DiffFile::display_path`] — see [`FoldRange`]'s docs for why path
     /// rather than `file_idx`, and [`Self::rederive`] for how this actually
     /// gets spliced back into `files` on every derivation.
     expanded_folds: HashMap<String, Vec<FoldRange>>,
+    /// The active semantic-unit scope, if any — see [`UnitFilter`].
+    /// Private for the same reason `expanded_folds` is: changing it
+    /// without a [`Self::rederive`] would desynchronize `files`/`rows`
+    /// from the state they're supposed to be derived from, so the only
+    /// doors in are [`Self::set_unit_filter`]/[`Self::clear_unit_filter`].
+    unit_filter: Option<UnitFilter>,
     /// Files whose trailing gap `z o` has probed and found genuinely empty
     /// (the working tree has no more lines past the last hunk) — fed into
     /// [`Self::rederive`] as an effective `known_eof` override so the same
@@ -247,7 +289,10 @@ impl App {
             interactive: true,
             disk_is_new_side: false,
             scope_label: None,
+            units_config: crate::config::UnitsConfig::default(),
+            units_prompt_needed: false,
             expanded_folds: HashMap::new(),
+            unit_filter: None,
             trailing_probed_empty: HashSet::new(),
             viewport_height: 1,
             // Unbounded until the first frame reports a real pane width
@@ -268,9 +313,10 @@ impl App {
     /// `pristine_files`. Two very different costs depending on whether
     /// there's any fold state to account for:
     ///
-    /// - **No folds** (`expanded_folds` and `trailing_probed_empty` both
-    ///   empty — watch mode's steady state for a reviewer who never
-    ///   presses `z o`): the derived view is `pristine_files` verbatim, so
+    /// - **No derived state** (`expanded_folds`/`trailing_probed_empty`
+    ///   empty and no [`UnitFilter`] active — watch mode's steady state
+    ///   for a reviewer who never presses `z o` or scopes to a unit): the
+    ///   derived view is `pristine_files` verbatim, so
     ///   this *moves* it into `files` (`std::mem::take`) instead of paying
     ///   for a full deep clone just to hand back an identical copy of what
     ///   was already there. `pristine_files` is left empty afterward
@@ -300,13 +346,27 @@ impl App {
     /// never a patch to the previous `files`, always a fresh, structurally
     /// consistent recomputation from the one source of truth.
     fn rederive(&mut self) {
-        let has_fold_state =
-            !self.expanded_folds.is_empty() || !self.trailing_probed_empty.is_empty();
-        self.files = if has_fold_state {
+        let has_derived_state = !self.expanded_folds.is_empty()
+            || !self.trailing_probed_empty.is_empty()
+            || self.unit_filter.is_some();
+        self.files = if has_derived_state {
             if self.pristine_files.is_empty() && !self.files.is_empty() {
                 self.pristine_files = self.files.clone();
             }
-            self.splice_folds()
+            let mut files = self.splice_folds();
+            if let Some(filter) = &self.unit_filter {
+                apply_unit_filter(&mut files, &filter.hunk_ids);
+                if files.is_empty() {
+                    // Every id stopped resolving — a watch refresh rewrote
+                    // the content this unit described. An empty diff view
+                    // with no visible way back would read as data loss;
+                    // silently widening back to the full diff is the
+                    // behavior a reviewer can actually recover from.
+                    self.unit_filter = None;
+                    files = self.splice_folds();
+                }
+            }
+            files
         } else {
             std::mem::take(&mut self.pristine_files)
         };
@@ -614,6 +674,10 @@ impl App {
         self.pristine_files = files;
         self.expanded_folds.clear();
         self.trailing_probed_empty.clear();
+        // Same reasoning as the fold state above: a unit grouping
+        // describes the *previous* scope's diff; against an unrelated one
+        // its ids are meaningless.
+        self.unit_filter = None;
         self.rederive();
         self.cursor = 0;
         self.scroll_offset = 0;
@@ -630,6 +694,65 @@ impl App {
         // scope and so keeps a confirmed search alive across it.
         self.search = None;
         self.clamp_scroll();
+    }
+
+    /// Scopes the whole diff view down to one semantic unit's hunks —
+    /// `Enter` on [`crate::ui::units_panel`]'s selected unit. Cursor and
+    /// scroll reset to the top rather than being anchor-restored: the
+    /// filtered view is a different reading surface (the unit is meant to
+    /// be read from its beginning), not a refresh of the same one — the
+    /// same reasoning [`Self::apply_scope_swap`] applies to scope changes.
+    pub fn set_unit_filter(&mut self, filter: UnitFilter) {
+        self.unit_filter = Some(filter);
+        self.rederive();
+        self.cursor = 0;
+        self.scroll_offset = 0;
+        self.active_symbol = 0;
+        // A confirmed search's matches were computed against the full row
+        // list; recomputing against the filtered one keeps `n`/`N` from
+        // landing on rows that no longer exist.
+        self.recompute_search();
+        self.clamp_scroll();
+    }
+
+    /// Widens back to the full diff — plain `Esc`'s first meaning while a
+    /// unit scope is active (see `ui::mod::handle_action`'s `Cancel` arm:
+    /// filter first, then search highlight). Returns whether there was
+    /// anything to clear, so that arm knows whether `Esc` is spent.
+    pub fn clear_unit_filter(&mut self) -> bool {
+        if self.unit_filter.is_none() {
+            return false;
+        }
+        self.unit_filter = None;
+        self.rederive();
+        self.cursor = 0;
+        self.scroll_offset = 0;
+        self.active_symbol = 0;
+        self.recompute_search();
+        self.clamp_scroll();
+        true
+    }
+
+    pub fn unit_filter(&self) -> Option<&UnitFilter> {
+        self.unit_filter.as_ref()
+    }
+
+    /// The complete diff regardless of any active [`UnitFilter`] — what
+    /// grouping-related lookups must key on. While any derived state is
+    /// active, `pristine_files` holds the full parse (see
+    /// [`Self::rederive`]'s slow path); in the steady state it was moved
+    /// into `files` and sits there instead. Callers that want *what's on
+    /// screen* keep reading `files`; this exists precisely for the
+    /// unit-grouping paths, where hashing the filtered view would make the
+    /// cache key describe the scope rather than the diff (a `u` pressed
+    /// mid-scope would then miss the cache and re-spawn the agent CLI on a
+    /// fragment of the diff).
+    pub fn full_files(&self) -> &[DiffFile] {
+        if self.pristine_files.is_empty() {
+            &self.files
+        } else {
+            &self.pristine_files
+        }
     }
 
     /// Index into `files`/`rows` for whichever file the cursor currently
@@ -735,6 +858,8 @@ impl App {
             Action::ToggleTimeline
             | Action::ToggleLogView
             | Action::OpenScopeMenu
+            | Action::ToggleUnits
+            | Action::RegenerateUnits
             | Action::ToggleRangeSelect => {}
             // `ui::mod` intercepts this before it reaches here too, same
             // bucket as `ToggleTimeline`/`ToggleLogView`/`OpenScopeMenu`
@@ -1260,6 +1385,35 @@ impl App {
 /// The file whose [`DiffFile::display_path`] is `display_path`, if any —
 /// shared by [`App::prune_stale_folds`]'s two retain passes so both look a
 /// path up the same way.
+/// [`App::rederive`]'s unit-filter pass: keeps only hunks whose content id
+/// is in `ids`, then drops files left with nothing to show. Ids are
+/// recomputed against the *derived* (fold-spliced) files each time rather
+/// than cached — [`crate::groups::enumerate_hunks`] hashes only changed
+/// rows, so an expanded fold's extra context rows don't move a hunk's id,
+/// while a hunk whose actual changes were edited correctly falls out of
+/// the unit (its content is no longer what the grouping described). The
+/// rare surprise this accepts: an expansion big enough to merge two hunks
+/// concatenates their changed rows into one new id, which drops the merged
+/// hunk from the unit until the filter is cleared.
+fn apply_unit_filter(files: &mut Vec<DiffFile>, ids: &HashSet<String>) {
+    let keep: HashSet<(usize, usize)> = crate::groups::enumerate_hunks(files)
+        .into_iter()
+        .filter(|meta| ids.contains(&meta.id))
+        .map(|meta| (meta.file_idx, meta.hunk_idx))
+        .collect();
+    for (file_idx, file) in files.iter_mut().enumerate() {
+        let mut hunk_idx = 0;
+        file.hunks.retain(|_| {
+            let kept = keep.contains(&(file_idx, hunk_idx));
+            hunk_idx += 1;
+            kept
+        });
+    }
+    // Binary files carry no hunks, so they can never belong to a unit and
+    // fall away here along with fully filtered-out text files.
+    files.retain(|file| !file.hunks.is_empty());
+}
+
 fn find_file<'a>(files: &'a [DiffFile], display_path: &str) -> Option<&'a DiffFile> {
     files.iter().find(|f| f.display_path() == display_path)
 }
@@ -1331,6 +1485,85 @@ mod tests {
         let mut app = App::new("test-repo".to_owned(), PathBuf::from("/repo"), files);
         app.set_viewport_height(10);
         app
+    }
+
+    #[test]
+    fn unit_filter_scopes_rows_and_files_to_the_unit_and_clear_widens_back() {
+        let mut app = test_app();
+        let full_file_count = app.files.len();
+        let full_row_count = app.rows.len();
+        assert!(full_file_count >= 2, "fixture must span files");
+        app.update(Action::CursorDown);
+        app.update(Action::CursorDown);
+
+        let first_hunk_id = crate::groups::enumerate_hunks(&app.files)[0].id.clone();
+        app.set_unit_filter(UnitFilter {
+            label: "first hunk only".to_owned(),
+            description: String::new(),
+            index: 1,
+            total: 2,
+            hunk_ids: HashSet::from([first_hunk_id]),
+        });
+
+        assert_eq!(app.files.len(), 1, "sidebar narrows with the scope");
+        assert_eq!(app.files[0].hunks.len(), 1);
+        assert!(app.rows.len() < full_row_count);
+        assert_eq!(
+            (app.cursor, app.scroll_offset),
+            (0, 0),
+            "a unit reads from its top"
+        );
+        assert_eq!(
+            app.full_files().len(),
+            full_file_count,
+            "grouping lookups must still see the whole diff"
+        );
+
+        assert!(app.clear_unit_filter());
+        assert_eq!(app.files.len(), full_file_count);
+        assert_eq!(app.rows.len(), full_row_count);
+        assert!(
+            !app.clear_unit_filter(),
+            "second clear has nothing left to do"
+        );
+    }
+
+    #[test]
+    fn a_unit_filter_matching_nothing_auto_clears_instead_of_blanking_the_view() {
+        let mut app = test_app();
+        let full_row_count = app.rows.len();
+        app.set_unit_filter(UnitFilter {
+            label: "stale".to_owned(),
+            description: String::new(),
+            index: 1,
+            total: 1,
+            hunk_ids: HashSet::from(["feedbeef00000000".to_owned()]),
+        });
+        assert!(
+            app.unit_filter().is_none(),
+            "unresolvable scope must self-clear"
+        );
+        assert_eq!(app.rows.len(), full_row_count);
+    }
+
+    #[test]
+    fn a_scope_swap_drops_the_unit_filter() {
+        let mut app = test_app();
+        let id = crate::groups::enumerate_hunks(&app.files)[0].id.clone();
+        app.set_unit_filter(UnitFilter {
+            label: "unit".to_owned(),
+            description: String::new(),
+            index: 1,
+            total: 1,
+            hunk_ids: HashSet::from([id]),
+        });
+        assert!(app.unit_filter().is_some());
+
+        app.apply_scope_swap(parse_unified_diff(FIXTURE), true, false, None);
+        assert!(
+            app.unit_filter().is_none(),
+            "a new scope's diff is unrelated to the grouping's"
+        );
     }
 
     #[test]

@@ -86,6 +86,17 @@ enum Command {
         /// does.
         #[arg(long, conflicts_with_all = ["revision", "from", "to"])]
         watch: bool,
+        /// Runs the semantic-units grouping headlessly (cache first, then
+        /// the agent CLI — exactly what `u` does in the TUI) and prints
+        /// the resulting units as plain text, then exits. For scripting
+        /// and E2E verification of the grouping pipeline without a
+        /// terminal or a human watching the panel.
+        #[arg(long, hide = true, conflicts_with = "dump")]
+        dump_units: bool,
+        /// With `--dump-units`, skip the groups.jsonl cache and ask the
+        /// agent CLI afresh — the headless twin of `U` in the TUI.
+        #[arg(long, hide = true, requires = "dump_units")]
+        regroup: bool,
         /// Renders this many frames of the diff pane offscreen (a
         /// `ratatui::backend::TestBackend`, no real terminal involved) and
         /// prints timing, then exits — a headless way to measure
@@ -409,6 +420,8 @@ fn main() -> Result<()> {
         from: None,
         to: None,
         watch: false,
+        dump_units: false,
+        regroup: false,
         bench_render: None,
         show_keys: false,
     }) {
@@ -421,6 +434,8 @@ fn main() -> Result<()> {
             from,
             to,
             watch,
+            dump_units,
+            regroup,
             bench_render,
             show_keys,
         } => run_diff(
@@ -432,6 +447,8 @@ fn main() -> Result<()> {
             from,
             to,
             watch,
+            dump_units,
+            regroup,
             bench_render,
             show_keys,
         ),
@@ -480,6 +497,8 @@ fn run_diff(
     from: Option<String>,
     to: Option<String>,
     watch: bool,
+    dump_units: bool,
+    regroup: bool,
     bench_render: Option<usize>,
     show_keys: bool,
 ) -> Result<()> {
@@ -548,6 +567,21 @@ fn run_diff(
         return Ok(());
     }
 
+    if dump_units {
+        let cached = if regroup {
+            None
+        } else {
+            groups::cached(&repo_root, &files)
+        };
+        let grouping = match cached {
+            Some(cached) => cached,
+            None => groups::generate(&repo_root, &files, &config.units)
+                .map_err(|e| anyhow::anyhow!(e))?,
+        };
+        print!("{}", format_dump_units(&grouping, &files));
+        return Ok(());
+    }
+
     let repo_name = repo_root
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -555,6 +589,8 @@ fn run_diff(
 
     let mut app = App::new(repo_name, repo_root, files);
     app.layout = layout.into();
+    app.units_config = config.units.clone();
+    app.units_prompt_needed = !config.units_configured;
     app.interactive = interactive;
     // The only one of this function's scopes whose new side is genuinely
     // the live working tree — `--staged`'s is the index, a git range/
@@ -1471,6 +1507,7 @@ fn run_doctor(no_live: bool, language: Option<String>, json: bool) -> Result<()>
     std::process::exit(doctor::exit_code(&report));
 }
 
+
 /// The very first request against a freshly resolved key is also what makes
 /// `LspManager` spawn the server at all (it's lazy — nothing starts until
 /// something asks for it). That request reaches the server the instant the
@@ -1942,6 +1979,40 @@ fn format_dump(files: &[DiffFile], comments: &CommentIndex) -> String {
             out.push_str(&format_comment_markers(
                 files, file_idx, hunk_idx, row_idx, comments,
             ));
+        }
+    }
+    out
+}
+
+/// Plain-text rendering of a semantic-units grouping — `--dump-units`'s
+/// output. Built on the same [`ui::units_panel::UnitsPanel::build`]
+/// resolution the TUI panel uses, so the two can't drift on how ids map
+/// back to the live diff.
+fn format_dump_units(grouping: &groups::Grouping, files: &[DiffFile]) -> String {
+    use std::fmt::Write;
+    let panel = ui::units_panel::UnitsPanel::build(grouping, files);
+    let mut out = format!("units: {}  via {}\n", panel.entries.len(), panel.agent);
+    for (idx, entry) in panel.entries.iter().enumerate() {
+        let badge = match entry.kind {
+            groups::UnitKind::Concern => "",
+            groups::UnitKind::Noise => " [noise]",
+            groups::UnitKind::Misc => " [ungrouped]",
+        };
+        let _ = write!(
+            out,
+            "\n{:>2}. {}{badge}  ({} hunk{}",
+            idx + 1,
+            entry.label,
+            entry.hunk_count,
+            if entry.hunk_count == 1 { "" } else { "s" },
+        );
+        if entry.files.is_empty() {
+            out.push_str(")\n");
+        } else {
+            let _ = writeln!(out, ": {})", entry.files);
+        }
+        if !entry.description.is_empty() {
+            let _ = writeln!(out, "    {}", entry.description);
         }
     }
     out

@@ -260,6 +260,8 @@ impl FileView {
             | Action::ToggleLayout
             | Action::ToggleTimeline
             | Action::ToggleLogView
+            | Action::ToggleUnits
+            | Action::RegenerateUnits
             | Action::ToggleRangeSelect
             | Action::OpenScopeMenu
             | Action::AddComment

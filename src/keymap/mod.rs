@@ -111,6 +111,25 @@ pub enum Action {
     /// the exact key handling once it's open (`j`/`k`/Enter/Esc, not this
     /// action again).
     OpenScopeMenu,
+    /// Opens [`crate::ui::units_panel`]'s overlay — the diff's hunks
+    /// grouped into semantic units by the user's own agent CLI (see
+    /// [`crate::groups`]) — or closes it when already open. `ui::mod`'s
+    /// event loop intercepts this rather than forwarding it through
+    /// `App::update`: a cache miss spawns the agent CLI on a background
+    /// thread and the result arrives asynchronously, none of which a pure
+    /// state transition could express. A no-op outside
+    /// [`crate::ui::view::View::Diff`].
+    ToggleUnits,
+    /// Regenerates the semantic-units grouping from scratch, skipping the
+    /// `.katamari/groups.jsonl` cache — for when the agent's proposal
+    /// wasn't a useful cut and the reviewer wants a fresh take on the
+    /// *same* diff (the one case `ToggleUnits`'s cache-first path can
+    /// never reach, since an unchanged diff always has an unchanged cache
+    /// key). Intercepted by `ui::mod` for the same reason `ToggleUnits`
+    /// is; the fresh result overwrites the cache by virtue of the store's
+    /// last-record-wins fold. A no-op outside
+    /// [`crate::ui::view::View::Diff`].
+    RegenerateUnits,
     /// Opens the M6 comment-compose overlay, anchored to the cursor's
     /// current row — `ui::mod`'s event loop intercepts this rather than
     /// forwarding it through `App::update`, since it needs the repo root
@@ -533,6 +552,8 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("t", Action::ToggleTimeline),
         ("L", Action::ToggleLogView),
         ("o", Action::OpenScopeMenu),
+        ("u", Action::ToggleUnits),
+        ("U", Action::RegenerateUnits),
         ("v", Action::ToggleRangeSelect),
         ("c", Action::AddComment),
         ("C", Action::ToggleComments),
@@ -606,6 +627,10 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("t", Action::ToggleTimeline),
         ("L", Action::ToggleLogView),
         ("o", Action::OpenScopeMenu),
+        // Same vim-keys-for-things-with-no-emacs-identity rule as `q`/`b`/
+        // `s`: semantic units have no emacs convention to defer to.
+        ("u", Action::ToggleUnits),
+        ("U", Action::RegenerateUnits),
         ("C-Space", Action::ToggleRangeSelect),
         ("C-c C-c", Action::AddComment),
         ("C", Action::ToggleComments),
@@ -682,6 +707,8 @@ pub fn action_name(action: Action) -> &'static str {
         Action::ToggleRangeSelect => "toggle-range-select",
         Action::ToggleLogView => "toggle-log-view",
         Action::OpenScopeMenu => "open-scope-menu",
+        Action::ToggleUnits => "toggle-units",
+        Action::RegenerateUnits => "regenerate-units",
         Action::AddComment => "add-comment",
         Action::ToggleComments => "toggle-comments",
         Action::ExpandFold => "expand-fold",
@@ -727,6 +754,8 @@ pub fn action_by_name(name: &str) -> Option<Action> {
         "toggle-range-select" => Action::ToggleRangeSelect,
         "toggle-log-view" => Action::ToggleLogView,
         "open-scope-menu" => Action::OpenScopeMenu,
+        "toggle-units" => Action::ToggleUnits,
+        "regenerate-units" => Action::RegenerateUnits,
         "add-comment" => Action::AddComment,
         "toggle-comments" => Action::ToggleComments,
         "expand-fold" => Action::ExpandFold,
@@ -1076,6 +1105,8 @@ mod tests {
             Action::OpenSearch,
             Action::NextMatch,
             Action::PrevMatch,
+            Action::ToggleUnits,
+            Action::RegenerateUnits,
         ];
         for action in all {
             let name = action_name(action);
@@ -1225,7 +1256,7 @@ mod tests {
     /// test.
     #[test]
     fn every_vim_and_emacs_binding_covers_every_action_exactly_once() {
-        const ACTION_COUNT: usize = 36;
+        const ACTION_COUNT: usize = 38;
         for ci_distinguishable in [false, true] {
             for preset in [
                 vim_preset(ci_distinguishable),
