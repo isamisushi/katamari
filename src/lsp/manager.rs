@@ -2342,6 +2342,38 @@ fn repull_open_documents(
     }
 }
 
+/// The exact message [`forward_observed`] substitutes on `recv_timeout`
+/// expiry. Outcome classification compares against this whole string —
+/// a substring match would misfile any OS-level transport error whose text
+/// happens to contain "timed out" as a request timeout.
+pub const REQUEST_TIMED_OUT: &str = "request timed out";
+
+/// How a finished (or failed) request is filed in the journal. Split from
+/// [`forward_observed`] so the taxonomy — the inspector's whole reason to
+/// exist — is testable without a live server. `Ok` results serialize to
+/// JSON to distinguish "answered with nothing" (`null`/`[]` → `NoResult`)
+/// from a real answer; both readings matter when diagnosing a
+/// go-to-definition that silently did nothing.
+fn request_outcome<T: serde::Serialize>(result: &Result<T, LspError>) -> EventOutcome {
+    match result {
+        Ok(value) => {
+            let empty = serde_json::to_value(value).ok().is_some_and(|value| {
+                value.is_null() || value.as_array().is_some_and(|array| array.is_empty())
+            });
+            if empty {
+                EventOutcome::NoResult
+            } else {
+                EventOutcome::Result
+            }
+        }
+        Err(LspError::Server { .. }) => EventOutcome::ServerError,
+        Err(LspError::Io(message)) if message == REQUEST_TIMED_OUT => EventOutcome::Timeout,
+        Err(LspError::Closed) | Err(LspError::Io(_)) | Err(LspError::Json(_)) => {
+            EventOutcome::TransportFailure
+        }
+    }
+}
+
 /// Waits (bounded by [`REQUEST_TIMEOUT`]) for `rx` to resolve and relays the
 /// result to `tx`, converting a timed-out wait into the same `LspError` a
 /// transport failure would produce — generic over the result type so
@@ -2360,25 +2392,9 @@ fn forward_observed<T: serde::Serialize + Send + 'static>(
 ) {
     let result = rx
         .recv_timeout(REQUEST_TIMEOUT)
-        .unwrap_or(Err(LspError::Io("request timed out".to_owned())));
+        .unwrap_or(Err(LspError::Io(REQUEST_TIMED_OUT.to_owned())));
     if let Some(observer) = observer {
-        let outcome = match &result {
-            Ok(value) => {
-                let empty = serde_json::to_value(value).ok().is_some_and(|value| {
-                    value.is_null() || value.as_array().is_some_and(|array| array.is_empty())
-                });
-                if empty {
-                    EventOutcome::NoResult
-                } else {
-                    EventOutcome::Result
-                }
-            }
-            Err(LspError::Server { .. }) => EventOutcome::ServerError,
-            Err(LspError::Io(message)) if message.contains("timed out") => EventOutcome::Timeout,
-            Err(LspError::Closed) | Err(LspError::Io(_)) | Err(LspError::Json(_)) => {
-                EventOutcome::TransportFailure
-            }
-        };
+        let outcome = request_outcome(&result);
         observer.record_request(
             identity.clone(),
             generation,
@@ -2431,6 +2447,64 @@ mod tests {
             .map(|_| bump_version(&mut versions, Path::new("/repo/a.rs")).unwrap())
             .collect();
         assert_eq!(seen, vec![2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn request_outcome_files_each_result_shape_under_the_right_taxonomy_entry() {
+        // A populated answer vs the two "answered with nothing" encodings a
+        // server can legally send back.
+        let populated: Result<serde_json::Value, LspError> = Ok(serde_json::json!({"uri": "x"}));
+        assert_eq!(request_outcome(&populated), EventOutcome::Result);
+        let null: Result<serde_json::Value, LspError> = Ok(serde_json::Value::Null);
+        assert_eq!(request_outcome(&null), EventOutcome::NoResult);
+        let empty: Result<Vec<u32>, LspError> = Ok(Vec::new());
+        assert_eq!(request_outcome(&empty), EventOutcome::NoResult);
+        let none: Result<Option<u32>, LspError> = Ok(None);
+        assert_eq!(request_outcome(&none), EventOutcome::NoResult);
+
+        let server: Result<(), LspError> = Err(LspError::Server {
+            code: -32603,
+            message: "boom".to_owned(),
+        });
+        assert_eq!(request_outcome(&server), EventOutcome::ServerError);
+        let timeout: Result<(), LspError> = Err(LspError::Io(REQUEST_TIMED_OUT.to_owned()));
+        assert_eq!(request_outcome(&timeout), EventOutcome::Timeout);
+        let closed: Result<(), LspError> = Err(LspError::Closed);
+        assert_eq!(request_outcome(&closed), EventOutcome::TransportFailure);
+        let io: Result<(), LspError> = Err(LspError::Io("broken pipe".to_owned()));
+        assert_eq!(request_outcome(&io), EventOutcome::TransportFailure);
+    }
+
+    #[test]
+    fn request_outcome_requires_the_exact_timeout_sentinel_not_a_substring() {
+        // An OS-level transport error mentioning "timed out" is a transport
+        // failure, not a request timeout — only the sentinel substituted by
+        // `forward_observed` itself means the deadline expired.
+        let os: Result<(), LspError> = Err(LspError::Io(
+            "connection timed out (os error 110)".to_owned(),
+        ));
+        assert_eq!(request_outcome(&os), EventOutcome::TransportFailure);
+    }
+
+    #[test]
+    fn lsp_message_level_maps_the_spec_constants_and_defaults_to_info() {
+        assert_eq!(
+            lsp_message_level(&serde_json::json!({"type": 1})),
+            EventLevel::Error
+        );
+        assert_eq!(
+            lsp_message_level(&serde_json::json!({"type": 2})),
+            EventLevel::Warn
+        );
+        assert_eq!(
+            lsp_message_level(&serde_json::json!({"type": 3})),
+            EventLevel::Info
+        );
+        assert_eq!(
+            lsp_message_level(&serde_json::json!({"type": 4})),
+            EventLevel::Debug
+        );
+        assert_eq!(lsp_message_level(&serde_json::json!({})), EventLevel::Info);
     }
 
     #[test]

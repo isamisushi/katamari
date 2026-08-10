@@ -181,6 +181,14 @@ impl Client {
         self.server_version.as_deref()
     }
 
+    /// As [`Self::supports_definition`], for `textDocument/hover`. This gate
+    /// is newer than the definition/references ones (hover used to be sent
+    /// unconditionally and rely on the server erroring), so it's the arm to
+    /// suspect first if a server that answers hover despite not advertising
+    /// it ever turns up. `is_some` deliberately counts an explicit
+    /// `hoverProvider: false` as "advertised", matching the two older gates
+    /// — a server saying `false` gets the request and may answer anyway;
+    /// only total silence in `initialize` is treated as unsupported.
     pub fn supports_hover(&self) -> bool {
         self.capabilities.hover_provider.is_some()
     }

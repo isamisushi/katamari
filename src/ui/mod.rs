@@ -2477,7 +2477,9 @@ fn request_error_outcome(error: &LspError) -> crate::lsp::EventOutcome {
         LspError::Io(message) if message.contains("does not advertise") => {
             crate::lsp::EventOutcome::Unsupported
         }
-        LspError::Io(message) if message.contains("timed out") => crate::lsp::EventOutcome::Timeout,
+        LspError::Io(message) if message == crate::lsp::manager::REQUEST_TIMED_OUT => {
+            crate::lsp::EventOutcome::Timeout
+        }
         LspError::Closed | LspError::Io(_) | LspError::Json(_) => {
             crate::lsp::EventOutcome::TransportFailure
         }
