@@ -654,25 +654,40 @@ fn event_loop(
         // layout's content width for a `View::Diff`, regardless of which
         // layout is actually showing (see `App::content_width`'s docs on
         // why side-by-side is a deliberately separate concern from this).
-        let (content_height, content_width) = match stack.top() {
+        let (content_height, content_width, files_viewport_height) = match stack.top() {
             View::Diff(app) => {
                 let status_height = hints::required_height(
                     &hints::diff_view_items(keymap, hints_expanded),
                     area.width,
                 );
-                let diff_area = diff_layout(area, app.sidebar_visible, status_height).diff;
+                let areas = diff_layout(area, app.sidebar_visible, status_height);
                 // Mirrors `draw`'s banner split exactly — viewport height
                 // fed to scroll math must equal the rows content actually
                 // gets, or the cursor could sit "visible" one banner-height
                 // below the pane's real bottom edge.
                 let banner_height = if app.unit_filter().is_some() {
-                    units_panel::BANNER_HEIGHT.min(diff_area.height)
+                    units_panel::BANNER_HEIGHT.min(areas.diff.height)
                 } else {
                     0
                 };
+                let diff_pane_area = Rect {
+                    height: areas.diff.height - banner_height,
+                    ..areas.diff
+                };
+                // `pane::inner_rect` is the exact same border-geometry
+                // function `render_focusable`'s real `PaneChrome` uses (see
+                // `diff_view::unified_content_width`'s docs) — req 8:
+                // content geometry derived from the new pane borders
+                // exactly once here, then reused for both dimensions,
+                // rather than hand-re-deriving height a second way.
+                let diff_inner = pane::inner_rect(diff_pane_area.width, diff_pane_area);
+                let files_viewport_height = areas.sidebar.map(|sidebar_area| {
+                    pane::inner_rect(sidebar_area.width, sidebar_area).height as usize
+                });
                 (
-                    diff_area.height - banner_height,
-                    diff_view::unified_content_width(diff_area.width),
+                    diff_inner.height,
+                    diff_view::unified_content_width(diff_pane_area.width),
+                    files_viewport_height,
                 )
             }
             View::File(_) => {
@@ -684,6 +699,7 @@ fn event_loop(
                 (
                     content_area.height,
                     file_view::content_width_for_pane(content_area.width),
+                    None,
                 )
             }
             View::Timeline(_) => {
@@ -691,19 +707,26 @@ fn event_loop(
                     &hints::timeline_view_items(keymap, hints_expanded),
                     area.width,
                 );
-                (timeline_view::layout(area, status_height).diff.height, 0)
+                (
+                    timeline_view::layout(area, status_height).diff.height,
+                    0,
+                    None,
+                )
             }
             View::Log(_) => {
                 let status_height = hints::required_height(
                     &hints::log_view_items(keymap, hints_expanded),
                     area.width,
                 );
-                (log_view::layout(area, status_height).list.height, 0)
+                (log_view::layout(area, status_height).list.height, 0, None)
             }
-            View::LspInspector(_) => (area.height.saturating_sub(2), area.width as usize),
+            View::LspInspector(_) => (area.height.saturating_sub(2), area.width as usize, None),
         };
         stack.top_mut().set_viewport_height(content_height as usize);
         stack.top_mut().set_content_width(content_width);
+        if let (Some(height), View::Diff(app)) = (files_viewport_height, stack.top_mut()) {
+            app.set_files_viewport_height(height);
+        }
 
         if !matches!(stack.top(), View::LspInspector(_))
             && let Some((generation, operation_id, rx)) = &pending_hover
@@ -1539,6 +1562,34 @@ fn supersede_pending_goto(
     }
 }
 
+/// The status-bar note for a diff-content `action` pressed while the files
+/// pane has focus (issue #14) — `None` for anything that either already
+/// makes sense in `Files` focus (movement, `Confirm`, pane toggles) or is
+/// handled by a routing change inside `App::update` itself (hunk/file/
+/// symbol navigation quietly no-op there instead of erroring — see
+/// `App::update`'s `MainPaneFocus::Files` arms). Every variant this matches
+/// needs a cursor position *inside the diff* to act on: a hover/definition/
+/// references target, a fold to expand/collapse, a comment anchor, or a
+/// search/diagnostic row to jump to — none of which `files_selection`
+/// provides. Named per-action rather than one generic "focus the diff pane
+/// first" so the message still says *what* is unavailable, matching this
+/// codebase's own rule that status notes name the action (see the roadmap
+/// issue's cross-cutting acceptance rules).
+fn files_focus_blocked_message(action: Action) -> Option<&'static str> {
+    Some(match action {
+        Action::Hover => "hover: focus the diff pane first",
+        Action::GotoDefinition => "definition: focus the diff pane first",
+        Action::FindReferences => "references: focus the diff pane first",
+        Action::AddComment => "comment: focus the diff pane first",
+        Action::ExpandFold | Action::CollapseFold => "fold: focus the diff pane first",
+        Action::OpenSearch | Action::NextMatch | Action::PrevMatch => {
+            "search: focus the diff pane first"
+        }
+        Action::NextDiagnostic | Action::PrevDiagnostic => "diagnostic: focus the diff pane first",
+        _ => return None,
+    })
+}
+
 /// Applies one matched [`Action`], handling every concern the pure
 /// `App`/`FileView::update` methods can't: issuing LSP requests
 /// (`Hover`/`GotoDefinition`/`FindReferences`), navigating on their
@@ -1791,6 +1842,24 @@ fn handle_action(
             Action::Hover | Action::Cancel => return hover_state.close(),
             _ => hover_state.close(),
         }
+    }
+
+    // Issue #14: a diff-content action (hover, go-to-definition, a fold
+    // toggle, search, ...) needs a cursor position *inside the diff* to act
+    // on — exactly what the files pane's own independent `files_selection`
+    // doesn't provide. Gated here, ahead of the main dispatch below, rather
+    // than inside `App::update` (which has no way to report a status note)
+    // or piecemeal in each arm (which would mean re-deriving "is Files
+    // focused" eleven separate times). Movement/paging, `Confirm`,
+    // `Cancel`, pane-focus/view toggles, and `OpenHelp`/`Quit` all pass
+    // through unblocked — see `files_focus_blocked_message`'s docs for the
+    // exact boundary.
+    if let View::Diff(app) = stack.top()
+        && app.focus == app::MainPaneFocus::Files
+        && let Some(message) = files_focus_blocked_message(action)
+    {
+        *goto_status = Some(message.to_owned());
+        return;
     }
 
     match action {
@@ -2199,6 +2268,28 @@ fn handle_action(
                 *goto_status = Some("scope: only available in the diff view".to_owned());
             }
         },
+        // Issue #14: Enter while `Files` has focus jumps the diff cursor to
+        // the selected file's header, hands focus to `Diff`, and records
+        // the jump in the general history exactly like every other
+        // significant navigation does (`from` captured *before*
+        // `confirm_files_selection` moves the cursor, so a header/`Del`-row
+        // starting point that has no source location of its own naturally
+        // records nothing — see `record_jump`'s docs). Checked ahead of the
+        // `stack.top_mut()` match below rather than as another arm inside
+        // it, since this needs an immutable `jump_entry()` read of the
+        // *pre-jump* cursor before the mutable call that moves it.
+        Action::Confirm if matches!(stack.top(), View::Diff(app) if app.focus == app::MainPaneFocus::Files) =>
+        {
+            let from = stack.top().jump_entry();
+            let to = match stack.top_mut() {
+                View::Diff(app) => app.confirm_files_selection(),
+                _ => None, // unreachable — the guard above already matched View::Diff
+            };
+            if let Some(to) = to {
+                record_jump(jump_stack, from, Some(to));
+                hover_state.invalidate();
+            }
+        }
         Action::Confirm => match stack.top_mut() {
             // Computing the diff is a real backend call that can fail, so
             // `LogView::confirm` is called directly here rather than
@@ -2222,6 +2313,28 @@ fn handle_action(
             let before = stack.top().hover_cursor_key();
             stack.top_mut().update(other);
             if stack.top().hover_cursor_key() != before {
+                hover_state.invalidate();
+            }
+            // Tabbing off the Diff pane supersedes an in-flight
+            // definition/references request the same way a newer press
+            // would (see `supersede_pending_goto`): the files-focus gate
+            // only guards *initiation*, so a `gd` dispatched from Diff
+            // focus could otherwise resolve seconds later — after the
+            // reviewer deliberately moved to the sidebar — and yank focus
+            // back to Diff via `jump_cursor_to`, clobbering the sidebar
+            // browsing position through `sync_files_selection`. Same
+            // no-surprise-navigation principle as issue #11's readiness
+            // gate, applied at response-apply time. A pending hover is
+            // covered by the generation bump.
+            if matches!(other, Action::FocusNextPane | Action::FocusPrevPane)
+                && let View::Diff(app) = stack.top()
+                && app.focus == app::MainPaneFocus::Files
+            {
+                supersede_pending_goto(
+                    pending_goto,
+                    observer,
+                    "navigation request superseded by focusing the files pane",
+                );
                 hover_state.invalidate();
             }
         }
@@ -2914,7 +3027,7 @@ fn draw(
             let status_height = hints::required_height(&hint_items, frame.area().width);
             let areas = diff_layout(frame.area(), app.sidebar_visible, status_height);
             if let Some(sidebar_area) = areas.sidebar {
-                sidebar::render(frame, sidebar_area, app);
+                sidebar::render(frame, sidebar_area, app, keymap);
             }
             // While a unit scope is active, the top of the diff pane is
             // given to its banner and everything else renders into what
@@ -2932,7 +3045,7 @@ fn draw(
                 diff_area.height -= banner.height;
             }
             let effective_layout = diff_view::effective_layout(app.layout, diff_area.width);
-            diff_view::render(
+            diff_view::render_focusable(
                 frame,
                 diff_area,
                 app,
@@ -2940,6 +3053,8 @@ fn draw(
                 effective_layout,
                 diagnostics,
                 comments,
+                app.focus == app::MainPaneFocus::Diff,
+                &hints::diff_pane_hints(keymap, app.sidebar_visible),
             );
             status_bar::render(
                 frame,
@@ -3514,5 +3629,79 @@ mod tests {
         );
 
         assert!(pending_goto.is_none());
+    }
+
+    // ---- files_focus_blocked_message (issue #14) ---------------------------
+
+    #[test]
+    fn every_diff_content_action_is_blocked_with_a_named_status() {
+        for action in [
+            Action::Hover,
+            Action::GotoDefinition,
+            Action::FindReferences,
+            Action::AddComment,
+            Action::ExpandFold,
+            Action::CollapseFold,
+            Action::OpenSearch,
+            Action::NextMatch,
+            Action::PrevMatch,
+            Action::NextDiagnostic,
+            Action::PrevDiagnostic,
+        ] {
+            let message = files_focus_blocked_message(action)
+                .unwrap_or_else(|| panic!("{action:?} must be blocked while Files is focused"));
+            assert!(
+                message.ends_with("focus the diff pane first"),
+                "{action:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn movement_confirm_and_pane_toggles_pass_through_unblocked() {
+        // The req 5/§9 boundary: these all either already make sense while
+        // `Files` is focused (movement routes inside `App::update` itself),
+        // or need to keep working regardless of focus (`Cancel`/jump
+        // history/pane-focus cycling/quitting/help) — none of them are
+        // diff-content actions this gate exists to shield.
+        for action in [
+            Action::CursorDown,
+            Action::CursorUp,
+            Action::Top,
+            Action::Bottom,
+            Action::HalfPageDown,
+            Action::HalfPageUp,
+            Action::NextHunk,
+            Action::PrevHunk,
+            Action::NextFile,
+            Action::PrevFile,
+            Action::NextSymbol,
+            Action::PrevSymbol,
+            Action::Confirm,
+            Action::Cancel,
+            Action::JumpBack,
+            Action::JumpForward,
+            Action::FocusNextPane,
+            Action::FocusPrevPane,
+            Action::ToggleSidebar,
+            Action::ToggleLayout,
+            Action::ToggleComments,
+            Action::ToggleTimeline,
+            Action::ToggleLogView,
+            Action::ToggleLspInspector,
+            Action::ToggleUnits,
+            Action::RegenerateUnits,
+            Action::ToggleHints,
+            Action::ToggleRangeSelect,
+            Action::OpenScopeMenu,
+            Action::OpenHelp,
+            Action::Quit,
+        ] {
+            assert_eq!(
+                files_focus_blocked_message(action),
+                None,
+                "{action:?} must not be blocked by the files-focus gate"
+            );
+        }
     }
 }

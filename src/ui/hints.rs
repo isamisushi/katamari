@@ -18,6 +18,7 @@
 //! uses it to size the status bar before the frame is split.
 
 use crate::keymap::{Action, Keymap};
+use crate::ui::pane;
 use crate::ui::text::display_width;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -89,6 +90,73 @@ impl HintItem {
             label,
         }
     }
+}
+
+/// One [`pane::Hint`] for a [`crate::ui::pane::PaneChrome`] border, built
+/// from the live `keymap` the same way [`HintItem::for_actions`] builds a
+/// status-bar item — reads whichever of `actions`' bindings currently
+/// resolve rather than a hardcoded literal, so a `[keys]` override or an
+/// emacs/vim preset switch updates a pane border's hint the same way it
+/// already updates the status bar. The LSP inspector's own `PaneChrome`
+/// hints (`src/ui/lsp_inspector.rs`) predate this helper and still
+/// hardcode vim notation directly — issue #14's files/diff panes are the
+/// first callers to route through this instead, to avoid growing a second
+/// copy of the bug class `HintItem::for_actions` already fixed once.
+/// `None` under the same "nothing in `actions` is bound" rule
+/// `HintItem::for_actions` follows.
+pub(crate) fn pane_hint(
+    keymap: &Keymap,
+    actions: &[Action],
+    label: &'static str,
+    essential: bool,
+) -> Option<pane::Hint<'static>> {
+    let keys: Vec<String> = actions
+        .iter()
+        .filter_map(|a| keymap.binding_for(*a))
+        .map(|seq| seq.compact_notation())
+        .collect();
+    if keys.is_empty() {
+        return None;
+    }
+    Some(pane::Hint::new(keys.join("/"), label, essential))
+}
+
+/// The files pane's border hints (issue #14): just enough to make the
+/// pane's own controls discoverable without the reviewer opening `?` —
+/// movement, confirming a selection, and jumping to the extremes. The full
+/// curated list stays in [`diff_view_items`]'s domain (the status bar);
+/// this is deliberately terser, matching how little a flat file list
+/// actually needs explained.
+pub(crate) fn files_pane_hints(keymap: &Keymap) -> Vec<pane::Hint<'static>> {
+    [
+        pane_hint(
+            keymap,
+            &[Action::CursorDown, Action::CursorUp],
+            "move",
+            true,
+        ),
+        pane_hint(keymap, &[Action::Confirm], "open", true),
+        pane_hint(keymap, &[Action::Top, Action::Bottom], "top/bottom", false),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// The diff pane's border hint: just enough to point a reviewer who hasn't
+/// discovered Tab yet at the files pane beside it — the diff pane's own
+/// full curated list already lives in the status bar below
+/// ([`diff_view_items`]), so this stays minimal on purpose (plan-14 §9.1).
+/// Empty when the sidebar is hidden, where Tab genuinely has nothing to
+/// cycle to (see `App::pane_visible`) and a "focus files" reminder would
+/// be actively misleading.
+pub(crate) fn diff_pane_hints(keymap: &Keymap, sidebar_visible: bool) -> Vec<pane::Hint<'static>> {
+    if !sidebar_visible {
+        return Vec::new();
+    }
+    pane_hint(keymap, &[Action::FocusNextPane], "focus files", true)
+        .into_iter()
+        .collect()
 }
 
 /// The separator between hint items on the same line — two spaces, matching
@@ -456,6 +524,44 @@ mod tests {
     fn for_actions_returns_none_when_nothing_in_the_list_is_bound() {
         let keymap = Keymap::from_bindings(&[(KeySeq::parse("j"), Action::CursorDown)]);
         assert!(HintItem::for_actions(&keymap, &[Action::Quit], "quit").is_none());
+    }
+
+    // ---- pane_hint / files_pane_hints / diff_pane_hints (issue #14) -------
+
+    #[test]
+    fn pane_hint_reads_the_live_binding_like_hint_item_does() {
+        let keymap = Keymap::from_bindings(&vim_preset(false));
+        let hint = pane_hint(
+            &keymap,
+            &[Action::CursorDown, Action::CursorUp],
+            "move",
+            true,
+        )
+        .expect("j/k is bound in the vim preset");
+        assert_eq!(hint.key, "j/k");
+        assert_eq!(hint.description, "move");
+        assert!(hint.essential);
+    }
+
+    #[test]
+    fn pane_hint_is_none_when_nothing_in_the_list_is_bound() {
+        let keymap = Keymap::from_bindings(&[(KeySeq::parse("j"), Action::CursorDown)]);
+        assert!(pane_hint(&keymap, &[Action::Quit], "quit", true).is_none());
+    }
+
+    #[test]
+    fn files_pane_hints_include_move_and_open() {
+        let keymap = Keymap::from_bindings(&vim_preset(false));
+        let hints = files_pane_hints(&keymap);
+        assert!(hints.iter().any(|h| h.description == "move"));
+        assert!(hints.iter().any(|h| h.description == "open"));
+    }
+
+    #[test]
+    fn diff_pane_hints_is_empty_when_the_sidebar_is_hidden() {
+        let keymap = Keymap::from_bindings(&vim_preset(false));
+        assert!(diff_pane_hints(&keymap, false).is_empty());
+        assert!(!diff_pane_hints(&keymap, true).is_empty());
     }
 
     #[test]

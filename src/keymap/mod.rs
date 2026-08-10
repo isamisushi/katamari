@@ -43,19 +43,21 @@ pub enum Action {
     PrevSymbol,
     /// Cycles which pane has focus, forward/backward, in whichever view
     /// currently has more than one — the LSP inspector's Servers/Detail/
-    /// Journal panes and the timeline's list/diff split today, with the
-    /// main files/diff panes joining later (issue #14). Bound to Tab/
-    /// BackTab in both presets. Deliberately a separate action from
-    /// `NextSymbol`/`PrevSymbol`: before issue #13, Tab/BackTab *were*
+    /// Journal panes, the timeline's list/diff split, and (issue #14) the
+    /// root diff view's own files/diff panes. Bound to Tab/BackTab in both
+    /// presets. Deliberately a separate action from `NextSymbol`/
+    /// `PrevSymbol`: before issue #13, Tab/BackTab *were*
     /// `NextSymbol`/`PrevSymbol`, repurposed per-view as ad hoc focus
     /// cycling — which meant a view with a nested `App` (the timeline)
     /// could never let symbol selection reach that nested diff, since Tab
     /// always meant "cycle my own panes" first. Splitting pane focus into
     /// its own action fixes that: a diff-view-shaped pane now sees real
     /// `NextSymbol`/`PrevSymbol` requests only when a reviewer actually
-    /// pressed `l`/`h`/`M-f`/`M-b`, never a repurposed Tab. A single-pane
-    /// view (`App`/`FileView`) has nothing to cycle, so both are harmless
-    /// no-ops there — see [`crate::ui::pane::cycle_focus`], the shared
+    /// pressed `l`/`h`/`M-f`/`M-b`, never a repurposed Tab. `FileView` is
+    /// still genuinely single-pane and has nothing to cycle, so both stay
+    /// harmless no-ops there; the root `App`'s own files/diff split (see
+    /// [`crate::ui::app::MainPaneFocus`]) is a real target for both as of
+    /// issue #14 — see [`crate::ui::pane::cycle_focus`], the shared
     /// mechanic every multi-pane view's `update` delegates to.
     FocusNextPane,
     FocusPrevPane,

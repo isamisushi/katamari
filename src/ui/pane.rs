@@ -8,6 +8,7 @@
 
 use std::borrow::Cow;
 
+use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
@@ -74,6 +75,21 @@ impl<'a> PaneChrome<'a> {
         }
         block
     }
+}
+
+/// The real [`Block::inner`] rect a [`PaneChrome`] of this exact `width`
+/// carves out of `area`, regardless of title/hints/focus (none of which
+/// change the border geometry itself — only which glyphs draw *in* the
+/// border). The one place that geometry lives, so a caller sizing a pane's
+/// content *before* the frame it's part of is even drawn (`ui::mod`'s frame
+/// preamble, computing next frame's viewport height/width ahead of
+/// `draw()`) and the real render call that follows agree on inner size by
+/// construction, rather than by two independently hand-counted border
+/// widths that can silently drift apart — see
+/// `diff_view::unified_content_width`'s docs for exactly the drift issue
+/// #14 fixed by routing through this instead of a literal `- 1`/`- 2`.
+pub(crate) fn inner_rect(width: u16, area: Rect) -> Rect {
+    PaneChrome::new(String::new(), width).block().inner(area)
 }
 
 fn focus_style() -> Style {

@@ -14,6 +14,7 @@ use crate::lsp::client::uri_to_path;
 use crate::ui::app::App;
 use crate::ui::file_view::FileView;
 use crate::ui::hover_popup::HoverQuery;
+use crate::ui::refresh;
 use crate::ui::symbols;
 use crate::ui::view::{View, ViewStack};
 use lsp_types::{GotoDefinitionResponse, Location, PositionEncodingKind};
@@ -323,6 +324,31 @@ impl App {
             .map(|s| s.display_start)
             .unwrap_or(0);
         Some((self.repo_root.join(relative), line, col))
+    }
+
+    /// `Enter` while the files pane has focus (issue #14): jumps the diff
+    /// cursor to the selected file's header row and hands focus back to
+    /// `Diff` (via [`Self::jump_cursor_to`], which sets that
+    /// unconditionally — see its own docs) — the sidebar's one and only way
+    /// to actually move the diff, since every other action while `Files` is
+    /// focused only moves `files_selection` (see [`Self::update`]'s
+    /// `MainPaneFocus::Files` arms). Returns the landed-on [`JumpEntry`]
+    /// (`line: None` — a file header is a structural destination, not a
+    /// source line, see [`JumpEntry::line`]'s docs) so `ui::mod`'s
+    /// `Action::Confirm` arm can record the jump the same way every other
+    /// significant navigation does, and so `Ctrl-o` can retrace it. `None`
+    /// only when there is genuinely no file to jump to (an empty diff).
+    pub fn confirm_files_selection(&mut self) -> Option<JumpEntry> {
+        let file = self.files.get(self.files_selection)?;
+        let display_path = file.display_path().to_owned();
+        let row = refresh::locate_in_diff(&self.files, &self.rows, &display_path, None)?;
+        self.jump_cursor_to(row, 0);
+        Some(JumpEntry {
+            file: self.repo_root.join(&display_path),
+            git_root: self.repo_root.clone(),
+            line: None,
+            col: 0,
+        })
     }
 }
 
@@ -820,5 +846,120 @@ mod tests {
             None,
             "a failed jump must not corrupt history"
         );
+    }
+
+    // ---- confirm_files_selection (issue #14) ------------------------------
+
+    /// Two one-line files — enough for `App::current_position`/`jump_entry`
+    /// to have a real source location to leave from in file 0, and a real
+    /// header to jump to in file 1. Row order per file is `[FileHeader,
+    /// HunkHeader, Line]`, so file 0's content row is index 2 and file 1's
+    /// header is index 3.
+    fn two_file_app(repo_root: &Path) -> crate::ui::app::App {
+        let make = |name: &str| DiffFile {
+            old_path: Some(name.to_owned()),
+            new_path: Some(name.to_owned()),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                known_eof: true,
+                rows: vec![DiffRow {
+                    kind: DiffLineKind::Context,
+                    text: "content".to_owned(),
+                    old_line: Some(1),
+                    new_line: Some(1),
+                }],
+            }],
+            ..Default::default()
+        };
+        crate::ui::app::App::new(
+            "repo".to_owned(),
+            repo_root.to_path_buf(),
+            vec![make("a.rs"), make("b.rs")],
+        )
+    }
+
+    #[test]
+    fn confirm_files_selection_lands_on_the_selected_files_header_and_focuses_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = two_file_app(dir.path());
+        app.cursor = 2; // file 0's content row — a real place to jump from
+        app.focus = crate::ui::app::MainPaneFocus::Files;
+        app.files_selection = 1; // b.rs
+
+        let to = app
+            .confirm_files_selection()
+            .expect("a two-file diff always has something to confirm");
+        assert_eq!(to.file, dir.path().join("b.rs"));
+        assert_eq!(to.line, None, "a file header is a structural destination");
+        assert_eq!(app.cursor, 3, "row 3 is b.rs's own file header");
+        assert_eq!(app.focus, crate::ui::app::MainPaneFocus::Diff);
+    }
+
+    /// [`View::jump_entry`]'s exact `View::Diff` computation, without
+    /// needing to move `app` into a `View` (which would stop the test from
+    /// using it afterward) — `App::current_position` is the same private
+    /// method that arm calls, reachable here since `tests` is a descendant
+    /// module of the one it's defined in.
+    fn jump_entry_for(app: &App, git_root: &Path) -> Option<JumpEntry> {
+        app.current_position().map(|(file, line, col)| JumpEntry {
+            file,
+            git_root: git_root.to_path_buf(),
+            line: Some(line),
+            col,
+        })
+    }
+
+    #[test]
+    fn confirm_files_selection_round_trips_through_the_jump_stack() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = two_file_app(dir.path());
+        app.cursor = 2; // a real source location in file 0
+        app.focus = crate::ui::app::MainPaneFocus::Files;
+        app.files_selection = 1;
+
+        let from = jump_entry_for(&app, dir.path());
+        let to = app.confirm_files_selection();
+        let mut jump_stack = JumpStack::new();
+        record_jump(&mut jump_stack, from.clone(), to);
+        assert_eq!(
+            jump_stack.back(None),
+            from,
+            "Ctrl-o must be able to retrace a confirm-from-files-selection jump"
+        );
+    }
+
+    #[test]
+    fn confirm_files_selection_from_a_header_records_nothing() {
+        // Cursor already on a header row (index 0): `jump_entry` has no
+        // source location to leave from, so `record_jump` — even given a
+        // real destination — must record nothing (mirrors
+        // `record_jump_does_nothing_without_both_a_from_and_a_to`, exercised
+        // here through the real `confirm_files_selection` caller instead of
+        // a synthetic entry).
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = two_file_app(dir.path());
+        assert_eq!(app.cursor, 0);
+        let from = jump_entry_for(&app, dir.path());
+        assert_eq!(from, None, "a header row has no source location");
+
+        app.focus = crate::ui::app::MainPaneFocus::Files;
+        app.files_selection = 1;
+        let to = app.confirm_files_selection();
+        let mut jump_stack = JumpStack::new();
+        record_jump(&mut jump_stack, from, to);
+        assert_eq!(jump_stack.back(None), None);
+    }
+
+    #[test]
+    fn confirm_files_selection_on_an_empty_diff_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app =
+            crate::ui::app::App::new("repo".to_owned(), dir.path().to_path_buf(), Vec::new());
+        app.focus = crate::ui::app::MainPaneFocus::Files;
+        assert_eq!(app.confirm_files_selection(), None);
     }
 }

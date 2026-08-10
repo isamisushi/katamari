@@ -49,6 +49,13 @@ pub enum Key {
     /// [`KittyMode::Unsupported`] — that collision is the exact thing under
     /// test there.
     Tab,
+    /// Shift-Tab / `Action::FocusPrevPane`. Unlike [`Key::CtrlI`], this is
+    /// unambiguous with a plain Tab in *both* modes — a real terminal never
+    /// sends a bare `0x09` for Shift-Tab, so there's a genuine legacy
+    /// encoding (`ESC [ Z`, the standard xterm/legacy BackTab sequence
+    /// crossterm's non-kitty parser recognizes) rather than `CtrlI`'s
+    /// "panics under `Unsupported`" shape.
+    BackTab,
     /// Enter / `Action::Confirm` — `0x0D` (carriage return), the byte a
     /// real terminal sends for the Enter key and what crossterm's legacy
     /// parser recognizes as `KeyCode::Enter` in both kitty modes, so this
@@ -89,6 +96,10 @@ impl Key {
             Key::AltRight => b"\x1b[1;3C".to_vec(),
             Key::CtrlS => vec![0x13],
             Key::Tab => vec![0x09],
+            Key::BackTab => match mode {
+                KittyMode::Supported => b"\x1b[9;2u".to_vec(),
+                KittyMode::Unsupported => b"\x1b[Z".to_vec(),
+            },
             Key::Enter => vec![0x0d],
             Key::Char(c) => {
                 let mut buf = [0u8; 4];

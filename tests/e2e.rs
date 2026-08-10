@@ -19,6 +19,8 @@ mod support;
 // one file.
 #[path = "e2e/doctor.rs"]
 mod doctor;
+#[path = "e2e/focus.rs"]
+mod focus;
 #[path = "e2e/fold.rs"]
 mod fold;
 #[path = "e2e/help.rs"]

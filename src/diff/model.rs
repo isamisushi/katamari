@@ -358,7 +358,7 @@ pub enum RenderRow {
     /// actual line range/offset, the same "structural, not cached"
     /// discipline the rest of this module already applies to
     /// hunk/line addressing. Cursor-addressable like any other row (`z o`
-    /// expands the gap it stands on, `App::selected_file` highlights its
+    /// expands the gap it stands on, `App::diff_file` highlights its
     /// file in the sidebar), but never a `Line` — hover/comments/
     /// diagnostics all key off `RenderRow::Line` alone, so a fold row is
     /// simply invisible to those systems until `z o` replaces it with real

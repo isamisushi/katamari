@@ -10,6 +10,7 @@ use crate::diff::{
 use crate::keymap::Action;
 use crate::lsp::DiagnosticsStore;
 use crate::ui::hover_popup::HoverQuery;
+use crate::ui::pane;
 use crate::ui::refresh;
 use crate::ui::scroll;
 use crate::ui::search;
@@ -79,6 +80,29 @@ impl Layout {
         }
     }
 }
+
+/// Which of the main view's two panes has keyboard focus — issue #14.
+/// Defaults to `Diff` (the pre-#14 behavior every action already assumed),
+/// so an `App` nobody has pressed Tab in yet behaves exactly as it always
+/// did. Reachable states are only ever what [`FOCUS_ORDER`]/
+/// [`App::pane_visible`] allow: `Files` only while the sidebar is showing
+/// (see `Action::ToggleSidebar`'s arm in [`App::update`], which moves focus
+/// off it the instant that stops being true). Unlike the LSP inspector's
+/// three-pane Servers/Detail/Journal split, the root diff view only ever
+/// has these two panes — a file tree (issue #15) restructures what `Files`
+/// shows, not how many panes there are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MainPaneFocus {
+    Files,
+    #[default]
+    Diff,
+}
+
+/// The order [`pane::cycle_focus`] walks for `Action::FocusNextPane`/
+/// `FocusPrevPane` in the root diff view — `Files` before `Diff` so a
+/// reviewer whose sidebar is visible always reaches it on the very first
+/// Tab, the pane this milestone just made keyboard-navigable at all.
+const FOCUS_ORDER: [MainPaneFocus; 2] = [MainPaneFocus::Files, MainPaneFocus::Diff];
 
 /// A semantic-unit scope on the diff — while set, [`App::rederive`] keeps
 /// only the hunks whose content-hash ids (see
@@ -264,6 +288,36 @@ pub struct App {
     /// outright instead, since a swap's new diff has no relationship to the
     /// old one for a match to persist against.
     pub search: Option<search::SearchHighlight>,
+    /// Which of the files/diff panes currently receives keyboard actions —
+    /// see [`MainPaneFocus`]. `pub` because [`crate::ui::sidebar`] and
+    /// [`crate::ui::diff_view::render_focusable`] both read it directly to
+    /// decide which border draws focused, the same way they already read
+    /// `sidebar_visible`.
+    pub focus: MainPaneFocus,
+    /// The files pane's independently browsed selection — an index into
+    /// `files`, distinct from [`Self::diff_file`] (derived from the diff
+    /// cursor) the moment `Files` has its own focus and its own movement
+    /// (see [`Self::update`]'s `MainPaneFocus::Files` arms). Kept in sync
+    /// with `diff_file` only while `Diff` owns focus (see
+    /// [`Self::sync_files_selection`]); re-anchored by display path across
+    /// a refresh/scope-swap/unit-filter change instead of just clamped
+    /// (see [`Self::resolve_files_selection`]), since a stale index into a
+    /// *different* files list would otherwise point at an unrelated file
+    /// or, if the list shrank, panic out of bounds.
+    pub files_selection: usize,
+    /// The files pane's own scroll offset — independent of `scroll_offset`
+    /// (the diff pane's) for the same reason `files_selection` is
+    /// independent of `cursor`.
+    pub files_scroll_offset: usize,
+    /// The files pane's visible row count, mirroring [`Self::viewport_height`]'s
+    /// own docs: refreshed every frame by [`Self::set_files_viewport_height`]
+    /// from the sidebar's real rendered inner height, so top/bottom/
+    /// half-page movement in `Files` focus and its scroll clamping use an
+    /// up-to-date value. Unlike `viewport_height`, every files-pane row is
+    /// exactly one visual row tall (a path never soft-wraps) — every
+    /// scroll computation over it passes `|_| 1` rather than a per-row
+    /// height lookup.
+    files_viewport_height: usize,
 }
 
 impl App {
@@ -299,6 +353,10 @@ impl App {
             // behavior, rather than wrapping against a width of `0`.
             content_width: usize::MAX,
             search: None,
+            focus: MainPaneFocus::default(),
+            files_selection: 0,
+            files_scroll_offset: 0,
+            files_viewport_height: 1,
         };
         // No folds exist yet, so this just moves `pristine_files` in
         // verbatim — reusing the one derivation path rather than
@@ -575,6 +633,13 @@ impl App {
     pub fn apply_refresh(&mut self, files: Vec<DiffFile>) -> bool {
         let anchor =
             refresh::capture_anchor(&self.files, &self.rows, self.cursor, self.scroll_offset);
+        // Captured against the *old* `files` before it's replaced below —
+        // see `Self::resolve_files_selection`'s docs on why the sidebar
+        // selection is re-anchored by path rather than just clamped.
+        let selected_path = self
+            .files
+            .get(self.files_selection)
+            .map(|f| f.display_path().to_owned());
 
         self.prune_stale_folds(&files);
         self.pristine_files = files;
@@ -585,6 +650,7 @@ impl App {
             self.cursor = 0;
             self.scroll_offset = 0;
             self.recompute_search();
+            self.resolve_files_selection(selected_path);
             return false;
         }
 
@@ -595,6 +661,7 @@ impl App {
             .saturating_sub(refresh::scroll_delta(&anchor));
         self.clamp_scroll();
         self.recompute_search();
+        self.resolve_files_selection(selected_path);
         restored.overlay_survives
     }
 
@@ -655,6 +722,10 @@ impl App {
     /// to preserve: the new diff isn't a later version of the old one, it's
     /// an unrelated review surface, so anchor restoration would just land
     /// the cursor somewhere arbitrary. Always resets to the top instead.
+    /// The files-pane selection is the one exception (req 10 — see
+    /// [`Self::resolve_files_selection`]): unlike the diff cursor, browsing
+    /// position in the sidebar can still meaningfully carry over when the
+    /// new scope happens to touch the same file.
     /// `interactive`/`disk_is_new_side`/`scope_label` are set by the caller
     /// (see `crate::ui::mod::apply_scope_swap`), which is the one place
     /// that knows which scope this diff came from. Every fold is dropped
@@ -669,6 +740,16 @@ impl App {
         disk_is_new_side: bool,
         scope_label: Option<String>,
     ) {
+        // Unlike the diff cursor below, the files-pane selection *is*
+        // worth trying to preserve across a scope swap (req 10): swapping
+        // working-tree <-> staged, say, very often touches the same files,
+        // and there's no reason to lose a reviewer's place in the sidebar
+        // just because the diff cursor itself has nothing meaningful to
+        // restore. Captured before `files` is replaced below.
+        let selected_path = self
+            .files
+            .get(self.files_selection)
+            .map(|f| f.display_path().to_owned());
         self.pristine_files = files;
         self.expanded_folds.clear();
         self.trailing_probed_empty.clear();
@@ -692,6 +773,7 @@ impl App {
         // scope and so keeps a confirmed search alive across it.
         self.search = None;
         self.clamp_scroll();
+        self.resolve_files_selection(selected_path);
     }
 
     /// Scopes the whole diff view down to one semantic unit's hunks —
@@ -700,7 +782,15 @@ impl App {
     /// filtered view is a different reading surface (the unit is meant to
     /// be read from its beginning), not a refresh of the same one — the
     /// same reasoning [`Self::apply_scope_swap`] applies to scope changes.
+    /// The files-pane selection still tries to survive by path (req 10;
+    /// also fixes a latent out-of-bounds risk: `files` can shrink to just
+    /// the unit's own files, and a `files_selection` left pointing at its
+    /// pre-filter index could land past the end of the new, shorter list).
     pub fn set_unit_filter(&mut self, filter: UnitFilter) {
+        let selected_path = self
+            .files
+            .get(self.files_selection)
+            .map(|f| f.display_path().to_owned());
         self.unit_filter = Some(filter);
         self.rederive();
         self.cursor = 0;
@@ -711,16 +801,24 @@ impl App {
         // landing on rows that no longer exist.
         self.recompute_search();
         self.clamp_scroll();
+        self.resolve_files_selection(selected_path);
     }
 
     /// Widens back to the full diff — plain `Esc`'s first meaning while a
     /// unit scope is active (see `ui::mod::handle_action`'s `Cancel` arm:
     /// filter first, then search highlight). Returns whether there was
-    /// anything to clear, so that arm knows whether `Esc` is spent.
+    /// anything to clear, so that arm knows whether `Esc` is spent. Same
+    /// files-pane re-anchoring as [`Self::set_unit_filter`], for the same
+    /// out-of-bounds reason (widening back grows `files`, so the previously
+    /// filtered-down selection's index is stale either way).
     pub fn clear_unit_filter(&mut self) -> bool {
         if self.unit_filter.is_none() {
             return false;
         }
+        let selected_path = self
+            .files
+            .get(self.files_selection)
+            .map(|f| f.display_path().to_owned());
         self.unit_filter = None;
         self.rederive();
         self.cursor = 0;
@@ -728,6 +826,7 @@ impl App {
         self.active_symbol = 0;
         self.recompute_search();
         self.clamp_scroll();
+        self.resolve_files_selection(selected_path);
         true
     }
 
@@ -753,9 +852,17 @@ impl App {
         }
     }
 
-    /// Index into `files`/`rows` for whichever file the cursor currently
-    /// sits within, for sidebar highlighting.
-    pub fn selected_file(&self) -> usize {
+    /// Index into `files`/`rows` for whichever file the diff cursor
+    /// currently sits within. Pre-#14 this *was* the sidebar's highlight;
+    /// now it's the "background" file [`crate::ui::sidebar::render`] marks
+    /// distinctly from [`Self::files_selection`] when the two differ (see
+    /// [`Self::sync_files_selection`]), and what
+    /// [`Self::resolve_files_selection`] falls back to when a refresh/
+    /// scope-swap can't find the previously selected path anymore. Renamed
+    /// from `selected_file` in #14 so callers can't confuse this
+    /// diff-cursor-derived value with the sidebar's own independently
+    /// browsed selection.
+    pub fn diff_file(&self) -> usize {
         match self.rows.get(self.cursor) {
             Some(RenderRow::FileHeader { file_idx }) => *file_idx,
             Some(RenderRow::BinaryNotice { file_idx }) => *file_idx,
@@ -777,43 +884,141 @@ impl App {
         let last = self.rows.len() - 1;
         let cursor_before = self.cursor;
         match action {
-            Action::CursorDown => self.cursor = (self.cursor + 1).min(last),
-            Action::CursorUp => self.cursor = self.cursor.saturating_sub(1),
-            Action::HalfPageDown => {
-                self.cursor =
-                    scroll::half_page_down(self.cursor, last, self.viewport_height, |i| {
+            // Cursor/paging/top-bottom movement targets whichever pane owns
+            // focus (issue #14) — `Files` moves `files_selection` over
+            // `self.files` instead of the diff cursor, using the same
+            // `ui::scroll` machinery with `|_| 1` row heights (a files-pane
+            // row never wraps, see `Self::files_viewport_height`'s docs).
+            // `Diff` behaves exactly as every milestone before #14 did.
+            Action::CursorDown => match self.focus {
+                MainPaneFocus::Diff => self.cursor = (self.cursor + 1).min(last),
+                MainPaneFocus::Files => {
+                    self.files_selection =
+                        (self.files_selection + 1).min(self.files.len().saturating_sub(1));
+                    self.clamp_files_scroll();
+                }
+            },
+            Action::CursorUp => match self.focus {
+                MainPaneFocus::Diff => self.cursor = self.cursor.saturating_sub(1),
+                MainPaneFocus::Files => {
+                    self.files_selection = self.files_selection.saturating_sub(1);
+                    self.clamp_files_scroll();
+                }
+            },
+            Action::HalfPageDown => match self.focus {
+                MainPaneFocus::Diff => {
+                    self.cursor =
+                        scroll::half_page_down(self.cursor, last, self.viewport_height, |i| {
+                            self.row_visual_height(i)
+                        });
+                }
+                MainPaneFocus::Files => {
+                    let last_file = self.files.len().saturating_sub(1);
+                    self.files_selection = scroll::half_page_down(
+                        self.files_selection,
+                        last_file,
+                        self.files_viewport_height,
+                        |_| 1,
+                    );
+                    self.clamp_files_scroll();
+                }
+            },
+            Action::HalfPageUp => match self.focus {
+                MainPaneFocus::Diff => {
+                    self.cursor = scroll::half_page_up(self.cursor, self.viewport_height, |i| {
                         self.row_visual_height(i)
                     });
+                }
+                MainPaneFocus::Files => {
+                    self.files_selection = scroll::half_page_up(
+                        self.files_selection,
+                        self.files_viewport_height,
+                        |_| 1,
+                    );
+                    self.clamp_files_scroll();
+                }
+            },
+            Action::Top => match self.focus {
+                MainPaneFocus::Diff => self.cursor = 0,
+                MainPaneFocus::Files => {
+                    self.files_selection = 0;
+                    self.clamp_files_scroll();
+                }
+            },
+            Action::Bottom => match self.focus {
+                MainPaneFocus::Diff => self.cursor = last,
+                MainPaneFocus::Files => {
+                    self.files_selection = self.files.len().saturating_sub(1);
+                    self.clamp_files_scroll();
+                }
+            },
+            // Hunk/file/symbol navigation is diff-content movement — while
+            // `Files` is focused it stays a no-op rather than reaching into
+            // a diff cursor the reviewer isn't looking at (req 5: "irrelevant
+            // diff-only actions do not mutate the diff cursor"). Next/
+            // PrevFile in particular could look tempting to repoint at
+            // `files_selection` instead, but issue #14 explicitly keeps
+            // that out of scope (see its "Out of scope" list) — the files
+            // pane's own up/down already does that job.
+            Action::NextHunk => {
+                if self.focus == MainPaneFocus::Diff {
+                    self.jump_to(|row| matches!(row, RenderRow::HunkHeader { .. }));
+                }
             }
-            Action::HalfPageUp => {
-                self.cursor = scroll::half_page_up(self.cursor, self.viewport_height, |i| {
-                    self.row_visual_height(i)
-                });
-            }
-            Action::Top => self.cursor = 0,
-            Action::Bottom => self.cursor = last,
-            Action::NextHunk => self.jump_to(|row| matches!(row, RenderRow::HunkHeader { .. })),
             Action::PrevHunk => {
-                self.jump_to_prev(|row| matches!(row, RenderRow::HunkHeader { .. }))
+                if self.focus == MainPaneFocus::Diff {
+                    self.jump_to_prev(|row| matches!(row, RenderRow::HunkHeader { .. }));
+                }
             }
-            Action::NextFile => self.jump_to(|row| matches!(row, RenderRow::FileHeader { .. })),
+            Action::NextFile => {
+                if self.focus == MainPaneFocus::Diff {
+                    self.jump_to(|row| matches!(row, RenderRow::FileHeader { .. }));
+                }
+            }
             Action::PrevFile => {
-                self.jump_to_prev(|row| matches!(row, RenderRow::FileHeader { .. }))
+                if self.focus == MainPaneFocus::Diff {
+                    self.jump_to_prev(|row| matches!(row, RenderRow::FileHeader { .. }));
+                }
             }
-            Action::ToggleSidebar => self.sidebar_visible = !self.sidebar_visible,
+            Action::ToggleSidebar => {
+                self.sidebar_visible = !self.sidebar_visible;
+                // Hiding the sidebar can never leave focus pointing at a
+                // pane that's no longer drawn (req 3); showing it back
+                // never steals focus away from wherever `Diff` already was.
+                if !self.sidebar_visible && self.focus == MainPaneFocus::Files {
+                    self.focus = MainPaneFocus::Diff;
+                }
+            }
             Action::ToggleLayout => self.layout = self.layout.toggled(),
             Action::ToggleComments => self.comments_visible = !self.comments_visible,
-            Action::NextSymbol => self.cycle_symbol(1),
-            Action::PrevSymbol => self.cycle_symbol(-1),
-            // Unlike the "intercepted by `ui::mod`" bucket below, this is a
-            // real no-op *here*, not just an action `App::update` never
-            // sees: the root diff view is single-pane (see issue #14 for
-            // when that changes), so there is nothing for Tab/BackTab to
-            // cycle focus between. `TimelineView` never forwards these to
-            // its nested `App` at all — its own `update` returns as soon as
-            // it has cycled `self.focus` (see that method's docs) — so this
-            // arm's only real caller is a root [`crate::ui::view::View::Diff`].
-            Action::FocusNextPane | Action::FocusPrevPane => {}
+            Action::NextSymbol => {
+                if self.focus == MainPaneFocus::Diff {
+                    self.cycle_symbol(1);
+                }
+            }
+            Action::PrevSymbol => {
+                if self.focus == MainPaneFocus::Diff {
+                    self.cycle_symbol(-1);
+                }
+            }
+            // Issue #14: the root diff view now has two real panes to
+            // cycle between. `pane::cycle_focus` is the same shared
+            // mechanic the LSP inspector's Servers/Detail/Journal split and
+            // the timeline's list/diff split already use — see its own
+            // docs for the visibility-skipping/wrap/no-op-when-alone rules
+            // this inherits for free. `TimelineView` never forwards these
+            // to its nested `App` at all (its own `update` returns as soon
+            // as it has cycled `self.focus` — see that method's docs), so
+            // this arm's only real caller is a root
+            // [`crate::ui::view::View::Diff`].
+            Action::FocusNextPane => {
+                self.focus =
+                    pane::cycle_focus(&FOCUS_ORDER, self.focus, true, |p| self.pane_visible(p));
+            }
+            Action::FocusPrevPane => {
+                self.focus =
+                    pane::cycle_focus(&FOCUS_ORDER, self.focus, false, |p| self.pane_visible(p));
+            }
             // `ui::mod`'s event loop intercepts all of these before they
             // reach here — each needs either the LSP manager, the
             // diagnostics store, the jump stack, or (for `AddComment`) the
@@ -889,6 +1094,84 @@ impl App {
             self.active_symbol = 0;
         }
         self.clamp_scroll();
+        self.sync_files_selection();
+    }
+
+    /// Whether `pane` is currently a valid focus target — the predicate
+    /// [`pane::cycle_focus`] skips past to land only somewhere actually on
+    /// screen. `Diff` is always visible (there is no way to hide the diff
+    /// pane itself); `Files` mirrors `sidebar_visible` exactly, so hiding
+    /// the sidebar can never leave focus pointing at a pane no longer drawn
+    /// — see `Action::ToggleSidebar`'s arm above for what happens to focus
+    /// already resting there when that flips.
+    fn pane_visible(&self, pane: MainPaneFocus) -> bool {
+        match pane {
+            MainPaneFocus::Files => self.sidebar_visible,
+            MainPaneFocus::Diff => true,
+        }
+    }
+
+    /// The files pane's visible row count changes on terminal resize the
+    /// same way the diff pane's does (see [`Self::set_viewport_height`]) —
+    /// reported every frame, from the sidebar's real rendered inner height,
+    /// so `Files`-focused top/bottom/half-page movement and its scroll
+    /// clamping use an up-to-date value.
+    pub fn set_files_viewport_height(&mut self, height: usize) {
+        self.files_viewport_height = height.max(1);
+        self.clamp_files_scroll();
+    }
+
+    fn clamp_files_scroll(&mut self) {
+        self.files_scroll_offset = scroll::clamp_scroll(
+            self.files_selection,
+            self.files_viewport_height,
+            self.files_scroll_offset,
+            |_| 1,
+        );
+    }
+
+    /// Keeps `files_selection` following wherever the diff cursor currently
+    /// sits, but only while `Diff` owns focus (req 6) — the sidebar reading
+    /// "whatever file the reviewer is scrolled to" is exactly the pre-#14
+    /// behavior `Self::diff_file` always provided. Once `Files` has its own
+    /// focus and its own independently browsed position (req 5), letting
+    /// the diff cursor keep overwriting it out from under an in-progress
+    /// `j`/`k` in the sidebar would fight the reviewer's own input, so this
+    /// is a no-op then. Called after every cursor-moving path that doesn't
+    /// already funnel through [`Self::update`]'s own tail call to this —
+    /// [`Self::jump_cursor_to`], [`Self::jump_to_diagnostic`],
+    /// [`Self::cancel_search`], [`Self::recompute_search_live`].
+    /// [`Self::resolve_files_selection`]'s callers (refresh/scope-swap/
+    /// unit-filter) deliberately do *not* call this too — they resolve by
+    /// path/fallback instead, a stronger rule this would only interfere
+    /// with.
+    fn sync_files_selection(&mut self) {
+        if self.focus == MainPaneFocus::Diff {
+            self.files_selection = self.diff_file();
+            self.clamp_files_scroll();
+        }
+    }
+
+    /// Re-anchors `files_selection` (and resets/clamps its scroll) after an
+    /// operation that just replaced `files`/`rows` out from under it — a
+    /// watch refresh, a scope swap, or a unit-filter toggle (req 10). Tries
+    /// to keep browsing the *same file* by display path first, captured by
+    /// the caller *before* `files` was replaced (the sidebar's whole point
+    /// is a browsing position independent of the diff cursor, so an
+    /// operation that keeps the file present should keep the selection on
+    /// it too, even though the file's index can shift); falls back to
+    /// wherever the diff cursor landed ([`Self::diff_file`], which is also
+    /// `0` on an empty diff) otherwise — the same two-tier fallback
+    /// [`refresh::restore_anchor`] uses for the diff cursor itself, applied
+    /// here to the sidebar's independent position instead of just clamping
+    /// a possibly out-of-bounds index into a files list that may have
+    /// changed length.
+    fn resolve_files_selection(&mut self, previous_path: Option<String>) {
+        self.files_selection = previous_path
+            .and_then(|path| self.files.iter().position(|f| f.display_path() == path))
+            .unwrap_or_else(|| self.diff_file());
+        self.files_scroll_offset = 0;
+        self.clamp_files_scroll();
     }
 
     /// The row index a `(target_file, target_line)` jump should land on
@@ -937,7 +1220,19 @@ impl App {
     /// scroll offset (rather than the minimal nudge ordinary cursor
     /// movement uses) so a jump's destination lands with surrounding
     /// context visible, not pinned to the viewport's edge.
+    /// Moves the cursor to `row_idx`, and — issue #14's plan decision 3 —
+    /// puts `Diff` in focus regardless of what it was before: every caller
+    /// (go-to-definition/references, `Ctrl-o`/`Ctrl-i`, search, diagnostic
+    /// stepping) is landing the cursor on a specific line of code, which
+    /// only makes sense to look at with `Diff` focused. In practice every
+    /// other caller can only ever run while `Diff` already is focused (the
+    /// files-focus gate in `ui::mod::handle_action` blocks the actions that
+    /// reach them), so this only has real work to do for a `Ctrl-o`/
+    /// `Ctrl-i` history return landing back inside the diff while `Files`
+    /// happened to be focused — but a single unconditional assignment here
+    /// is simpler than threading that one case through every caller.
     pub fn jump_cursor_to(&mut self, row_idx: usize, display_col: usize) {
+        self.focus = MainPaneFocus::Diff;
         self.cursor = row_idx.min(self.rows.len().saturating_sub(1));
         self.active_symbol = self
             .cursor_row_text()
@@ -951,6 +1246,7 @@ impl App {
             self.row_visual_height(i)
         });
         self.clamp_scroll();
+        self.sync_files_selection();
     }
 
     /// Moves the cursor to the next (`forward`) or previous row whose
@@ -967,6 +1263,7 @@ impl App {
             self.row_visual_height(i)
         });
         self.clamp_scroll();
+        self.sync_files_selection();
     }
 
     fn find_diagnostic_row(&self, diagnostics: &DiagnosticsStore, forward: bool) -> Option<usize> {
@@ -1225,6 +1522,7 @@ impl App {
                 self.clamp_scroll();
             }
         }
+        self.sync_files_selection();
     }
 
     /// Esc in the prompt: restores the cursor/scroll to exactly where `/`
@@ -1247,6 +1545,7 @@ impl App {
         self.active_symbol = 0;
         self.clamp_scroll();
         self.search = None;
+        self.sync_files_selection();
     }
 
     /// Enter in the prompt: locks the current live preview in as the
@@ -2716,5 +3015,306 @@ index 1111111..2222222 100644\n\
             other => panic!("expected a line or gap row, got {other:?}"),
         };
         assert_eq!(app.files[file_idx].display_path(), "src/lib.rs");
+    }
+
+    // ---- Issue #14: main-pane focus -------------------------------------
+
+    fn one_file_app() -> App {
+        let files = parse_unified_diff(
+            "diff --git a/a.rs b/a.rs\n\
+             index 1111111..2222222 100644\n\
+             --- a/a.rs\n\
+             +++ b/a.rs\n\
+             @@ -1,2 +1,2 @@\n\
+             -old\n\
+             +new\n\
+             \x20unchanged\n",
+        );
+        let mut app = App::new("repo".to_owned(), PathBuf::from("/repo"), files);
+        app.set_viewport_height(10);
+        app
+    }
+
+    #[test]
+    fn focus_defaults_to_diff() {
+        assert_eq!(test_app().focus, MainPaneFocus::Diff);
+    }
+
+    #[test]
+    fn hiding_the_sidebar_while_files_focused_moves_focus_to_diff() {
+        let mut app = test_app();
+        app.focus = MainPaneFocus::Files;
+        app.update(Action::ToggleSidebar);
+        assert!(!app.sidebar_visible);
+        assert_eq!(
+            app.focus,
+            MainPaneFocus::Diff,
+            "hiding the sidebar can never leave focus on an invisible pane"
+        );
+    }
+
+    #[test]
+    fn showing_the_sidebar_never_steals_focus_from_diff() {
+        let mut app = test_app();
+        app.update(Action::ToggleSidebar); // hide it first
+        assert_eq!(app.focus, MainPaneFocus::Diff);
+        app.update(Action::ToggleSidebar); // show it again
+        assert!(app.sidebar_visible);
+        assert_eq!(
+            app.focus,
+            MainPaneFocus::Diff,
+            "showing the sidebar must not grab focus away from Diff"
+        );
+    }
+
+    #[test]
+    fn focus_next_and_prev_pane_cycle_files_and_diff_and_wrap() {
+        let mut app = test_app();
+        assert_eq!(app.focus, MainPaneFocus::Diff);
+        app.update(Action::FocusNextPane);
+        assert_eq!(app.focus, MainPaneFocus::Files);
+        app.update(Action::FocusNextPane);
+        assert_eq!(app.focus, MainPaneFocus::Diff, "forward must wrap");
+        app.update(Action::FocusPrevPane);
+        assert_eq!(app.focus, MainPaneFocus::Files, "backward must wrap too");
+        app.update(Action::FocusPrevPane);
+        assert_eq!(app.focus, MainPaneFocus::Diff);
+    }
+
+    #[test]
+    fn focus_cycling_is_a_no_op_when_the_sidebar_is_hidden() {
+        let mut app = test_app();
+        app.update(Action::ToggleSidebar);
+        assert!(!app.sidebar_visible);
+        app.update(Action::FocusNextPane);
+        assert_eq!(
+            app.focus,
+            MainPaneFocus::Diff,
+            "Files isn't visible, so there's nothing else to cycle to"
+        );
+    }
+
+    #[test]
+    fn focus_cycling_still_works_on_a_one_file_diff() {
+        // req 9's no-op is specifically about a *hidden sidebar*, not a
+        // short files list — a one-file diff's sidebar is still a real,
+        // focusable pane.
+        let mut app = one_file_app();
+        assert!(app.sidebar_visible);
+        app.update(Action::FocusNextPane);
+        assert_eq!(app.focus, MainPaneFocus::Files);
+    }
+
+    #[test]
+    fn an_empty_diff_never_panics_on_focus_actions_and_stays_on_diff() {
+        // req 9: "empty diffs ... remain stable." `App::update` returns
+        // before its own match on an empty `rows` (nothing to review at
+        // all — see its own early-return docs), so `Files`/`Diff` never
+        // actually differ in practice here; this pins down that the early
+        // return doesn't panic reaching for `self.files.len() - 1` or
+        // similar and that focus simply stays at its default.
+        let mut app = App::new("repo".to_owned(), PathBuf::from("/repo"), Vec::new());
+        assert!(app.rows.is_empty());
+        app.update(Action::FocusNextPane);
+        app.update(Action::FocusPrevPane);
+        app.update(Action::ToggleSidebar);
+        assert_eq!(app.focus, MainPaneFocus::Diff);
+    }
+
+    #[test]
+    fn files_focused_movement_never_touches_the_diff_cursor() {
+        let mut app = test_app();
+        let cursor_before = app.cursor;
+        app.focus = MainPaneFocus::Files;
+        app.update(Action::CursorDown);
+        app.update(Action::CursorDown);
+        app.update(Action::Bottom);
+        app.update(Action::Top);
+        app.update(Action::HalfPageDown);
+        app.update(Action::HalfPageUp);
+        assert_eq!(
+            app.cursor, cursor_before,
+            "Files-focused movement must only move files_selection"
+        );
+    }
+
+    #[test]
+    fn files_focused_cursor_down_and_up_move_and_clamp_the_selection() {
+        let mut app = test_app();
+        app.focus = MainPaneFocus::Files;
+        let last = app.files.len() - 1;
+        app.update(Action::CursorUp); // already at 0: must not underflow
+        assert_eq!(app.files_selection, 0);
+        for _ in 0..app.files.len() + 2 {
+            app.update(Action::CursorDown);
+        }
+        assert_eq!(app.files_selection, last, "must clamp at the last file");
+        app.update(Action::Top);
+        assert_eq!(app.files_selection, 0);
+        app.update(Action::Bottom);
+        assert_eq!(app.files_selection, last);
+    }
+
+    #[test]
+    fn hunk_and_file_navigation_are_no_ops_while_files_is_focused() {
+        let mut app = test_app();
+        app.focus = MainPaneFocus::Files;
+        let cursor_before = app.cursor;
+        let selection_before = app.files_selection;
+        for action in [
+            Action::NextHunk,
+            Action::PrevHunk,
+            Action::NextFile,
+            Action::PrevFile,
+        ] {
+            app.update(action);
+        }
+        assert_eq!(app.cursor, cursor_before);
+        assert_eq!(app.files_selection, selection_before);
+    }
+
+    #[test]
+    fn next_and_prev_symbol_are_no_ops_while_files_is_focused() {
+        let mut app = test_app();
+        app.focus = MainPaneFocus::Files;
+        let symbol_before = app.active_symbol;
+        app.update(Action::NextSymbol);
+        app.update(Action::PrevSymbol);
+        assert_eq!(app.active_symbol, symbol_before);
+    }
+
+    #[test]
+    fn files_selection_follows_the_diff_cursor_while_diff_is_focused() {
+        let mut app = test_app();
+        assert_eq!(app.focus, MainPaneFocus::Diff);
+        app.update(Action::NextFile);
+        assert_eq!(
+            app.files_selection,
+            app.diff_file(),
+            "the sidebar must track wherever the diff cursor lands"
+        );
+        app.update(Action::NextFile);
+        assert_eq!(app.files_selection, app.diff_file());
+    }
+
+    #[test]
+    fn files_selection_diverges_from_diff_file_while_files_is_focused() {
+        let mut app = test_app();
+        app.update(Action::NextFile); // diff cursor -> file 1
+        let diff_file_before = app.diff_file();
+        app.focus = MainPaneFocus::Files;
+        app.files_selection = diff_file_before; // start in sync
+        app.update(Action::CursorDown); // moves only files_selection
+        app.update(Action::CursorDown);
+        assert_ne!(
+            app.files_selection, diff_file_before,
+            "browsing the sidebar must not drag the diff cursor's file along"
+        );
+        assert_eq!(
+            app.diff_file(),
+            diff_file_before,
+            "the diff cursor itself never moved"
+        );
+    }
+
+    #[test]
+    fn set_files_viewport_height_clamps_a_scrolled_past_offset() {
+        let mut app = test_app();
+        app.focus = MainPaneFocus::Files;
+        app.update(Action::Bottom); // files_selection = last file
+        app.set_files_viewport_height(1);
+        assert!(
+            app.files_scroll_offset <= app.files_selection,
+            "the scroll offset must never sit past the selection"
+        );
+    }
+
+    #[test]
+    fn refresh_preserves_the_files_selection_by_path_when_it_survives() {
+        let mut app = test_app();
+        app.files_selection = app
+            .files
+            .iter()
+            .position(|f| f.display_path() == "src/new_module.rs")
+            .unwrap();
+        let same_files = parse_unified_diff(FIXTURE);
+        app.apply_refresh(same_files);
+        assert_eq!(
+            app.files[app.files_selection].display_path(),
+            "src/new_module.rs",
+            "a refresh that keeps the file must keep browsing it"
+        );
+    }
+
+    #[test]
+    fn refresh_falls_back_to_the_diff_file_when_the_selected_path_disappears() {
+        let mut app = test_app();
+        // Select a file this refresh's incoming diff won't contain at all.
+        app.files_selection = app
+            .files
+            .iter()
+            .position(|f| f.display_path() == "src/old_module.rs")
+            .unwrap();
+        let narrowed = parse_unified_diff(FIXTURE)
+            .into_iter()
+            .filter(|f| f.display_path() != "src/old_module.rs")
+            .collect::<Vec<_>>();
+        app.apply_refresh(narrowed);
+        assert_eq!(
+            app.files_selection,
+            app.diff_file(),
+            "a vanished selection must fall back to the restored diff cursor's file"
+        );
+    }
+
+    #[test]
+    fn scope_swap_preserves_the_files_selection_by_path_despite_resetting_the_cursor() {
+        let mut app = test_app();
+        app.files_selection = app
+            .files
+            .iter()
+            .position(|f| f.display_path() == "src/new_module.rs")
+            .unwrap();
+        app.apply_scope_swap(parse_unified_diff(FIXTURE), true, false, None);
+        assert_eq!(app.cursor, 0, "the diff cursor always resets to the top");
+        assert_eq!(
+            app.files[app.files_selection].display_path(),
+            "src/new_module.rs",
+            "but the files-pane selection tries to survive by path"
+        );
+    }
+
+    #[test]
+    fn unit_filter_re_resolves_the_files_selection_within_the_narrowed_list() {
+        let mut app = test_app();
+        let target_path = "src/new_module.rs".to_owned();
+        app.files_selection = app
+            .files
+            .iter()
+            .position(|f| f.display_path() == target_path)
+            .unwrap();
+        let hunk_id = crate::groups::enumerate_hunks(&app.files)
+            .into_iter()
+            .find(|meta| app.files[meta.file_idx].display_path() == target_path)
+            .expect("the target file has a hunk")
+            .id;
+        app.set_unit_filter(UnitFilter {
+            label: "one file".to_owned(),
+            description: String::new(),
+            index: 1,
+            total: 1,
+            hunk_ids: HashSet::from([hunk_id]),
+        });
+        assert!(
+            app.files_selection < app.files.len(),
+            "the selection must never point past the narrowed files list"
+        );
+        assert_eq!(app.files[app.files_selection].display_path(), target_path);
+
+        assert!(app.clear_unit_filter());
+        assert!(
+            app.files_selection < app.files.len(),
+            "widening back must also leave the selection in bounds"
+        );
     }
 }

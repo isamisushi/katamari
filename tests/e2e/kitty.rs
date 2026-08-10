@@ -108,30 +108,34 @@ fn kitty_supported() {
     h.send(Key::AltRight);
     h.wait_for_text("jump: no later position");
 
-    // Tab now means `FocusNextPane`, not `NextSymbol` (issue #13) — this
-    // single-pane diff view has nothing to focus-cycle, so Tab must be a
-    // genuine no-op here: the active symbol's underline must not move.
-    // There's no later event a `wait_for_text` could key off to prove a
-    // *lack* of movement non-racily, so this uses the same
-    // sleep-then-assert-unchanged idiom `assert_key_has_no_jump_binding`
-    // above uses for the identical class of claim. The two
-    // `clear_jump_status` calls above already moved the cursor two rows
-    // down onto content (row 3), so there's a real active symbol here for
-    // Tab to (not) move.
+    // Tab now means `FocusNextPane`, not `NextSymbol` (issue #13) — and as
+    // of issue #14 the root diff view is no longer single-pane, so Tab
+    // really does move focus to the files pane rather than being a no-op.
+    // Proven the same way `tests/e2e/focus.rs` proves it (no PTY test here
+    // inspects cell color): `gd` only ever reports the files-focus-gate
+    // note while `Files` owns focus. The active symbol's underline must
+    // still not move — focusing a different pane is not the same as
+    // cycling the symbol within this one. The two `clear_jump_status`
+    // calls above already moved the cursor two rows down onto content
+    // (row 3), so there's a real active symbol here to prove didn't move.
     h.wait_for_text("\u{b7} 3/");
     let before = h.with_screen(underlined_cells);
     h.send(Key::Tab);
-    std::thread::sleep(Duration::from_millis(300));
+    h.send(Key::Char('g'));
+    h.send(Key::Char('d'));
+    h.wait_for_text("definition: focus the diff pane first");
     assert_eq!(
         h.with_screen(underlined_cells),
         before,
-        "Tab must focus a pane (a no-op in this single-pane diff view), \
-         not move the active symbol"
+        "focusing the files pane must not move the diff's active symbol"
     );
 
-    // `l` is the vim preset's real `NextSymbol` binding now (issue #13) —
-    // sending it must move the active symbol, proving the split landed on
-    // the right key rather than just proving Tab no longer does it.
+    // Tab again cycles back to `Diff` (the root view's only other pane).
+    // `l` is the vim preset's real `NextSymbol` binding (issue #13) —
+    // sending it must move the active symbol, proving focus genuinely
+    // landed back on the diff pane rather than merely that Tab was
+    // pressed a second time.
+    h.send(Key::Tab);
     h.send(Key::Char('l'));
     h.wait_until(Duration::from_secs(2), |s| {
         underlined_cells(s) != before && !underlined_cells(s).is_empty()
@@ -185,31 +189,38 @@ fn kitty_unsupported() {
     // The mirror image of `kitty_supported`'s Tab check: in this mode, raw
     // `0x09` is *only* ever a literal Tab (no `Ctrl-i` binding exists to
     // collide with it) — and, as of issue #13, that literal Tab means
-    // `FocusNextPane`, a no-op in this single-pane diff view. Same
-    // sleep-then-assert-unchanged idiom as `kitty_supported`'s Tab check
-    // (and `assert_key_has_no_jump_binding` above) for the same "prove a
-    // lack of movement" reason. The two `clear_jump_status` calls above
-    // already moved the cursor two rows down onto content (row 3), so
-    // there's nothing more to do here before the Tab press itself.
+    // `FocusNextPane`, which (issue #14) now really does move focus to the
+    // files pane rather than being a no-op — proven the same
+    // files-focus-gate way `kitty_supported` proves it. The active
+    // symbol's underline must not move, and a literal Tab must still
+    // never be mistaken for `Ctrl-i`/`JumpForward` (the actual byte
+    // collision this test exists to guard against). The two
+    // `clear_jump_status` calls above already moved the cursor two rows
+    // down onto content (row 3), so there's a real active symbol here to
+    // prove didn't move.
     h.wait_for_text("\u{b7} 3/");
     let before = h.with_screen(underlined_cells);
     h.send(Key::Tab);
-    std::thread::sleep(Duration::from_millis(300));
-    let after_tab = h.with_screen(underlined_cells);
+    h.send(Key::Char('g'));
+    h.send(Key::Char('d'));
+    h.wait_for_text("definition: focus the diff pane first");
     assert_eq!(
-        after_tab, before,
-        "Tab must focus a pane (a no-op in this single-pane diff view), \
-         not move the active symbol"
+        h.with_screen(underlined_cells),
+        before,
+        "focusing the files pane must not move the diff's active symbol"
     );
     assert!(
         !h.screen_contents().contains("jump: no later position"),
         "a literal Tab must never be mistaken for Ctrl-i when the kitty protocol isn't active"
     );
 
-    // `l` is the vim preset's real `NextSymbol` binding now — sending it
-    // must move the active symbol, unaffected by the kitty protocol not
-    // being active (this binding has nothing to do with the Tab/Ctrl-i
-    // byte collision the rest of this test guards against).
+    // Tab again cycles back to `Diff`. `l` is the vim preset's real
+    // `NextSymbol` binding — sending it must move the active symbol,
+    // unaffected by the kitty protocol not being active (this binding has
+    // nothing to do with the Tab/Ctrl-i byte collision above), and proving
+    // focus genuinely landed back on the diff pane rather than merely that
+    // Tab was pressed a second time.
+    h.send(Key::Tab);
     h.send(Key::Char('l'));
     h.wait_until(Duration::from_secs(2), |s| {
         underlined_cells(s) != before && !underlined_cells(s).is_empty()

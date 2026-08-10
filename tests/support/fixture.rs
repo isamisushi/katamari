@@ -154,16 +154,27 @@ pub fn japanese_repo() -> FixtureRepo {
 /// the M13 wrap E2E fixture. The line is built to an exact, known shape:
 /// 100 display columns of prefix (70 ASCII dashes then 15 double-width
 /// Japanese characters, mixing both the way a real diff line would), then a
-/// `TAILMARKER` word found nowhere else in the fixture. At a 100-column
-/// terminal with the sidebar showing, `[ui] wrap`'s rendered content width
-/// works out to 50 columns (`100 - 30 sidebar - 1 border - 19 gutter` — see
-/// `diff_view::unified_content_width`/`gutter_width`), so `TAILMARKER`
-/// (starting at column 100) lands intact on a continuation row when
-/// wrapped, or never renders at all when truncated — an unambiguous,
-/// deterministic witness either way. `wrap` is always written into
-/// `.katamari/config.toml` explicitly (never left to the built-in default),
-/// so the fixture's behavior doesn't silently depend on what that default
-/// happens to be.
+/// `TAILMARKER` word found nowhere else in the fixture. At the default
+/// 100-column terminal `tests/e2e/wrap.rs`'s two tests spawn, with the
+/// sidebar showing, `[ui] wrap`'s rendered content width works out to 49
+/// columns (`100 - 30 sidebar - 2 border - 19 gutter` — see
+/// `diff_view::unified_content_width`/`gutter_width`; issue #14 grew the
+/// diff pane's border from 1 column, a bare left rule, to 2, a full
+/// `PaneChrome` box — `unified_content_width` derives this from
+/// `pane::inner_rect` rather than hand-counting it, so this comment is the
+/// only place that number is written down at all). `TAILMARKER` (columns
+/// 101-110) still lands fully intact on the third wrapped row (columns
+/// 99-147) at that width — 49 no longer divides 100 evenly the way the
+/// pre-#14 width of 50 did, so it's no longer aligned to that row's very
+/// first column, but it still fits inside it — or never renders at all
+/// when truncated: still an unambiguous, deterministic witness either way.
+/// At *other* terminal widths this alignment isn't guaranteed — narrow
+/// enough and `TAILMARKER` itself can land split across two wrapped rows
+/// (`tests/e2e/focus.rs`'s narrow-terminal case hits exactly this and
+/// checks for the wrap marker glyph instead of the word itself). `wrap` is
+/// always written into `.katamari/config.toml` explicitly (never left to
+/// the built-in default), so the fixture's behavior doesn't silently
+/// depend on what that default happens to be.
 pub fn long_line_repo(wrap: bool) -> FixtureRepo {
     let dir = init_repo();
     let root = dir.path();

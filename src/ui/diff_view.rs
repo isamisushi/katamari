@@ -21,6 +21,7 @@ use crate::diff::{
 use crate::highlight::{HighlightKind, Language, LineHighlighter, Span as HlSpan};
 use crate::lsp::DiagnosticsStore;
 use crate::ui::app::{App, Layout};
+use crate::ui::pane::{self, Hint as PaneHint, PaneChrome};
 // Only the tests below construct a `search::SearchHighlight`/call
 // `search::compute_matches` directly — `content_line`'s own render path
 // reaches `search::Match`/`SearchHighlight` only through `App::search`'s
@@ -62,6 +63,14 @@ pub fn effective_layout(requested: Layout, available_width: u16) -> Layout {
     }
 }
 
+/// The plain, non-focusable diff pane render every milestone before #14
+/// used — kept exactly as it was (`Borders::LEFT`, no focus/hint chrome)
+/// because [`crate::ui::timeline_view::TimelineView`] still calls this
+/// directly for its own nested diff pane, which has no sibling pane to
+/// focus away from and needs none of [`render_focusable`]'s
+/// [`crate::ui::pane::PaneChrome`] machinery. The root `View::Diff` — which
+/// *does* have a files pane beside it — uses [`render_focusable`] instead
+/// (see `ui::mod::draw`'s `View::Diff` arm).
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -74,7 +83,65 @@ pub fn render(
     let block = Block::default().borders(Borders::LEFT).title(" diff ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    render_content(
+        frame,
+        inner,
+        app,
+        highlighter,
+        layout,
+        diagnostics,
+        comments,
+    );
+}
 
+/// Issue #14: the root diff pane's render, through
+/// [`crate::ui::pane::PaneChrome`] so it gets the same focused-border/
+/// bottom-hint treatment every other focusable pane does (the files pane
+/// beside it, the LSP inspector's three panes, the timeline's list/diff
+/// split) — see [`render`]'s own docs for why [`TimelineView`]'s nested
+/// diff pane deliberately keeps using the plain version instead.
+///
+/// [`TimelineView`]: crate::ui::timeline_view::TimelineView
+#[allow(clippy::too_many_arguments)] // mirrors `render`'s own shape plus
+// the two focus/hint parameters `PaneChrome` needs; splitting this into a
+// struct would just move the same fields one level down.
+pub fn render_focusable(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    highlighter: &mut LineHighlighter,
+    layout: Layout,
+    diagnostics: &DiagnosticsStore,
+    comments: &CommentIndex,
+    focused: bool,
+    hints: &[PaneHint<'_>],
+) {
+    let block = PaneChrome::new(" diff ", area.width)
+        .focused(focused)
+        .hints(hints)
+        .block();
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    render_content(
+        frame,
+        inner,
+        app,
+        highlighter,
+        layout,
+        diagnostics,
+        comments,
+    );
+}
+
+fn render_content(
+    frame: &mut Frame,
+    inner: Rect,
+    app: &App,
+    highlighter: &mut LineHighlighter,
+    layout: Layout,
+    diagnostics: &DiagnosticsStore,
+    comments: &CommentIndex,
+) {
     match layout {
         Layout::Unified => render_unified(frame, inner, app, highlighter, diagnostics, comments),
         Layout::SideBySide => {
@@ -638,16 +705,27 @@ fn gutter_width() -> usize {
 }
 
 /// The display-column budget available to a *unified*-layout content row's
-/// highlighted text at a pane of `pane_width` columns: the pane's border (1
-/// column, see [`render`]'s `Borders::LEFT`) and [`gutter_width`] subtracted
-/// out. Exposed so `App::row_visual_height` derives the same wrap width
+/// highlighted text at a pane of `pane_width` columns: the root diff pane's
+/// real border columns (via [`pane::inner_rect`] — [`render_focusable`]'s
+/// [`PaneChrome`] draws a full box, two columns wide, not the single
+/// left-only rule the plain [`render`] draws for `TimelineView`'s nested
+/// pane) and [`gutter_width`] subtracted out. Routing the border width
+/// through `pane::inner_rect` rather than a hand-counted literal is
+/// deliberate — issue #14 had to fix exactly one such drift (the border
+/// grew from 1 column to 2 when the root diff pane moved onto
+/// `PaneChrome`, and this used to hardcode the old value) and the whole
+/// point of `inner_rect` is that this can't happen again silently. Exposed
+/// so `App::row_visual_height` derives the same wrap width
 /// [`render_unified`]'s own [`content_line`] call uses, keeping
 /// cursor-visibility and half-page scroll math in agreement with what's
-/// actually on screen in the unified layout — see `App::content_width`'s
-/// docs for why side-by-side, whose two columns are each narrower still, is
-/// a deliberately separate concern from this.
+/// actually on screen — see `App::content_width`'s docs for why
+/// side-by-side, whose two columns are each narrower still, is a
+/// deliberately separate concern from this, and this function's own only
+/// caller (`ui::mod`'s frame preamble, `View::Diff`-only) for why
+/// `TimelineView`'s plain-`render`ed nested pane never reaches this at all.
 pub fn unified_content_width(pane_width: u16) -> usize {
-    (pane_width.saturating_sub(1) as usize).saturating_sub(gutter_width())
+    let probe = pane::inner_rect(pane_width, Rect::new(0, 0, pane_width, 1));
+    (probe.width as usize).saturating_sub(gutter_width())
 }
 
 /// The gutter for a wrapped content row's second-and-later visual rows:
@@ -981,12 +1059,94 @@ mod tests {
 
     #[test]
     fn unified_content_width_subtracts_the_border_and_the_gutter() {
-        assert_eq!(unified_content_width(100), 100 - 1 - gutter_width());
+        // Issue #14: the root diff pane's `PaneChrome` box is 2 columns
+        // wide (left + right border), not the 1-column left-only rule the
+        // pre-#14 plain `render` drew — this is the exact arithmetic that
+        // changed, pinned down directly rather than only through
+        // `pane::inner_rect`'s own tests.
+        assert_eq!(unified_content_width(100), 100 - 2 - gutter_width());
+    }
+
+    #[test]
+    fn unified_content_width_never_hand_counts_the_border_a_second_way() {
+        // `unified_content_width` must always agree with
+        // `pane::inner_rect`, whatever `PaneChrome`'s border width happens
+        // to be — the drift issue #14 fixed by routing through the shared
+        // helper instead of a literal. This would still pass even if
+        // `PaneChrome`'s borders changed again later, unlike a test that
+        // hardcodes an expected number.
+        for pane_width in [0u16, 1, 2, 3, 30, 68, 70, 100, 250] {
+            let probe = pane::inner_rect(pane_width, Rect::new(0, 0, pane_width, 1));
+            let expected = (probe.width as usize).saturating_sub(gutter_width());
+            assert_eq!(unified_content_width(pane_width), expected);
+        }
     }
 
     #[test]
     fn unified_content_width_saturates_rather_than_underflowing_on_a_tiny_pane() {
         assert_eq!(unified_content_width(3), 0);
+    }
+
+    #[test]
+    fn render_focusable_draws_a_focused_cyan_border() {
+        use ratatui::backend::TestBackend;
+
+        let app = app_with_plain_row("fn main() {}");
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let comments = CommentIndex::default();
+        let backend = TestBackend::new(30, 6);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_focusable(
+                    frame,
+                    frame.area(),
+                    &app,
+                    &mut highlighter,
+                    Layout::Unified,
+                    &diagnostics,
+                    &comments,
+                    true,
+                    &[],
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let corner = buffer.cell((0, 0)).expect("top-left corner");
+        assert_eq!(corner.symbol(), "\u{250c}"); // ┌ — a real box, not `render`'s Borders::LEFT rule
+        assert_eq!(corner.fg, Color::Cyan);
+        assert!(corner.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn render_focusable_leaves_the_border_unstyled_when_not_focused() {
+        use ratatui::backend::TestBackend;
+
+        let app = app_with_plain_row("fn main() {}");
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let comments = CommentIndex::default();
+        let backend = TestBackend::new(30, 6);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_focusable(
+                    frame,
+                    frame.area(),
+                    &app,
+                    &mut highlighter,
+                    Layout::Unified,
+                    &diagnostics,
+                    &comments,
+                    false,
+                    &[],
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let corner = buffer.cell((0, 0)).expect("top-left corner");
+        assert_ne!(corner.fg, Color::Cyan);
     }
 
     #[test]
