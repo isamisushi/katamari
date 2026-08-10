@@ -20,6 +20,7 @@ use crate::lsp::DiagnosticsStore;
 use crate::ui::app::{App, Layout};
 use crate::ui::hints;
 use crate::ui::hover_popup::HoverQuery;
+use crate::ui::pane::cycle_focus;
 use crate::vcs::jj::{JjRepo, SnapshotOp};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout as RatLayout, Rect};
@@ -28,16 +29,26 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use std::path::Path;
 
-/// Which pane `j`/`k`/`gg`/`G`/etc. currently act on. Toggled by
-/// `Tab`/`BackTab` (reusing [`Action::NextSymbol`]/[`Action::PrevSymbol`] —
-/// meaningless in a timeline the same way `ToggleSidebar` is meaningless in
-/// a [`crate::ui::file_view::FileView`], so repurposing rather than adding
-/// new bindings).
+/// Which pane `j`/`k`/`gg`/`G`/etc. currently act on. Cycled by
+/// `Action::FocusNextPane`/`FocusPrevPane` (Tab/BackTab) through
+/// [`cycle_focus`] against [`FOCUS_ORDER`] — issue #13's split of pane
+/// focus out of `NextSymbol`/`PrevSymbol`. That split has a real behavior
+/// consequence here, not just a rename: before it, Tab/BackTab (then
+/// `NextSymbol`/`PrevSymbol`) were intercepted unconditionally at the top
+/// of [`TimelineView::update`], which meant a reviewer could never reach
+/// the *nested* diff pane's own symbol cycling — every Tab press toggled
+/// this `Focus` back to `List` first, no matter which pane already had it.
+/// Now that pane focus and symbol selection are different actions, `l`/`h`
+/// (or `M-f`/`M-b`) genuinely fall through to `self.diff_app.update` once
+/// `Focus::Diff` is active, the same as every other action `update_list`
+/// doesn't special-case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     List,
     Diff,
 }
+
+const FOCUS_ORDER: [Focus; 2] = [Focus::List, Focus::Diff];
 
 /// Default `limit` for [`JjRepo::snapshot_ops`] — bounds the *raw* op log
 /// fetched, not the number of snapshot entries returned; see that method's
@@ -126,11 +137,13 @@ impl TimelineView {
 
     pub fn update(&mut self, action: Action) {
         match action {
-            Action::NextSymbol | Action::PrevSymbol => {
-                self.focus = match self.focus {
-                    Focus::List => Focus::Diff,
-                    Focus::Diff => Focus::List,
-                };
+            Action::FocusNextPane | Action::FocusPrevPane => {
+                self.focus = cycle_focus(
+                    &FOCUS_ORDER,
+                    self.focus,
+                    action == Action::FocusNextPane,
+                    |_| true,
+                );
                 return;
             }
             Action::ToggleRangeSelect => {
@@ -606,5 +619,119 @@ mod tests {
     #[test]
     fn short_op_id_leaves_a_shorter_string_untouched() {
         assert_eq!(short_op_id("abc"), "abc");
+    }
+
+    // ---- TimelineView focus (issue #13) --------------------------------
+
+    /// A minimal real `jj` fixture: a colocated repo with two working-copy
+    /// snapshots, the second adding a line with two identifier-like tokens
+    /// (`SYMONE SYMTWO`) — enough for `TimelineView::new` to load a
+    /// non-empty `diff_app` with a `cycle_symbol`-able row at the bottom.
+    /// `crate::vcs::jj`'s own test module has an equivalent fixture, but
+    /// it's private to that module and shaped around `jj commit` (real
+    /// history) rather than [`JjRepo::snapshot`] (what actually populates
+    /// [`JjRepo::snapshot_ops`], the list this view renders) — building a
+    /// second, smaller one here is simpler than exporting a shared helper
+    /// two call sites would use differently. Every caller skips (rather
+    /// than fails) when `jj` isn't on `PATH`, the same convention
+    /// `crate::vcs::jj`'s own tests and `tests/e2e/lsp_readiness.rs`'s
+    /// `python3_available` guard both follow.
+    fn jj_timeline_fixture() -> Option<(tempfile::TempDir, TimelineView)> {
+        let jj_bin = crate::vcs::jj::resolve_jj_bin()?;
+        let dir = tempfile::tempdir().ok()?;
+        let path = dir.path();
+
+        let git_ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(path)
+            .status()
+            .ok()?
+            .success();
+        if !git_ok {
+            return None;
+        }
+        // `jj git init --colocate` creates the repo `JjRepo::detect` needs;
+        // unlike every later jj call it can't take `-R <path>` (that flag
+        // targets a repo that already exists), so this one runs with
+        // `current_dir` instead — the same split `crate::vcs::jj`'s own
+        // fixture makes for the identical reason.
+        let init_ok = std::process::Command::new(&jj_bin)
+            .args([
+                "--color",
+                "never",
+                "--no-pager",
+                "git",
+                "init",
+                "--colocate",
+            ])
+            .current_dir(path)
+            .status()
+            .ok()?
+            .success();
+        if !init_ok {
+            return None;
+        }
+
+        let repo = JjRepo::detect(path, jj_bin)?;
+        std::fs::write(path.join("a.txt"), "one\n").ok()?;
+        repo.snapshot().ok()?;
+        std::fs::write(path.join("a.txt"), "one\nSYMONE SYMTWO\n").ok()?;
+        repo.snapshot().ok()?;
+
+        let view = TimelineView::new(repo, DEFAULT_OP_LOG_LIMIT).ok()?;
+        Some((dir, view))
+    }
+
+    #[test]
+    fn focus_next_pane_and_focus_prev_pane_toggle_list_and_diff_focus() {
+        let Some((_dir, mut view)) = jj_timeline_fixture() else {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        };
+
+        assert_eq!(view.focus, Focus::List);
+        view.update(Action::FocusNextPane);
+        assert_eq!(view.focus, Focus::Diff);
+        // Only two panes exist, so a second forward step wraps straight
+        // back to `List` — the same wraparound `cycle_focus`'s own tests
+        // cover generically, observed here through a real view.
+        view.update(Action::FocusNextPane);
+        assert_eq!(view.focus, Focus::List);
+        view.update(Action::FocusPrevPane);
+        assert_eq!(view.focus, Focus::Diff);
+        view.update(Action::FocusPrevPane);
+        assert_eq!(view.focus, Focus::List);
+    }
+
+    /// Pins the behavior fix issue #13's split enables (see [`Focus`]'s
+    /// docs): once the diff pane has focus, `NextSymbol` (vim's `l`, or
+    /// emacs's `M-f` — Tab no longer means this) reaches the nested
+    /// `App::update` and moves its `active_symbol`, instead of being
+    /// swallowed by `TimelineView`'s own focus toggle the way every
+    /// pre-#13 Tab press was.
+    #[test]
+    fn next_symbol_reaches_the_nested_diffs_cycle_symbol_once_the_diff_pane_is_focused() {
+        let Some((_dir, mut view)) = jj_timeline_fixture() else {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        };
+
+        view.update(Action::FocusNextPane);
+        assert_eq!(view.focus, Focus::Diff);
+        // `Bottom` lands on the trailing fold-gap row this two-line file's
+        // diff renders below its last real content line (see
+        // `RenderRow::Gap`) — one `CursorUp` from there reaches the
+        // fixture's actual last line, the `SYMONE SYMTWO` addition, which
+        // is what needs a `cycle_symbol`-able row under the cursor.
+        view.update(Action::Bottom);
+        view.update(Action::CursorUp);
+        assert_eq!(view.diff_app.active_symbol, 0);
+
+        view.update(Action::NextSymbol);
+        assert_eq!(
+            view.diff_app.active_symbol, 1,
+            "NextSymbol must move the nested diff's active symbol, not \
+             bounce focus back to List the way it did before issue #13"
+        );
     }
 }

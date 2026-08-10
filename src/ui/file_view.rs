@@ -219,6 +219,11 @@ impl FileView {
             Action::Bottom => self.cursor = last,
             Action::NextSymbol => self.cycle_symbol(1),
             Action::PrevSymbol => self.cycle_symbol(-1),
+            // A real no-op, not an action this view never sees: an opened
+            // file is a single pane, so there's nothing for Tab/BackTab to
+            // cycle focus between — same reasoning as `App::update`'s
+            // identical arm (see that method's comment).
+            Action::FocusNextPane | Action::FocusPrevPane => {}
             // `ui::mod` intercepts all of these before they reach here,
             // same as in `App::update` — see that method's comment. `Quit`
             // joins this bucket rather than `TimelineView`/`LogView`'s own

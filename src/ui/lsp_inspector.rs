@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use super::pane::{Hint as PaneHint, PaneChrome};
+use super::pane::{Hint as PaneHint, PaneChrome, cycle_focus};
 
 const SERVER_LIST_WIDTH: u16 = 34;
 // The detail pane has twelve data fields. Values are pre-wrapped into the
@@ -28,12 +28,21 @@ const DETAIL_LABEL_WIDTH: usize = 12;
 /// explicit. Journal records themselves are already bounded by the observer.
 const OSC52_MAX_BYTES: usize = 64 * 1024;
 
+/// Which of this view's three panes `j`/`k`/half-page/`gg`/`G` currently
+/// act on — cycled by `Action::FocusNextPane`/`FocusPrevPane` (Tab/BackTab)
+/// through [`cycle_focus`] against [`FOCUS_ORDER`]. All three panes are
+/// always rendered (see [`LspInspectorView::render`]'s narrow/wide split —
+/// neither layout ever hides one), so every call passes an
+/// always-`true` `visible` closure: there is no invisible-pane case to skip
+/// here, unlike a view that can hide a pane conditionally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Servers,
     Detail,
     Journal,
 }
+
+const FOCUS_ORDER: [Focus; 3] = [Focus::Servers, Focus::Detail, Focus::Journal];
 
 #[derive(Debug, Clone)]
 struct JournalRow {
@@ -319,19 +328,11 @@ impl LspInspectorView {
                     self.should_quit = true;
                 }
             }
-            Action::NextSymbol => {
-                self.focus = match self.focus {
-                    Focus::Servers => Focus::Detail,
-                    Focus::Detail => Focus::Journal,
-                    Focus::Journal => Focus::Servers,
-                }
+            Action::FocusNextPane => {
+                self.focus = cycle_focus(&FOCUS_ORDER, self.focus, true, |_| true);
             }
-            Action::PrevSymbol => {
-                self.focus = match self.focus {
-                    Focus::Servers => Focus::Journal,
-                    Focus::Detail => Focus::Servers,
-                    Focus::Journal => Focus::Detail,
-                }
+            Action::FocusPrevPane => {
+                self.focus = cycle_focus(&FOCUS_ORDER, self.focus, false, |_| true);
             }
             Action::CursorDown => match self.focus {
                 Focus::Servers => {
@@ -1127,8 +1128,8 @@ mod tests {
     fn empty_journal_visual_keys_report_status_without_creating_an_invalid_selection() {
         let store = crate::lsp::ObservationStore::in_memory();
         let mut view = LspInspectorView::new(store, None);
-        view.update(Action::NextSymbol);
-        view.update(Action::NextSymbol);
+        view.update(Action::FocusNextPane);
+        view.update(Action::FocusNextPane);
 
         assert_eq!(
             view.handle_literal_key(key(KeyCode::Char('V'))),
@@ -1168,20 +1169,20 @@ mod tests {
         assert_eq!(view.focus, Focus::Servers);
         view.update(Action::CursorDown);
         assert_eq!(view.selected, 1);
-        view.update(Action::NextSymbol);
+        view.update(Action::FocusNextPane);
         assert_eq!(view.focus, Focus::Detail);
         let selected = view.selected;
         view.update(Action::CursorDown);
         assert_eq!(view.selected, selected, "detail is explicitly read-only");
-        view.update(Action::NextSymbol);
+        view.update(Action::FocusNextPane);
         assert_eq!(view.focus, Focus::Journal);
-        view.update(Action::NextSymbol);
+        view.update(Action::FocusNextPane);
         assert_eq!(view.focus, Focus::Servers);
-        view.update(Action::PrevSymbol);
+        view.update(Action::FocusPrevPane);
         assert_eq!(view.focus, Focus::Journal);
-        view.update(Action::PrevSymbol);
+        view.update(Action::FocusPrevPane);
         assert_eq!(view.focus, Focus::Detail);
-        view.update(Action::PrevSymbol);
+        view.update(Action::FocusPrevPane);
         assert_eq!(view.focus, Focus::Servers);
     }
 
@@ -1201,8 +1202,13 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         for (expected_title, border_x, border_y, action) in [
-            ("Servers", 1, 1, Some(Action::NextSymbol)),
-            ("Server detail [read-only]", 35, 1, Some(Action::NextSymbol)),
+            ("Servers", 1, 1, Some(Action::FocusNextPane)),
+            (
+                "Server detail [read-only]",
+                35,
+                1,
+                Some(Action::FocusNextPane),
+            ),
             ("Journal (following", 35, 15, None),
         ] {
             terminal
@@ -1253,8 +1259,8 @@ mod tests {
         }
         let mut view = LspInspectorView::new(store, None);
         view.set_viewport_height(2);
-        view.update(Action::NextSymbol);
-        view.update(Action::NextSymbol);
+        view.update(Action::FocusNextPane);
+        view.update(Action::FocusNextPane);
         view.update(Action::CursorUp);
         assert!(!view.follow);
         view.update(Action::Bottom);
@@ -1275,8 +1281,8 @@ mod tests {
         let mut view = LspInspectorView::new(store.clone(), None);
         let journal_area = Rect::new(0, 0, 120, 8);
         view.set_journal_geometry(journal_area);
-        view.update(Action::NextSymbol);
-        view.update(Action::NextSymbol);
+        view.update(Action::FocusNextPane);
+        view.update(Action::FocusNextPane);
 
         let viewport = view.journal_viewport_height;
         let initial_cursor = view.journal_cursor;
@@ -1398,8 +1404,8 @@ mod tests {
         ));
         let mut view = LspInspectorView::new(store, None);
         view.set_journal_geometry(Rect::new(0, 0, 24, 8));
-        view.update(Action::NextSymbol);
-        view.update(Action::NextSymbol);
+        view.update(Action::FocusNextPane);
+        view.update(Action::FocusNextPane);
         view.update(Action::Top);
 
         assert_eq!(
@@ -1441,8 +1447,8 @@ mod tests {
         ));
         let mut view = LspInspectorView::new(store.clone(), None);
         view.set_journal_geometry(Rect::new(0, 0, 32, 8));
-        view.update(Action::NextSymbol);
-        view.update(Action::NextSymbol);
+        view.update(Action::FocusNextPane);
+        view.update(Action::FocusNextPane);
         view.update(Action::Top);
         assert_eq!(
             view.handle_literal_key(key(KeyCode::Char('V'))),
@@ -1484,8 +1490,8 @@ mod tests {
             "event",
         ));
         let mut view = LspInspectorView::new(store, None);
-        view.update(Action::NextSymbol);
-        view.update(Action::NextSymbol);
+        view.update(Action::FocusNextPane);
+        view.update(Action::FocusNextPane);
         assert_eq!(
             view.handle_literal_key(key(KeyCode::Char('V'))),
             InspectorKeyOutcome::Handled
@@ -1539,7 +1545,7 @@ mod tests {
             assert!(lines.iter().all(|line| !line.contains("journal keys")));
 
             view.snapshots[0].program = Some("long-command-part-".repeat(16));
-            view.update(Action::NextSymbol);
+            view.update(Action::FocusNextPane);
             terminal
                 .draw(|frame| view.render(frame, frame.area()))
                 .unwrap();
@@ -1548,7 +1554,7 @@ mod tests {
             assert!(lines.iter().any(|line| line.contains("gg/G top/bottom")));
             assert!(lines.iter().all(|line| !line.contains("controls")));
 
-            view.update(Action::NextSymbol);
+            view.update(Action::FocusNextPane);
             terminal
                 .draw(|frame| view.render(frame, frame.area()))
                 .unwrap();
@@ -1696,7 +1702,7 @@ mod tests {
         assert!(view.detail_total_rows > view.detail_viewport_height);
         assert!(view.journal_viewport_height >= 4);
 
-        view.update(Action::NextSymbol);
+        view.update(Action::FocusNextPane);
         view.update(Action::Bottom);
         assert_eq!(
             view.detail_scroll,
@@ -1742,8 +1748,8 @@ mod tests {
             ));
         }
         let mut view = LspInspectorView::new(store, None);
-        view.update(Action::NextSymbol);
-        view.update(Action::NextSymbol);
+        view.update(Action::FocusNextPane);
+        view.update(Action::FocusNextPane);
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal

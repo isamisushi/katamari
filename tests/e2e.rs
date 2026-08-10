@@ -27,6 +27,8 @@ mod help;
 mod kitty;
 #[path = "e2e/log.rs"]
 mod log;
+#[path = "e2e/lsp_inspector.rs"]
+mod lsp_inspector;
 #[path = "e2e/lsp_readiness.rs"]
 mod lsp_readiness;
 #[path = "e2e/navigation.rs"]

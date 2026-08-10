@@ -43,9 +43,11 @@ pub enum Key {
     /// `Ctrl-s` — the comment-compose overlay's `ComposeOutcome::Save`,
     /// unambiguous in both modes (`0x13`).
     CtrlS,
-    /// A literal Tab / `Action::NextSymbol`. Encodes to the same `0x09` byte
-    /// as legacy `Ctrl-i` in [`KittyMode::Unsupported`] — that collision is
-    /// the exact thing under test there.
+    /// A literal Tab / `Action::FocusNextPane` (issue #13 split pane focus
+    /// out of the pre-#13 `Action::NextSymbol` Tab used to mean). Encodes
+    /// to the same `0x09` byte as legacy `Ctrl-i` in
+    /// [`KittyMode::Unsupported`] — that collision is the exact thing under
+    /// test there.
     Tab,
     /// Enter / `Action::Confirm` — `0x0D` (carriage return), the byte a
     /// real terminal sends for the Enter key and what crossterm's legacy

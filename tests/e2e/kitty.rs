@@ -108,15 +108,31 @@ fn kitty_supported() {
     h.send(Key::AltRight);
     h.wait_for_text("jump: no later position");
 
-    // Tab itself must still mean `NextSymbol`, unaffected by the kitty
-    // protocol being active — checked via the active symbol's underline
-    // moving, the only on-screen signal `NextSymbol` produces. `NextSymbol`
-    // is a no-op on the header row the cursor started on, but the two
-    // `clear_jump_status` calls above already moved it two rows down onto
-    // content (row 3) as a side effect.
+    // Tab now means `FocusNextPane`, not `NextSymbol` (issue #13) — this
+    // single-pane diff view has nothing to focus-cycle, so Tab must be a
+    // genuine no-op here: the active symbol's underline must not move.
+    // There's no later event a `wait_for_text` could key off to prove a
+    // *lack* of movement non-racily, so this uses the same
+    // sleep-then-assert-unchanged idiom `assert_key_has_no_jump_binding`
+    // above uses for the identical class of claim. The two
+    // `clear_jump_status` calls above already moved the cursor two rows
+    // down onto content (row 3), so there's a real active symbol here for
+    // Tab to (not) move.
     h.wait_for_text("\u{b7} 3/");
     let before = h.with_screen(underlined_cells);
     h.send(Key::Tab);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        h.with_screen(underlined_cells),
+        before,
+        "Tab must focus a pane (a no-op in this single-pane diff view), \
+         not move the active symbol"
+    );
+
+    // `l` is the vim preset's real `NextSymbol` binding now (issue #13) —
+    // sending it must move the active symbol, proving the split landed on
+    // the right key rather than just proving Tab no longer does it.
+    h.send(Key::Char('l'));
     h.wait_until(Duration::from_secs(2), |s| {
         underlined_cells(s) != before && !underlined_cells(s).is_empty()
     });
@@ -168,21 +184,36 @@ fn kitty_unsupported() {
 
     // The mirror image of `kitty_supported`'s Tab check: in this mode, raw
     // `0x09` is *only* ever a literal Tab (no `Ctrl-i` binding exists to
-    // collide with it). Sending it must move the active symbol, not produce
-    // a jump-status message. `NextSymbol` is a no-op on the header row the
-    // cursor started on, but the two `clear_jump_status` calls above already
-    // moved it two rows down onto content (row 3) as a side effect, so
+    // collide with it) — and, as of issue #13, that literal Tab means
+    // `FocusNextPane`, a no-op in this single-pane diff view. Same
+    // sleep-then-assert-unchanged idiom as `kitty_supported`'s Tab check
+    // (and `assert_key_has_no_jump_binding` above) for the same "prove a
+    // lack of movement" reason. The two `clear_jump_status` calls above
+    // already moved the cursor two rows down onto content (row 3), so
     // there's nothing more to do here before the Tab press itself.
     h.wait_for_text("\u{b7} 3/");
     let before = h.with_screen(underlined_cells);
     h.send(Key::Tab);
-    h.wait_until(Duration::from_secs(2), |s| {
-        underlined_cells(s) != before && !underlined_cells(s).is_empty()
-    });
+    std::thread::sleep(Duration::from_millis(300));
+    let after_tab = h.with_screen(underlined_cells);
+    assert_eq!(
+        after_tab, before,
+        "Tab must focus a pane (a no-op in this single-pane diff view), \
+         not move the active symbol"
+    );
     assert!(
         !h.screen_contents().contains("jump: no later position"),
         "a literal Tab must never be mistaken for Ctrl-i when the kitty protocol isn't active"
     );
+
+    // `l` is the vim preset's real `NextSymbol` binding now — sending it
+    // must move the active symbol, unaffected by the kitty protocol not
+    // being active (this binding has nothing to do with the Tab/Ctrl-i
+    // byte collision the rest of this test guards against).
+    h.send(Key::Char('l'));
+    h.wait_until(Duration::from_secs(2), |s| {
+        underlined_cells(s) != before && !underlined_cells(s).is_empty()
+    });
 
     h.send(Key::Char('q'));
     let status = h.wait_exit(Duration::from_secs(5));

@@ -199,6 +199,55 @@ fn hint_description_style() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
+/// Cycles `current` to the next (`forward`) or previous entry in `order`
+/// that `visible` accepts, wrapping around at either end — the small
+/// mechanic every Tab/BackTab-driven pane-focus view needs (the LSP
+/// inspector's Servers/Detail/Journal panes, the timeline's list/diff
+/// split, and the main files/diff panes later — issue #14) and none of
+/// them should hand-roll separately. Deliberately generic over `T` rather
+/// than any one view's own `Focus` enum, and deliberately ignorant of
+/// `App`/`View`: this stays a pure focus-ring primitive, matching
+/// [`PaneChrome`]'s own "styling primitive, not a layout framework" scope
+/// — geometry and rendering remain view-owned.
+///
+/// - An empty `order` has nothing to cycle through: `current` unchanged.
+/// - `current` present in `order`: walks at most `order.len()` steps in
+///   the requested direction, skipping any entry `visible` rejects, and
+///   wraps past either end. If nothing else is visible (a single-pane
+///   view, or every sibling pane currently hidden), this returns `current`
+///   unchanged rather than looping forever or landing somewhere invisible
+///   — a genuinely single-pane-visible state is a no-op, not an error.
+/// - `current` absent from `order` (a pane that disappeared out from under
+///   the caller — a state change this module has no way to know about):
+///   recovers to the first visible entry in `order`, or `current` itself
+///   if nothing is visible at all.
+pub(crate) fn cycle_focus<T: Copy + PartialEq>(
+    order: &[T],
+    current: T,
+    forward: bool,
+    visible: impl Fn(T) -> bool,
+) -> T {
+    if order.is_empty() {
+        return current;
+    }
+    let Some(start) = order.iter().position(|&candidate| candidate == current) else {
+        return order
+            .iter()
+            .copied()
+            .find(|&candidate| visible(candidate))
+            .unwrap_or(current);
+    };
+    let len = order.len();
+    for step in 1..=len {
+        let offset = if forward { step } else { len - step };
+        let index = (start + offset) % len;
+        if visible(order[index]) {
+            return order[index];
+        }
+    }
+    current
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +345,85 @@ mod tests {
         assert!(text.contains("scoped action"));
 
         let _owned_block: Block<'static> = PaneChrome::new("Runtime", 80).hints(&hints).block();
+    }
+
+    // ---- cycle_focus (issue #13) ---------------------------------------
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Pane {
+        A,
+        B,
+        C,
+    }
+
+    const ORDER: [Pane; 3] = [Pane::A, Pane::B, Pane::C];
+
+    fn all_visible(_pane: Pane) -> bool {
+        true
+    }
+
+    #[test]
+    fn forward_advances_one_step_and_wraps_past_the_end() {
+        assert_eq!(cycle_focus(&ORDER, Pane::A, true, all_visible), Pane::B);
+        assert_eq!(cycle_focus(&ORDER, Pane::B, true, all_visible), Pane::C);
+        assert_eq!(
+            cycle_focus(&ORDER, Pane::C, true, all_visible),
+            Pane::A,
+            "forward from the last entry must wrap to the first"
+        );
+    }
+
+    #[test]
+    fn backward_retreats_one_step_and_wraps_past_the_start() {
+        assert_eq!(cycle_focus(&ORDER, Pane::C, false, all_visible), Pane::B);
+        assert_eq!(cycle_focus(&ORDER, Pane::B, false, all_visible), Pane::A);
+        assert_eq!(
+            cycle_focus(&ORDER, Pane::A, false, all_visible),
+            Pane::C,
+            "backward from the first entry must wrap to the last"
+        );
+    }
+
+    #[test]
+    fn invisible_entries_are_skipped_in_either_direction() {
+        let skip_b = |pane: Pane| pane != Pane::B;
+        assert_eq!(
+            cycle_focus(&ORDER, Pane::A, true, skip_b),
+            Pane::C,
+            "forward from A must skip hidden B and land on C"
+        );
+        assert_eq!(
+            cycle_focus(&ORDER, Pane::C, false, skip_b),
+            Pane::A,
+            "backward from C must skip hidden B and land on A"
+        );
+    }
+
+    #[test]
+    fn only_the_current_pane_visible_is_a_no_op() {
+        let only_a = |pane: Pane| pane == Pane::A;
+        assert_eq!(cycle_focus(&ORDER, Pane::A, true, only_a), Pane::A);
+        assert_eq!(cycle_focus(&ORDER, Pane::A, false, only_a), Pane::A);
+    }
+
+    #[test]
+    fn a_current_pane_absent_from_order_recovers_to_the_first_visible_entry() {
+        // `Pane::A` isn't in this order at all — the shape of a pane that
+        // disappeared out from under the caller (see `cycle_focus`'s docs).
+        let without_a = [Pane::B, Pane::C];
+        assert_eq!(cycle_focus(&without_a, Pane::A, true, all_visible), Pane::B);
+    }
+
+    #[test]
+    fn a_current_pane_absent_from_order_with_nothing_visible_falls_back_to_current() {
+        let without_a = [Pane::B, Pane::C];
+        assert_eq!(cycle_focus(&without_a, Pane::A, true, |_| false), Pane::A);
+    }
+
+    #[test]
+    fn an_empty_order_leaves_current_unchanged() {
+        let empty: [Pane; 0] = [];
+        assert_eq!(cycle_focus(&empty, Pane::A, true, all_visible), Pane::A);
+        assert_eq!(cycle_focus(&empty, Pane::A, false, all_visible), Pane::A);
     }
 }

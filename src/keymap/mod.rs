@@ -35,9 +35,30 @@ pub enum Action {
     /// Moves the row's "active symbol" — the identifier-like token `Hover`
     /// targets — to the next/previous one on the current line. Purely a
     /// cursor-adjacent selection index, so unlike `Hover` this *is* handled
-    /// inside `App`/`FileView::update`.
+    /// inside `App`/`FileView::update`. Bound to vim's `l`/`h` and emacs's
+    /// `M-f`/`M-b` (issue #13) — *not* Tab/BackTab, which mean
+    /// [`FocusNextPane`](Action::FocusNextPane)/[`FocusPrevPane`](Action::FocusPrevPane)
+    /// instead; see those variants' docs for why the two were split apart.
     NextSymbol,
     PrevSymbol,
+    /// Cycles which pane has focus, forward/backward, in whichever view
+    /// currently has more than one — the LSP inspector's Servers/Detail/
+    /// Journal panes and the timeline's list/diff split today, with the
+    /// main files/diff panes joining later (issue #14). Bound to Tab/
+    /// BackTab in both presets. Deliberately a separate action from
+    /// `NextSymbol`/`PrevSymbol`: before issue #13, Tab/BackTab *were*
+    /// `NextSymbol`/`PrevSymbol`, repurposed per-view as ad hoc focus
+    /// cycling — which meant a view with a nested `App` (the timeline)
+    /// could never let symbol selection reach that nested diff, since Tab
+    /// always meant "cycle my own panes" first. Splitting pane focus into
+    /// its own action fixes that: a diff-view-shaped pane now sees real
+    /// `NextSymbol`/`PrevSymbol` requests only when a reviewer actually
+    /// pressed `l`/`h`/`M-f`/`M-b`, never a repurposed Tab. A single-pane
+    /// view (`App`/`FileView`) has nothing to cycle, so both are harmless
+    /// no-ops there — see [`crate::ui::pane::cycle_focus`], the shared
+    /// mechanic every multi-pane view's `update` delegates to.
+    FocusNextPane,
+    FocusPrevPane,
     /// Closes an open hover popup; otherwise a no-op. Separate from `Quit`
     /// because Esc closing a transient overlay and `q` quitting the whole
     /// view are different intents that happen to share "get me out of
@@ -71,8 +92,8 @@ pub enum Action {
     /// [`emacs_preset`] bind `C-i` (matching neovim) ahead of `Alt-Right`;
     /// without it, both share the same byte on the wire, so `C-i` is left
     /// unbound entirely — binding it there would silently steal every Tab
-    /// press meant for [`NextSymbol`](Action::NextSymbol) — and `Alt-Right`
-    /// becomes forward's sole, canonical binding instead. `Ctrl-t` (the
+    /// press meant for [`FocusNextPane`](Action::FocusNextPane) — and
+    /// `Alt-Right` becomes forward's sole, canonical binding instead. `Ctrl-t` (the
     /// pre-#12 legacy-terminal fallback) and `Ctrl-]` (vim's tag-stack key)
     /// are both deliberately left unbound — see the roadmap issue's "Why
     /// there is no tag stack." See `ui::mod`'s kitty-protocol startup probe
@@ -542,7 +563,7 @@ impl<'a> Resolver<'a> {
 /// mapping to one action, only with one sequence mapping to two). When
 /// `false`, `C-i` is left unbound entirely — the terminal delivers the
 /// identical byte for a literal Tab and `Ctrl-i` in that case, and Tab
-/// already means [`Action::NextSymbol`] — so `M-Right` becomes forward's
+/// already means [`Action::FocusNextPane`] — so `M-Right` becomes forward's
 /// sole, canonical binding. `M-Left` is `JumpBack`'s alias unconditionally,
 /// alongside `C-o`, in both branches.
 pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
@@ -560,6 +581,15 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("b", Action::ToggleSidebar),
         ("s", Action::ToggleLayout),
         ("K", Action::Hover),
+        // Familiar vim left/right motions, repurposed for the row's active
+        // symbol rather than the line cursor (issue #13's epic decision 4)
+        // — the uppercase pair isn't used for this since vim already claims
+        // `H`/`L` for screen top/bottom (and `L` is ToggleLogView below
+        // anyway), while `l`/`h`'s own line-cursor-motion meaning has no
+        // katamari equivalent to conflict with (this app scrolls a rendered
+        // diff, not raw text columns).
+        ("l", Action::NextSymbol),
+        ("h", Action::PrevSymbol),
         ("g d", Action::GotoDefinition),
         ("g r", Action::FindReferences),
         ("] d", Action::NextDiagnostic),
@@ -573,8 +603,8 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
     bindings.push(("M-Right", Action::JumpForward));
     bindings.extend([
         ("Enter", Action::Confirm),
-        ("Tab", Action::NextSymbol),
-        ("BackTab", Action::PrevSymbol),
+        ("Tab", Action::FocusNextPane),
+        ("BackTab", Action::FocusPrevPane),
         ("Esc", Action::Cancel),
         ("t", Action::ToggleTimeline),
         ("L", Action::ToggleLogView),
@@ -607,14 +637,19 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
 /// `xref-find-references`'s actual default keys; `C-Space` is
 /// `set-mark-command`, the closest emacs analogue to "start a range
 /// selection"; `M-g M-n`/`M-g M-p` mirror `next-error`/`previous-error`'s
-/// `M-g` prefix), and a small app-specific choice where none does (`C-h`
+/// `M-g` prefix; `M-f`/`M-b` are `forward-word`/`backward-word`'s actual
+/// keys, repurposed here for next/prev active-symbol selection — moving
+/// between identifier-like tokens on the line is the closest thing this app
+/// has to word motion, and Tab/BackTab are unavailable for it since issue
+/// #13 gives those to pane focus instead), and a small app-specific choice
+/// where none does (`C-h`
 /// for hover — this app owns every key at the terminal level, so there's no
 /// real help-prefix conflict to avoid the way there would be inside actual
 /// emacs). `C-x n`/`C-x p` for next/prev file exercise the same
 /// two-chord-with-a-shared-prefix shape `C-x` itself is famous for, without
 /// this app actually needing a `C-x` prefix for anything else. A handful of
 /// bindings that have no strong identity in either editor (the sidebar/
-/// layout/timeline/comments/scope-menu toggles, symbol cycling,
+/// layout/timeline/comments/scope-menu toggles,
 /// confirm/cancel) keep
 /// vim's keys rather than invent an arbitrary emacs-flavored alternative —
 /// `q` for quit most of all, kept identical across both presets by design
@@ -638,6 +673,8 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("b", Action::ToggleSidebar),
         ("s", Action::ToggleLayout),
         ("C-h", Action::Hover),
+        ("M-f", Action::NextSymbol),
+        ("M-b", Action::PrevSymbol),
         ("M-.", Action::GotoDefinition),
         ("M-?", Action::FindReferences),
         ("M-g M-n", Action::NextDiagnostic),
@@ -651,8 +688,8 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
     bindings.push(("M-Right", Action::JumpForward));
     bindings.extend([
         ("Enter", Action::Confirm),
-        ("Tab", Action::NextSymbol),
-        ("BackTab", Action::PrevSymbol),
+        ("Tab", Action::FocusNextPane),
+        ("BackTab", Action::FocusPrevPane),
         ("Esc", Action::Cancel),
         ("t", Action::ToggleTimeline),
         ("L", Action::ToggleLogView),
@@ -727,6 +764,8 @@ pub fn action_name(action: Action) -> &'static str {
         Action::Hover => "hover",
         Action::NextSymbol => "next-symbol",
         Action::PrevSymbol => "prev-symbol",
+        Action::FocusNextPane => "focus-next-pane",
+        Action::FocusPrevPane => "focus-prev-pane",
         Action::Cancel => "cancel",
         Action::GotoDefinition => "goto-definition",
         Action::FindReferences => "find-references",
@@ -776,6 +815,8 @@ pub fn action_by_name(name: &str) -> Option<Action> {
         "hover" => Action::Hover,
         "next-symbol" => Action::NextSymbol,
         "prev-symbol" => Action::PrevSymbol,
+        "focus-next-pane" => Action::FocusNextPane,
+        "focus-prev-pane" => Action::FocusPrevPane,
         "cancel" => Action::Cancel,
         "goto-definition" => Action::GotoDefinition,
         "find-references" => Action::FindReferences,
@@ -876,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn hover_and_symbol_cycling_keys_resolve() {
+    fn hover_focus_pane_and_cancel_keys_resolve() {
         let keymap = Keymap::from_bindings(&vim_preset(false));
         let mut resolver = keymap.resolver();
         assert_eq!(
@@ -885,16 +926,72 @@ mod tests {
         );
         assert_eq!(
             resolver.feed(KeyChord::new(KeyCode::Tab, KeyModifiers::NONE)),
-            StepResult::Matched(Action::NextSymbol)
+            StepResult::Matched(Action::FocusNextPane)
         );
         assert_eq!(
             resolver.feed(KeyChord::new(KeyCode::BackTab, KeyModifiers::NONE)),
-            StepResult::Matched(Action::PrevSymbol)
+            StepResult::Matched(Action::FocusPrevPane)
         );
         assert_eq!(
             resolver.feed(KeyChord::new(KeyCode::Esc, KeyModifiers::NONE)),
             StepResult::Matched(Action::Cancel)
         );
+    }
+
+    /// Issue #13's epic decision 4: lowercase `l`/`h` select the next/prev
+    /// active symbol in the vim preset — Tab/BackTab's pre-#13 job, now that
+    /// those are [`Action::FocusNextPane`]/[`Action::FocusPrevPane`] instead.
+    #[test]
+    fn vim_l_and_h_resolve_to_next_and_prev_symbol() {
+        let keymap = Keymap::from_bindings(&vim_preset(false));
+        let mut resolver = keymap.resolver();
+        assert_eq!(
+            resolver.feed(chord('l')),
+            StepResult::Matched(Action::NextSymbol)
+        );
+        assert_eq!(
+            resolver.feed(chord('h')),
+            StepResult::Matched(Action::PrevSymbol)
+        );
+    }
+
+    /// The emacs preset's counterpart: `M-f`/`M-b`, real emacs
+    /// `forward-word`/`backward-word` keys repurposed for symbol selection
+    /// (see [`emacs_preset`]'s docs).
+    #[test]
+    fn emacs_meta_f_and_meta_b_resolve_to_next_and_prev_symbol() {
+        let keymap = Keymap::from_bindings(&emacs_preset(false));
+        let mut resolver = keymap.resolver();
+        assert_eq!(
+            resolver.feed(alt('f')),
+            StepResult::Matched(Action::NextSymbol)
+        );
+        assert_eq!(
+            resolver.feed(alt('b')),
+            StepResult::Matched(Action::PrevSymbol)
+        );
+    }
+
+    /// Acceptance criterion: "Tab/BackTab never resolve to symbol actions in
+    /// a fresh built-in keymap" — checked positively (they resolve to the
+    /// pane-focus actions) in both presets at once, the same
+    /// loop-over-both-preset-functions shape
+    /// [`open_help_binds_to_plain_question_mark_in_both_presets`] uses.
+    #[test]
+    fn tab_and_backtab_resolve_to_focus_next_and_prev_pane_in_both_presets() {
+        for preset_fn in [vim_preset, emacs_preset] {
+            let keymap = Keymap::from_bindings(&preset_fn(false));
+            let mut resolver = keymap.resolver();
+            assert_eq!(
+                resolver.feed(KeyChord::new(KeyCode::Tab, KeyModifiers::NONE)),
+                StepResult::Matched(Action::FocusNextPane)
+            );
+            let mut resolver = keymap.resolver();
+            assert_eq!(
+                resolver.feed(KeyChord::new(KeyCode::BackTab, KeyModifiers::NONE)),
+                StepResult::Matched(Action::FocusPrevPane)
+            );
+        }
     }
 
     #[test]
@@ -1144,6 +1241,8 @@ mod tests {
             Action::Hover,
             Action::NextSymbol,
             Action::PrevSymbol,
+            Action::FocusNextPane,
+            Action::FocusPrevPane,
             Action::Cancel,
             Action::GotoDefinition,
             Action::FindReferences,
@@ -1203,6 +1302,31 @@ mod tests {
         let keymap = Keymap::from_bindings(&emacs_preset(false));
         let seq = keymap.binding_for(Action::GotoDefinition).unwrap();
         assert_eq!(seq.compact_notation(), "M-.");
+    }
+
+    /// Mirrors [`binding_for_finds_a_vim_preset_binding`]/
+    /// [`binding_for_finds_an_emacs_preset_binding`] for `NextSymbol` —
+    /// pinning that the live-binding-driven hint text (`ui::hints`) reports
+    /// `l` under vim and `M-f` under emacs, not the pre-#13 Tab either
+    /// preset used to share.
+    #[test]
+    fn binding_for_finds_next_symbol_bound_to_l_in_vim_and_meta_f_in_emacs() {
+        let vim_keymap = Keymap::from_bindings(&vim_preset(false));
+        assert_eq!(
+            vim_keymap
+                .binding_for(Action::NextSymbol)
+                .unwrap()
+                .compact_notation(),
+            "l"
+        );
+        let emacs_keymap = Keymap::from_bindings(&emacs_preset(false));
+        assert_eq!(
+            emacs_keymap
+                .binding_for(Action::NextSymbol)
+                .unwrap()
+                .compact_notation(),
+            "M-f"
+        );
     }
 
     #[test]
@@ -1302,25 +1426,26 @@ mod tests {
         assert_eq!(KeySeq::parse("q").compact_notation(), "q");
     }
 
-    /// The 40 actions (see the `action_name_and_action_by_name_round_trip…`
+    /// The 42 actions (see the `action_name_and_action_by_name_round_trip…`
     /// test's `all` list) each get exactly one binding — except `JumpBack`,
     /// which always gets a second one (`M-Left`), and `JumpForward`, which
-    /// gets `M-Right` unconditionally plus a *third* one (`C-i`) precisely
-    /// when `ci_distinguishable` is set, per [`vim_preset`]/[`emacs_preset`]'s
-    /// docs. So this checks two things per preset: every action is still
-    /// reachable (`actions.len() == 40` after dedup), and the raw entry
-    /// count is exactly two more than that (the unconditional `M-Left`/
-    /// `M-Right` aliases) plus one more still when the extra `C-i` alias is
-    /// present. As a side effect, this also forces `?`/`/`/`n`/`N` to be
-    /// bound in both presets the moment `ACTION_COUNT` bumps —
-    /// [`Action::OpenHelp`]/[`Action::OpenSearch`]/[`Action::NextMatch`]/
-    /// [`Action::PrevMatch`] with no binding in either preset would fail
-    /// the `actions.len() == ACTION_COUNT` assertion below, not just the
-    /// dedicated `open_help_binds_to_plain_question_mark_in_both_presets`
-    /// test.
+    /// gets a second one (`C-i`) precisely when `ci_distinguishable` is set
+    /// (per [`vim_preset`]/[`emacs_preset`]'s docs, `M-Right` *replaces* the
+    /// pre-#12 `C-t` as `JumpForward`'s own single baseline binding rather
+    /// than adding to it). So this checks two things per preset: every
+    /// action is still reachable (`actions.len() == 42` after dedup), and
+    /// the raw entry count is exactly one more than that (`JumpBack`'s
+    /// unconditional `M-Left` alias) plus one more still when the extra
+    /// `C-i` alias is present. As a side effect, this also forces
+    /// `?`/`/`/`n`/`N` to be bound in both presets the moment `ACTION_COUNT`
+    /// bumps — [`Action::OpenHelp`]/[`Action::OpenSearch`]/
+    /// [`Action::NextMatch`]/[`Action::PrevMatch`] with no binding in either
+    /// preset would fail the `actions.len() == ACTION_COUNT` assertion
+    /// below, not just the dedicated
+    /// `open_help_binds_to_plain_question_mark_in_both_presets` test.
     #[test]
     fn every_vim_and_emacs_binding_covers_every_action_exactly_once() {
-        const ACTION_COUNT: usize = 40;
+        const ACTION_COUNT: usize = 42;
         for ci_distinguishable in [false, true] {
             for preset in [
                 vim_preset(ci_distinguishable),
@@ -1433,21 +1558,22 @@ mod tests {
         }
     }
 
-    /// Tab must keep meaning `NextSymbol` in both modes — the whole reason
-    /// `ci_distinguishable=false` refuses to bind `C-i` at all is that an
-    /// undisambiguating terminal reports a literal Tab keypress with the
-    /// exact same byte, so binding `C-i` there would silently reroute every
-    /// Tab press meant for symbol-cycling. Checking it explicitly under
-    /// both modes pins that down rather than trusting it by omission.
+    /// Tab must keep meaning `FocusNextPane` in both modes — the whole
+    /// reason `ci_distinguishable=false` refuses to bind `C-i` at all is
+    /// that an undisambiguating terminal reports a literal Tab keypress
+    /// with the exact same byte, so binding `C-i` there would silently
+    /// reroute every Tab press meant for pane-focus cycling. Checking it
+    /// explicitly under both modes pins that down rather than trusting it
+    /// by omission.
     #[test]
-    fn tab_still_resolves_to_next_symbol_in_both_ci_distinguishable_modes() {
+    fn tab_still_resolves_to_focus_next_pane_in_both_ci_distinguishable_modes() {
         for ci_distinguishable in [false, true] {
             for preset_fn in [vim_preset, emacs_preset] {
                 let keymap = Keymap::from_bindings(&preset_fn(ci_distinguishable));
                 let mut resolver = keymap.resolver();
                 assert_eq!(
                     resolver.feed(KeyChord::new(KeyCode::Tab, KeyModifiers::NONE)),
-                    StepResult::Matched(Action::NextSymbol)
+                    StepResult::Matched(Action::FocusNextPane)
                 );
             }
         }

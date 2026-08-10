@@ -352,7 +352,8 @@ between.
 | Find references | `gr` | `M-?` |
 | Jump back / forward | `C-o` / `C-i`\* (also `M-Left`/`M-Right`) | `C-o` / `C-i`\* (also `M-Left`/`M-Right`) |
 | Search diff / next / prev match | `/` / `n` / `N` | `/` / `n` / `N` |
-| Next / prev symbol on line | `Tab` / `BackTab` | `Tab` / `BackTab` |
+| Focus next / prev pane | `Tab` / `BackTab` | `Tab` / `BackTab` |
+| Next / prev symbol on line | `l` / `h` | `M-f` / `M-b` |
 | Confirm / cancel | `Enter` / `Esc` | `Enter` / `Esc` |
 | Toggle sidebar | `b` | `b` |
 | Toggle unified/side-by-side | `s` | `s` |
@@ -370,7 +371,7 @@ between.
 [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/)
 (Ghostty, kitty, WezTerm, iTerm2 3.5+, Alacritty), which lets katamari tell a
 literal Tab keypress apart from `Ctrl-i` on the wire — without it they arrive
-as the same byte, and Tab already means next-symbol-on-line, so katamari
+as the same byte, and Tab already means focus-next-pane, so katamari
 uses `M-Right` as jump-forward's canonical binding there instead (notably
 Terminal.app, which doesn't implement the protocol). Detected once at
 startup. `M-Left`/`M-Right` are unconditional aliases for back/forward in

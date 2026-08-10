@@ -28,9 +28,11 @@ pub fn hint_line_count(screen_contents: &str) -> usize {
 /// `(row, col)` of every cell the terminal is currently rendering
 /// underlined — in `diff_view`/`file_view`, exactly the active symbol's
 /// span (see `diff_view::render`'s `mark_range(... Modifier::UNDERLINED)`
-/// call), so this is what `Action::NextSymbol`/`PrevSymbol` (Tab/BackTab)
-/// actually moves, observable end-to-end through a real terminal emulator
-/// rather than asserted against `App::active_symbol` directly.
+/// call), so this is what `Action::NextSymbol`/`PrevSymbol` (`l`/`h` in
+/// vim, `M-f`/`M-b` in emacs — Tab/BackTab move pane focus instead as of
+/// issue #13) actually moves, observable end-to-end through a real
+/// terminal emulator rather than asserted against `App::active_symbol`
+/// directly.
 pub fn underlined_cells(screen: &vt100::Screen) -> Vec<(u16, u16)> {
     let (rows, cols) = screen.size();
     let mut cells = Vec::new();

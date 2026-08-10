@@ -805,6 +805,15 @@ impl App {
             Action::ToggleComments => self.comments_visible = !self.comments_visible,
             Action::NextSymbol => self.cycle_symbol(1),
             Action::PrevSymbol => self.cycle_symbol(-1),
+            // Unlike the "intercepted by `ui::mod`" bucket below, this is a
+            // real no-op *here*, not just an action `App::update` never
+            // sees: the root diff view is single-pane (see issue #14 for
+            // when that changes), so there is nothing for Tab/BackTab to
+            // cycle focus between. `TimelineView` never forwards these to
+            // its nested `App` at all — its own `update` returns as soon as
+            // it has cycled `self.focus` (see that method's docs) — so this
+            // arm's only real caller is a root [`crate::ui::view::View::Diff`].
+            Action::FocusNextPane | Action::FocusPrevPane => {}
             // `ui::mod`'s event loop intercepts all of these before they
             // reach here — each needs either the LSP manager, the
             // diagnostics store, the jump stack, or (for `AddComment`) the

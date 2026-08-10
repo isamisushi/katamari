@@ -1203,6 +1203,49 @@ mod tests {
         assert!(quit_seq.unwrap().contains("Char('Z')"));
     }
 
+    /// Issue #13's acceptance criterion: pane focus and symbol selection
+    /// can be rebound independently — a single `[keys]` override touching
+    /// one must never drag the other's binding along with it, since they
+    /// used to share Tab/BackTab before this milestone split them apart.
+    /// The override targets (`C-]`, `y`) are picked to be unbound in the
+    /// vim preset, so this only exercises independent rebinding, not the
+    /// separate shadowing behavior `binding_for_never_reports_an_entry_…`
+    /// (in `keymap::tests`) already covers.
+    #[test]
+    fn apply_key_overrides_rebinds_pane_focus_and_symbol_selection_independently() {
+        let bindings = keymap::vim_preset(false);
+        let overrides = HashMap::from([
+            ("focus-next-pane".to_owned(), "C-]".to_owned()),
+            ("next-symbol".to_owned(), "y".to_owned()),
+        ]);
+        let rebound = apply_key_overrides(bindings, &overrides).unwrap();
+        let seq_for = |action: Action| {
+            rebound
+                .iter()
+                .find(|(_, a)| *a == action)
+                .map(|(seq, _)| format!("{seq:?}"))
+                .unwrap()
+        };
+        assert!(seq_for(Action::FocusNextPane).contains("Char(']')"));
+        assert!(seq_for(Action::NextSymbol).contains("Char('y')"));
+        // `FocusPrevPane`/`PrevSymbol` were left untouched — still their
+        // preset defaults (BackTab/`h`), not dragged along by the other
+        // pair's override.
+        let live = keymap::Keymap::from_bindings(&rebound);
+        assert_eq!(
+            live.binding_for(Action::FocusPrevPane)
+                .unwrap()
+                .compact_notation(),
+            "BackTab"
+        );
+        assert_eq!(
+            live.binding_for(Action::PrevSymbol)
+                .unwrap()
+                .compact_notation(),
+            "h"
+        );
+    }
+
     #[test]
     fn apply_key_overrides_reports_an_unknown_action_name() {
         let overrides = HashMap::from([("not-a-real-action".to_owned(), "q".to_owned())]);

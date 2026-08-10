@@ -56,7 +56,7 @@ impl HintItem {
     /// (callers `.flatten()` a list of these). If at least one does, the
     /// item is built from whichever bindings are present; in practice every
     /// action this is called with always has one (both built-in presets
-    /// bind all 33 actions, and `[keys]` only rebinds/appends — see
+    /// bind every action, and `[keys]` only rebinds/appends — see
     /// `Keymap::binding_for`'s docs), so this only ever loses a pair down to
     /// its single working half, never disappears outright.
     pub fn for_actions(keymap: &Keymap, actions: &[Action], label: &'static str) -> Option<Self> {
@@ -359,7 +359,11 @@ pub fn timeline_view_items(keymap: &Keymap, expanded: bool) -> Vec<HintItem> {
         HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "select"),
         HintItem::for_actions(keymap, &[Action::OpenHelp], "help"),
         HintItem::for_actions(keymap, &[Action::ToggleLspInspector], "LSP log"),
-        HintItem::for_actions(keymap, &[Action::NextSymbol], "focus"),
+        HintItem::for_actions(
+            keymap,
+            &[Action::FocusNextPane, Action::FocusPrevPane],
+            "focus",
+        ),
         HintItem::for_actions(keymap, &[Action::ToggleRangeSelect], "range"),
         HintItem::for_actions(keymap, &[Action::Confirm], "back to diff"),
         HintItem::for_actions(keymap, &[Action::Cancel, Action::ToggleTimeline], "close"),
