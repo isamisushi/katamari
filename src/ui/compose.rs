@@ -11,6 +11,7 @@
 //! movement) is testable without a terminal, matching every other pure state
 //! transition in this codebase.
 
+use crate::ui::app::CommentTarget;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -264,20 +265,18 @@ pub fn handle_key(buffer: &mut ComposeBuffer, key: KeyEvent) -> ComposeOutcome {
     }
 }
 
-/// State for one open compose overlay: which row it was opened from (the
-/// file/line a saved comment will anchor to — see `App::comment_target`)
-/// and the buffer being edited.
+/// State for one open compose overlay: what it was opened to comment on —
+/// a single line or (issue #19) a validated visual-selection range, see
+/// `App::comment_target` — and the buffer being edited.
 pub struct ComposeState {
-    pub file: String,
-    pub line: u32,
+    pub target: CommentTarget,
     buffer: ComposeBuffer,
 }
 
 impl ComposeState {
-    pub fn new(file: String, line: u32) -> Self {
+    pub fn new(target: CommentTarget) -> Self {
         Self {
-            file,
-            line,
+            target,
             buffer: ComposeBuffer::new(),
         }
     }
@@ -301,7 +300,7 @@ pub fn render(frame: &mut Frame, area: Rect, cursor_screen_row: u16, state: &Com
     let rect = popup_rect(area, cursor_screen_row);
     frame.render_widget(Clear, rect);
 
-    let title = format!(" comment: {}:{} ", state.file, state.line);
+    let title = format!(" comment: {} ", state.target.location_label());
     let block = Block::default().borders(Borders::ALL).title(title);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);

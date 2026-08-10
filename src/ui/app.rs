@@ -4,8 +4,8 @@
 //! testable without a real terminal.
 
 use crate::diff::{
-    ColumnMap, DiffFile, Gap, RenderRow, SideBySideRow, context_rows_for_gap, file_gaps, flatten,
-    flatten_side_by_side, gap_boundary_matches, lsp_target, splice_gap,
+    ColumnMap, DiffFile, DiffLineKind, Gap, RenderRow, SideBySideRow, context_rows_for_gap,
+    file_gaps, flatten, flatten_side_by_side, gap_boundary_matches, lsp_target, splice_gap,
 };
 use crate::keymap::Action;
 use crate::lsp::DiagnosticsStore;
@@ -75,6 +75,114 @@ pub enum VisualToggleOutcome {
     /// The cursor isn't on a [`RenderRow::Line`] — nothing here to start a
     /// selection from.
     NotSelectable,
+}
+
+/// What `Action::AddComment` ("c") would create a review comment about —
+/// [`App::comment_target`]'s success type. `Single` is the pre-#19 shape
+/// (one file, one line); `Range` is issue #19's addition, backed by the
+/// same-named `end_anchor`-carrying half of [`crate::comments::Comment`].
+/// Deliberately its own type rather than a tuple threaded through
+/// `ui::mod`'s event loop and [`crate::ui::compose::ComposeState`] — the
+/// issue's "State guidance": one value that names what it is, not a
+/// `(String, u32)` a reader has to infer the meaning of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommentTarget {
+    Single {
+        file: String,
+        line: u32,
+    },
+    /// `start <= end` by construction: [`App::range_comment_target`] is the
+    /// only place this variant is built, and it only ever builds one from
+    /// an already-validated, strictly contiguous run of ascending new-side
+    /// line numbers — nothing downstream needs to re-check the ordering.
+    Range {
+        file: String,
+        start: u32,
+        end: u32,
+    },
+}
+
+impl CommentTarget {
+    /// The repo-relative file this target anchors to, regardless of variant
+    /// — `ui::mod::save_comment` reads this once before matching on the
+    /// rest of the shape.
+    pub fn file(&self) -> &str {
+        match self {
+            CommentTarget::Single { file, .. } | CommentTarget::Range { file, .. } => file,
+        }
+    }
+
+    /// `path:line` for `Single`, `path:start-end` for `Range` (req 5) — the
+    /// compose overlay's title, via [`crate::comments::location_label`],
+    /// the same formatting `ktmr comments list`/`add`/export already use so
+    /// a range reads identically wherever it's shown.
+    pub fn location_label(&self) -> String {
+        match self {
+            CommentTarget::Single { file, line } => {
+                crate::comments::location_label(file, *line, *line)
+            }
+            CommentTarget::Range { file, start, end } => {
+                crate::comments::location_label(file, *start, *end)
+            }
+        }
+    }
+}
+
+/// Why [`App::comment_target`] refused to produce a [`CommentTarget`] —
+/// `ui::mod`'s `Action::AddComment` arm turns each variant into its own
+/// status-bar note (req 3: report the exact reason a selection was
+/// rejected, never a generic failure), replacing the pre-#19 `Option<...>`'s
+/// single undifferentiated "nothing to annotate here."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentTargetError {
+    /// The diff isn't [`App::interactive`] — a historical/read-only diff's
+    /// on-disk content may not match what's on screen at all (the same
+    /// class of risk [`App::disk_is_new_side`]'s docs describe for `z o`),
+    /// so neither a single line nor a range should ever anchor against it.
+    /// Checked ahead of both paths in [`App::comment_target`], closing the
+    /// gap [`App::toggle_visual`]'s own docs used to note.
+    NotInteractive,
+    /// The cursor (single-line path) isn't on a row with a current
+    /// working-tree line to comment about — a header row, a `Del` row, or a
+    /// deleted/binary file.
+    NoSelectableLine,
+    /// The selection (range path) spans more than one [`DiffFile`].
+    MultipleFiles,
+    /// The selection (range path) is on a deleted file. Checked ahead of
+    /// [`Self::ContainsDeletion`] so this more specific reason always wins
+    /// — every row of a deleted file is itself a `Del` row (see
+    /// [`DiffFile::status`]), so the reverse check order would make this
+    /// variant unreachable.
+    DeletedFile,
+    /// The selection (range path) includes at least one `Del` row.
+    ContainsDeletion,
+    /// The selection (range path)'s new-side line numbers aren't strictly
+    /// contiguous — it crosses a collapsed [`crate::diff::Gap`] or a hunk/
+    /// file boundary with hidden context lines in between.
+    Discontinuous,
+}
+
+impl CommentTargetError {
+    /// The exact status-bar text `ui::mod`'s `Action::AddComment` arm shows
+    /// for this rejection — kept here, next to the variant it describes,
+    /// rather than duplicated at that call site, so the wording and the
+    /// reason it names can never drift apart.
+    pub fn message(self) -> &'static str {
+        match self {
+            CommentTargetError::NotInteractive => {
+                "comment: not available on a historical/read-only diff"
+            }
+            CommentTargetError::NoSelectableLine => "comment: nothing to annotate on this row",
+            CommentTargetError::MultipleFiles => "comment: selection spans more than one file",
+            CommentTargetError::DeletedFile => "comment: can't comment on a deleted file",
+            CommentTargetError::ContainsDeletion => {
+                "comment: selection includes a deleted line — select added/context lines only"
+            }
+            CommentTargetError::Discontinuous => {
+                "comment: selection isn't contiguous — it crosses a gap"
+            }
+        }
+    }
 }
 
 /// Which of the two diff layouts the diff pane renders. Toggled by
@@ -669,27 +777,155 @@ impl App {
         })
     }
 
-    /// The file (repo-relative, exactly as it appears in the diff) and
-    /// 1-based working-tree line `Action::AddComment` would anchor a new
-    /// comment to: the cursor's current row, when it's eligible the same
-    /// way [`Self::hover_query`]'s target is — a `Context`/`Add` row on a
-    /// file that's still present on disk (see [`lsp_target`]'s docs for the
-    /// exact rule). `None` on a header row, a `Del` row, or a
-    /// deleted/binary file, none of which have a current line for a
-    /// comment to be *about*.
-    pub fn comment_target(&self) -> Option<(String, u32)> {
-        let RenderRow::Line {
+    /// What `Action::AddComment` ("c") would create a review comment about
+    /// right now: a single line at the cursor when no visual selection is
+    /// active, or (issue #19) the active selection's contiguous new-side
+    /// range when one is — dispatching to [`Self::single_comment_target`]/
+    /// [`Self::range_comment_target`] respectively. Gated on
+    /// [`Self::interactive`] at the very top, ahead of either path (see
+    /// [`CommentTargetError::NotInteractive`]'s docs) — this is the gate
+    /// [`Self::toggle_visual`]'s own docs used to note was missing.
+    pub fn comment_target(&self) -> Result<CommentTarget, CommentTargetError> {
+        if !self.interactive {
+            return Err(CommentTargetError::NotInteractive);
+        }
+        if self.visual_active() {
+            self.range_comment_target()
+        } else {
+            self.single_comment_target()
+        }
+    }
+
+    /// The single-line case: the cursor's current row, when it's eligible
+    /// the same way [`Self::hover_query`]'s target is — a `Context`/`Add`
+    /// row on a file that's still present on disk (see [`lsp_target`]'s
+    /// docs for the exact rule). [`CommentTargetError::NoSelectableLine`]
+    /// on a header row, a `Del` row, or a deleted/binary file, none of
+    /// which have a current line for a comment to be *about*.
+    fn single_comment_target(&self) -> Result<CommentTarget, CommentTargetError> {
+        let Some(RenderRow::Line {
             file_idx,
             hunk_idx,
             row_idx,
-        } = self.rows.get(self.cursor)?
+        }) = self.rows.get(self.cursor)
         else {
-            return None;
+            return Err(CommentTargetError::NoSelectableLine);
         };
         let file = &self.files[*file_idx];
         let row = &file.hunks[*hunk_idx].rows[*row_idx];
-        let (relative_path, line0) = lsp_target(row, file)?;
-        Some((relative_path.to_string_lossy().into_owned(), line0 + 1))
+        let Some((relative_path, line0)) = lsp_target(row, file) else {
+            return Err(CommentTargetError::NoSelectableLine);
+        };
+        Ok(CommentTarget::Single {
+            file: relative_path.to_string_lossy().into_owned(),
+            line: line0 + 1,
+        })
+    }
+
+    /// The range case (issue #19): every row [`Self::selected_rows`]
+    /// currently covers must be a `Context`/`Add` row, in the same file, on
+    /// a file that still exists, forming one strictly contiguous inclusive
+    /// run of new-side line numbers (issue #10's decision 6). Checked in
+    /// one ascending pass over `selected_rows()`: the first *row* that
+    /// violates anything decides the reported reason, with the checks
+    /// ordered per row as below — so a selection failing several
+    /// conditions on *different* rows reports whichever the earliest bad
+    /// row hit (e.g. a deletion crossed early masks a file boundary crossed
+    /// later). Every reported reason is a true statement about the
+    /// selection; no whole-selection priority ranking is promised.
+    ///
+    /// Within one row, the check order is:
+    ///
+    /// 1. [`CommentTargetError::MultipleFiles`] — the row must share the
+    ///    first row's `file_idx`.
+    /// 2. [`CommentTargetError::DeletedFile`] — checked *before* row kind:
+    ///    every row of a deleted file is a `Del` row (see
+    ///    [`DiffFile::status`]), so checking kind first would make this
+    ///    variant unreachable, and "the file is gone" is the more useful
+    ///    thing to tell a reviewer who selected across one.
+    /// 3. [`CommentTargetError::ContainsDeletion`] — any remaining `Del`
+    ///    row.
+    ///
+    /// [`CommentTargetError::Discontinuous`] runs after the pass, once
+    /// every row's `new_line` is known good: adjacent selected rows'
+    /// new-side line numbers must differ by exactly `1`. This one numeric
+    /// check covers both a selection spanning a collapsed
+    /// [`crate::diff::Gap`] (whose lines were never material to begin with
+    /// — `RenderRow::Gap` never appears in `selected_rows()`) and one
+    /// crossing a hunk/file boundary with hidden context in between,
+    /// without needing to special-case either shape.
+    ///
+    /// A selection that clears every check collapses to
+    /// [`CommentTarget::Single`] when it covers exactly one line — "a
+    /// one-row visual selection may create a single-line record" (req 4) is
+    /// this function's natural output, not a separate branch.
+    fn range_comment_target(&self) -> Result<CommentTarget, CommentTargetError> {
+        let rows = self.selected_rows();
+        let Some(&first_idx) = rows.first() else {
+            // Structurally unreachable while `visual_active()` —
+            // `toggle_visual` only ever starts a selection on a
+            // `RenderRow::Line`, which is always inside `visual_bounds()`
+            // and so always present in `selected_rows()` — but reporting a
+            // clean rejection here costs nothing and needs no unchecked
+            // assumption about an invariant this function doesn't itself
+            // enforce.
+            return Err(CommentTargetError::NoSelectableLine);
+        };
+        let RenderRow::Line {
+            file_idx: first_file_idx,
+            ..
+        } = self.rows[first_idx]
+        else {
+            return Err(CommentTargetError::NoSelectableLine);
+        };
+
+        let mut new_lines = Vec::with_capacity(rows.len());
+        for &idx in &rows {
+            let RenderRow::Line {
+                file_idx,
+                hunk_idx,
+                row_idx,
+            } = self.rows[idx]
+            else {
+                return Err(CommentTargetError::NoSelectableLine);
+            };
+            if file_idx != first_file_idx {
+                return Err(CommentTargetError::MultipleFiles);
+            }
+            let file = &self.files[file_idx];
+            if file.is_deleted {
+                return Err(CommentTargetError::DeletedFile);
+            }
+            let row = &file.hunks[hunk_idx].rows[row_idx];
+            if row.kind == DiffLineKind::Del {
+                return Err(CommentTargetError::ContainsDeletion);
+            }
+            // A non-deleted file's Context/Add row always carries a
+            // `new_line` (see `DiffRow`'s docs) — a binary file never
+            // reaches this point at all (`toggle_visual` only ever starts a
+            // selection on a `Line` row, and `flatten` never emits one for
+            // a binary file), so there is no reachable case where this is
+            // `None`.
+            let Some(new_line) = row.new_line else {
+                return Err(CommentTargetError::NoSelectableLine);
+            };
+            new_lines.push(new_line);
+        }
+
+        if !new_lines.windows(2).all(|w| w[1] == w[0] + 1) {
+            return Err(CommentTargetError::Discontinuous);
+        }
+
+        let file = self.files[first_file_idx].display_path().to_owned();
+        let start = new_lines[0];
+        let end = *new_lines
+            .last()
+            .expect("selected_rows is non-empty whenever first_idx resolved");
+        if start == end {
+            Ok(CommentTarget::Single { file, line: start })
+        } else {
+            Ok(CommentTarget::Range { file, start, end })
+        }
     }
 
     /// `V`'s effect. Cancel-first — checked via `.take()` *before* the
@@ -705,9 +941,9 @@ impl App {
     /// Deliberately does *not* gate on [`Self::interactive`]: a historical/
     /// read-only diff can still select and later copy lines (req 11) — the
     /// interactivity gate belongs only to what visual selection eventually
-    /// feeds (hover stays gated at [`Self::hover_query`]; a range comment
-    /// will need its own gate — see [`Self::comment_target`]'s docs on the
-    /// pre-existing gap there).
+    /// feeds (hover stays gated at [`Self::hover_query`]; issue #19 gave
+    /// [`Self::comment_target`] that same gate, at the top of both its
+    /// single-line and range paths).
     pub fn toggle_visual(&mut self) -> VisualToggleOutcome {
         if self.visual_anchor.take().is_some() {
             return VisualToggleOutcome::Cancelled;
@@ -778,10 +1014,8 @@ impl App {
     /// as selected. Indices only, never text or file/line numbers, per the
     /// issue's "State guidance" — a caller that needs more looks each index
     /// up in `self.rows`/`self.files` itself, which is exactly what
-    /// `ui::clipboard::resolve_selection` does for issue #17's `y`.
-    ///
-    /// #19 (range comment) still has no production caller — this module's
-    /// own tests exercised it alone until #17 landed.
+    /// `ui::clipboard::resolve_selection` does for issue #17's `y` and
+    /// [`Self::range_comment_target`] does for issue #19's `c`.
     pub fn selected_rows(&self) -> Vec<usize> {
         let Some((lo, hi)) = self.visual_bounds() else {
             return Vec::new();
@@ -818,6 +1052,15 @@ impl App {
     /// says its text soft-wraps into at [`Self::content_width`]. The single
     /// row-height oracle every wrap-aware call into `ui::scroll` in this
     /// module reads.
+    ///
+    /// Never accounts for a comment's own inline body block (single-line or
+    /// #19 range alike) the way it does a row's soft-wrap — that mismatch
+    /// predates #19 and stays out of scope here too; see
+    /// `diff_view::render_unified`'s doc for the accepted trade-off. #19's
+    /// `.at()` -> `.starting_at()` render fix (`diff_view::comments_starting_at_row`)
+    /// already bounds a range's worst-case contribution to that mismatch to
+    /// exactly what a single-line comment always had, since a range's body
+    /// now renders once regardless of how many lines it spans.
     fn row_visual_height(&self, idx: usize) -> usize {
         if !crate::config::wrap_enabled() {
             return 1;
@@ -4383,5 +4626,190 @@ index 1111111..2222222 100644\n\
             app.cancel_visual(),
             "select-and-later-cancel/copy must work on a read-only historical diff"
         );
+    }
+
+    // -- Issue #19: range comment target ---------------------------------
+    //
+    // `test_app()` (`FIXTURE` = `multi_file.diff`) rows relevant below:
+    // 0 FileHeader(src/lib.rs), 1 HunkHeader,
+    // 2 ctx new1 "fn helper() {}", 3 del (old2, no new_line),
+    // 4 add new2 "fn new_name() {}", 5 add new3 "fn new_name2() {}",
+    // 6 ctx new4 "fn tail() {}", 7 ctx new5 "fn unchanged() {}",
+    // 8 Gap, 9 FileHeader(src/new_module.rs), 10 HunkHeader,
+    // 11 add new1, 12 add new2,
+    // 13 FileHeader(src/old_module.rs, deleted), 14 HunkHeader,
+    // 15 del old1 (no new_line), 16 del old2 (no new_line).
+
+    #[test]
+    fn single_line_comment_target_is_unchanged_by_the_result_type() {
+        let mut app = test_app();
+        app.cursor = 2; // ctx "fn helper() {}", new_line 1
+        assert_eq!(
+            app.comment_target(),
+            Ok(CommentTarget::Single {
+                file: "src/lib.rs".to_owned(),
+                line: 1
+            })
+        );
+    }
+
+    #[test]
+    fn comment_target_on_a_header_row_reports_no_selectable_line() {
+        let mut app = test_app();
+        app.cursor = 0; // FileHeader
+        assert_eq!(
+            app.comment_target(),
+            Err(CommentTargetError::NoSelectableLine)
+        );
+    }
+
+    #[test]
+    fn comment_target_single_line_path_is_gated_on_interactive() {
+        // The gap issue #19 closes: pre-#19, `comment_target` had no
+        // `interactive` check at all — this is the regression guard.
+        let mut app = test_app();
+        app.interactive = false;
+        app.cursor = 2;
+        assert_eq!(
+            app.comment_target(),
+            Err(CommentTargetError::NotInteractive)
+        );
+    }
+
+    #[test]
+    fn a_forward_range_selection_targets_the_contiguous_new_line_span() {
+        let mut app = test_app();
+        app.cursor = 4; // add new2
+        app.toggle_visual();
+        app.cursor = 6; // ctx new4 — rows 4,5,6 are new_line 2,3,4
+        assert_eq!(
+            app.comment_target(),
+            Ok(CommentTarget::Range {
+                file: "src/lib.rs".to_owned(),
+                start: 2,
+                end: 4
+            })
+        );
+    }
+
+    #[test]
+    fn a_reversed_range_selection_targets_the_same_span() {
+        let mut app = test_app();
+        app.cursor = 6; // ctx new4
+        app.toggle_visual();
+        app.cursor = 4; // add new2 — anchor above cursor now
+        assert_eq!(
+            app.comment_target(),
+            Ok(CommentTarget::Range {
+                file: "src/lib.rs".to_owned(),
+                start: 2,
+                end: 4
+            })
+        );
+    }
+
+    #[test]
+    fn a_one_row_selection_collapses_to_single_rather_than_a_redundant_range() {
+        let mut app = test_app();
+        app.cursor = 4; // add new2
+        app.toggle_visual();
+        assert_eq!(
+            app.comment_target(),
+            Ok(CommentTarget::Single {
+                file: "src/lib.rs".to_owned(),
+                line: 2
+            })
+        );
+    }
+
+    #[test]
+    fn a_selection_spanning_two_files_reports_multiple_files() {
+        let mut app = test_app();
+        app.cursor = 7; // src/lib.rs, ctx new5
+        app.toggle_visual();
+        app.cursor = 11; // src/new_module.rs, add new1
+        assert_eq!(app.comment_target(), Err(CommentTargetError::MultipleFiles));
+    }
+
+    #[test]
+    fn the_earliest_violating_row_decides_the_reported_reason() {
+        // Rows 3..=11 both cross a deletion (row 3, src/lib.rs's del) and a
+        // file boundary (row 11, src/new_module.rs). The per-row pass stops
+        // at the first bad row — the deletion — even though a later row
+        // violates a different condition: pins `range_comment_target`'s
+        // documented first-bad-row rule (no whole-selection priority
+        // ranking is promised).
+        let mut app = test_app();
+        app.cursor = 3; // src/lib.rs, del row
+        app.toggle_visual();
+        app.cursor = 11; // src/new_module.rs, add new1
+        assert_eq!(
+            app.comment_target(),
+            Err(CommentTargetError::ContainsDeletion)
+        );
+    }
+
+    #[test]
+    fn a_selection_including_a_deletion_reports_contains_deletion() {
+        let mut app = test_app();
+        app.cursor = 3; // del
+        app.toggle_visual();
+        app.cursor = 4; // add new2
+        assert_eq!(
+            app.comment_target(),
+            Err(CommentTargetError::ContainsDeletion)
+        );
+    }
+
+    #[test]
+    fn a_selection_on_a_deleted_file_reports_deleted_file_before_contains_deletion() {
+        // Both rows of `src/old_module.rs` are `Del` — checking row kind
+        // first would make `DeletedFile` unreachable (see
+        // `App::range_comment_target`'s docs on the priority order).
+        let mut app = test_app();
+        app.cursor = 15; // src/old_module.rs, del old1
+        app.toggle_visual();
+        app.cursor = 16; // del old2
+        assert_eq!(app.comment_target(), Err(CommentTargetError::DeletedFile));
+    }
+
+    #[test]
+    fn a_selection_crossing_a_gap_reports_discontinuous() {
+        let mut app = gap_fixture_app();
+        app.cursor = 4; // "line 3", new_line 3
+        app.toggle_visual();
+        app.cursor = 7; // "line 10", new_line 10 — spans the Between gap and
+        // the second hunk's own HunkHeader, both structural
+        assert_eq!(app.selected_rows(), vec![4, 7]);
+        assert_eq!(app.comment_target(), Err(CommentTargetError::Discontinuous));
+    }
+
+    #[test]
+    fn a_valid_range_is_still_gated_on_interactive() {
+        let mut app = test_app();
+        app.interactive = false;
+        app.cursor = 4;
+        app.toggle_visual();
+        app.cursor = 6;
+        assert_eq!(
+            app.comment_target(),
+            Err(CommentTargetError::NotInteractive)
+        );
+    }
+
+    #[test]
+    fn comment_target_location_label_formats_single_and_range() {
+        let single = CommentTarget::Single {
+            file: "a.rs".to_owned(),
+            line: 5,
+        };
+        assert_eq!(single.location_label(), "a.rs:5");
+
+        let range = CommentTarget::Range {
+            file: "a.rs".to_owned(),
+            start: 5,
+            end: 8,
+        };
+        assert_eq!(range.location_label(), "a.rs:5-8");
     }
 }

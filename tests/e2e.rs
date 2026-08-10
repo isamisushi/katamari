@@ -37,6 +37,8 @@ mod lsp_inspector;
 mod lsp_readiness;
 #[path = "e2e/navigation.rs"]
 mod navigation;
+#[path = "e2e/range_comment.rs"]
+mod range_comment;
 #[path = "e2e/rendering.rs"]
 mod rendering;
 #[path = "e2e/scope_menu.rs"]

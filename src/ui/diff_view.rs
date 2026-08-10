@@ -177,6 +177,34 @@ fn comments_for_row<'a>(
     }
 }
 
+/// As [`comments_for_row`], but the comments whose relocated (or, if
+/// detached, original) *start* is `row`'s line — issue #19's fix for the
+/// pre-#19 bug where a range's body block rendered once per line it
+/// covered, via [`comments_for_row`]'s `.at()` fan-out, instead of once at
+/// the range's first line. The gutter marker (drawn via [`comments_for_row`]
+/// in [`render_row`]) is deliberately unaffected: every covered line still
+/// needs its own marker, only the body block needs to render once.
+fn comments_starting_at_row<'a>(
+    app: &App,
+    row: RenderRow,
+    comments: &'a CommentIndex,
+) -> &'a [CommentAnnotation] {
+    let RenderRow::Line {
+        file_idx,
+        hunk_idx,
+        row_idx,
+    } = row
+    else {
+        return &[];
+    };
+    let file = &app.files[file_idx];
+    let diff_row = &file.hunks[hunk_idx].rows[row_idx];
+    match diff_row.new_line {
+        Some(line) => comments.starting_at(file.display_path(), line),
+        None => &[],
+    }
+}
+
 /// Renders the unified layout's visible window, interleaving each row with
 /// its inline comment block (when `App::comments_visible`) directly
 /// underneath it rather than as a fixed one-row-per-`RenderRow` mapping —
@@ -223,7 +251,7 @@ fn render_unified(
         }
         if app.comments_visible {
             for block_line in
-                comment_block_lines(comments_for_row(app, row, comments), content_width)
+                comment_block_lines(comments_starting_at_row(app, row, comments), content_width)
             {
                 if lines.len() >= viewport_height {
                     break;
@@ -279,7 +307,7 @@ fn render_side_by_side(
             lines.push(line);
         }
         if app.comments_visible {
-            let annotations = side_by_side_row_comments(app, row, comments);
+            let annotations = side_by_side_row_comments_starting_at(app, row, comments);
             for block_line in comment_block_lines(annotations, width) {
                 if lines.len() >= viewport_height {
                     break;
@@ -293,11 +321,16 @@ fn render_side_by_side(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// As [`comments_for_row`], for one [`SideBySideRow`] — only the *new* side
-/// carries comment anchors (comments are only ever left on a `Context`/`Add`
-/// row, which always has a `new_line` — see `App::comment_target`), so a
-/// `Paired` row's old-side cell is never consulted here.
-fn side_by_side_row_comments<'a>(
+/// As [`comments_starting_at_row`], for one [`SideBySideRow`] — the
+/// side-by-side layout's own body-block call site, needing the same
+/// once-per-range fix [`comments_starting_at_row`]'s own docs describe for
+/// unified. Only the *new* side carries comment anchors (comments are only
+/// ever left on a `Context`/`Add` row, which always has a `new_line` — see
+/// `App::comment_target`), so a `Paired` row's old-side cell is never
+/// consulted here — req 8's "new-cell-only" rule falls out of this for free,
+/// the same way it already does for [`render_row`]'s marker (called through
+/// `comments_for_row`, unaffected by this function).
+fn side_by_side_row_comments_starting_at<'a>(
     app: &App,
     row: SideBySideRow,
     comments: &'a CommentIndex,
@@ -314,7 +347,7 @@ fn side_by_side_row_comments<'a>(
         } => None,
     };
     match flat_idx {
-        Some(flat_idx) => comments_for_row(app, app.rows[flat_idx], comments),
+        Some(flat_idx) => comments_starting_at_row(app, app.rows[flat_idx], comments),
         None => &[],
     }
 }
@@ -571,12 +604,17 @@ fn comment_marker_span(annotations: &[CommentAnnotation], bg: Option<Color>) -> 
 
 /// Renders the inline comment block for one row's `annotations`: one
 /// dimmed/labeled header line per comment (`[open]`/`[resolved]`/
-/// `[detached]` plus a short id prefix, so `ktmr comments resolve <id>`'s
-/// argument is visible without leaving the TUI) followed by its
-/// word-wrapped body, indented so it reads as subordinate to the diff line
-/// above it rather than another row of the diff itself. A resolved
+/// `[detached]`, issue #19's `start-end` when the annotation is a range
+/// (`start != end` — nothing extra for a single-line one, so this is a
+/// no-op on every pre-#19 comment), and a short id prefix, so `ktmr comments
+/// resolve <id>`'s argument is visible without leaving the TUI) followed by
+/// its word-wrapped body, indented so it reads as subordinate to the diff
+/// line above it rather than another row of the diff itself. A resolved
 /// comment's body renders struck through and dimmed; an open one in plain
-/// (but still slightly indented) text.
+/// (but still slightly indented) text. Callers pass this
+/// [`comments_starting_at_row`]'s output, never [`comments_for_row`]'s —
+/// see that function's docs — so `annotations` here is never more than one
+/// row's worth of *range starts*, not every line a range happens to cover.
 fn comment_block_lines(annotations: &[CommentAnnotation], width: usize) -> Vec<Line<'static>> {
     const INDENT: &str = "      ";
     let body_width = width.saturating_sub(display_width(INDENT));
@@ -599,10 +637,15 @@ fn comment_block_lines(annotations: &[CommentAnnotation], width: usize) -> Vec<L
             Style::default().fg(Color::Cyan)
         };
         let id_prefix = &annotation.id[..annotation.id.len().min(8)];
-        out.push(Line::from(Span::styled(
-            format!("{INDENT}[{label} {id_prefix}]"),
-            header_style,
-        )));
+        let header_text = if annotation.start == annotation.end {
+            format!("{INDENT}[{label} {id_prefix}]")
+        } else {
+            format!(
+                "{INDENT}[{label} {}-{} {id_prefix}]",
+                annotation.start, annotation.end
+            )
+        };
+        out.push(Line::from(Span::styled(header_text, header_style)));
 
         let mut body_style = Style::default().fg(Color::Gray);
         if annotation.status == CommentStatus::Resolved {
@@ -1052,10 +1095,12 @@ fn pad_or_truncate(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::comments::CommentIndex;
+    use crate::comments::{self, Comment, CommentIndex};
     use crate::diff::{DiffFile, DiffHunk, DiffLineKind, DiffRow, SideBySideRow, SideCell};
     use crate::lsp::DiagnosticsStore;
-    use std::path::PathBuf;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use std::path::{Path, PathBuf};
 
     fn row(kind: DiffLineKind, text: &str, old: Option<u32>, new: Option<u32>) -> DiffRow {
         DiffRow {
@@ -1086,8 +1131,133 @@ mod tests {
         App::new("repo".to_owned(), PathBuf::from("/repo"), vec![file])
     }
 
+    /// As [`app_with_rows`], but rooted at a real `repo_root` (a tempdir
+    /// standing in for the reviewed repo) instead of the fixed, nonexistent
+    /// `/repo` — issue #19's comment-render tests need `comments::build_index`
+    /// to actually read a file, which `/repo` can never satisfy.
+    fn app_with_rows_in(repo_root: &Path, filename: &str, rows: Vec<DiffRow>) -> App {
+        let file = DiffFile {
+            old_path: Some(filename.to_owned()),
+            new_path: Some(filename.to_owned()),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: rows.len() as u32,
+                new_start: 1,
+                new_lines: rows.len() as u32,
+                header: String::new(),
+                known_eof: true,
+                rows,
+            }],
+            ..Default::default()
+        };
+        App::new("repo".to_owned(), repo_root.to_owned(), vec![file])
+    }
+
+    /// A `Comment` (single-line when `start == end`, a range otherwise),
+    /// anchored against `lines` — the same tempdir+`build_index` pattern
+    /// `comments::index`'s own tests use, so a render test's
+    /// `CommentAnnotation`s come from the real relocation path rather than
+    /// being hand-assembled with fields a real build could never produce
+    /// together.
+    fn range_comment(
+        id: &str,
+        file: &str,
+        lines: &[&str],
+        start: u32,
+        end: u32,
+        body: &str,
+        status: CommentStatus,
+    ) -> Comment {
+        Comment {
+            id: id.to_owned(),
+            created_at: 0,
+            file: file.to_owned(),
+            anchor: comments::anchor_for(lines, start).unwrap(),
+            end_anchor: if start == end {
+                None
+            } else {
+                Some(comments::anchor_for(lines, end).unwrap())
+            },
+            body: body.to_owned(),
+            status,
+            resolved_at: None,
+        }
+    }
+
     fn line_text(line: &Line) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// Renders `app` through `render_unified`/`render_side_by_side`
+    /// directly (bypassing `render`/`render_focusable`'s border chrome, so
+    /// `width`/`height` map onto content rows one-to-one) into an offscreen
+    /// `width`x`height` buffer.
+    fn draw_unified(app: &App, comments: &CommentIndex, width: u16, height: u16) -> Buffer {
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let backend = TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_unified(
+                    frame,
+                    frame.area(),
+                    app,
+                    &mut highlighter,
+                    &diagnostics,
+                    comments,
+                )
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// As [`draw_unified`], through `render_side_by_side` instead.
+    fn draw_side_by_side(app: &App, comments: &CommentIndex, width: u16, height: u16) -> Buffer {
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let backend = TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_side_by_side(
+                    frame,
+                    frame.area(),
+                    app,
+                    &mut highlighter,
+                    &diagnostics,
+                    comments,
+                )
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// The whole buffer's cells, concatenated in row-major order — for a
+    /// whole-output substring count (e.g. "this text appears exactly
+    /// once"), the same shape `sidebar`'s own `buffer_text` helper uses.
+    fn buffer_text(buffer: &Buffer) -> String {
+        buffer.content.iter().map(|cell| cell.symbol()).collect()
+    }
+
+    /// One row's cells, concatenated left to right — for asserting what's
+    /// (or isn't) on a *specific* screen row, which whole-buffer
+    /// concatenation alone can't distinguish (it drops row boundaries).
+    fn row_text(buffer: &Buffer, y: u16, width: u16) -> String {
+        (0..width)
+            .map(|x| buffer.cell((x, y)).map_or(" ", |c| c.symbol()))
+            .collect()
+    }
+
+    /// The first screen row (top to bottom) whose text contains `needle` —
+    /// for locating a row by its known content rather than a hand-counted
+    /// `y`, which shifts depending on how many lines an earlier row's
+    /// comment body block consumed.
+    fn find_row_containing(buffer: &Buffer, height: u16, width: u16, needle: &str) -> String {
+        (0..height)
+            .map(|y| row_text(buffer, y, width))
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no row contains {needle:?}"))
     }
 
     /// As [`app_with_rows`], but for a single-row file at a `.lock`
@@ -2048,6 +2218,345 @@ mod tests {
                 .any(is_visual_selected),
             "a selected context row must mark the new cell too; spans: {:?}",
             lines[0].spans
+        );
+    }
+
+    // -- Issue #19: range comment rendering -------------------------------
+
+    /// The gutter marker fans out to every covered line (unchanged `.at()`
+    /// behavior — req 7's first bullet), but the body block itself renders
+    /// exactly once, at the range's first line — the `.at()` -> `.starting_at()`
+    /// core fix this issue makes (see `comments_starting_at_row`'s docs for
+    /// the pre-#19 bug this replaces).
+    #[test]
+    fn unified_range_marks_every_covered_row_but_renders_the_body_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.rs"), "one\ntwo\nthree\nfour\n").unwrap();
+        let lines = ["one", "two", "three", "four"];
+        let rows = vec![
+            row(DiffLineKind::Context, "one", Some(1), Some(1)),
+            row(DiffLineKind::Context, "two", Some(2), Some(2)),
+            row(DiffLineKind::Context, "three", Some(3), Some(3)),
+            row(DiffLineKind::Context, "four", Some(4), Some(4)),
+        ];
+        let app = app_with_rows_in(dir.path(), "f.rs", rows);
+        let comment = range_comment(
+            "rangeid1",
+            "f.rs",
+            &lines,
+            2,
+            3,
+            "check this range",
+            CommentStatus::Open,
+        );
+        let index = comments::build_index(dir.path(), std::slice::from_ref(&comment));
+
+        let buffer = draw_unified(&app, &index, 80, 20);
+
+        let marker = '\u{25C6}'; // open, still-anchored marker
+        let one_row = find_row_containing(&buffer, 20, 80, "one");
+        assert!(
+            !one_row.contains(marker),
+            "row before the range: {one_row:?}"
+        );
+        let two_row = find_row_containing(&buffer, 20, 80, "two");
+        assert!(two_row.contains(marker), "range start row: {two_row:?}");
+        let three_row = find_row_containing(&buffer, 20, 80, "three");
+        assert!(three_row.contains(marker), "range end row: {three_row:?}");
+        let four_row = find_row_containing(&buffer, 20, 80, "four");
+        assert!(
+            !four_row.contains(marker),
+            "row after the range: {four_row:?}"
+        );
+
+        let whole = buffer_text(&buffer);
+        assert_eq!(
+            whole.matches("check this range").count(),
+            1,
+            "the body must render exactly once, not once per covered line"
+        );
+    }
+
+    /// The `.at()` → `.starting_at()` body-block switch through the *full*
+    /// unified render path with a genuinely single-line comment
+    /// (`end_anchor: None`) — the acceptance criterion "existing
+    /// single-line comments render unchanged" pinned by execution, not by
+    /// the inference that `start == end` makes the two lookups agree.
+    #[test]
+    fn unified_single_line_comment_still_renders_marker_and_body_at_its_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.rs"), "one\ntwo\nthree\n").unwrap();
+        let lines = ["one", "two", "three"];
+        let rows = vec![
+            row(DiffLineKind::Context, "one", Some(1), Some(1)),
+            row(DiffLineKind::Context, "two", Some(2), Some(2)),
+            row(DiffLineKind::Context, "three", Some(3), Some(3)),
+        ];
+        let app = app_with_rows_in(dir.path(), "f.rs", rows);
+        // start == end → `range_comment` builds `end_anchor: None`.
+        let comment = range_comment(
+            "single01",
+            "f.rs",
+            &lines,
+            2,
+            2,
+            "just this line",
+            CommentStatus::Open,
+        );
+        let index = comments::build_index(dir.path(), std::slice::from_ref(&comment));
+
+        let buffer = draw_unified(&app, &index, 80, 20);
+
+        let marker = '\u{25C6}';
+        let two_row = find_row_containing(&buffer, 20, 80, "two");
+        assert!(two_row.contains(marker), "anchored row: {two_row:?}");
+        let one_row = find_row_containing(&buffer, 20, 80, "one");
+        assert!(!one_row.contains(marker), "row above: {one_row:?}");
+        let three_row = find_row_containing(&buffer, 20, 80, "three");
+        assert!(!three_row.contains(marker), "row below: {three_row:?}");
+
+        let whole = buffer_text(&buffer);
+        assert_eq!(whole.matches("just this line").count(), 1);
+        assert!(
+            !whole.contains("2-2"),
+            "a single-line header never shows a range extent"
+        );
+    }
+
+    /// As the unified test above, but through the side-by-side layout and
+    /// specifically covering a paired del/add row's *new* cell as the
+    /// range's start — the body block must still render exactly once
+    /// (issue #19's fix applies per `SideBySideRow`, not per old/new cell),
+    /// and only in association with the new-side content, never the old.
+    #[test]
+    fn side_by_side_range_starting_on_a_paired_rows_new_cell_renders_the_body_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.rs"), "one\nadded\nthree\n").unwrap();
+        let lines = ["one", "added", "three"];
+        let rows = vec![
+            row(DiffLineKind::Context, "one", Some(1), Some(1)),
+            row(DiffLineKind::Del, "removed", Some(2), None),
+            row(DiffLineKind::Add, "added", None, Some(2)),
+            row(DiffLineKind::Context, "three", Some(3), Some(3)),
+        ];
+        let app = app_with_rows_in(dir.path(), "f.rs", rows);
+        // Range covers new_line 2 ("added") through 3 ("three") — starts on
+        // the paired del/add row's new cell.
+        let comment = range_comment(
+            "rangeid2",
+            "f.rs",
+            &lines,
+            2,
+            3,
+            "side by side range body",
+            CommentStatus::Open,
+        );
+        let index = comments::build_index(dir.path(), std::slice::from_ref(&comment));
+
+        let buffer = draw_side_by_side(&app, &index, 80, 20);
+
+        let whole = buffer_text(&buffer);
+        assert_eq!(
+            whole.matches("side by side range body").count(),
+            1,
+            "the body must render exactly once across the whole side-by-side pane"
+        );
+        let added_row = find_row_containing(&buffer, 20, 80, "added");
+        assert!(
+            added_row.contains('\u{25C6}'),
+            "the new cell's own row must still carry the marker: {added_row:?}"
+        );
+    }
+
+    /// The header line issue #19 adds a `start-end` suffix to — present for
+    /// a range (`start != end`), absent for a single-line comment (`start
+    /// == end`), each built through the real `comments::build_index`
+    /// relocation path.
+    #[test]
+    fn comment_block_lines_header_shows_the_range_only_when_start_and_end_differ() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.rs"), "one\ntwo\nthree\nfour\n").unwrap();
+        let lines = ["one", "two", "three", "four"];
+        let range = range_comment(
+            "rangeid3",
+            "f.rs",
+            &lines,
+            2,
+            4,
+            "range body",
+            CommentStatus::Open,
+        );
+        let single = range_comment(
+            "singleid",
+            "f.rs",
+            &lines,
+            2,
+            2,
+            "single body",
+            CommentStatus::Open,
+        );
+        let index = comments::build_index(dir.path(), &[range, single]);
+
+        let range_annotations = index.starting_at("f.rs", 2);
+        // Both comments start at line 2 — creation order preserves `range`
+        // (pushed first) ahead of `single`.
+        assert_eq!(range_annotations.len(), 2);
+        let rendered = comment_block_lines(range_annotations, 80);
+        let header_texts: Vec<String> = rendered.iter().map(line_text).collect();
+        let range_header = header_texts
+            .iter()
+            .find(|t| t.contains("rangeid3"))
+            .expect("range comment's header line");
+        assert!(range_header.contains("2-4"), "{range_header:?}");
+        let single_header = header_texts
+            .iter()
+            .find(|t| t.contains("singleid"))
+            .expect("single-line comment's header line");
+        assert!(
+            !single_header.contains('-'),
+            "a single-line comment's header must carry no range suffix: {single_header:?}"
+        );
+    }
+
+    /// A resolved range renders struck through and dimmed — the same
+    /// semantics a resolved single-line comment already had, unaffected by
+    /// issue #19's `.starting_at()` switch (this checks the annotation
+    /// that switch now feeds `comment_block_lines`, not a new dimming rule).
+    #[test]
+    fn comment_block_lines_dims_and_strikes_through_a_resolved_range() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.rs"), "one\ntwo\nthree\n").unwrap();
+        let lines = ["one", "two", "three"];
+        let comment = range_comment(
+            "resolved1",
+            "f.rs",
+            &lines,
+            2,
+            3,
+            "already handled",
+            CommentStatus::Resolved,
+        );
+        let index = comments::build_index(dir.path(), std::slice::from_ref(&comment));
+
+        let annotations = index.starting_at("f.rs", 2);
+        assert_eq!(annotations.len(), 1);
+        let rendered = comment_block_lines(annotations, 80);
+
+        let header = &rendered[0];
+        assert!(line_text(header).contains("resolved"));
+        let body_line = rendered
+            .iter()
+            .find(|l| line_text(l).contains("already handled"))
+            .expect("body line");
+        let body_span = &body_line.spans[0];
+        assert!(
+            body_span.style.add_modifier.contains(Modifier::CROSSED_OUT),
+            "a resolved comment's body must render struck through: {:?}",
+            body_span.style
+        );
+    }
+
+    /// A range whose endpoints can no longer both be relocated renders once,
+    /// at its *original* start line, labeled `detached` — issue #19's
+    /// `.starting_at()` fix is keyed by `CommentAnnotation::start`, which
+    /// [`comments::build_index`] leaves at the original stored anchor for a
+    /// detached range (never reordered or dropped — see
+    /// `comments::RelocatedRange::detached`'s docs), so this falls out of
+    /// the same mechanism the attached-range tests above exercise, not a
+    /// separate code path.
+    #[test]
+    fn unified_detached_range_renders_once_at_its_original_start() {
+        let dir = tempfile::tempdir().unwrap();
+        // Disk content shares nothing with the lines the comment was
+        // anchored against below — both endpoints fail to relocate.
+        std::fs::write(dir.path().join("f.rs"), "unrelated content\n").unwrap();
+        let anchor_lines = ["one", "two", "three", "four"];
+        let rows = vec![
+            row(DiffLineKind::Context, "one", Some(1), Some(1)),
+            row(DiffLineKind::Context, "two", Some(2), Some(2)),
+            row(DiffLineKind::Context, "three", Some(3), Some(3)),
+            row(DiffLineKind::Context, "four", Some(4), Some(4)),
+        ];
+        let app = app_with_rows_in(dir.path(), "f.rs", rows);
+        let comment = range_comment(
+            "detached1",
+            "f.rs",
+            &anchor_lines,
+            2,
+            3,
+            "orphaned range body",
+            CommentStatus::Open,
+        );
+        let index = comments::build_index(dir.path(), std::slice::from_ref(&comment));
+
+        let buffer = draw_unified(&app, &index, 80, 20);
+        let whole = buffer_text(&buffer);
+        assert_eq!(
+            whole.matches("orphaned range body").count(),
+            1,
+            "a detached range's body must still render exactly once"
+        );
+
+        let two_row = find_row_containing(&buffer, 20, 80, "two");
+        assert!(
+            two_row.contains('\u{25C7}'),
+            "a detached-only annotation shows the dim marker at its original start: {two_row:?}"
+        );
+        let three_row = find_row_containing(&buffer, 20, 80, "three");
+        assert!(
+            !three_row.contains("orphaned range body"),
+            "the body must not also render at the range's original end row"
+        );
+    }
+
+    /// Two comments whose ranges both start on the same line render in
+    /// creation order — `comments::build_index` never sorts, and
+    /// `comment_block_lines` renders `annotations` in whatever order it's
+    /// given, so this is really pinning that neither of those quietly
+    /// starts reordering by id, status, or range length.
+    #[test]
+    fn overlapping_comments_starting_on_the_same_line_render_in_creation_order() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.rs"), "one\ntwo\nthree\n").unwrap();
+        let lines = ["one", "two", "three"];
+        let first = range_comment(
+            "firstid1",
+            "f.rs",
+            &lines,
+            2,
+            2,
+            "first comment",
+            CommentStatus::Open,
+        );
+        let second = range_comment(
+            "secondid",
+            "f.rs",
+            &lines,
+            2,
+            3,
+            "second comment",
+            CommentStatus::Open,
+        );
+        let index = comments::build_index(dir.path(), &[first, second]);
+
+        let annotations = index.starting_at("f.rs", 2);
+        assert_eq!(annotations.len(), 2);
+        assert_eq!(annotations[0].id, "firstid1");
+        assert_eq!(annotations[1].id, "secondid");
+
+        let rendered = comment_block_lines(annotations, 80);
+        let texts: Vec<String> = rendered.iter().map(line_text).collect();
+        let first_idx = texts
+            .iter()
+            .position(|t| t.contains("first comment"))
+            .expect("first comment's body line");
+        let second_idx = texts
+            .iter()
+            .position(|t| t.contains("second comment"))
+            .expect("second comment's body line");
+        assert!(
+            first_idx < second_idx,
+            "overlapping comments must render in creation order: {texts:?}"
         );
     }
 }

@@ -237,8 +237,13 @@ diff whose new side is the live working tree (a plain `ktmr diff`) — fold
 rows still show everywhere else (staged, a revision diff, `ktmr log`), `zo`
 there just explains why it can't expand.
 
-Leave a review comment on the current line with `c`, then `C-s` to save.
-An AI coding agent addresses them with:
+Leave a review comment on the current line with `c`, then `C-s` to save. With
+a visual selection active (`V`, above), `c` instead comments the whole
+selection as one range, as long as it resolves to a contiguous run of
+added/context lines in a single file — the title and status bar read
+`path:start-end`; anything else (a deletion, more than one file, a gap)
+is refused with the specific reason, leaving the selection in place so you
+can adjust it and try again. An AI coding agent addresses either shape with:
 
 ```
 ktmr comments list --json           # or: ktmr comments export --format=md

@@ -933,6 +933,18 @@ fn event_loop(
                                 &mut comment_index,
                             );
                             compose = None;
+                            // Issue #19's range-compose counterpart to #17's
+                            // `y`: a successful save clears the selection
+                            // that produced it, so the reviewer sees the new
+                            // range's markers land in place of the (now
+                            // stale) highlighted rows instead of both
+                            // showing at once. A no-op for a plain `c` —
+                            // `cancel_visual`'s own `bool` result already
+                            // handles "there was nothing to cancel," so this
+                            // doesn't need to distinguish the two cases.
+                            if saved && let View::Diff(app) = stack.top_mut() {
+                                app.cancel_visual();
+                            }
 
                             // The prompt only ever fires once per session
                             // (`skill_prompt_offered`), only after a comment
@@ -1384,26 +1396,47 @@ fn run_skill_install_prompt(repo_root: Option<&Path>) -> String {
 }
 
 /// Builds and appends the [`Comment`] a finished compose overlay describes:
-/// re-reads `state.file`'s current content (rather than trusting whatever
-/// it was when the overlay opened, in case it changed mid-edit) to compute
-/// a fresh [`comments::Anchor`], then writes it through
-/// [`CommentStore::append_comment`].
+/// re-reads `state.target.file()`'s current content (rather than trusting
+/// whatever it was when the overlay opened, in case it changed mid-edit) to
+/// compute a fresh [`comments::Anchor`] per endpoint, then writes it through
+/// [`CommentStore::append_comment`]. A [`app::CommentTarget::Range`]'s two
+/// endpoints are anchored independently against that same read — issue
+/// #18's `Comment::end_anchor` already carries its own content/context hash,
+/// so there's no shortcut that derives one anchor from the other. A file
+/// that shrinks mid-compose so only one endpoint still exists is reported
+/// per-endpoint ("line N no longer exists…") rather than silently anchoring
+/// half a range; a comment log corrupted by a watch refresh that moves the
+/// file *between* the two `anchor_for` calls below is a pre-existing risk
+/// class this doesn't newly introduce (the single-line path always had the
+/// same window between its read and its one `anchor_for` call).
 fn save_comment(repo_root: &Path, state: &ComposeState) -> std::result::Result<Comment, String> {
-    let absolute = repo_root.join(&state.file);
-    let content = std::fs::read_to_string(&absolute)
-        .map_err(|e| format!("couldn't re-read {}: {e}", state.file))?;
+    let file = state.target.file();
+    let absolute = repo_root.join(file);
+    let content =
+        std::fs::read_to_string(&absolute).map_err(|e| format!("couldn't re-read {file}: {e}"))?;
     let lines: Vec<&str> = content.lines().collect();
-    let anchor = comments::anchor_for(&lines, state.line)
-        .ok_or_else(|| format!("line {} no longer exists in {}", state.line, state.file))?;
+
+    let (anchor, end_anchor) = match &state.target {
+        app::CommentTarget::Single { line, .. } => {
+            let anchor = comments::anchor_for(&lines, *line)
+                .ok_or_else(|| format!("line {line} no longer exists in {file}"))?;
+            (anchor, None)
+        }
+        app::CommentTarget::Range { start, end, .. } => {
+            let start_anchor = comments::anchor_for(&lines, *start)
+                .ok_or_else(|| format!("line {start} no longer exists in {file}"))?;
+            let end_anchor = comments::anchor_for(&lines, *end)
+                .ok_or_else(|| format!("line {end} no longer exists in {file}"))?;
+            (start_anchor, Some(end_anchor))
+        }
+    };
 
     let comment = Comment {
         id: comments::generate_id(),
         created_at: comments::now_unix(),
-        file: state.file.clone(),
+        file: file.to_owned(),
         anchor,
-        // The TUI compose overlay has no range-selection UI yet (that's a
-        // later milestone) — every comment it saves is single-line.
-        end_anchor: None,
+        end_anchor,
         body: state.buffer().text(),
         status: comments::Status::Open,
         resolved_at: None,
@@ -2027,8 +2060,12 @@ fn handle_action(
         },
         Action::AddComment => match stack.top() {
             View::Diff(app) => match app.comment_target() {
-                Some((file, line)) => *compose = Some(ComposeState::new(file, line)),
-                None => *goto_status = Some("comment: nothing to annotate on this row".to_owned()),
+                Ok(target) => *compose = Some(ComposeState::new(target)),
+                // Never touches visual state — a rejected range leaves the
+                // selection exactly as it was, so the reviewer can fix the
+                // status-bar-reported problem (or just try `c` again) without
+                // having to reselect (req 3).
+                Err(reason) => *goto_status = Some(reason.message().to_owned()),
             },
             View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
                 *goto_status = Some("comment: only available in the diff view".to_owned());

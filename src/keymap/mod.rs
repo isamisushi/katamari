@@ -169,12 +169,16 @@ pub enum Action {
     /// owns), and deliberately view-independent: the hint bar exists on
     /// all of them.
     ToggleHints,
-    /// Opens the M6 comment-compose overlay, anchored to the cursor's
-    /// current row — `ui::mod`'s event loop intercepts this rather than
-    /// forwarding it through `App::update`, since it needs the repo root
-    /// and the comment store, neither of which `App` owns. A no-op outside
-    /// [`crate::ui::view::View::Diff`] or on a row with nothing to anchor
-    /// to (a header, or a `Del` row — see `App::comment_target`).
+    /// Opens the M6 comment-compose overlay — anchored to the cursor's
+    /// current row, or (issue #19) to a whole contiguous new-side range when
+    /// a visual selection is active — `ui::mod`'s event loop intercepts this
+    /// rather than forwarding it through `App::update`, since it needs the
+    /// repo root and the comment store, neither of which `App` owns. A
+    /// no-op outside [`crate::ui::view::View::Diff`], on a historical/
+    /// read-only diff, or when there's nothing eligible to anchor to (a
+    /// header/`Del` row for the single-line path; a selection spanning
+    /// multiple files, a deletion, a deleted file, or a gap for the range
+    /// path — see `App::comment_target`).
     AddComment,
     /// Toggles whether a commented row's body renders as an inline block
     /// underneath it; the gutter marker itself always shows regardless.

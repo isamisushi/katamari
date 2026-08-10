@@ -259,6 +259,25 @@ pub fn relocate_range(comment: &Comment, current_lines: &[&str]) -> RelocatedRan
     }
 }
 
+/// `file:line` for a single-line comment, `file:start-end` for a range
+/// (`start == end` is what makes it single-line, regardless of whether a
+/// range was ever requested — a `--end-line` equal to the start line is a
+/// degenerate one-line range and reads identically to a plain comment).
+/// Shared by `ktmr comments list`'s table, `ktmr comments add`'s
+/// confirmation line, `main.rs`'s markdown export headings, and (issue #19)
+/// the TUI compose overlay's title via [`crate::ui::app::CommentTarget::location_label`],
+/// so none of them can ever drift on how a range's location reads. Lives
+/// here rather than in `main.rs` (where it started, M6-through-#18) because
+/// #19 gave the TUI its own caller that has no reason to depend on the
+/// binary's `main` module.
+pub fn location_label(file: &str, start: u32, end: u32) -> String {
+    if start == end {
+        format!("{file}:{start}")
+    } else {
+        format!("{file}:{start}-{end}")
+    }
+}
+
 /// A short random-looking hex id for a new comment: not cryptographically
 /// random (no new dependency is worth pulling in for an id whose only job is
 /// "don't collide with the other comments in this repo"), but seeded from a
@@ -535,5 +554,15 @@ mod tests {
         assert_eq!(anchor_for(&lines, 0), None);
         assert_eq!(anchor_for(&lines, 2), None);
         assert!(anchor_for(&lines, 1).is_some());
+    }
+
+    #[test]
+    fn location_label_formats_a_single_line_as_file_colon_line() {
+        assert_eq!(location_label("a.rs", 5, 5), "a.rs:5");
+    }
+
+    #[test]
+    fn location_label_formats_a_range_as_file_colon_start_dash_end() {
+        assert_eq!(location_label("a.rs", 5, 8), "a.rs:5-8");
     }
 }

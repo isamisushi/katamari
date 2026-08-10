@@ -82,7 +82,7 @@ pub fn describe(action: Action) -> (&'static str, &'static str) {
         Action::PrevSymbol => ("LSP", "Select the previous symbol on this line"),
         Action::NextDiagnostic => ("LSP", "Jump to the next diagnostic"),
         Action::PrevDiagnostic => ("LSP", "Jump to the previous diagnostic"),
-        Action::AddComment => ("Comments", "Add a comment on this row"),
+        Action::AddComment => ("Comments", "Add a comment on this row or visual range"),
         Action::ToggleComments => ("Comments", "Show or hide inline comment bodies"),
         Action::ToggleSidebar => ("View", "Show or hide the file sidebar"),
         Action::ToggleLayout => ("View", "Toggle unified/side-by-side layout"),

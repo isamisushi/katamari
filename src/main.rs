@@ -16,7 +16,9 @@ mod watch;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use comments::{Comment, CommentAnnotation, CommentIndex, CommentStore, Status as CommentStatus};
+use comments::{
+    Comment, CommentAnnotation, CommentIndex, CommentStore, Status as CommentStatus, location_label,
+};
 use diff::{
     DiffFile, DiffLineKind, RenderRow, SideBySideRow, SideCell, flatten, flatten_side_by_side,
     parse_unified_diff,
@@ -1129,21 +1131,6 @@ fn run_comments_export(format: ExportFormat, status: StatusFilter) -> Result<()>
         ExportFormat::Md => print!("{}", format_export_markdown(&repo_root, &filtered)),
     }
     Ok(())
-}
-
-/// `file:line` for a single-line comment, `file:start-end` for a range
-/// (`start == end` is what makes it single-line, regardless of whether a
-/// range was ever requested — a `--end-line` equal to the start line is a
-/// degenerate one-line range and reads identically to a plain comment).
-/// Shared by `ktmr comments list`'s table, `ktmr comments add`'s
-/// confirmation line, and [`format_export_markdown`]'s headings, so the
-/// three can never drift on how a range's location reads.
-fn location_label(file: &str, start: u32, end: u32) -> String {
-    if start == end {
-        format!("{file}:{start}")
-    } else {
-        format!("{file}:{start}-{end}")
-    }
 }
 
 /// Groups `comments` by file (in first-appearance order) and renders each as
@@ -2441,6 +2428,14 @@ fn format_comment_markers_for_flat_row(
     format_comment_markers(files, file_idx, hunk_idx, row_idx, comments)
 }
 
+/// Appends ` {start}-{end}` after the id for a range comment (`start !=
+/// end`) — nothing for a single-line one, so `--dump`'s pre-#19 output is
+/// byte-for-byte unchanged for every comment that isn't a range. Exists
+/// mainly for testability: `--dump`'s own reader (a human, or a script
+/// checking parser correctness against real `git diff` output — see
+/// [`format_dump`]'s docs) had no way to see a range's extent at all before
+/// this, since [`format_comment_markers`] only ever prints one `COMMENT`
+/// line per row regardless of how many lines the comment's range spans.
 fn format_comment_marker(annotation: &CommentAnnotation) -> String {
     let status = if annotation.detached {
         "detached"
@@ -2450,8 +2445,16 @@ fn format_comment_marker(annotation: &CommentAnnotation) -> String {
             CommentStatus::Resolved => "resolved",
         }
     };
+    let range = if annotation.start == annotation.end {
+        String::new()
+    } else {
+        format!(" {}-{}", annotation.start, annotation.end)
+    };
     let first_line = annotation.body.lines().next().unwrap_or("");
-    format!("      COMMENT {} [{status}] {first_line}\n", annotation.id)
+    format!(
+        "      COMMENT {}{range} [{status}] {first_line}\n",
+        annotation.id
+    )
 }
 
 #[cfg(test)]
@@ -2509,6 +2512,47 @@ index 1111111..2222222 100644\n\
         assert!(dump.contains("GAP unchanged (to EOF)"), "dump:\n{dump}");
         assert!(dump.contains("FILE f.txt"), "dump:\n{dump}");
         assert!(dump.contains("HUNK"), "dump:\n{dump}");
+    }
+
+    /// `format_dump`'s own tests above only ever pass `CommentIndex::default()`
+    /// — the empty case. This is the first to build a real, populated index
+    /// (via `comments::build_index`, against a tempdir standing in for the
+    /// repo root) and check `--dump`'s `COMMENT` line actually reflects it,
+    /// including issue #19's range suffix — `format_comment_marker`'s own
+    /// unit is otherwise untested end to end.
+    ///
+    /// Deliberately its own single-line diff constant rather than reusing
+    /// `GAP_FIXTURE`: that constant's multi-line `\` source continuations
+    /// eat each context row's leading marker space (Rust string-literal
+    /// continuation strips leading whitespace after the escaped newline),
+    /// so its context rows silently never make it into `hunk.rows` at all
+    /// — harmless for `GAP_FIXTURE`'s own tests (none read a context row's
+    /// text), but exactly what this test needs to anchor a comment to.
+    #[test]
+    fn format_dump_reports_a_populated_range_comment_with_its_marker_suffix() {
+        const RANGE_FIXTURE: &str = "diff --git a/f.txt b/f.txt\nindex 1111111..2222222 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1,3 +1,3 @@\n one\n two\n three\n";
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "one\ntwo\nthree\n").unwrap();
+        let files = parse_unified_diff(RANGE_FIXTURE);
+        let comment_lines = ["one", "two", "three"];
+        let comment = Comment {
+            id: "abc12345".to_owned(),
+            created_at: 0,
+            file: "f.txt".to_owned(),
+            anchor: comments::anchor_for(&comment_lines, 2).unwrap(),
+            end_anchor: Some(comments::anchor_for(&comment_lines, 3).unwrap()),
+            body: "look at this range".to_owned(),
+            status: CommentStatus::Open,
+            resolved_at: None,
+        };
+        let index = comments::build_index(dir.path(), std::slice::from_ref(&comment));
+
+        let dump = format_dump(&files, &index);
+        assert!(
+            dump.contains("COMMENT abc12345 2-3 [open] look at this range"),
+            "dump:\n{dump}"
+        );
     }
 
     #[test]
@@ -2680,16 +2724,6 @@ index 1111111..2222222 100644\n\
             .unwrap_err()
             .to_string();
         assert!(err.contains("must not be before"), "{err}");
-    }
-
-    #[test]
-    fn location_label_formats_a_single_line_as_file_colon_line() {
-        assert_eq!(location_label("a.rs", 5, 5), "a.rs:5");
-    }
-
-    #[test]
-    fn location_label_formats_a_range_as_file_colon_start_dash_end() {
-        assert_eq!(location_label("a.rs", 5, 8), "a.rs:5-8");
     }
 
     #[test]

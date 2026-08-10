@@ -57,16 +57,10 @@ pub struct CommentAnnotation {
 #[derive(Debug, Default)]
 pub struct CommentIndex {
     by_location: HashMap<(String, u32), Vec<CommentAnnotation>>,
-    // `starting_at` (field and the `Self::starting_at` accessor below) has
-    // no production caller yet in #18 — `ui::diff_view`'s body-block
-    // rendering still calls `at()` once per row and will keep doing so,
-    // rendering a range's body once per covered line, until #19 teaches it
-    // to render a range's body only at its first line. Populated and
-    // exercised by this module's own tests now so #19 lands on a working,
-    // already-tested index rather than needing to design this half of the
-    // contract from scratch. Same convention as `Segments::display_len` in
-    // `diff::coords`.
-    #[allow(dead_code)]
+    // `ui::diff_view`'s body-block rendering (issue #19) reads this through
+    // `Self::starting_at` instead of `Self::at()`, so a range's body block
+    // renders exactly once — at its first covered line — rather than once
+    // per line the marker fans out to.
     starting_at: HashMap<(String, u32), Vec<CommentAnnotation>>,
 }
 
@@ -84,9 +78,9 @@ impl CommentIndex {
     /// The comments whose relocated (or, if detached, original) *start*
     /// line is `file`:`line` — for a caller that renders a comment's body
     /// once, at the top of the range it annotates, rather than once per
-    /// line [`Self::at`] would report it on. See the `starting_at` field's
-    /// doc comment on why this has no caller yet.
-    #[allow(dead_code)]
+    /// line [`Self::at`] would report it on. `ui::diff_view`'s body-block
+    /// rendering is that caller (issue #19); its gutter marker keeps using
+    /// [`Self::at`] instead, since every covered line still needs a marker.
     pub fn starting_at(&self, file: &str, line: u32) -> &[CommentAnnotation] {
         self.starting_at
             .get(&(file.to_owned(), line))
