@@ -1465,7 +1465,13 @@ fn handle_action(
     // The inspector is a full-screen modal view.  Route every action to it
     // before hover/references/scope overlays can consume Esc or navigation
     // keys, so nothing beneath it can change while the user is inspecting.
-    if let View::LspInspector(inspector) = stack.top_mut() {
+    // `OpenHelp` is the one exception: help mutates nothing beneath the
+    // inspector and its "opens from any view" contract (see the arm below)
+    // would be silently broken by the catch-all `_ => {}` in the
+    // inspector's own `update`.
+    if !matches!(action, Action::OpenHelp)
+        && let View::LspInspector(inspector) = stack.top_mut()
+    {
         inspector.update(action);
         return;
     }

@@ -980,6 +980,11 @@ fn capability_style(snapshot: &ServerSnapshot) -> Style {
 /// multiplexer; terminal support and policy determine whether the sequence is
 /// actually accepted. The caller has already applied the inspector's byte
 /// bound and selected-record mapping.
+///
+/// Hand-rolled on purpose: crossterm 0.29 ships a byte-identical
+/// `clipboard::CopyToClipboard`, but only behind its non-default `osc52`
+/// feature, which drags in the `base64` crate — a new dependency to replace
+/// forty tested lines isn't a trade this repo makes.
 pub fn write_osc52(text: &str) -> io::Result<()> {
     if text.len() > OSC52_MAX_BYTES {
         return Err(io::Error::new(
