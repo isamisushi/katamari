@@ -622,6 +622,54 @@ fn finalize(raw: RawFile) -> Config {
     }
 }
 
+/// Removes every `[units]` table from `text`, returning the remainder —
+/// or `None` when there was nothing to strip. Line-based surgery on
+/// purpose: parsing and reserializing would destroy comments and
+/// formatting everywhere *else* in a hand-maintained file, while a
+/// conventionally written TOML table is exactly a contiguous run of lines
+/// from its `[units]` header up to the next `[…]` header. Everything in
+/// that run — including blank lines and comments inside the section — goes
+/// with it; a blank line *above* the header survives (it goes back to
+/// separating the neighbors it separated before `[units]` arrived), and a
+/// trailing blank run left when `[units]` was the file's last table is
+/// trimmed. A top-level
+/// dotted key (`units.agent = …`) would escape this; katamari never
+/// writes that form, and `ktmr reset`'s help says to hand-edit in exotic
+/// cases.
+pub fn strip_units_section(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut stripped = false;
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].trim() == "[units]" {
+            stripped = true;
+            i += 1;
+            while i < lines.len() && !lines[i].trim_start().starts_with('[') {
+                i += 1;
+            }
+        } else {
+            kept.push(lines[i]);
+            i += 1;
+        }
+    }
+    if !stripped {
+        return None;
+    }
+    // The blank line *before* the removed header stays (it now separates
+    // the neighbors it used to separate from `[units]`); only the file's
+    // trailing blank run — left behind when `[units]` was the last table —
+    // is trimmed away.
+    while kept.last().is_some_and(|line| line.trim().is_empty()) {
+        kept.pop();
+    }
+    let mut out = kept.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    Some(out)
+}
+
 /// Appends `section` (a complete, newline-led `[units]`-style TOML block)
 /// to the home config file, creating it — and `~/.config/katamari/` —
 /// if needed. Append, never rewrite: the file may hold hand-written
@@ -903,6 +951,34 @@ mod tests {
             Some("opus"),
             "the rest of the section still applies"
         );
+    }
+
+    #[test]
+    fn strip_units_section_removes_only_that_table_and_its_leading_blank() {
+        let text = "# my config\n[ui]\ntab_width = 2\n\n[units]\nagent = \"claude\"\n\
+                    claude_model = \"opus\"\n\n[watch]\ndebounce_ms = 100\n";
+        let stripped = strip_units_section(text).expect("section present");
+        assert_eq!(
+            stripped, "# my config\n[ui]\ntab_width = 2\n\n[watch]\ndebounce_ms = 100\n",
+            "everything else — including comments — must survive byte-for-byte"
+        );
+    }
+
+    #[test]
+    fn strip_units_section_at_end_of_file_leaves_no_trailing_blanks() {
+        let text = "[ui]\nwrap = false\n\n[units]\nagent = \"codex\"\n";
+        assert_eq!(strip_units_section(text).unwrap(), "[ui]\nwrap = false\n");
+    }
+
+    #[test]
+    fn strip_units_section_of_a_units_only_file_yields_empty() {
+        let text = "\n[units]\nagent = \"claude\"\nclaude_model = \"\"\n";
+        assert_eq!(strip_units_section(text).unwrap(), "");
+    }
+
+    #[test]
+    fn strip_units_section_without_one_returns_none() {
+        assert_eq!(strip_units_section("[ui]\nwrap = true\n"), None);
     }
 
     #[test]

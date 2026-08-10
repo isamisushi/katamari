@@ -268,6 +268,43 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Remove katamari's accumulated state, returning it to a fresh
+    /// install. With no flags, only *reports* every piece of state and its
+    /// location — nothing is removed without an explicit flag, because the
+    /// state mixes disposable caches with things that are expensive
+    /// (managed language servers) or irreplaceable (review comments).
+    /// Review comments are never included in `--all`; removing them takes
+    /// the dedicated flag, every time.
+    Reset {
+        /// Remove the regenerable caches: this repository's grouping cache
+        /// (`.katamari/groups.jsonl`) and the state directory holding the
+        /// update-check cache and language-server index caches.
+        #[arg(long)]
+        cache: bool,
+        /// Strip the `[units]` table from both config files (repo and
+        /// home), so the next `u` in a diff session runs first-use setup
+        /// again. Only the `[units]` section is touched; the rest of each
+        /// file — including comments — is preserved byte-for-byte, and a
+        /// file left empty by the strip is removed entirely.
+        #[arg(long)]
+        units_config: bool,
+        /// Remove every katamari-managed language server
+        /// (`~/.local/share/katamari/servers`). They re-install on demand
+        /// (`[lsp] auto_install`) or via `ktmr lsp install`, but the
+        /// downloads are large — hence not bundled into `--cache`.
+        #[arg(long)]
+        servers: bool,
+        /// Remove this repository's review comments
+        /// (`.katamari/comments.jsonl`). This is review *data*, not cache
+        /// — there is no way back but a backup, so not even `--all`
+        /// implies it.
+        #[arg(long)]
+        comments: bool,
+        /// Everything except `--comments`: caches, `[units]` config, and
+        /// managed servers.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -481,6 +518,13 @@ fn main() -> Result<()> {
             language,
             json,
         } => run_doctor(no_live, language, json),
+        Command::Reset {
+            cache,
+            units_config,
+            servers,
+            comments,
+            all,
+        } => run_reset(cache, units_config, servers, comments, all),
     }
 }
 
@@ -1507,6 +1551,173 @@ fn run_doctor(no_live: bool, language: Option<String>, json: bool) -> Result<()>
     std::process::exit(doctor::exit_code(&report));
 }
 
+/// `ktmr reset` — see `Command::Reset`'s docs for the flag semantics. The
+/// no-flag report and the removal actions share one table of targets
+/// (label, path, flag) so the report can never advertise a location the
+/// removal code doesn't actually touch.
+fn run_reset(
+    cache: bool,
+    units_config: bool,
+    servers: bool,
+    comments: bool,
+    all: bool,
+) -> Result<()> {
+    let (cache, units_config, servers) = if all {
+        (true, true, true)
+    } else {
+        (cache, units_config, servers)
+    };
+
+    // Best-effort, not required: the user-level targets (servers, state,
+    // home config) are meaningful from any directory, so running outside a
+    // repository only skips the repo-scoped rows.
+    let repo_root = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| GitSource::discover(&cwd).ok())
+        .and_then(|source| source.repo_root().ok());
+    let in_repo = |name: &str| repo_root.as_ref().map(|r| r.join(".katamari").join(name));
+
+    let groups_path = in_repo("groups.jsonl");
+    let comments_path = in_repo("comments.jsonl");
+    let repo_config = in_repo("config.toml");
+    let home_config = config::home_config_path();
+    let servers_dir = lsp::install::prefix_dir();
+    let state_dir = update::state_dir();
+
+    if !(cache || units_config || servers || comments) {
+        println!("katamari state (nothing removed — pass a flag to remove):\n");
+        report_target("grouping cache", groups_path.as_deref(), "--cache");
+        report_target("update/index caches", Some(&state_dir), "--cache");
+        report_target(
+            "repo config [units]",
+            repo_config.as_deref(),
+            "--units-config",
+        );
+        report_target(
+            "home config [units]",
+            home_config.as_deref(),
+            "--units-config",
+        );
+        report_target("managed LSP servers", Some(&servers_dir), "--servers");
+        report_target("review comments", comments_path.as_deref(), "--comments");
+        println!("\n`--all` = everything above except review comments.");
+        return Ok(());
+    }
+
+    if cache {
+        remove_path("grouping cache", groups_path.as_deref())?;
+        remove_path("update/index caches", Some(&state_dir))?;
+    }
+    if units_config {
+        strip_units_from("repo config", repo_config.as_deref())?;
+        strip_units_from("home config", home_config.as_deref())?;
+    }
+    if servers {
+        remove_path("managed LSP servers", Some(&servers_dir))?;
+    }
+    if comments {
+        remove_path("review comments", comments_path.as_deref())?;
+    }
+
+    // A `.katamari/` left holding nothing but its own self-ignoring
+    // `.gitignore` (see `CommentStore::ensure_dir`) is bookkeeping with
+    // nothing left to keep — removing it is what makes the repo actually
+    // read as untouched again.
+    if let Some(root) = &repo_root {
+        let dir = root.join(".katamari");
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let only_gitignore = entries
+                .filter_map(|e| e.ok())
+                .all(|e| e.file_name() == ".gitignore");
+            if only_gitignore && std::fs::remove_dir_all(&dir).is_ok() {
+                println!(
+                    "  removed   {} (only its own .gitignore remained)",
+                    dir.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One row of `ktmr reset`'s no-flag report: whether the target currently
+/// exists (for `[units]` rows, whether the file exists *and* contains a
+/// `[units]` table — a config without one has nothing this command would
+/// touch), and which flag removes it.
+fn report_target(label: &str, path: Option<&Path>, flag: &str) {
+    let Some(path) = path else {
+        println!("  {label:<22} (not in a git repository)");
+        return;
+    };
+    let present = if flag == "--units-config" {
+        std::fs::read_to_string(path)
+            .ok()
+            .is_some_and(|text| config::strip_units_section(&text).is_some())
+    } else {
+        path.exists()
+    };
+    let status = if present { flag } else { "absent" };
+    println!("  {label:<22} {:<15} {}", status, path.display());
+}
+
+/// Removes a file or directory, reporting what happened; an absent target
+/// is the ordinary case, not an error. `None` (no repository) reports as
+/// skipped rather than silently doing nothing — the user asked for a
+/// removal and should see why it didn't apply.
+fn remove_path(label: &str, path: Option<&Path>) -> Result<()> {
+    let Some(path) = path else {
+        println!("  skipped   {label} (not in a git repository)");
+        return Ok(());
+    };
+    let result = match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("  absent    {}", path.display());
+            return Ok(());
+        }
+        Err(e) => Err(e),
+    };
+    result.with_context(|| format!("failed to remove {}", path.display()))?;
+    println!("  removed   {}", path.display());
+    Ok(())
+}
+
+/// Strips the `[units]` table from one config file via
+/// [`config::strip_units_section`], deleting the file outright when the
+/// strip leaves nothing but whitespace — a config that only ever held the
+/// first-use wizard's appended section should vanish entirely, not linger
+/// as an empty file.
+fn strip_units_from(label: &str, path: Option<&Path>) -> Result<()> {
+    let Some(path) = path else {
+        println!("  skipped   {label} (not in a git repository)");
+        return Ok(());
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("  absent    {}", path.display());
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    match config::strip_units_section(&text) {
+        None => println!("  kept      {} (no [units] section)", path.display()),
+        Some(rest) if rest.trim().is_empty() => {
+            std::fs::remove_file(path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+            println!("  removed   {} (held only [units])", path.display());
+        }
+        Some(rest) => {
+            std::fs::write(path, rest)
+                .with_context(|| format!("failed to rewrite {}", path.display()))?;
+            println!("  stripped  {} ([units] section removed)", path.display());
+        }
+    }
+    Ok(())
+}
 
 /// The very first request against a freshly resolved key is also what makes
 /// `LspManager` spawn the server at all (it's lazy — nothing starts until
