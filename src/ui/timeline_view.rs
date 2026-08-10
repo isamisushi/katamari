@@ -20,6 +20,7 @@ use crate::lsp::DiagnosticsStore;
 use crate::ui::app::{App, Layout};
 use crate::ui::hints;
 use crate::ui::hover_popup::HoverQuery;
+use crate::ui::mouse::{FrameGeometry, ScrollTarget};
 use crate::ui::pane::cycle_focus;
 use crate::vcs::jj::{JjRepo, SnapshotOp};
 use ratatui::Frame;
@@ -202,6 +203,32 @@ impl TimelineView {
             self.selected = clamped;
             self.reload_diff();
         }
+    }
+
+    /// Issue #20's wheel vocabulary for the snapshot list. Unlike the diff
+    /// pane's `scroll_diff_by`, the list has no independent scroll offset
+    /// of its own to begin with — `render_list` always windows around
+    /// `selected` (see that function's docs), so "scroll the list" and
+    /// "move the selection" are the same operation here. That's a real
+    /// inconsistency with the diff panes' decoupled cursor/viewport (wheel
+    /// there never moves the cursor) — accepted for this issue rather than
+    /// inventing a second, list-only scroll-offset concept just for the
+    /// wheel; `refs_panel`/`units_panel` share the same shape already.
+    /// Goes through `Self::select` (not a direct field write) so a changed
+    /// selection reloads the diff exactly once, the same as `j`/`k`.
+    pub fn scroll_list_by(&mut self, delta: isize) {
+        let target = if delta.is_negative() {
+            self.selected.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.selected.saturating_add(delta as usize)
+        };
+        self.select(target);
+    }
+
+    /// As `App::scroll_by`, for the nested diff pane — moves its own
+    /// scroll offset without touching its cursor or this view's `selected`.
+    pub fn scroll_diff_by(&mut self, delta: isize) {
+        self.diff_app.scroll_by(delta);
     }
 
     /// Rebuilds `diff_app` (and `diff_note`) for the current
@@ -391,6 +418,9 @@ pub fn layout(area: Rect, status_height: u16) -> Areas {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // one render pass threading through
+// the same view/render pieces `ui::mod::draw` already juggles for every
+// other view; see that function's own justification.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -399,10 +429,13 @@ pub fn render(
     keymap: &Keymap,
     key_display: &crate::ui::key_display::KeyDisplayState,
     hints_expanded: bool,
+    geometry: &mut FrameGeometry,
 ) {
     let hint_items = hints::timeline_view_items(keymap, hints_expanded);
     let status_height = hints::required_height(&hint_items, area.width);
     let areas = layout(area, status_height);
+    geometry.record(areas.list, ScrollTarget::TimelineList);
+    geometry.record(areas.diff, ScrollTarget::TimelineDiff);
     render_list(frame, areas.list, view);
     let diagnostics = DiagnosticsStore::new();
     // A past snapshot's diff has nothing in `.katamari/comments.jsonl` to
@@ -443,10 +476,23 @@ fn render_list(frame: &mut Frame, area: Rect, view: &TimelineView) {
         .range_anchor
         .map(|anchor| (anchor.min(view.selected), anchor.max(view.selected)));
 
+    // Windows around `selected` the same way `refs_panel::render`/
+    // `units_panel::render` do — a pre-existing bug fixed alongside issue
+    // #20: without this, a selection past the pane's visible height simply
+    // scrolled off the top of an unwindowed `Paragraph` (which clips from
+    // its first line, not around the selection), rather than staying on
+    // screen the way every other list in this codebase already does.
+    let visible_height = (inner.height as usize).max(1);
+    let start = view
+        .selected
+        .saturating_sub(visible_height.saturating_sub(1));
+
     let lines: Vec<Line> = view
         .ops
         .iter()
         .enumerate()
+        .skip(start)
+        .take(visible_height)
         .map(|(idx, op)| {
             let is_selected = idx == view.selected;
             let in_range = range.is_some_and(|(lo, hi)| idx >= lo && idx <= hi);
@@ -732,6 +778,109 @@ mod tests {
             view.diff_app.active_symbol, 1,
             "NextSymbol must move the nested diff's active symbol, not \
              bounce focus back to List the way it did before issue #13"
+        );
+    }
+
+    // ---- scroll_list_by / scroll_diff_by (issue #20 wheel routing) ----
+
+    #[test]
+    fn scroll_list_by_moves_selection_and_reloads_the_diff_once() {
+        let Some((_dir, mut view)) = jj_timeline_fixture() else {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        };
+        assert_eq!(view.selected, 0);
+        assert_eq!(view.diff_note, None, "the newest snapshot has a real diff");
+
+        view.scroll_list_by(1);
+        assert_eq!(view.selected, 1, "moved to the older (only other) snapshot");
+        assert_eq!(
+            view.diff_note.as_deref(),
+            Some("oldest loaded snapshot — no earlier one to diff against"),
+            "selecting the oldest snapshot must have reloaded the diff \
+             exactly once — this note only ever comes from `reload_diff`"
+        );
+        assert_eq!(
+            view.focus,
+            Focus::List,
+            "wheel scrolling never touches keyboard focus"
+        );
+    }
+
+    #[test]
+    fn scroll_list_by_clamps_at_both_ends() {
+        let Some((_dir, mut view)) = jj_timeline_fixture() else {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        };
+        view.scroll_list_by(-100);
+        assert_eq!(view.selected, 0);
+        view.scroll_list_by(100);
+        assert_eq!(view.selected, view.ops.len() - 1);
+        let settled = view.selected;
+        view.scroll_list_by(100);
+        assert_eq!(view.selected, settled, "already at the bottom");
+    }
+
+    #[test]
+    fn scroll_diff_by_moves_the_nested_diffs_viewport_without_selection_or_focus() {
+        let Some((_dir, mut view)) = jj_timeline_fixture() else {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        };
+        view.diff_app.set_viewport_height(1);
+        view.diff_app.scroll_by(1000); // park it away from the top first
+        let offset_before = view.diff_app.scroll_offset;
+        let selected_before = view.selected;
+
+        view.scroll_diff_by(-1);
+        assert_ne!(view.diff_app.scroll_offset, offset_before);
+        assert_eq!(
+            view.selected, selected_before,
+            "scrolling the nested diff must never move the list's own selection"
+        );
+        assert_eq!(view.focus, Focus::List, "and never touches focus either");
+    }
+
+    // ---- render_list windowing ------------------------------------------
+
+    #[test]
+    fn render_list_windows_around_a_selection_past_the_fold() {
+        use ratatui::backend::TestBackend;
+
+        let Some((_dir, mut view)) = jj_timeline_fixture() else {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        };
+        // Overwrite the fixture's real (two-entry) history with a long
+        // synthetic one so a small terminal genuinely can't show it all —
+        // the actual jj plumbing above only exists to produce a real
+        // `JjRepo`; the list itself renders from `view.ops` alone.
+        view.ops = (0..50)
+            .map(|i| op(&format!("op{i:02}"), i as i64))
+            .collect();
+        view.selected = 45;
+
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_list(frame, frame.area(), &view))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            text.contains("op45"),
+            "the selected row must stay visible past the fold, not scroll \
+             off the top of an unwindowed list:\n{text}"
+        );
+        assert!(
+            !text.contains("op00"),
+            "and the window must actually have moved, not just grown:\n{text}"
         );
     }
 }

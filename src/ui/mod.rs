@@ -25,6 +25,7 @@ pub mod hover_popup;
 pub mod key_display;
 pub mod log_view;
 pub mod lsp_inspector;
+pub mod mouse;
 pub mod navigation;
 mod pane;
 pub mod refresh;
@@ -79,7 +80,8 @@ use crate::vcs::jj::{self, JjRepo};
 use crate::watch::{self, WatchSignal};
 use anyhow::Result;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
@@ -240,6 +242,13 @@ pub fn run(
     // event-reader lock.
     let ci_distinguishable = enable_kitty_keyboard_protocol();
 
+    // Issue #20: unlike the kitty probe above, this is a plain write with
+    // no reply to race against `spawn_input_thread`'s reader — the ordering
+    // here is only about keeping "every terminal-mode write happens in one
+    // place, before the input thread starts" one rule, not working around a
+    // second hard race. See `enable_mouse_capture`'s docs.
+    enable_mouse_capture(config.mouse);
+
     let preset = match config.keymap {
         config::KeymapPreset::Vim => vim_preset(ci_distinguishable),
         config::KeymapPreset::Emacs => emacs_preset(ci_distinguishable),
@@ -328,6 +337,7 @@ pub fn run(
         show_keys,
         config.offer_install,
         observer.clone(),
+        config.mouse,
     );
 
     restore_terminal(&mut terminal)?;
@@ -575,6 +585,7 @@ fn event_loop(
     show_keys: bool,
     offer_skill_install: bool,
     observer: crate::lsp::ObservationHandle,
+    mouse_enabled: bool,
 ) -> Result<()> {
     let mut key_display = key_display::KeyDisplayState::new(show_keys);
     let mut hover_state = hover_popup::HoverState::default();
@@ -885,6 +896,13 @@ fn event_loop(
             .or_else(|| units_status.clone())
             .or_else(|| lsp_status.clone())
             .or_else(|| watch_status.as_ref().map(|s| s.text.clone()));
+        // Issue #20: rebuilt fresh every iteration — every rect a pane/
+        // overlay might have moved (resize, a toggled sidebar, a popup
+        // opening) since the last frame, so nothing here is ever carried
+        // over stale. `draw`'s closure borrows this mutably (never moves
+        // it), so it's still populated and in scope for the wheel-routing
+        // arm below, covering this same iteration's one `recv_timeout` event.
+        let mut geometry = mouse::FrameGeometry::new();
         terminal.draw(|frame| {
             draw(
                 frame,
@@ -905,6 +923,7 @@ fn event_loop(
                 jj_repo.is_some(),
                 &key_display,
                 hints_expanded,
+                &mut geometry,
             )
         })?;
 
@@ -1223,9 +1242,56 @@ fn event_loop(
                     }
                 }
             }
+            // Issue #20: only wheel events route anywhere. `ScrollUp`/
+            // `ScrollDown` are the only two kinds this task covers (req 9
+            // — "ignore unsupported buttons/motions") — `Down`/`Up`/`Drag`/
+            // `Moved`/`ScrollLeft`/`ScrollRight` all fall to the wildcard
+            // arm below, the seam #21 (file-tree clicks)/#22 (code-pane
+            // targeting) extend with real handling. `mouse::scroll_at`
+            // never touches keyboard focus by construction (see that
+            // function's docs), which is what makes req 5's "wheel
+            // scrolling does not steal keyboard focus" true here without a
+            // separate check.
+            //
+            // Gated on `mouse_enabled` (`[ui] mouse`, see
+            // `Config::mouse`'s docs) even though `run` already skips
+            // sending `EnableMouseCapture` when it's `false`: on a real
+            // terminal that alone is enough (nothing generates SGR mouse
+            // reports for the input thread to ever forward), but this is
+            // belt-and-suspenders against a terminal/multiplexer that
+            // reports mouse events regardless of what katamari asked for —
+            // "keyboard behavior is identical with mouse disabled" means
+            // *nothing* here should react to a wheel byte that arrives
+            // anyway, not just "we didn't ask for it."
+            Ok(AppEvent::Terminal(Event::Mouse(mouse_event))) if mouse_enabled => {
+                match mouse_event.kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        let delta = if mouse_event.kind == MouseEventKind::ScrollUp {
+                            -mouse::WHEEL_SCROLL_ROWS
+                        } else {
+                            mouse::WHEEL_SCROLL_ROWS
+                        };
+                        mouse::scroll_at(
+                            &geometry,
+                            mouse_event.column,
+                            mouse_event.row,
+                            delta,
+                            stack,
+                            &mut hover_state,
+                            refs_panel.as_mut().map(|s| &mut s.panel),
+                            units_panel.as_mut(),
+                            help.as_mut(),
+                            keymap,
+                            &mut help_row_count_cache,
+                            area,
+                        );
+                    }
+                    _ => {}
+                }
+            }
             Ok(AppEvent::Terminal(_)) => {
-                // Resize, mouse, focus, paste: nothing to dispatch, but the
-                // next iteration re-measures the viewport and redraws
+                // Resize, focus, paste: nothing to dispatch, but the next
+                // iteration re-measures the viewport and redraws
                 // regardless, which is all a resize actually needs.
             }
             Ok(AppEvent::Lsp(ServerEvent {
@@ -3161,6 +3227,7 @@ fn draw(
     jj_available: bool,
     key_display: &key_display::KeyDisplayState,
     hints_expanded: bool,
+    geometry: &mut mouse::FrameGeometry,
 ) {
     match view {
         View::Diff(app) => {
@@ -3168,6 +3235,12 @@ fn draw(
             let status_height = hints::required_height(&hint_items, frame.area().width);
             let areas = diff_layout(frame.area(), app.sidebar_visible, status_height);
             if let Some(sidebar_area) = areas.sidebar {
+                // Recorded here rather than inside `sidebar::render` — the
+                // rect is already exactly what this call site computed and
+                // is about to hand it, no different from `diff_area` a few
+                // lines below; see this module's `mouse` docs on reusing
+                // the layout calculation rather than re-deriving it.
+                geometry.record(sidebar_area, mouse::ScrollTarget::DiffFiles);
                 sidebar::render(frame, sidebar_area, app, keymap);
             }
             // While a unit scope is active, the top of the diff pane is
@@ -3185,6 +3258,10 @@ fn draw(
                 diff_area.y += banner.height;
                 diff_area.height -= banner.height;
             }
+            // Recorded post-banner (after the subtraction above) so a wheel
+            // over the banner itself — which shows a unit's label/rationale,
+            // not diff content — doesn't scroll content it isn't over.
+            geometry.record(diff_area, mouse::ScrollTarget::DiffPane);
             let effective_layout = diff_view::effective_layout(app.layout, diff_area.width);
             diff_view::render_focusable(
                 frame,
@@ -3207,24 +3284,32 @@ fn draw(
                 &hint_items,
             );
             if let Some(row) = view.cursor_screen_row() {
-                hover_popup::render(frame, diff_area, row, hover_state);
+                hover_popup::render(frame, diff_area, row, hover_state, geometry);
             }
             if let Some(panel) = refs_panel {
-                refs_panel::render(frame, diff_area, panel);
+                refs_panel::render(frame, diff_area, panel, geometry);
             }
             if let Some(panel) = units_panel {
-                units_panel::render(frame, diff_area, panel);
+                units_panel::render(frame, diff_area, panel, geometry);
             }
             if let Some(state) = units_setup {
                 units_setup::render(frame, diff_area, state);
+                // Recorded over the whole pane, not the popup's own rect:
+                // these overlays are fully modal for keys, so a wheel tick
+                // anywhere over the content they block must be captured and
+                // discarded, not scroll what's underneath — see
+                // `mouse::ScrollTarget`'s docs on the modal variants.
+                geometry.record(diff_area, mouse::ScrollTarget::UnitsSetupModal);
             }
             if let Some(state) = compose
                 && let Some(row) = view.cursor_screen_row()
             {
                 compose::render(frame, diff_area, row, state);
+                geometry.record(diff_area, mouse::ScrollTarget::ComposeModal);
             }
             if let Some(state) = scope_menu {
                 scope_menu::render(frame, diff_area, state, jj_available);
+                geometry.record(diff_area, mouse::ScrollTarget::ScopeMenuModal);
             }
             key_display::render(frame, diff_area, key_display);
         }
@@ -3232,13 +3317,13 @@ fn draw(
             let hint_items = hints::file_view_items(keymap, hints_expanded);
             let status_height = hints::required_height(&hint_items, frame.area().width);
             let areas = file_view::layout(frame.area(), status_height);
-            file_view::render(frame, areas.content, file, diagnostics);
+            file_view::render(frame, areas.content, file, diagnostics, geometry);
             file_view::render_status(frame, areas.status, file, status_note, &hint_items);
             if let Some(row) = view.cursor_screen_row() {
-                hover_popup::render(frame, areas.content, row, hover_state);
+                hover_popup::render(frame, areas.content, row, hover_state, geometry);
             }
             if let Some(panel) = refs_panel {
-                refs_panel::render(frame, areas.content, panel);
+                refs_panel::render(frame, areas.content, panel, geometry);
             }
             key_display::render(frame, areas.content, key_display);
         }
@@ -3252,14 +3337,23 @@ fn draw(
                 keymap,
                 key_display,
                 hints_expanded,
+                geometry,
             );
         }
         View::Log(log) => {
             let area = frame.area();
-            log_view::render(frame, area, log, keymap, key_display, hints_expanded);
+            log_view::render(
+                frame,
+                area,
+                log,
+                keymap,
+                key_display,
+                hints_expanded,
+                geometry,
+            );
         }
         View::LspInspector(inspector) => {
-            inspector.render(frame, frame.area());
+            inspector.render(frame, frame.area(), geometry);
         }
     }
 
@@ -3268,9 +3362,12 @@ fn draw(
     // those two only ever open from a live `View::Diff` session, but
     // `Action::OpenHelp` opens from any view (see its docs), and sizing
     // this against `frame.area()` rather than `areas.diff` is what makes
-    // that true on screen, not just in `handle_action`'s dispatch.
+    // that true on screen, not just in `handle_action`'s dispatch. Recorded
+    // last, for the same reason: nothing else in this function can possibly
+    // draw on top of it, so it must win `FrameGeometry::hit`'s
+    // last-recorded-wins scan over literally everything above.
     if let Some(state) = help {
-        help::render(frame, frame.area(), state, keymap);
+        help::render(frame, frame.area(), state, keymap, geometry);
     }
 }
 
@@ -3358,21 +3455,57 @@ fn enable_kitty_keyboard_protocol() -> bool {
     .is_ok()
 }
 
+/// Issue #20: best-effort `EnableMouseCapture` — called after
+/// [`enable_kitty_keyboard_protocol`] (see `run`'s docs on the ordering,
+/// which is about "one place, before the input thread starts," not a probe
+/// race the way kitty's ordering is) and before [`spawn_input_thread`]
+/// starts reading events, so wheel events arrive on
+/// [`AppEvent::Terminal`] from the very first `event::read()` rather than a
+/// window where some early scroll silently does nothing. `enabled` is
+/// `false` for `[ui] mouse = false` (see [`crate::config::Config::mouse`]'s
+/// docs on the native-terminal-selection trade-off this exists for) — a
+/// session that opts out never sends the enabling escape sequence at all,
+/// matching "keyboard behavior is identical with mouse disabled" (the
+/// input thread still forwards whatever bytes arrive; there's just nothing
+/// generating SGR mouse sequences for it to forward). Errors are ignored
+/// the same way [`enable_kitty_keyboard_protocol`]'s own write is treated —
+/// a terminal that can't take this write has bigger problems than a
+/// missing scroll feature, and failing startup over it would be worse.
+fn enable_mouse_capture(enabled: bool) {
+    if enabled {
+        let _ = execute!(io::stdout(), EnableMouseCapture);
+    }
+}
+
+/// The one definition of `restore_terminal`'s ANSI teardown ordering,
+/// shared with the composition test below so the test exercises the exact
+/// command list production sends rather than a hand-copied duplicate that
+/// could silently drift (the test's whole point is the relative order of
+/// mouse-off vs leave-alternate-screen).
+macro_rules! write_restore_sequence {
+    ($writer:expr) => {
+        execute!(
+            $writer,
+            PopKeyboardEnhancementFlags,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        )
+    };
+}
+
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode()?;
-    // Popping unconditionally — not gated on whether `enable_kitty_keyboard_protocol`
-    // actually pushed anything — mirrors `disable_raw_mode`/`LeaveAlternateScreen`
-    // right alongside it: both run every time regardless of what this
-    // particular session did on the way in. It's safe to do: a terminal
-    // that never understood the push in the first place ignores this CSI
-    // sequence the same way it ignored that one (unrecognized CSI final
-    // bytes are conventionally no-ops per ECMA-48), and the kitty protocol
-    // itself specifies popping an empty flag stack as a no-op too.
-    execute!(
-        terminal.backend_mut(),
-        PopKeyboardEnhancementFlags,
-        LeaveAlternateScreen
-    )?;
+    // Popping/disabling unconditionally — not gated on whether
+    // `enable_kitty_keyboard_protocol`/`enable_mouse_capture` actually did
+    // anything on the way in — mirrors `disable_raw_mode`/`LeaveAlternateScreen`
+    // right alongside them: every one of these runs every time regardless
+    // of what this particular session did on the way in. It's safe to do:
+    // a terminal that never understood the enabling sequence in the first
+    // place ignores the disabling one the same way (unrecognized CSI final
+    // bytes are conventionally no-ops per ECMA-48), the kitty protocol
+    // itself specifies popping an empty flag stack as a no-op, and
+    // `DisableMouseCapture` is the same shape of paired on/off CSI toggle.
+    write_restore_sequence!(terminal.backend_mut())?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -3388,6 +3521,14 @@ fn install_panic_hook() {
     let original = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        // Issue #20: same best-effort, unconditional `DisableMouseCapture`
+        // `restore_terminal` sends on a clean exit — a panic mid-session
+        // must leave the terminal exactly as un-stuck either way, and this
+        // is cheap enough (and safe enough on a terminal that never enabled
+        // capture at all — see `restore_terminal`'s docs) to just always
+        // send rather than plumbing whether `[ui] mouse` was even on
+        // through to the panic hook.
+        let _ = execute!(io::stdout(), DisableMouseCapture);
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
         original(info);
@@ -3952,5 +4093,34 @@ mod tests {
                 "{action:?} must not be blocked by the files-focus gate"
             );
         }
+    }
+
+    // ---- terminal-restore sequence composition (issue #20) ---------------
+
+    #[test]
+    fn restore_terminal_disables_mouse_capture_before_leaving_the_alternate_screen() {
+        // Drives the same `write_restore_sequence!` invocation
+        // `restore_terminal` itself runs (see the macro's docs — that
+        // sharing is the point: a hand-copied command list here could
+        // silently drift from production), against an in-memory writer
+        // instead of a real PTY or a panicking-process E2E test, both of
+        // which destabilize the test terminal.
+        let mut written: Vec<u8> = Vec::new();
+        write_restore_sequence!(&mut written).unwrap();
+        let written = String::from_utf8(written).unwrap();
+
+        let mouse_off = written
+            .find("\x1b[?1006l")
+            .expect("DisableMouseCapture must emit the SGR-mouse-off sequence");
+        let leave_alt_screen = written
+            .find("\x1b[?1049l")
+            .expect("LeaveAlternateScreen must emit its own sequence");
+        assert!(
+            mouse_off < leave_alt_screen,
+            "mouse capture must be disabled before leaving the alternate \
+             screen, not after — a terminal that only honors the disable \
+             sequence while still in the alternate screen would otherwise \
+             leave capture stuck on; got:\n{written:?}"
+        );
     }
 }

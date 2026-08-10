@@ -13,6 +13,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::clipboard;
+use super::mouse::{FrameGeometry, ScrollTarget};
 use super::pane::{Hint as PaneHint, PaneChrome, cycle_focus};
 
 const SERVER_LIST_WIDTH: u16 = 34;
@@ -448,6 +449,40 @@ impl LspInspectorView {
         self.detail_scroll = row.min(max);
     }
 
+    /// Issue #20's wheel vocabulary for the Servers pane — moves `selected`
+    /// directly (this list has no independent scroll offset, the same
+    /// "scroll means select" shape `TimelineView`/`LogView`'s own wheel
+    /// methods document) regardless of which of the inspector's three panes
+    /// currently has keyboard focus.
+    pub(crate) fn scroll_servers_by(&mut self, delta: isize) {
+        if self.snapshots.is_empty() {
+            return;
+        }
+        let max = self.snapshots.len() - 1;
+        self.selected = if delta.is_negative() {
+            self.selected.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.selected.saturating_add(delta as usize).min(max)
+        };
+    }
+
+    /// Issue #20's wheel vocabulary for the Detail pane — a thin wrapper
+    /// over the same private method `Action::CursorDown`/`Up` already call
+    /// while `Focus::Detail` has keyboard focus, reused here so the wheel
+    /// works regardless of which pane actually does.
+    pub(crate) fn scroll_detail_by(&mut self, delta: isize) {
+        self.move_detail_scroll(delta);
+    }
+
+    /// Issue #20's wheel vocabulary for the Journal pane — as
+    /// `Self::scroll_detail_by`, reusing `Self::move_journal_cursor`
+    /// directly: it already disengages `follow` the same way an ordinary
+    /// `j`/`k` press does (see that method's docs), which is exactly what a
+    /// reviewer scrolling up to read backlog expects the wheel to do too.
+    pub(crate) fn scroll_journal_by(&mut self, delta: isize) {
+        self.move_journal_cursor(delta);
+    }
+
     fn toggle_journal_selection(&mut self) {
         if self.log_rows.is_empty() {
             self.status_message = Some("journal: no entries to select".to_owned());
@@ -532,7 +567,7 @@ impl LspInspectorView {
         })
     }
 
-    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, geometry: &mut FrameGeometry) {
         self.refresh();
         let outer_title = match self.status_message.as_deref() {
             Some(status) => format!(" LSP Inspector · {status} "),
@@ -589,27 +624,28 @@ impl LspInspectorView {
                 .split(inner);
             self.set_journal_geometry(rows[2]);
             self.refresh();
-            self.render_servers(frame, rows[0]);
-            self.render_detail(frame, rows[1]);
-            self.render_log(frame, rows[2]);
+            self.render_servers(frame, rows[0], geometry);
+            self.render_detail(frame, rows[1], geometry);
+            self.render_log(frame, rows[2], geometry);
         } else {
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Length(SERVER_LIST_WIDTH), Constraint::Min(20)])
                 .split(inner);
-            self.render_servers(frame, cols[0]);
+            self.render_servers(frame, cols[0], geometry);
             let right = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Length(DETAIL_ROWS), Constraint::Min(4)])
                 .split(cols[1]);
             self.set_journal_geometry(right[1]);
             self.refresh();
-            self.render_detail(frame, right[0]);
-            self.render_log(frame, right[1]);
+            self.render_detail(frame, right[0], geometry);
+            self.render_log(frame, right[1], geometry);
         }
     }
 
-    fn render_servers(&self, frame: &mut Frame, area: Rect) {
+    fn render_servers(&self, frame: &mut Frame, area: Rect, geometry: &mut FrameGeometry) {
+        geometry.record(area, ScrollTarget::InspectorServers);
         let focused = self.focus == Focus::Servers;
         let items = self.snapshots.iter().map(|snapshot| {
             let state =
@@ -655,7 +691,8 @@ impl LspInspectorView {
         );
     }
 
-    fn render_detail(&mut self, frame: &mut Frame, area: Rect) {
+    fn render_detail(&mut self, frame: &mut Frame, area: Rect, geometry: &mut FrameGeometry) {
+        geometry.record(area, ScrollTarget::InspectorDetail);
         let focused = self.focus == Focus::Detail;
         self.sync_detail_selection();
         let Some(snapshot) = self.snapshots.get(self.selected).cloned() else {
@@ -691,7 +728,8 @@ impl LspInspectorView {
         );
     }
 
-    fn render_log(&self, frame: &mut Frame, area: Rect) {
+    fn render_log(&self, frame: &mut Frame, area: Rect, geometry: &mut FrameGeometry) {
+        geometry.record(area, ScrollTarget::InspectorJournal);
         let focused = self.focus == Focus::Journal;
         let height = area.height.saturating_sub(2) as usize;
         let start = self.log_scroll.min(self.log_rows.len());
@@ -1027,7 +1065,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(area.width, area.height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| view.render_log(frame, frame.area()))
+            .draw(|frame| view.render_log(frame, frame.area(), &mut FrameGeometry::new()))
             .unwrap();
         let width = terminal.backend().buffer().area.width as usize;
         terminal
@@ -1134,7 +1172,7 @@ mod tests {
             ("Journal (following", 35, 15, None),
         ] {
             terminal
-                .draw(|frame| view.render(frame, frame.area()))
+                .draw(|frame| view.render(frame, frame.area(), &mut FrameGeometry::new()))
                 .unwrap();
             let width = terminal.backend().buffer().area.width as usize;
             let lines = terminal
@@ -1166,6 +1204,101 @@ mod tests {
                 view.update(action);
             }
         }
+    }
+
+    // ---- scroll_servers_by / scroll_detail_by / scroll_journal_by
+    // (issue #20 wheel routing) --------------------------------------
+
+    #[test]
+    fn scroll_servers_by_moves_selection_and_clamps_at_both_ends() {
+        let store = crate::lsp::ObservationStore::in_memory();
+        store.begin_generation(identity("/one"), None, vec![]);
+        store.begin_generation(identity("/two"), None, vec![]);
+        store.begin_generation(identity("/three"), None, vec![]);
+        let mut view = LspInspectorView::new(store, None);
+        view.selected = 0;
+
+        view.scroll_servers_by(1);
+        assert_eq!(view.selected, 1);
+        view.scroll_servers_by(-5);
+        assert_eq!(view.selected, 0, "clamps at the top");
+        view.scroll_servers_by(100);
+        assert_eq!(
+            view.selected,
+            view.snapshots.len() - 1,
+            "clamps at the bottom"
+        );
+    }
+
+    #[test]
+    fn scroll_servers_by_is_a_no_op_with_no_servers() {
+        let store = crate::lsp::ObservationStore::in_memory();
+        let mut view = LspInspectorView::new(store, None);
+        assert!(view.snapshots.is_empty());
+        view.scroll_servers_by(3);
+        assert_eq!(view.selected, 0);
+    }
+
+    #[test]
+    fn scroll_detail_by_moves_the_scroll_regardless_of_which_pane_has_focus() {
+        let store = crate::lsp::ObservationStore::in_memory();
+        store.begin_generation(identity("/one"), None, vec![]);
+        let mut view = LspInspectorView::new(store, None);
+        // `detail_total_rows`/`detail_viewport_height` are only populated by
+        // a real render pass — mirrors how `render_detail` already works
+        // for keyboard-driven scrolling too.
+        let backend = ratatui::backend::TestBackend::new(60, 4);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                view.render_detail(frame, Rect::new(0, 0, 60, 4), &mut FrameGeometry::new())
+            })
+            .unwrap();
+
+        assert_eq!(view.focus, Focus::Servers, "keyboard focus is on Servers");
+        view.scroll_detail_by(2);
+        assert_eq!(view.detail_scroll, 2);
+        assert_eq!(
+            view.focus,
+            Focus::Servers,
+            "wheel scroll never changes keyboard focus"
+        );
+    }
+
+    #[test]
+    fn scroll_journal_by_moves_the_cursor_and_disengages_follow() {
+        let store = crate::lsp::ObservationStore::in_memory();
+        for index in 0..8 {
+            store.record(JournalEvent::simple(
+                EventSource::Ui,
+                EventLevel::Info,
+                None,
+                format!("event {index}"),
+            ));
+        }
+        let mut view = LspInspectorView::new(store, None);
+        view.set_viewport_height(2);
+        assert!(view.follow, "starts following the tail");
+
+        view.scroll_journal_by(-1);
+        assert!(
+            !view.follow,
+            "scrolling up must disengage follow, same as an ordinary keypress"
+        );
+        assert_eq!(view.journal_cursor, view.log_rows.len() - 2);
+        assert_eq!(
+            view.focus,
+            Focus::Servers,
+            "wheel scroll never changes keyboard focus"
+        );
+    }
+
+    #[test]
+    fn scroll_journal_by_is_a_no_op_with_no_events() {
+        let store = crate::lsp::ObservationStore::in_memory();
+        let mut view = LspInspectorView::new(store, None);
+        view.scroll_journal_by(-3);
+        assert_eq!(view.journal_cursor, 0);
     }
 
     #[test]
@@ -1426,7 +1559,7 @@ mod tests {
             let backend = ratatui::backend::TestBackend::new(width, 40);
             let mut terminal = ratatui::Terminal::new(backend).unwrap();
             terminal
-                .draw(|frame| view.render(frame, frame.area()))
+                .draw(|frame| view.render(frame, frame.area(), &mut FrameGeometry::new()))
                 .unwrap();
             let rendered_lines = |terminal: &ratatui::Terminal<ratatui::backend::TestBackend>| {
                 let terminal_width = terminal.backend().buffer().area.width as usize;
@@ -1449,7 +1582,7 @@ mod tests {
             view.snapshots[0].program = Some("long-command-part-".repeat(16));
             view.update(Action::FocusNextPane);
             terminal
-                .draw(|frame| view.render(frame, frame.area()))
+                .draw(|frame| view.render(frame, frame.area(), &mut FrameGeometry::new()))
                 .unwrap();
             let lines = rendered_lines(&terminal);
             assert!(lines.iter().any(|line| line.contains("j/k scroll")));
@@ -1458,7 +1591,7 @@ mod tests {
 
             view.update(Action::FocusNextPane);
             terminal
-                .draw(|frame| view.render(frame, frame.area()))
+                .draw(|frame| view.render(frame, frame.area(), &mut FrameGeometry::new()))
                 .unwrap();
             let lines = rendered_lines(&terminal);
             assert!(lines.iter().any(|line| line.contains("V select")));
@@ -1481,7 +1614,7 @@ mod tests {
                 let backend = ratatui::backend::TestBackend::new(width, 40);
                 let mut terminal = ratatui::Terminal::new(backend).unwrap();
                 terminal
-                    .draw(|frame| view.render(frame, frame.area()))
+                    .draw(|frame| view.render(frame, frame.area(), &mut FrameGeometry::new()))
                     .unwrap();
 
                 let terminal_width = terminal.backend().buffer().area.width as usize;
@@ -1599,7 +1732,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| view.render(frame, frame.area()))
+            .draw(|frame| view.render(frame, frame.area(), &mut FrameGeometry::new()))
             .unwrap();
         assert!(view.detail_total_rows > view.detail_viewport_height);
         assert!(view.journal_viewport_height >= 4);
@@ -1611,7 +1744,7 @@ mod tests {
             view.detail_total_rows - view.detail_viewport_height
         );
         terminal
-            .draw(|frame| view.render(frame, frame.area()))
+            .draw(|frame| view.render(frame, frame.area(), &mut FrameGeometry::new()))
             .unwrap();
         let width = terminal.backend().buffer().area.width as usize;
         let lines = terminal
@@ -1655,7 +1788,7 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(120, 40);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| view.render(frame, frame.area()))
+            .draw(|frame| view.render(frame, frame.area(), &mut FrameGeometry::new()))
             .unwrap();
 
         // Wide layout: 38 inner rows minus the 14-row detail pane leaves a

@@ -9,6 +9,7 @@
 
 use crate::diff::DiffFile;
 use crate::groups::{Grouping, UnitKind, enumerate_hunks};
+use crate::ui::mouse::{FrameGeometry, ScrollTarget};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -153,8 +154,10 @@ fn panel_rect(area: Rect) -> Rect {
     }
 }
 
-pub fn render(frame: &mut Frame, area: Rect, panel: &UnitsPanel) {
+pub fn render(frame: &mut Frame, area: Rect, panel: &UnitsPanel, geometry: &mut FrameGeometry) {
     let rect = panel_rect(area);
+    // As `refs_panel::render` — only recorded while actually drawn.
+    geometry.record(rect, ScrollTarget::UnitsPanel);
     frame.render_widget(Clear, rect);
 
     let block = Block::default().borders(Borders::ALL).title(format!(

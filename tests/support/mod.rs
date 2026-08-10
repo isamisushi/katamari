@@ -7,7 +7,9 @@
 pub mod fixture;
 pub mod harness;
 pub mod key;
+pub mod mouse;
 pub mod screen;
 
 pub use harness::{Harness, KittyMode, SpawnOptions};
 pub use key::Key;
+pub use mouse::MouseKey;

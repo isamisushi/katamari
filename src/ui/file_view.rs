@@ -15,6 +15,7 @@ use crate::keymap::Action;
 use crate::lsp::DiagnosticsStore;
 use crate::ui::hints::{self, HintItem};
 use crate::ui::hover_popup::HoverQuery;
+use crate::ui::mouse::{FrameGeometry, ScrollTarget};
 use crate::ui::scroll;
 use crate::ui::symbols;
 use crate::ui::text::{
@@ -165,17 +166,33 @@ impl FileView {
     }
 
     /// The content pane's visible row count changes on terminal resize; the
-    /// event loop reports it before each frame, mirroring `App`.
+    /// event loop reports it before each frame, mirroring `App`. As
+    /// [`crate::ui::app::App::set_viewport_height`], a no-op when `height`
+    /// is unchanged — issue #20's `Self::scroll_by` moves `scroll_offset`
+    /// without moving `self.cursor`, and this is called every event-loop
+    /// iteration regardless of an actual resize, so re-clamping
+    /// unconditionally would snap a wheel-scrolled `FileView` right back
+    /// before the next draw ever showed it.
     pub fn set_viewport_height(&mut self, height: usize) {
-        self.viewport_height = height.max(1);
+        let height = height.max(1);
+        if height == self.viewport_height {
+            return;
+        }
+        self.viewport_height = height;
         self.clamp_scroll();
     }
 
     /// As [`crate::ui::app::App::set_content_width`] — refreshed every
     /// frame alongside [`Self::set_viewport_height`] so [`Self::row_visual_height`]'s
-    /// wrap width stays current with the pane's actual size.
+    /// wrap width stays current with the pane's actual size. Skips the
+    /// clamp when `width` is unchanged, for the same reason
+    /// [`Self::set_viewport_height`] does.
     pub fn set_content_width(&mut self, width: usize) {
-        self.content_width = width.max(1);
+        let width = width.max(1);
+        if width == self.content_width {
+            return;
+        }
+        self.content_width = width;
         self.clamp_scroll();
     }
 
@@ -310,6 +327,26 @@ impl FileView {
             });
     }
 
+    /// Issue #20's wheel vocabulary — as [`crate::ui::app::App::scroll_by`],
+    /// moving `scroll_offset` directly by `delta` visual rows without
+    /// touching `self.cursor`. No `clamp_scroll` call afterward for the
+    /// same reason `App::scroll_by` skips it: that method derives
+    /// `scroll_offset` from the cursor, which would just undo this. The
+    /// next cursor-moving key press runs it anyway and self-heals.
+    pub fn scroll_by(&mut self, delta: isize) {
+        if self.line_count() == 0 {
+            return;
+        }
+        let last_row = self.line_count() - 1;
+        self.scroll_offset = scroll::scroll_by(
+            self.scroll_offset,
+            delta,
+            last_row,
+            self.viewport_height,
+            |i| self.row_visual_height(i),
+        );
+    }
+
     /// Moves the cursor to `line` and, if the active symbol there covers
     /// `display_col`, selects it — mirrors [`crate::ui::app::App::jump_cursor_to`];
     /// see that method's docs for why centering rather than clamping.
@@ -382,7 +419,14 @@ pub fn layout(area: Rect, status_height: u16) -> Areas {
     }
 }
 
-pub fn render(frame: &mut Frame, area: Rect, view: &FileView, diagnostics: &DiagnosticsStore) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    view: &FileView,
+    diagnostics: &DiagnosticsStore,
+    geometry: &mut FrameGeometry,
+) {
+    geometry.record(area, ScrollTarget::FilePane);
     let block = Block::default().borders(Borders::LEFT).title(" file ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -639,6 +683,56 @@ mod tests {
         view.update(Action::Bottom);
         assert!(view.cursor >= view.scroll_offset);
         assert!(view.cursor < view.scroll_offset + 2);
+    }
+
+    // ---- scroll_by (issue #20 wheel routing) ---------------------------
+
+    #[test]
+    fn scroll_by_moves_the_offset_without_touching_the_cursor() {
+        let mut view = test_view();
+        view.update(Action::Bottom);
+        let cursor_before = view.cursor;
+        view.scroll_by(1);
+        assert_eq!(
+            view.cursor, cursor_before,
+            "wheel scroll never moves the cursor"
+        );
+        assert!(view.scroll_offset > 0);
+    }
+
+    #[test]
+    fn scroll_by_clamps_at_the_top() {
+        let mut view = test_view();
+        view.scroll_by(-5);
+        assert_eq!(view.scroll_offset, 0);
+    }
+
+    #[test]
+    fn scroll_by_clamps_at_the_last_useful_offset() {
+        let mut view = test_view();
+        view.scroll_by(1000);
+        let maxed = view.scroll_offset;
+        view.scroll_by(1000);
+        assert_eq!(view.scroll_offset, maxed);
+    }
+
+    #[test]
+    fn scroll_by_offset_self_heals_on_the_next_cursor_move() {
+        let mut view = test_view();
+        view.update(Action::Bottom);
+        let settled_offset = view.scroll_offset;
+        view.scroll_by(-2);
+        assert_ne!(view.scroll_offset, settled_offset);
+        view.update(Action::CursorDown); // already at the bottom, cursor unchanged
+        assert_eq!(view.scroll_offset, settled_offset);
+    }
+
+    #[test]
+    fn scroll_by_is_a_no_op_on_an_empty_file() {
+        let mut view = FileView::with_hover_target("empty.rs".to_owned(), "", None);
+        view.set_viewport_height(2);
+        view.scroll_by(5);
+        assert_eq!(view.scroll_offset, 0);
     }
 
     #[test]

@@ -348,6 +348,45 @@ pub fn tree_repo() -> FixtureRepo {
     FixtureRepo { dir }
 }
 
+/// `count` small top-level files, each with one changed line — issue #20's
+/// mouse E2E fixture. Two independent things need to overflow a default
+/// (100x30) terminal at once here: the *sidebar*, so wheel-scrolling it is
+/// observable (`count` flat top-level files means `count` sidebar rows, no
+/// synthetic directory row to pad past the terminal's usable ~26 with), and
+/// the *diff pane*, so wheel-scrolling it moves real content into view
+/// (`count` files at ~5 rendered rows each — file header, hunk header,
+/// context/changed/context — comfortably clears a 30-row screen well
+/// before `count` on its own would). `FIRST_MARKER`/`LAST_MARKER` sit in
+/// the first and last files respectively (alphabetical == diff order here,
+/// since every name is zero-padded to sort correctly) — unambiguous
+/// witnesses for "did the diff pane's visible window actually move," the
+/// same role `SEARCH_TARGET_UNIQUE` plays in [`search_repo`].
+pub fn many_files_repo(count: usize) -> FixtureRepo {
+    let dir = init_repo();
+    let root = dir.path();
+
+    for i in 0..count {
+        std::fs::write(root.join(format!("file{i:03}.txt")), "alpha\nbeta\ngamma\n").unwrap();
+    }
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "initial commit"]);
+
+    for i in 0..count {
+        let marker = match i {
+            0 => "FIRST_MARKER",
+            n if n == count - 1 => "LAST_MARKER",
+            _ => "CHANGED",
+        };
+        std::fs::write(
+            root.join(format!("file{i:03}.txt")),
+            format!("alpha {marker}\nbeta\ngamma\n"),
+        )
+        .unwrap();
+    }
+
+    FixtureRepo { dir }
+}
+
 pub fn lsp_readiness_repo(init_delay_secs: f64, definition_delay_secs: f64) -> FixtureRepo {
     lsp_readiness_repo_inner(init_delay_secs, definition_delay_secs, false)
 }

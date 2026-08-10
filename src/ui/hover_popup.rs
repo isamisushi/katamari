@@ -10,6 +10,7 @@
 
 use crate::highlight::{Language, LineHighlighter};
 use crate::lsp::{HoverResult, LspError};
+use crate::ui::mouse::{FrameGeometry, ScrollTarget};
 use crate::ui::text::highlight_color;
 use lsp_types::{
     Diagnostic, DiagnosticSeverity, HoverContents, MarkedString, MarkupContent, MarkupKind,
@@ -208,14 +209,32 @@ impl HoverState {
 /// cursor's row within `area`, 0-based). A no-op when nothing is showing —
 /// pending/message states surface through [`HoverState::status_hint`] in
 /// the status bar instead.
-pub fn render(frame: &mut Frame, area: Rect, cursor_screen_row: u16, state: &HoverState) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    cursor_screen_row: u16,
+    state: &HoverState,
+    geometry: &mut FrameGeometry,
+) {
     if let Status::Shown(rendered) = &state.status {
-        render_popup(frame, area, cursor_screen_row, rendered);
+        render_popup(frame, area, cursor_screen_row, rendered, geometry);
     }
 }
 
-fn render_popup(frame: &mut Frame, area: Rect, cursor_screen_row: u16, rendered: &RenderedHover) {
+fn render_popup(
+    frame: &mut Frame,
+    area: Rect,
+    cursor_screen_row: u16,
+    rendered: &RenderedHover,
+    geometry: &mut FrameGeometry,
+) {
     let rect = popup_rect(area, cursor_screen_row);
+    // Recorded only in the branch that actually draws the popup — a closed
+    // or pending hover has no rect for a wheel event to land on, so it
+    // simply falls through to whatever's underneath (req 7's modal
+    // precedence, the same "only record what's really on screen" rule
+    // every other overlay in this module family follows).
+    geometry.record(rect, ScrollTarget::HoverPopup);
     frame.render_widget(Clear, rect);
 
     let block = Block::default().borders(Borders::ALL).title(" hover ");

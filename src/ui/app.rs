@@ -1028,8 +1028,26 @@ impl App {
     /// The diff pane's visible row count changes on terminal resize; the
     /// event loop reports it before each frame so half-page scrolling and
     /// scroll-to-cursor clamping use an up-to-date value.
+    ///
+    /// A no-op when `height` already matches — issue #20 made this matter
+    /// for the first time: `ui::mod`'s event loop calls this every single
+    /// iteration (not only on an actual resize), and before #20 that was
+    /// always harmless, since `self.clamp_scroll()` re-deriving
+    /// `scroll_offset` from `self.cursor` was idempotent — every path that
+    /// ever moved the cursor already called it too, so a same-value resize
+    /// call always recomputed the identical `scroll_offset`. `Self::scroll_by`
+    /// broke that idempotence on purpose: it moves `scroll_offset` *without*
+    /// moving `self.cursor`, and calling this every frame with the same
+    /// unchanged height would otherwise re-run `clamp_scroll` and pull that
+    /// wheel-scrolled offset right back to the cursor's row before the next
+    /// draw ever showed it — the guard below is what lets a wheel scroll
+    /// actually stay on screen.
     pub fn set_viewport_height(&mut self, height: usize) {
-        self.viewport_height = height.max(1);
+        let height = height.max(1);
+        if height == self.viewport_height {
+            return;
+        }
+        self.viewport_height = height;
         self.clamp_scroll();
     }
 
@@ -1039,9 +1057,14 @@ impl App {
     /// [`Self::content_width`]'s docs for exactly what width this expects
     /// (the unified layout's, regardless of which layout is actually
     /// showing) and [`crate::ui::diff_view::unified_content_width`], which
-    /// every caller derives it through.
+    /// every caller derives it through. Skips the clamp when `width` is
+    /// unchanged for the same reason [`Self::set_viewport_height`] does.
     pub fn set_content_width(&mut self, width: usize) {
-        self.content_width = width.max(1);
+        let width = width.max(1);
+        if width == self.content_width {
+            return;
+        }
+        self.content_width = width;
         self.clamp_scroll();
     }
 
@@ -1119,10 +1142,7 @@ impl App {
 
         let restored = refresh::restore_anchor(&self.files, &self.rows, &anchor);
         self.cursor = restored.row_index;
-        self.scroll_offset = restored
-            .row_index
-            .saturating_sub(refresh::scroll_delta(&anchor));
-        self.clamp_scroll();
+        self.restore_scroll_from_delta(restored.row_index, refresh::scroll_delta(&anchor));
         self.recompute_search();
         self.resolve_files_selection(selected_id);
         restored.overlay_survives
@@ -1631,9 +1651,18 @@ impl App {
     /// same way the diff pane's does (see [`Self::set_viewport_height`]) —
     /// reported every frame, from the sidebar's real rendered inner height,
     /// so `Files`-focused top/bottom/half-page movement and its scroll
-    /// clamping use an up-to-date value.
+    /// clamping use an up-to-date value. Skips the clamp when `height` is
+    /// unchanged, for the same reason [`Self::set_viewport_height`] does:
+    /// `Self::scroll_files_by` moves `files_scroll_offset` without moving
+    /// `files_selection`, and an every-frame re-clamp against an unchanged
+    /// height would otherwise snap a wheel-scrolled sidebar right back
+    /// before the next draw ever showed it.
     pub fn set_files_viewport_height(&mut self, height: usize) {
-        self.files_viewport_height = height.max(1);
+        let height = height.max(1);
+        if height == self.files_viewport_height {
+            return;
+        }
+        self.files_viewport_height = height;
         self.clamp_files_scroll();
     }
 
@@ -1921,6 +1950,73 @@ impl App {
             });
     }
 
+    /// Issue #20: the wheel's whole vocabulary for the diff pane — moves
+    /// `scroll_offset` directly by `delta` visual rows without touching
+    /// `self.cursor` at all, so scrolling the pane under the pointer can
+    /// never disturb wherever the reviewer's own keyboard navigation left
+    /// the cursor (req 5: works "regardless of which pane owns keyboard
+    /// focus," and must not move a *different* pane). Deliberately doesn't
+    /// call [`Self::clamp_scroll`] afterward — that function derives
+    /// `scroll_offset` from `self.cursor`, which would just undo the wheel
+    /// movement. The next cursor-moving action runs it anyway, pulling the
+    /// offset back to wherever the cursor needs it; a wheel-only session is
+    /// allowed to leave the cursor's row scrolled off screen in the
+    /// meantime, the same as any ordinary scrollable document viewer.
+    pub fn scroll_by(&mut self, delta: isize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let last_row = self.rows.len() - 1;
+        self.scroll_offset = scroll::scroll_by(
+            self.scroll_offset,
+            delta,
+            last_row,
+            self.viewport_height,
+            |i| self.row_visual_height(i),
+        );
+    }
+
+    /// Reapplies a captured [`refresh::scroll_delta`] once a restored
+    /// cursor row is known — the shared tail of [`Self::apply_refresh`],
+    /// [`Self::cancel_search`], and [`Self::recompute_search_live`]'s
+    /// no-match branch. The clamp depends on the delta's sign: a
+    /// non-negative delta is the ordinary cursor-coupled state and keeps
+    /// the pre-existing [`Self::clamp_scroll`] (cursor stays visible); a
+    /// negative one is the wheel-decoupled state ([`Self::scroll_by`] ran
+    /// the viewport past the cursor), where cursor-clamping would snap the
+    /// view back onto a cursor the reviewer deliberately scrolled away
+    /// from — there only the content-bounds clamp applies, via
+    /// `scroll_by(0)`.
+    fn restore_scroll_from_delta(&mut self, row_index: usize, delta: isize) {
+        self.scroll_offset = (row_index as isize - delta).max(0) as usize;
+        if delta >= 0 {
+            self.clamp_scroll();
+        } else {
+            self.scroll_by(0);
+        }
+    }
+
+    /// As [`Self::scroll_by`], for the files pane: moves
+    /// `files_scroll_offset` without touching `files_selection`, regardless
+    /// of which pane currently owns keyboard focus and independent of it —
+    /// a wheel over the sidebar scrolls the sidebar even while `Diff` owns
+    /// focus, req 5's "wheel scrolls the pane under the pointer... does not
+    /// steal keyboard focus" in one method. Files-pane rows never wrap (see
+    /// [`Self::files_viewport_height`]'s docs), so every row is `1`.
+    pub fn scroll_files_by(&mut self, delta: isize) {
+        if self.visible_rows.is_empty() {
+            return;
+        }
+        let last_row = self.visible_rows.len() - 1;
+        self.files_scroll_offset = scroll::scroll_by(
+            self.files_scroll_offset,
+            delta,
+            last_row,
+            self.files_viewport_height,
+            |_| 1,
+        );
+    }
+
     /// `z o`'s pure half: expands the gap at `(file_idx, gap_idx)` using
     /// `file_lines` (the new side's on-disk content, already split via
     /// `.lines()` by the caller — see `ui::mod::handle_action`'s
@@ -2105,9 +2201,8 @@ impl App {
             }
             None => {
                 self.cursor = origin_row;
-                self.scroll_offset = origin_row.saturating_sub(refresh::scroll_delta(origin));
+                self.restore_scroll_from_delta(origin_row, refresh::scroll_delta(origin));
                 self.active_symbol = 0;
-                self.clamp_scroll();
             }
         }
         self.sync_files_selection();
@@ -2127,11 +2222,8 @@ impl App {
     pub fn cancel_search(&mut self, origin: &refresh::Anchor) {
         let restored = refresh::restore_anchor(&self.files, &self.rows, origin);
         self.cursor = restored.row_index;
-        self.scroll_offset = restored
-            .row_index
-            .saturating_sub(refresh::scroll_delta(origin));
+        self.restore_scroll_from_delta(restored.row_index, refresh::scroll_delta(origin));
         self.active_symbol = 0;
-        self.clamp_scroll();
         self.search = None;
         self.sync_files_selection();
     }
@@ -2642,6 +2734,150 @@ mod tests {
         app.update(Action::Bottom);
         assert!(app.cursor >= app.scroll_offset);
         assert!(app.cursor < app.scroll_offset + 3);
+    }
+
+    // ---- scroll_by / scroll_files_by (issue #20 wheel routing) --------
+
+    #[test]
+    fn scroll_by_moves_the_offset_without_touching_the_cursor() {
+        let mut app = test_app();
+        app.set_viewport_height(3);
+        app.update(Action::Bottom);
+        let cursor_before = app.cursor;
+        let offset_before = app.scroll_offset;
+        app.scroll_by(-1);
+        assert_eq!(
+            app.cursor, cursor_before,
+            "wheel scroll never moves the cursor"
+        );
+        assert_eq!(app.scroll_offset, offset_before.saturating_sub(1));
+    }
+
+    #[test]
+    fn scroll_by_clamps_at_the_top() {
+        let mut app = test_app();
+        app.set_viewport_height(3);
+        assert_eq!(app.scroll_offset, 0);
+        app.scroll_by(-5);
+        assert_eq!(app.scroll_offset, 0, "can't scroll above the top");
+    }
+
+    #[test]
+    fn scroll_by_clamps_at_the_last_useful_offset() {
+        let mut app = test_app();
+        app.set_viewport_height(3);
+        app.scroll_by(1000);
+        let maxed = app.scroll_offset;
+        app.scroll_by(1000);
+        assert_eq!(
+            app.scroll_offset, maxed,
+            "already at the furthest useful offset — nothing more to scroll"
+        );
+    }
+
+    #[test]
+    fn scroll_by_is_a_no_op_on_an_empty_diff() {
+        let mut app = App::new("empty".to_owned(), PathBuf::from("/repo"), Vec::new());
+        app.set_viewport_height(3);
+        app.scroll_by(5);
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn a_wheel_scrolled_viewport_survives_a_refresh_of_unchanged_content() {
+        // The wheel-decoupled state must round-trip through the anchor:
+        // before the signed `scroll_delta`, `capture_anchor` saturated
+        // `cursor - scroll_offset` to 0 here and a background watch
+        // refresh pinned the cursor's row to the top of the viewport,
+        // silently discarding the position the reviewer had wheeled to.
+        let mut app = test_app();
+        app.set_viewport_height(3);
+        // Cursor stays near the top; wheel runs the viewport well past it.
+        app.scroll_by(1000);
+        let offset_before = app.scroll_offset;
+        assert!(
+            offset_before > app.cursor,
+            "sanity: this test needs the decoupled state"
+        );
+
+        let same_files = parse_unified_diff(FIXTURE);
+        app.apply_refresh(same_files);
+
+        assert_eq!(
+            app.scroll_offset, offset_before,
+            "an unchanged-content refresh must not move a wheeled viewport"
+        );
+        assert!(app.scroll_offset > app.cursor, "still decoupled");
+    }
+
+    #[test]
+    fn scroll_by_offset_self_heals_on_the_next_cursor_move() {
+        let mut app = test_app();
+        app.set_viewport_height(3);
+        app.update(Action::Bottom);
+        let settled_offset = app.scroll_offset;
+        app.scroll_by(-3);
+        assert_ne!(
+            app.scroll_offset, settled_offset,
+            "the wheel scroll actually moved the viewport"
+        );
+        // Already at the last row, so `CursorDown` doesn't move `cursor` —
+        // but `Self::update` runs `clamp_scroll` unconditionally at its
+        // tail, which pulls `scroll_offset` right back to the cursor's row.
+        app.update(Action::CursorDown);
+        assert_eq!(
+            app.scroll_offset, settled_offset,
+            "the next cursor-moving action self-heals the scroll offset"
+        );
+    }
+
+    #[test]
+    fn scroll_files_by_moves_the_files_offset_without_touching_selection() {
+        let mut app = test_app();
+        app.set_files_viewport_height(1);
+        assert!(
+            app.visible_rows.len() > 1,
+            "fixture must have more file-tree rows than the viewport"
+        );
+        let selection_before = app.files_selection;
+        // A one-row viewport already needed to scroll to keep whatever
+        // `files_selection` started on visible — read the real starting
+        // offset back rather than assuming zero, the same way
+        // `scroll_by_moves_the_offset_without_touching_the_cursor` above
+        // reads `scroll_offset` before asserting a relative delta.
+        let offset_before = app.files_scroll_offset;
+        app.scroll_files_by(1);
+        assert_eq!(
+            app.files_selection, selection_before,
+            "wheel scroll never moves the files selection"
+        );
+        assert_eq!(app.files_scroll_offset, offset_before + 1);
+    }
+
+    #[test]
+    fn scroll_files_by_clamps_at_the_top() {
+        let mut app = test_app();
+        app.set_files_viewport_height(1);
+        app.scroll_files_by(-5);
+        assert_eq!(app.files_scroll_offset, 0);
+    }
+
+    #[test]
+    fn scroll_files_by_clamps_at_the_last_useful_offset() {
+        let mut app = test_app();
+        app.set_files_viewport_height(1);
+        app.scroll_files_by(1000);
+        let maxed = app.files_scroll_offset;
+        app.scroll_files_by(1000);
+        assert_eq!(app.files_scroll_offset, maxed);
+    }
+
+    #[test]
+    fn scroll_files_by_is_a_no_op_on_an_empty_diff() {
+        let mut app = App::new("empty".to_owned(), PathBuf::from("/repo"), Vec::new());
+        app.set_files_viewport_height(1);
+        app.scroll_files_by(5);
+        assert_eq!(app.files_scroll_offset, 0);
     }
 
     /// A one-hunk file whose middle line is much longer than the others —

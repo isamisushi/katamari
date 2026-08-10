@@ -31,6 +31,7 @@
 
 use crate::keymap::{Action, Keymap, action_name};
 use crate::ui::compose::{char_byte_index, cursor_marked_line};
+use crate::ui::mouse::{FrameGeometry, ScrollTarget};
 use crate::ui::text::display_width;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -671,8 +672,21 @@ const FOOTER: &str = "/ filter \u{b7} j/k scroll \u{b7} Esc close";
 /// static [`FOOTER`] in `Browse` mode, or the filter text with its cursor
 /// marked (reusing [`crate::ui::compose::cursor_marked_line`], prefixed
 /// with `/`) in `Filter` mode.
-pub fn render(frame: &mut Frame, area: Rect, state: &HelpState, keymap: &Keymap) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    state: &HelpState,
+    keymap: &Keymap,
+    geometry: &mut FrameGeometry,
+) {
     let rect = popup_rect(area);
+    // The help popup is drawn last, unconditionally, outside every other
+    // view's `match` arm in `draw` (see that function's docs) — recording
+    // it last here is what makes it win `FrameGeometry::hit`'s
+    // last-recorded-wins scan over anything else on screen, req 7's modal
+    // precedence for the one overlay that can open on top of literally
+    // any view.
+    geometry.record(rect, ScrollTarget::HelpPopup);
     frame.render_widget(Clear, rect);
 
     let block = Block::default().borders(Borders::ALL).title(" help ");

@@ -36,11 +36,15 @@ pub struct Anchor {
     /// refresh.
     text_hash: Option<u64>,
     old_flat_index: usize,
-    /// `cursor - scroll_offset` before the refresh — restored verbatim
-    /// (clamped afterward the same way ordinary scrolling is) so the
-    /// cursor keeps its screen-relative position rather than re-centering
-    /// on every refresh.
-    scroll_delta: usize,
+    /// `cursor - scroll_offset` before the refresh — restored relative to
+    /// the relocated row so the cursor keeps its screen-relative position
+    /// rather than re-centering on every refresh. Signed, because a wheel
+    /// scroll (see `App::scroll_by`) can deliberately run `scroll_offset`
+    /// *past* the cursor; saturating that state to `0` here would make a
+    /// background refresh or a cancelled search silently snap the viewport
+    /// back onto a cursor the reviewer scrolled away from. Consumers pick
+    /// their clamp by sign — see `App::restore_scroll_from_delta`.
+    scroll_delta: isize,
 }
 
 /// Where [`restore_anchor`] decided the cursor should land.
@@ -73,7 +77,7 @@ pub fn capture_anchor(
         new_line,
         text_hash: text.map(hash_text),
         old_flat_index: cursor,
-        scroll_delta: cursor.saturating_sub(scroll_offset),
+        scroll_delta: cursor as isize - scroll_offset as isize,
     }
 }
 
@@ -126,12 +130,14 @@ pub fn restore_anchor(files: &[DiffFile], rows: &[RenderRow], anchor: &Anchor) -
     }
 }
 
-/// `cursor - scroll_offset` as [`capture_anchor`] recorded it, for a caller
-/// to reapply once it has decided the restored cursor's row index —
-/// deliberately not folded into [`restore_anchor`] itself, since clamping
-/// the result against a real viewport height is a rendering concern this
-/// module has no business doing (see [`crate::ui::scroll`]).
-pub fn scroll_delta(anchor: &Anchor) -> usize {
+/// `cursor - scroll_offset` as [`capture_anchor`] recorded it (negative
+/// when a wheel scroll had run the viewport past the cursor — see
+/// [`Anchor::scroll_delta`]'s docs), for a caller to reapply once it has
+/// decided the restored cursor's row index — deliberately not folded into
+/// [`restore_anchor`] itself, since clamping the result against a real
+/// viewport height is a rendering concern this module has no business
+/// doing (see [`crate::ui::scroll`]).
+pub fn scroll_delta(anchor: &Anchor) -> isize {
     anchor.scroll_delta
 }
 
@@ -542,6 +548,18 @@ mod tests {
         let cursor = 3; // some row a few past the top
         let anchor = capture_anchor(&before, &before_rows, cursor, 1);
         assert_eq!(scroll_delta(&anchor), 2);
+    }
+
+    #[test]
+    fn scroll_delta_goes_negative_when_the_viewport_ran_past_the_cursor() {
+        // The wheel-decoupled state (`App::scroll_by`): scroll_offset can
+        // exceed the cursor, and the anchor must represent that distance
+        // rather than saturating it to 0 — otherwise a refresh restores
+        // the cursor pinned to the top row, discarding the wheel position.
+        let before = vec![context_file("a.rs", &["one", "two", "three"])];
+        let before_rows = flatten(&before);
+        let anchor = capture_anchor(&before, &before_rows, 1, 4);
+        assert_eq!(scroll_delta(&anchor), -3);
     }
 
     // ---- locate_in_diff -------------------------------------------------

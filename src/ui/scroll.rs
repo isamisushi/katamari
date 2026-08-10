@@ -91,6 +91,35 @@ pub fn center(cursor: usize, viewport_height: usize, row_height: impl Fn(usize) 
     offset
 }
 
+/// The scroll offset after nudging `current` by `delta` *visual* rows —
+/// issue #20's wheel vocabulary, and the one function in this module that
+/// moves a pane's viewport without any notion of a cursor at all (contrast
+/// [`clamp_scroll`], which always keeps a cursor's row on screen and never
+/// takes a signed delta). `delta` is negative for "scroll up," matching
+/// [`crossterm::event::MouseEventKind::ScrollUp`]'s sign convention once
+/// `ui::mouse::scroll_at` negates its fixed row count.
+///
+/// The upper bound comes from [`clamp_scroll`] itself: the offset that
+/// would land if `last_row` (the final row) were the "cursor" and the
+/// starting offset were `0` is exactly the furthest a viewport can usefully
+/// scroll — anything past it would leave blank space below the last row,
+/// the same "never dangle past the end" guarantee
+/// [`crate::ui::help::HelpState::scroll_down`]'s docs describe for the help
+/// popup. Reusing `clamp_scroll` here rather than a second max-scroll
+/// formula is what keeps the two functions' idea of "the last useful
+/// offset" from ever drifting apart.
+pub fn scroll_by(
+    current: usize,
+    delta: isize,
+    last_row: usize,
+    viewport_height: usize,
+    row_height: impl Fn(usize) -> usize,
+) -> usize {
+    let max = clamp_scroll(last_row, viewport_height, 0, row_height);
+    let shifted = current as isize + delta;
+    shifted.clamp(0, max as isize) as usize
+}
+
 /// `Action::HalfPageDown`'s destination: `cursor` moved forward by
 /// [`half_page`]'s *visual*-row budget, landing on whichever logical row
 /// that visual distance reaches rather than always advancing by the same
@@ -271,6 +300,47 @@ mod tests {
     #[test]
     fn half_page_down_wrapped_clamps_to_the_last_row_even_mid_tall_row() {
         assert_eq!(half_page_down(3, 3, 6, mixed_heights), 3);
+    }
+
+    // ---- scroll_by ----------------------------------------------------
+
+    #[test]
+    fn scroll_by_moves_the_offset_by_the_given_delta() {
+        assert_eq!(scroll_by(5, 3, 100, 10, uniform), 8);
+        assert_eq!(scroll_by(5, -3, 100, 10, uniform), 2);
+    }
+
+    #[test]
+    fn scroll_by_clamps_at_zero_scrolling_up_past_the_top() {
+        assert_eq!(scroll_by(1, -3, 100, 10, uniform), 0);
+        assert_eq!(scroll_by(0, -3, 100, 10, uniform), 0);
+    }
+
+    #[test]
+    fn scroll_by_clamps_at_the_last_useful_offset_scrolling_down_past_the_bottom() {
+        // 20 rows, 10-row viewport: the furthest useful offset is 10 (rows
+        // 10..=19 fill the viewport exactly) — going past it would leave
+        // blank space below row 19.
+        assert_eq!(scroll_by(9, 3, 19, 10, uniform), 10);
+        assert_eq!(scroll_by(10, 3, 19, 10, uniform), 10);
+    }
+
+    #[test]
+    fn scroll_by_on_content_that_already_fits_never_leaves_zero() {
+        // Fewer rows than the viewport: nothing to scroll to either way.
+        assert_eq!(scroll_by(0, 3, 4, 10, uniform), 0);
+        assert_eq!(scroll_by(0, -3, 4, 10, uniform), 0);
+    }
+
+    #[test]
+    fn scroll_by_respects_a_tall_wrapped_row_in_its_upper_bound() {
+        // Same fixture as `clamp_scroll`'s own wrapped tests: row 3 is 4
+        // visual rows tall. Rows: [1,1,1,4,1,1,1,1,1,1] (10 logical rows),
+        // 6-row viewport. The furthest useful offset keeps row 9 (the last)
+        // visible without dangling space — same value `clamp_scroll(9, 6,
+        // 0, mixed_heights)` would report on its own.
+        let max = clamp_scroll(9, 6, 0, mixed_heights);
+        assert_eq!(scroll_by(0, 100, 9, 6, mixed_heights), max);
     }
 
     #[test]

@@ -26,6 +26,7 @@ use crate::keymap::Action;
 use crate::ui::app::App;
 use crate::ui::hints;
 use crate::ui::hover_popup::HoverQuery;
+use crate::ui::mouse::{FrameGeometry, ScrollTarget};
 use crate::ui::timeline_view::relative_time;
 use crate::vcs::{LogBackend, LogEntry, RevisionEntry};
 use anyhow::Result;
@@ -136,6 +137,21 @@ impl LogView {
         }
         self.selected = idx.min(self.entries.len() - 1);
         self.status_note = None;
+    }
+
+    /// Issue #20's wheel vocabulary. As
+    /// `crate::ui::timeline_view::TimelineView::scroll_list_by`: this list
+    /// has no independent scroll offset — `render_list` always windows
+    /// around `selected` — so "scroll" and "move the selection" are the
+    /// same operation here (the same accepted inconsistency with the diff
+    /// panes' decoupled cursor/viewport; see that method's docs).
+    pub fn scroll_by(&mut self, delta: isize) {
+        let target = if delta.is_negative() {
+            self.selected.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.selected.saturating_add(delta as usize)
+        };
+        self.select(target);
     }
 
     fn toggle_range_select(&mut self) {
@@ -251,10 +267,12 @@ pub fn render(
     keymap: &crate::keymap::Keymap,
     key_display: &crate::ui::key_display::KeyDisplayState,
     hints_expanded: bool,
+    geometry: &mut FrameGeometry,
 ) {
     let hint_items = hints::log_view_items(keymap, hints_expanded);
     let status_height = hints::required_height(&hint_items, area.width);
     let areas = layout(area, status_height);
+    geometry.record(areas.list, ScrollTarget::LogList);
     render_list(frame, areas.list, view);
     render_status(frame, areas.status, view, &hint_items);
     crate::ui::key_display::render(frame, areas.list, key_display);
@@ -321,10 +339,21 @@ fn render_list(frame: &mut Frame, area: Rect, view: &LogView) {
         .range_anchor
         .map(|anchor| (anchor.min(view.selected), anchor.max(view.selected)));
 
+    // Windows around `selected` the same way `refs_panel::render`/
+    // `units_panel::render`/`timeline_view::render_list` do — a
+    // pre-existing bug fixed alongside issue #20 (see that function's
+    // identical comment for what an unwindowed list did instead).
+    let visible_height = (inner.height as usize).max(1);
+    let start = view
+        .selected
+        .saturating_sub(visible_height.saturating_sub(1));
+
     let lines: Vec<Line> = view
         .entries
         .iter()
         .enumerate()
+        .skip(start)
+        .take(visible_height)
         .map(|(idx, entry)| {
             let selected = idx == view.selected;
             let in_range = range.is_some_and(|(lo, hi)| idx >= lo && idx <= hi);
@@ -415,6 +444,7 @@ pub fn format_dump(entries: &[LogEntry]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vcs::git::GitSource;
 
     fn revision(id: &str, summary: &str, working_copy: bool) -> LogEntry {
         LogEntry::Revision(RevisionEntry {
@@ -426,6 +456,26 @@ mod tests {
             refs: Vec::new(),
             is_working_copy: working_copy,
         })
+    }
+
+    /// A `LogView` with `count` synthetic revisions — bypasses
+    /// `LogView::new`'s real `LogBackend::log` call, since these tests only
+    /// exercise pure selection/windowing logic, never `Self::confirm`
+    /// (which is what would actually touch `backend`).
+    fn view_with_entries(count: usize) -> LogView {
+        let entries = (0..count)
+            .map(|i| revision(&format!("r{i:02}"), &format!("summary {i}"), false))
+            .collect();
+        LogView {
+            backend: LogBackend::Git(GitSource::at(std::path::PathBuf::from("/repo"))),
+            entries,
+            selected: 0,
+            range_anchor: None,
+            status_note: None,
+            pending_keys: String::new(),
+            should_quit: false,
+            viewport_height: 1,
+        }
     }
 
     #[test]
@@ -453,5 +503,66 @@ mod tests {
     #[test]
     fn format_dump_on_empty_history_is_a_clear_message_not_a_blank_line() {
         assert_eq!(format_dump(&[]), "(no history yet)\n");
+    }
+
+    // ---- scroll_by (issue #20 wheel routing) ---------------------------
+
+    #[test]
+    fn scroll_by_moves_selection_and_clears_the_status_note() {
+        let mut view = view_with_entries(10);
+        view.status_note = Some("stale note".to_owned());
+        view.scroll_by(3);
+        assert_eq!(view.selected, 3);
+        assert_eq!(view.status_note, None);
+    }
+
+    #[test]
+    fn scroll_by_clamps_at_both_ends() {
+        let mut view = view_with_entries(5);
+        view.scroll_by(-100);
+        assert_eq!(view.selected, 0);
+        view.scroll_by(100);
+        assert_eq!(view.selected, 4);
+        let settled = view.selected;
+        view.scroll_by(100);
+        assert_eq!(view.selected, settled);
+    }
+
+    #[test]
+    fn scroll_by_is_a_no_op_on_an_empty_log() {
+        let mut view = view_with_entries(0);
+        view.scroll_by(5);
+        assert_eq!(view.selected, 0);
+    }
+
+    // ---- render_list windowing ------------------------------------------
+
+    #[test]
+    fn render_list_windows_around_a_selection_past_the_fold() {
+        use ratatui::backend::TestBackend;
+
+        let mut view = view_with_entries(50);
+        view.selected = 45;
+
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_list(frame, frame.area(), &view))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            text.contains("r45"),
+            "the selected row must stay visible past the fold:\n{text}"
+        );
+        assert!(
+            !text.contains("r00"),
+            "and the window must actually have moved, not just grown:\n{text}"
+        );
     }
 }

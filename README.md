@@ -389,6 +389,21 @@ Tab. `Ctrl-]` and `Ctrl-t` have no default binding at all: katamari has one
 general jump history rather than a separate vim-style tag stack, so there's
 no second "go back" key to bind.
 
+### Mouse
+
+Wheel scrolling works out of the box (`[ui] mouse = true`, the default):
+scrolling over the files pane, the diff pane, a pushed file/timeline/log/
+inspector view, or an open hover/references/help overlay scrolls whichever
+one is under the pointer, without moving the keyboard cursor or changing
+which pane has keyboard focus. Click, drag, and hover are not implemented
+yet. While capture is on, a terminal's plain click-and-drag text selection
+goes to katamari instead of the terminal — most terminals still offer
+native selection by holding Shift while dragging. Set `[ui] mouse = false`
+to leave capture off entirely and get plain, unshifted drag selection
+back; katamari makes no attempt to emulate selection itself. Inside tmux,
+`set -g mouse on` is additionally required for wheel events to reach
+katamari at all, regardless of `[ui] mouse`.
+
 With a visual selection active (`V`, above), `y` copies it to the terminal
 clipboard via OSC 52: each selected line's repo-relative path, old/new line
 numbers, and diff marker (` `/`+`/`-`), grouped by file in selection order —
@@ -527,6 +542,10 @@ wrap = true
 # by default, without needing `--show-keys` on every invocation. Default
 # false.
 show_keys = false
+# Enables mouse capture (wheel scrolling — see "Mouse" under "Keybindings"
+# above). Default true; set false to leave the terminal's own
+# click-and-drag text selection working instead.
+mouse = true
 
 [watch]
 # Debounce window for live refresh: how long a burst of filesystem changes

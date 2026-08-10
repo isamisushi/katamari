@@ -7,6 +7,7 @@
 //! definitely finished.
 
 use super::key::Key;
+use super::mouse::MouseKey;
 use pty_process::Size;
 use pty_process::blocking::{Command, Pty, open};
 use std::io::{Read, Write};
@@ -214,6 +215,14 @@ impl Harness {
     /// see [`Harness::spawn`]'s docs on the ordering this relies on.
     pub fn send(&self, key: Key) {
         write_locked(&self.pty, &self.write_lock, &key.encode(self.kitty_mode));
+    }
+
+    /// Sends one SGR mouse-wheel event. Unlike [`Self::send`], this never
+    /// depends on [`KittyMode`] — see [`MouseKey::encode`]'s docs on why
+    /// SGR mouse reporting and the kitty keyboard protocol are independent
+    /// wire formats.
+    pub fn send_mouse(&self, key: MouseKey) {
+        write_locked(&self.pty, &self.write_lock, &key.encode());
     }
 
     /// Polls the parsed screen every 10ms until `predicate` is true, or

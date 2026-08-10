@@ -144,6 +144,21 @@ pub struct Config {
     /// `--show-keys` flag forces this on for one session regardless of what
     /// this field says — see `main.rs`'s per-command flag docs.
     pub show_keys: bool,
+    /// `[ui] mouse` — whether a TUI session enables crossterm mouse capture
+    /// at startup (`true`, the default) or leaves the terminal's own mouse
+    /// reporting untouched. Capturing the mouse is what makes wheel
+    /// scrolling route to the pane under the pointer (issue #20), but it
+    /// also intercepts the terminal's plain click-and-drag text selection —
+    /// most terminals still offer native selection under capture by
+    /// holding Shift while dragging (tmux additionally needs its own
+    /// `set -g mouse on`/`off` to match). `false` is the escape hatch for
+    /// a reviewer who wants plain, unshifted drag selection with the
+    /// terminal's own mechanism instead of katamari's; katamari makes no
+    /// attempt to emulate that selection itself. Read once, in
+    /// [`crate::ui::run`], not through the `wrap`/`tab_width` `OnceLock`
+    /// pattern — nothing renders differently based on this, only whether
+    /// capture is ever enabled at all.
+    pub mouse: bool,
     pub debounce_ms: u64,
     /// `[update] check` — whether a TUI session ever looks for a newer
     /// katamari release: both the once-a-day background GitHub check
@@ -239,6 +254,7 @@ impl Default for Config {
             highlight_max_lines: DEFAULT_HIGHLIGHT_MAX_LINES,
             wrap: true,
             show_keys: false,
+            mouse: true,
             debounce_ms: DEFAULT_DEBOUNCE_MS,
             update_check: true,
             offer_install: true,
@@ -302,6 +318,7 @@ struct RawUi {
     highlight_max_lines: Option<usize>,
     wrap: Option<bool>,
     show_keys: Option<bool>,
+    mouse: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -351,7 +368,13 @@ const SERVER_KEYS: &[&str] = &[
     "language_id",
     "initialization_options",
 ];
-const UI_KEYS: &[&str] = &["tab_width", "highlight_max_lines", "wrap", "show_keys"];
+const UI_KEYS: &[&str] = &[
+    "tab_width",
+    "highlight_max_lines",
+    "wrap",
+    "show_keys",
+    "mouse",
+];
 const WATCH_KEYS: &[&str] = &["debounce_ms"];
 const UPDATE_KEYS: &[&str] = &["check"];
 const SKILL_KEYS: &[&str] = &["offer_install"];
@@ -416,6 +439,9 @@ fn merge_raw(base: &mut RawFile, overlay: RawFile) {
         }
         if overlay_ui.show_keys.is_some() {
             base_ui.show_keys = overlay_ui.show_keys;
+        }
+        if overlay_ui.mouse.is_some() {
+            base_ui.mouse = overlay_ui.mouse;
         }
     }
     if let Some(overlay_watch) = overlay.watch {
@@ -667,6 +693,7 @@ fn finalize(raw: RawFile) -> Config {
             .unwrap_or(DEFAULT_HIGHLIGHT_MAX_LINES),
         wrap: ui.wrap.unwrap_or(true),
         show_keys: ui.show_keys.unwrap_or(false),
+        mouse: ui.mouse.unwrap_or(true),
         debounce_ms: watch.debounce_ms.unwrap_or(DEFAULT_DEBOUNCE_MS),
         update_check: update.check.unwrap_or(true),
         offer_install: skill.offer_install.unwrap_or(true),
@@ -957,6 +984,21 @@ mod tests {
     }
 
     #[test]
+    fn mouse_defaults_to_true_and_can_be_disabled() {
+        let repo = fixture_repo();
+        assert!(load_merged(&repo).mouse, "on by default");
+
+        write_repo_config(&repo, "[ui]\nmouse = false\n");
+        let config = load_merged(&repo);
+        assert!(!config.mouse);
+        // Disabling mouse capture doesn't reset a sibling `[ui]` field back
+        // to its default — same field-level merge guarantee `wrap`/
+        // `tab_width` get.
+        assert_eq!(config.tab_width, DEFAULT_TAB_WIDTH);
+        assert!(config.wrap);
+    }
+
+    #[test]
     fn repo_config_takes_precedence_over_home_config_field_by_field() {
         // Simulate the merge directly rather than mutating the real $HOME,
         // which every test in this binary shares: `merge_raw` is exactly
@@ -969,6 +1011,7 @@ mod tests {
                 highlight_max_lines: Some(1000),
                 wrap: None,
                 show_keys: None,
+                mouse: None,
             }),
             watch: Some(RawWatch {
                 debounce_ms: Some(500),
@@ -981,6 +1024,7 @@ mod tests {
                 highlight_max_lines: None,
                 wrap: None,
                 show_keys: None,
+                mouse: None,
             }),
             ..RawFile::default()
         };

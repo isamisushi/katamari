@@ -35,6 +35,8 @@ mod log;
 mod lsp_inspector;
 #[path = "e2e/lsp_readiness.rs"]
 mod lsp_readiness;
+#[path = "e2e/mouse.rs"]
+mod mouse;
 #[path = "e2e/navigation.rs"]
 mod navigation;
 #[path = "e2e/range_comment.rs"]

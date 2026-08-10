@@ -9,6 +9,7 @@
 
 use crate::diff::ColumnMap;
 use crate::lsp::client::uri_to_path;
+use crate::ui::mouse::{FrameGeometry, ScrollTarget};
 use crate::ui::text::display_width;
 use lsp_types::{Location, PositionEncodingKind};
 use ratatui::Frame;
@@ -156,8 +157,13 @@ fn panel_rect(area: Rect) -> Rect {
     }
 }
 
-pub fn render(frame: &mut Frame, area: Rect, panel: &RefsPanel) {
+pub fn render(frame: &mut Frame, area: Rect, panel: &RefsPanel, geometry: &mut FrameGeometry) {
     let rect = panel_rect(area);
+    // Only recorded while the panel is actually being rendered — `ui::mod`
+    // only calls this at all when `refs_panel` is `Some`, so there's no
+    // "closed but still hittable" state to guard against here the way
+    // `hover_popup::render_popup` has to for its own `Status::Pending`.
+    geometry.record(rect, ScrollTarget::RefsPanel);
     frame.render_widget(Clear, rect);
 
     let count_note = if panel.truncated > 0 {
