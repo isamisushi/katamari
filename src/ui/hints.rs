@@ -121,12 +121,12 @@ pub(crate) fn pane_hint(
     Some(pane::Hint::new(keys.join("/"), label, essential))
 }
 
-/// The files pane's border hints (issue #14): just enough to make the
-/// pane's own controls discoverable without the reviewer opening `?` —
-/// movement, confirming a selection, and jumping to the extremes. The full
-/// curated list stays in [`diff_view_items`]'s domain (the status bar);
-/// this is deliberately terser, matching how little a flat file list
-/// actually needs explained.
+/// The files pane's border hints (issue #14, extended by #15's tree): just
+/// enough to make the pane's own controls discoverable without the
+/// reviewer opening `?` — movement, confirming a selection, toggling a
+/// directory, and jumping to the extremes. The full curated list stays in
+/// [`diff_view_items`]'s domain (the status bar); this is deliberately
+/// terser, matching how little the files pane actually needs explained.
 pub(crate) fn files_pane_hints(keymap: &Keymap) -> Vec<pane::Hint<'static>> {
     [
         pane_hint(
@@ -136,6 +136,7 @@ pub(crate) fn files_pane_hints(keymap: &Keymap) -> Vec<pane::Hint<'static>> {
             true,
         ),
         pane_hint(keymap, &[Action::Confirm], "open", true),
+        pane_hint(keymap, &[Action::ToggleDirectory], "toggle", false),
         pane_hint(keymap, &[Action::Top, Action::Bottom], "top/bottom", false),
     ]
     .into_iter()
@@ -555,6 +556,20 @@ mod tests {
         let hints = files_pane_hints(&keymap);
         assert!(hints.iter().any(|h| h.description == "move"));
         assert!(hints.iter().any(|h| h.description == "open"));
+    }
+
+    /// Issue #15: `Space` toggles a directory row, distinctly from `Enter`
+    /// (which also opens a *file* row) — the files pane's border hint must
+    /// name it separately so a reviewer discovers it without opening `?`.
+    #[test]
+    fn files_pane_hints_include_toggle() {
+        let keymap = Keymap::from_bindings(&vim_preset(false));
+        let hints = files_pane_hints(&keymap);
+        let toggle = hints
+            .iter()
+            .find(|h| h.description == "toggle")
+            .expect("toggle hint present");
+        assert_eq!(toggle.key, "Space");
     }
 
     #[test]

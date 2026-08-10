@@ -299,6 +299,28 @@ pub(crate) fn record_jump(
     }
 }
 
+/// [`App::confirm_files_selection`]'s three-way result (issue #15) — a plain
+/// `Option<JumpEntry>` (#14's own shape) can't distinguish "there was
+/// nothing to confirm" from "confirming toggled a directory, which produces
+/// no jump at all," and `ui::mod`'s `Action::Confirm` arm needs to tell
+/// those apart to decide whether to record jump history and invalidate an
+/// open hover popup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilesConfirmOutcome {
+    /// Nothing was selected to confirm — only reachable on an empty diff
+    /// (`visible_rows` itself empty).
+    NoSelection,
+    /// The selection was a directory row: its collapsed state was flipped
+    /// (see [`App::toggle_directory`]). This never leaves the files pane's
+    /// own focus, let alone jumps the diff cursor, so `ui::mod` must record
+    /// no jump history and invalidate no hover popup for this outcome —
+    /// unlike `Opened`, nothing under the diff cursor changed.
+    Toggled,
+    /// The selection was a file row: the diff cursor jumped to its header
+    /// and focus returned to `Diff`, exactly as every #14 confirm did.
+    Opened(JumpEntry),
+}
+
 impl App {
     /// The cursor's current absolute file/line/column, if it sits on
     /// content that has one — looser than [`Self::hover_query`] (no symbol
@@ -326,29 +348,48 @@ impl App {
         Some((self.repo_root.join(relative), line, col))
     }
 
-    /// `Enter` while the files pane has focus (issue #14): jumps the diff
-    /// cursor to the selected file's header row and hands focus back to
-    /// `Diff` (via [`Self::jump_cursor_to`], which sets that
-    /// unconditionally — see its own docs) — the sidebar's one and only way
-    /// to actually move the diff, since every other action while `Files` is
-    /// focused only moves `files_selection` (see [`Self::update`]'s
-    /// `MainPaneFocus::Files` arms). Returns the landed-on [`JumpEntry`]
-    /// (`line: None` — a file header is a structural destination, not a
-    /// source line, see [`JumpEntry::line`]'s docs) so `ui::mod`'s
-    /// `Action::Confirm` arm can record the jump the same way every other
-    /// significant navigation does, and so `Ctrl-o` can retrace it. `None`
-    /// only when there is genuinely no file to jump to (an empty diff).
-    pub fn confirm_files_selection(&mut self) -> Option<JumpEntry> {
-        let file = self.files.get(self.files_selection)?;
-        let display_path = file.display_path().to_owned();
-        let row = refresh::locate_in_diff(&self.files, &self.rows, &display_path, None)?;
-        self.jump_cursor_to(row, 0);
-        Some(JumpEntry {
-            file: self.repo_root.join(&display_path),
-            git_root: self.repo_root.clone(),
-            line: None,
-            col: 0,
-        })
+    /// `Enter` while the files pane has focus (issue #14, extended by #15's
+    /// tree): a directory row toggles its collapsed state (mirroring
+    /// `Space`/`Action::ToggleDirectory` — see [`Self::toggle_directory`]'s
+    /// docs), producing no jump; a file row jumps the diff cursor to its
+    /// header row and hands focus back to `Diff` (via
+    /// [`Self::jump_cursor_to`], which sets that unconditionally — see its
+    /// own docs), the sidebar's one and only way to actually move the diff,
+    /// since every other action while `Files` is focused only moves
+    /// `files_selection` (see [`Self::update`]'s `MainPaneFocus::Files`
+    /// arms). See [`FilesConfirmOutcome`] for what `ui::mod`'s
+    /// `Action::Confirm` arm does with each case.
+    pub fn confirm_files_selection(&mut self) -> FilesConfirmOutcome {
+        let Some(row) = self.visible_rows.get(self.files_selection) else {
+            return FilesConfirmOutcome::NoSelection;
+        };
+        match row.kind {
+            crate::ui::file_tree::VisibleKind::Directory { .. } => {
+                let path = row.id.path.clone();
+                self.toggle_directory(&path);
+                FilesConfirmOutcome::Toggled
+            }
+            crate::ui::file_tree::VisibleKind::File { file_idx } => {
+                let display_path = self.files[file_idx].display_path().to_owned();
+                // `find_first_row_of_file` (the tail of `locate_in_diff`'s
+                // fallback chain) always succeeds here: `display_path` was
+                // just read from `self.files` itself, and `flatten` gives
+                // every file a `FileHeader` row unconditionally — this
+                // `let...else` is defensive, not a real path.
+                let Some(target_row) =
+                    refresh::locate_in_diff(&self.files, &self.rows, &display_path, None)
+                else {
+                    return FilesConfirmOutcome::NoSelection;
+                };
+                self.jump_cursor_to(target_row, 0);
+                FilesConfirmOutcome::Opened(JumpEntry {
+                    file: self.repo_root.join(&display_path),
+                    git_root: self.repo_root.clone(),
+                    line: None,
+                    col: 0,
+                })
+            }
+        }
     }
 }
 
@@ -890,9 +931,9 @@ mod tests {
         app.focus = crate::ui::app::MainPaneFocus::Files;
         app.files_selection = 1; // b.rs
 
-        let to = app
-            .confirm_files_selection()
-            .expect("a two-file diff always has something to confirm");
+        let FilesConfirmOutcome::Opened(to) = app.confirm_files_selection() else {
+            panic!("a two-file diff's file row must open, not toggle or no-op");
+        };
         assert_eq!(to.file, dir.path().join("b.rs"));
         assert_eq!(to.line, None, "a file header is a structural destination");
         assert_eq!(app.cursor, 3, "row 3 is b.rs's own file header");
@@ -922,9 +963,11 @@ mod tests {
         app.files_selection = 1;
 
         let from = jump_entry_for(&app, dir.path());
-        let to = app.confirm_files_selection();
+        let FilesConfirmOutcome::Opened(to) = app.confirm_files_selection() else {
+            panic!("a two-file diff's file row must open, not toggle or no-op");
+        };
         let mut jump_stack = JumpStack::new();
-        record_jump(&mut jump_stack, from.clone(), to);
+        record_jump(&mut jump_stack, from.clone(), Some(to));
         assert_eq!(
             jump_stack.back(None),
             from,
@@ -948,18 +991,64 @@ mod tests {
 
         app.focus = crate::ui::app::MainPaneFocus::Files;
         app.files_selection = 1;
-        let to = app.confirm_files_selection();
+        let FilesConfirmOutcome::Opened(to) = app.confirm_files_selection() else {
+            panic!("a two-file diff's file row must open, not toggle or no-op");
+        };
         let mut jump_stack = JumpStack::new();
-        record_jump(&mut jump_stack, from, to);
+        record_jump(&mut jump_stack, from, Some(to));
         assert_eq!(jump_stack.back(None), None);
     }
 
     #[test]
-    fn confirm_files_selection_on_an_empty_diff_returns_none() {
+    fn confirm_files_selection_on_an_empty_diff_reports_no_selection() {
         let dir = tempfile::tempdir().unwrap();
         let mut app =
             crate::ui::app::App::new("repo".to_owned(), dir.path().to_path_buf(), Vec::new());
         app.focus = crate::ui::app::MainPaneFocus::Files;
-        assert_eq!(app.confirm_files_selection(), None);
+        assert_eq!(
+            app.confirm_files_selection(),
+            FilesConfirmOutcome::NoSelection
+        );
+    }
+
+    /// Issue #15: confirming a directory row toggles it instead of jumping
+    /// the diff cursor — the sidebar's selection and focus both stay on
+    /// `Files`, unlike a file row's `Opened`.
+    #[test]
+    fn confirm_files_selection_on_a_directory_row_toggles_it_without_jumping() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = crate::ui::app::App::new(
+            "repo".to_owned(),
+            dir.path().to_path_buf(),
+            vec![DiffFile {
+                new_path: Some("src/lib.rs".to_owned()),
+                old_path: Some("src/lib.rs".to_owned()),
+                hunks: vec![DiffHunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 1,
+                    header: String::new(),
+                    known_eof: true,
+                    rows: vec![DiffRow {
+                        kind: DiffLineKind::Context,
+                        text: "content".to_owned(),
+                        old_line: Some(1),
+                        new_line: Some(1),
+                    }],
+                }],
+                ..Default::default()
+            }],
+        );
+        app.focus = crate::ui::app::MainPaneFocus::Files;
+        app.files_selection = 0; // the "src" directory row
+
+        assert_eq!(app.confirm_files_selection(), FilesConfirmOutcome::Toggled);
+        assert_eq!(
+            app.focus,
+            crate::ui::app::MainPaneFocus::Files,
+            "toggling a directory must not hand focus to Diff"
+        );
+        assert_eq!(app.cursor, 0, "the diff cursor must not move either");
     }
 }

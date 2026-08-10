@@ -9,6 +9,7 @@ use crate::diff::{
 };
 use crate::keymap::Action;
 use crate::lsp::DiagnosticsStore;
+use crate::ui::file_tree::{self, FileTree, NodeId};
 use crate::ui::hover_popup::HoverQuery;
 use crate::ui::pane;
 use crate::ui::refresh;
@@ -295,15 +296,17 @@ pub struct App {
     /// `sidebar_visible`.
     pub focus: MainPaneFocus,
     /// The files pane's independently browsed selection — an index into
-    /// `files`, distinct from [`Self::diff_file`] (derived from the diff
-    /// cursor) the moment `Files` has its own focus and its own movement
-    /// (see [`Self::update`]'s `MainPaneFocus::Files` arms). Kept in sync
-    /// with `diff_file` only while `Diff` owns focus (see
-    /// [`Self::sync_files_selection`]); re-anchored by display path across
-    /// a refresh/scope-swap/unit-filter change instead of just clamped
-    /// (see [`Self::resolve_files_selection`]), since a stale index into a
-    /// *different* files list would otherwise point at an unrelated file
-    /// or, if the list shrank, panic out of bounds.
+    /// [`Self::visible_rows`] (issue #15; a directory row has no `files`
+    /// counterpart, so this can no longer index `files` directly the way
+    /// #14 had it), distinct from [`Self::diff_file`] (derived from the
+    /// diff cursor) the moment `Files` has its own focus and its own
+    /// movement (see [`Self::update`]'s `MainPaneFocus::Files` arms). Kept
+    /// in sync with `diff_file` only while `Diff` owns focus (see
+    /// [`Self::sync_files_selection`]); re-anchored by [`NodeId`] across a
+    /// refresh/scope-swap/unit-filter/directory-toggle change instead of
+    /// just clamped (see [`Self::resolve_files_selection`]), since a stale
+    /// index into a *different* `visible_rows` would otherwise point at an
+    /// unrelated row or, if the list shrank, panic out of bounds.
     pub files_selection: usize,
     /// The files pane's own scroll offset — independent of `scroll_offset`
     /// (the diff pane's) for the same reason `files_selection` is
@@ -318,6 +321,36 @@ pub struct App {
     /// scroll computation over it passes `|_| 1` rather than a per-row
     /// height lookup.
     files_viewport_height: usize,
+    /// The files pane's derived directory tree (issue #15) — rebuilt from
+    /// `files` on every [`Self::rederive`], the same choke point every
+    /// other derived-from-`files` field (`rows`/`side_by_side_rows`/
+    /// `gap_cache`) already goes through. Private: nothing outside `App`
+    /// addresses a [`file_tree::Node`] directly — only through
+    /// `visible_rows`, [`Self::toggle_directory`], and whatever needs a
+    /// file's own [`NodeId`] (see [`Self::file_node_id`]).
+    tree: FileTree,
+    /// Directory paths currently collapsed in the files-pane tree, keyed by
+    /// path exactly the way `collapsed`'s callers in
+    /// [`crate::ui::file_tree`] expect. Survives every `rederive` — a watch
+    /// refresh's whole point is preserving a reviewer's place, and epic
+    /// decision 5 extends that to a scope swap too (unlike `expanded_folds`/
+    /// `unit_filter`, which a scope swap *does* clear — see
+    /// [`Self::apply_scope_swap`]'s docs: a fold or a unit scope describes
+    /// specific diff *content* that a swap's unrelated new diff has no
+    /// relationship to, but "which directories this reviewer likes
+    /// collapsed" is a browsing preference that plausibly carries over
+    /// regardless of which diff is on screen). [`file_tree::prune_collapsed`]
+    /// still drops whatever a rebuild's new tree no longer has a matching
+    /// directory for, the same staleness cleanup `prune_stale_folds` performs
+    /// for `expanded_folds`.
+    collapsed_dirs: HashSet<String>,
+    /// The files pane's flattened, indexable row sequence — [`Self::files_selection`]
+    /// indexes into *this*, not `files` directly, as of issue #15 (a
+    /// directory row has no `files` counterpart at all). Rebuilt alongside
+    /// `tree` on every [`Self::rederive`]; `pub` because
+    /// [`crate::ui::sidebar::render`] reads it directly, the same way it
+    /// already reads `files_selection`/`files_scroll_offset`.
+    pub visible_rows: Vec<file_tree::VisibleRow>,
 }
 
 impl App {
@@ -357,11 +390,39 @@ impl App {
             files_selection: 0,
             files_scroll_offset: 0,
             files_viewport_height: 1,
+            tree: FileTree::default(),
+            collapsed_dirs: HashSet::new(),
+            visible_rows: Vec::new(),
         };
         // No folds exist yet, so this just moves `pristine_files` in
         // verbatim — reusing the one derivation path rather than
         // duplicating its move-then-flatten shape here.
         app.rederive();
+        // Issue #15: `files_selection`'s struct-literal default (`0`) is no
+        // longer guaranteed to mean "the diff cursor's own file" the moment
+        // there's a tree — a root-level directory can sort ahead of every
+        // file (e.g. a dotfile directory alphabetically before an ordinary
+        // one), landing index `0` on a *directory* row instead. Pre-#15
+        // this was harmless: every row *was* a file row in the same order
+        // as `files` itself, so `files_selection == 0` and `diff_file() ==
+        // 0` were simply the same fact stated twice.
+        //
+        // Resolved directly via `resolve_and_set_selection`, not the
+        // `sync_files_selection`/`toggle_directory` wrapper that also
+        // clamps scroll: `files_viewport_height` is still its harmless-only-
+        // once-a-real-frame-has-run placeholder of `1` at this point (the
+        // event loop's frame prep calls `Self::set_files_viewport_height`
+        // with the real terminal height, but only once rendering actually
+        // starts, well after construction) — clamping scroll against that
+        // placeholder here would compute a bogus offset that a *later*,
+        // correctly-sized `set_files_viewport_height` call can't necessarily
+        // undo (`ui::scroll::clamp_scroll` only ever pulls an offset
+        // *forward*, never resets one that's already sitting past where a
+        // newly-widened viewport would put it). Leaving `files_scroll_offset`
+        // at its own harmless default (`0`) instead means the first real
+        // `set_files_viewport_height` call clamps correctly from a clean
+        // slate.
+        app.resolve_and_set_selection(None);
         app
     }
 
@@ -429,6 +490,20 @@ impl App {
         self.rows = flatten(&self.files);
         self.side_by_side_rows = flatten_side_by_side(&self.files);
         self.gap_cache = self.files.iter().map(file_gaps).collect();
+        // Issue #15: the files-pane tree is derived from `files` the same
+        // way `rows`/`side_by_side_rows`/`gap_cache` are — one rebuild here
+        // covers every caller of `rederive` (a watch refresh, a scope swap,
+        // a unit-filter change, and even a plain `z o`/`z c` fold toggle,
+        // which touches no path at all and so leaves `visible_rows`
+        // structurally identical — see this method's own callers'
+        // docs) rather than each duplicating the same three calls.
+        // `files_selection` is deliberately left untouched here: every
+        // caller that actually needs to re-anchor it after a rebuild does
+        // so itself, afterward, with the *old* selection captured before
+        // this call — see `Self::resolve_files_selection`'s docs.
+        self.tree = file_tree::build(&self.files);
+        file_tree::prune_collapsed(&self.tree, &mut self.collapsed_dirs);
+        self.visible_rows = file_tree::flatten_visible(&self.tree, &self.collapsed_dirs);
     }
 
     /// [`Self::rederive`]'s slow path: clones `pristine_files` and splices
@@ -633,13 +708,14 @@ impl App {
     pub fn apply_refresh(&mut self, files: Vec<DiffFile>) -> bool {
         let anchor =
             refresh::capture_anchor(&self.files, &self.rows, self.cursor, self.scroll_offset);
-        // Captured against the *old* `files` before it's replaced below —
-        // see `Self::resolve_files_selection`'s docs on why the sidebar
-        // selection is re-anchored by path rather than just clamped.
-        let selected_path = self
-            .files
+        // Captured against the *old* `visible_rows` before it's rebuilt
+        // below — see `Self::resolve_files_selection`'s docs on why the
+        // sidebar selection is re-anchored by `NodeId` rather than just
+        // clamped.
+        let selected_id = self
+            .visible_rows
             .get(self.files_selection)
-            .map(|f| f.display_path().to_owned());
+            .map(|r| r.id.clone());
 
         self.prune_stale_folds(&files);
         self.pristine_files = files;
@@ -650,7 +726,7 @@ impl App {
             self.cursor = 0;
             self.scroll_offset = 0;
             self.recompute_search();
-            self.resolve_files_selection(selected_path);
+            self.resolve_files_selection(selected_id);
             return false;
         }
 
@@ -661,7 +737,7 @@ impl App {
             .saturating_sub(refresh::scroll_delta(&anchor));
         self.clamp_scroll();
         self.recompute_search();
-        self.resolve_files_selection(selected_path);
+        self.resolve_files_selection(selected_id);
         restored.overlay_survives
     }
 
@@ -745,11 +821,14 @@ impl App {
         // working-tree <-> staged, say, very often touches the same files,
         // and there's no reason to lose a reviewer's place in the sidebar
         // just because the diff cursor itself has nothing meaningful to
-        // restore. Captured before `files` is replaced below.
-        let selected_path = self
-            .files
+        // restore. Captured before `files`/`visible_rows` is rebuilt below.
+        // `collapsed_dirs` itself is *not* cleared here (unlike
+        // `expanded_folds`/`unit_filter` just below) — see that field's own
+        // docs for why a scope swap keeps it.
+        let selected_id = self
+            .visible_rows
             .get(self.files_selection)
-            .map(|f| f.display_path().to_owned());
+            .map(|r| r.id.clone());
         self.pristine_files = files;
         self.expanded_folds.clear();
         self.trailing_probed_empty.clear();
@@ -773,7 +852,7 @@ impl App {
         // scope and so keeps a confirmed search alive across it.
         self.search = None;
         self.clamp_scroll();
-        self.resolve_files_selection(selected_path);
+        self.resolve_files_selection(selected_id);
     }
 
     /// Scopes the whole diff view down to one semantic unit's hunks —
@@ -787,10 +866,10 @@ impl App {
     /// the unit's own files, and a `files_selection` left pointing at its
     /// pre-filter index could land past the end of the new, shorter list).
     pub fn set_unit_filter(&mut self, filter: UnitFilter) {
-        let selected_path = self
-            .files
+        let selected_id = self
+            .visible_rows
             .get(self.files_selection)
-            .map(|f| f.display_path().to_owned());
+            .map(|r| r.id.clone());
         self.unit_filter = Some(filter);
         self.rederive();
         self.cursor = 0;
@@ -801,7 +880,7 @@ impl App {
         // landing on rows that no longer exist.
         self.recompute_search();
         self.clamp_scroll();
-        self.resolve_files_selection(selected_path);
+        self.resolve_files_selection(selected_id);
     }
 
     /// Widens back to the full diff — plain `Esc`'s first meaning while a
@@ -815,10 +894,10 @@ impl App {
         if self.unit_filter.is_none() {
             return false;
         }
-        let selected_path = self
-            .files
+        let selected_id = self
+            .visible_rows
             .get(self.files_selection)
-            .map(|f| f.display_path().to_owned());
+            .map(|r| r.id.clone());
         self.unit_filter = None;
         self.rederive();
         self.cursor = 0;
@@ -826,7 +905,7 @@ impl App {
         self.active_symbol = 0;
         self.recompute_search();
         self.clamp_scroll();
-        self.resolve_files_selection(selected_path);
+        self.resolve_files_selection(selected_id);
         true
     }
 
@@ -886,15 +965,17 @@ impl App {
         match action {
             // Cursor/paging/top-bottom movement targets whichever pane owns
             // focus (issue #14) — `Files` moves `files_selection` over
-            // `self.files` instead of the diff cursor, using the same
-            // `ui::scroll` machinery with `|_| 1` row heights (a files-pane
-            // row never wraps, see `Self::files_viewport_height`'s docs).
-            // `Diff` behaves exactly as every milestone before #14 did.
+            // `self.visible_rows` (issue #15's tree rows, not `self.files`
+            // directly — a directory row has no `files` counterpart at all)
+            // instead of the diff cursor, using the same `ui::scroll`
+            // machinery with `|_| 1` row heights (a files-pane row never
+            // wraps, see `Self::files_viewport_height`'s docs). `Diff`
+            // behaves exactly as every milestone before #14 did.
             Action::CursorDown => match self.focus {
                 MainPaneFocus::Diff => self.cursor = (self.cursor + 1).min(last),
                 MainPaneFocus::Files => {
                     self.files_selection =
-                        (self.files_selection + 1).min(self.files.len().saturating_sub(1));
+                        (self.files_selection + 1).min(self.visible_rows.len().saturating_sub(1));
                     self.clamp_files_scroll();
                 }
             },
@@ -913,10 +994,10 @@ impl App {
                         });
                 }
                 MainPaneFocus::Files => {
-                    let last_file = self.files.len().saturating_sub(1);
+                    let last_row = self.visible_rows.len().saturating_sub(1);
                     self.files_selection = scroll::half_page_down(
                         self.files_selection,
-                        last_file,
+                        last_row,
                         self.files_viewport_height,
                         |_| 1,
                     );
@@ -948,10 +1029,27 @@ impl App {
             Action::Bottom => match self.focus {
                 MainPaneFocus::Diff => self.cursor = last,
                 MainPaneFocus::Files => {
-                    self.files_selection = self.files.len().saturating_sub(1);
+                    self.files_selection = self.visible_rows.len().saturating_sub(1);
                     self.clamp_files_scroll();
                 }
             },
+            // Issue #15: `Space` toggles the selected directory row's
+            // collapsed state — a no-op off `Files` focus or off a
+            // directory row (a file row has nothing to toggle; `Confirm`/
+            // Enter is what opens it). Handled entirely here, unlike most
+            // `ui::mod`-intercepted actions, since there's no LSP/IO/
+            // overlay concern — just `App`'s own tree/collapse state, the
+            // same pure-state-flip shape `ToggleSidebar`/`ToggleComments`
+            // already have.
+            Action::ToggleDirectory => {
+                if self.focus == MainPaneFocus::Files
+                    && let Some(row) = self.visible_rows.get(self.files_selection)
+                    && matches!(row.kind, file_tree::VisibleKind::Directory { .. })
+                {
+                    let path = row.id.path.clone();
+                    self.toggle_directory(&path);
+                }
+            }
             // Hunk/file/symbol navigation is diff-content movement — while
             // `Files` is focused it stays a no-op rather than reaching into
             // a diff cursor the reviewer isn't looking at (req 5: "irrelevant
@@ -1143,34 +1241,106 @@ impl App {
     /// [`Self::cancel_search`], [`Self::recompute_search_live`].
     /// [`Self::resolve_files_selection`]'s callers (refresh/scope-swap/
     /// unit-filter) deliberately do *not* call this too — they resolve by
-    /// path/fallback instead, a stronger rule this would only interfere
-    /// with.
+    /// `NodeId`/fallback instead, a stronger rule this would only interfere
+    /// with. As of issue #15, "wherever the diff cursor sits" may resolve to
+    /// the cursor's own file row, or (when a collapsed directory hides it)
+    /// the nearest visible ancestor directory — see
+    /// [`Self::resolve_and_set_selection`], the same resolution
+    /// [`Self::confirm_files_selection`]'s `Toggled` outcome and
+    /// [`Self::toggle_directory`] itself both go through.
     fn sync_files_selection(&mut self) {
         if self.focus == MainPaneFocus::Diff {
-            self.files_selection = self.diff_file();
+            self.resolve_and_set_selection(None);
             self.clamp_files_scroll();
         }
     }
 
+    /// [`file_tree::NodeId`] for `files[file_idx]`'s own (never a directory)
+    /// row — what [`Self::resolve_and_set_selection`] resolves against as a
+    /// fallback candidate, and what [`Self::confirm_files_selection`] jumps
+    /// to for a selected file row. `None` only for an out-of-range
+    /// `file_idx` (an empty diff's `Self::diff_file`, which is always `0`
+    /// and never a valid index into an empty `files`).
+    fn file_node_id(&self, file_idx: usize) -> Option<NodeId> {
+        self.files.get(file_idx).map(|f| NodeId {
+            path: f.display_path().to_owned(),
+            is_directory: false,
+        })
+    }
+
+    /// Resolves `previous` (falling back to wherever the diff cursor's own
+    /// file currently sits) against the current `visible_rows`, via
+    /// [`file_tree::resolve_selection`], and sets `files_selection` to the
+    /// resulting row's index — or `0` if nothing resolves at all (an empty
+    /// `visible_rows`; `resolve_selection` itself already returns `None`
+    /// then). Deliberately leaves scroll untouched: [`Self::resolve_files_selection`]
+    /// (refresh/scope-swap/unit-filter) resets it to `0` afterward — those
+    /// operations can shift *everything*, so re-centering is the right
+    /// call — while [`Self::sync_files_selection`]/[`Self::toggle_directory`]
+    /// only clamp, since neither should yank a deliberately-scrolled sidebar
+    /// back to the top over what's typically a small, local change.
+    fn resolve_and_set_selection(&mut self, previous: Option<NodeId>) {
+        let fallback = self.file_node_id(self.diff_file());
+        let resolved =
+            file_tree::resolve_selection(&self.visible_rows, previous.as_ref(), fallback.as_ref());
+        self.files_selection = resolved
+            .and_then(|id| self.visible_rows.iter().position(|row| row.id == id))
+            .unwrap_or(0);
+    }
+
     /// Re-anchors `files_selection` (and resets/clamps its scroll) after an
-    /// operation that just replaced `files`/`rows` out from under it — a
+    /// operation that just rebuilt `visible_rows` out from under it — a
     /// watch refresh, a scope swap, or a unit-filter toggle (req 10). Tries
-    /// to keep browsing the *same file* by display path first, captured by
-    /// the caller *before* `files` was replaced (the sidebar's whole point
-    /// is a browsing position independent of the diff cursor, so an
-    /// operation that keeps the file present should keep the selection on
-    /// it too, even though the file's index can shift); falls back to
-    /// wherever the diff cursor landed ([`Self::diff_file`], which is also
-    /// `0` on an empty diff) otherwise — the same two-tier fallback
-    /// [`refresh::restore_anchor`] uses for the diff cursor itself, applied
-    /// here to the sidebar's independent position instead of just clamping
-    /// a possibly out-of-bounds index into a files list that may have
-    /// changed length.
-    fn resolve_files_selection(&mut self, previous_path: Option<String>) {
-        self.files_selection = previous_path
-            .and_then(|path| self.files.iter().position(|f| f.display_path() == path))
-            .unwrap_or_else(|| self.diff_file());
+    /// to keep browsing the *same node* first, identified by
+    /// [`file_tree::NodeId`] and captured by the caller *before*
+    /// `visible_rows` was rebuilt (the sidebar's whole point is a browsing
+    /// position independent of the diff cursor, so an operation that keeps
+    /// the node present — or at least a visible ancestor of it, once a
+    /// collapsed directory can hide it — should keep the selection there
+    /// too, even though a node's index can shift); falls back to wherever
+    /// the diff cursor landed otherwise, via [`Self::resolve_and_set_selection`].
+    fn resolve_files_selection(&mut self, previous: Option<NodeId>) {
+        self.resolve_and_set_selection(previous);
         self.files_scroll_offset = 0;
+        self.clamp_files_scroll();
+    }
+
+    /// The visible-row index that best represents wherever the diff cursor
+    /// currently sits — an exact match for that file's own row when it's
+    /// visible, or its nearest visible ancestor directory when a collapsed
+    /// directory hides it. Computed independently of `files_selection`
+    /// (which may have diverged from the diff cursor while `Files` owns its
+    /// own focus — see that field's docs) so [`crate::ui::sidebar::render`]
+    /// can still mark the diff's "background" file distinctly even then.
+    /// `None` only on an empty diff (`visible_rows` itself empty).
+    pub fn diff_file_visible_row(&self) -> Option<usize> {
+        let fallback = self.file_node_id(self.diff_file())?;
+        let resolved = file_tree::resolve_selection(&self.visible_rows, None, Some(&fallback));
+        resolved.and_then(|id| self.visible_rows.iter().position(|row| row.id == id))
+    }
+
+    /// `Space`/`Enter`'s effect on a selected directory row (issue #15):
+    /// flips its collapsed state, re-flattens `visible_rows` against the
+    /// updated `collapsed_dirs`, and re-anchors `files_selection` the same
+    /// way [`Self::resolve_files_selection`] does elsewhere — capturing the
+    /// *current* selection as `previous` before the flip is what makes req
+    /// 7 ("collapsing a directory that contains the selection moves
+    /// selection to that directory") fall out for free: if the selection
+    /// was a descendant that just got hidden, [`file_tree::resolve_selection`]'s
+    /// ancestor-walk tier lands it on `path` itself (now the nearest
+    /// visible ancestor) without this method needing to special-case that
+    /// at all. Only clamps scroll rather than resetting it — see
+    /// [`Self::resolve_and_set_selection`]'s docs on why.
+    pub fn toggle_directory(&mut self, path: &str) {
+        let previous = self
+            .visible_rows
+            .get(self.files_selection)
+            .map(|row| row.id.clone());
+        if !self.collapsed_dirs.remove(path) {
+            self.collapsed_dirs.insert(path.to_owned());
+        }
+        self.visible_rows = file_tree::flatten_visible(&self.tree, &self.collapsed_dirs);
+        self.resolve_and_set_selection(previous);
         self.clamp_files_scroll();
     }
 
@@ -1812,6 +1982,32 @@ mod tests {
         let mut app = App::new("test-repo".to_owned(), PathBuf::from("/repo"), files);
         app.set_viewport_height(10);
         app
+    }
+
+    /// The display path of whichever `visible_rows` node `files_selection`
+    /// currently points at — `None` for an out-of-range index (an empty
+    /// tree). Issue #15 made `files_selection` an index into the *tree's*
+    /// flattened rows rather than `files` directly (a directory row has no
+    /// `files` counterpart at all), so tests that want to assert "the
+    /// sidebar is browsing file X" read through this rather than
+    /// `app.files[app.files_selection]`, which — now that a leading
+    /// directory row can shift every file's row index — no longer names the
+    /// same file `files_selection`'s value would suggest.
+    fn selected_path(app: &App) -> Option<&str> {
+        Some(app.visible_rows.get(app.files_selection)?.id.path.as_str())
+    }
+
+    /// `files_selection`'s value re-expressed as a `file_idx` into `files`,
+    /// for tests that want to compare it against [`App::diff_file`] — the
+    /// pre-#15 relationship "`files_selection == diff_file()`" only held
+    /// because every row *was* a file row; #15's directory rows break that,
+    /// so this looks the file up through `visible_rows` instead. `None` for
+    /// a directory row or an out-of-range index.
+    fn selected_file_idx(app: &App) -> Option<usize> {
+        match app.visible_rows.get(app.files_selection)?.kind {
+            file_tree::VisibleKind::File { file_idx } => Some(file_idx),
+            file_tree::VisibleKind::Directory { .. } => None,
+        }
     }
 
     #[test]
@@ -3142,13 +3338,16 @@ index 1111111..2222222 100644\n\
     fn files_focused_cursor_down_and_up_move_and_clamp_the_selection() {
         let mut app = test_app();
         app.focus = MainPaneFocus::Files;
-        let last = app.files.len() - 1;
+        // One extra row over `files.len()` for the fixture's single "src"
+        // directory row (issue #15) — every file in `FIXTURE` shares that
+        // one top-level prefix.
+        let last = app.visible_rows.len() - 1;
         app.update(Action::CursorUp); // already at 0: must not underflow
         assert_eq!(app.files_selection, 0);
-        for _ in 0..app.files.len() + 2 {
+        for _ in 0..app.visible_rows.len() + 2 {
             app.update(Action::CursorDown);
         }
-        assert_eq!(app.files_selection, last, "must clamp at the last file");
+        assert_eq!(app.files_selection, last, "must clamp at the last row");
         app.update(Action::Top);
         assert_eq!(app.files_selection, 0);
         app.update(Action::Bottom);
@@ -3189,12 +3388,12 @@ index 1111111..2222222 100644\n\
         assert_eq!(app.focus, MainPaneFocus::Diff);
         app.update(Action::NextFile);
         assert_eq!(
-            app.files_selection,
-            app.diff_file(),
+            selected_file_idx(&app),
+            Some(app.diff_file()),
             "the sidebar must track wherever the diff cursor lands"
         );
         app.update(Action::NextFile);
-        assert_eq!(app.files_selection, app.diff_file());
+        assert_eq!(selected_file_idx(&app), Some(app.diff_file()));
     }
 
     #[test]
@@ -3233,27 +3432,35 @@ index 1111111..2222222 100644\n\
     fn refresh_preserves_the_files_selection_by_path_when_it_survives() {
         let mut app = test_app();
         app.files_selection = app
-            .files
+            .visible_rows
             .iter()
-            .position(|f| f.display_path() == "src/new_module.rs")
+            .position(|r| r.id.path == "src/new_module.rs")
             .unwrap();
         let same_files = parse_unified_diff(FIXTURE);
         app.apply_refresh(same_files);
         assert_eq!(
-            app.files[app.files_selection].display_path(),
-            "src/new_module.rs",
+            selected_path(&app),
+            Some("src/new_module.rs"),
             "a refresh that keeps the file must keep browsing it"
         );
     }
 
+    /// Issue #15's ancestor-walk tier (`file_tree::resolve_selection`) sits
+    /// *ahead* of the plain fallback-to-diff-cursor tier — see that
+    /// function's docs. So a vanished selection whose parent directory
+    /// still exists (every other `FIXTURE` file shares the "src" prefix
+    /// `old_module.rs` also had) lands on that directory, not on wherever
+    /// the diff cursor happens to be. This supersedes #14's
+    /// `refresh_falls_back_to_the_diff_file_when_the_selected_path_disappears`,
+    /// whose "fall straight back to the diff cursor" expectation predates
+    /// there being any ancestor to land on at all.
     #[test]
-    fn refresh_falls_back_to_the_diff_file_when_the_selected_path_disappears() {
+    fn refresh_falls_back_to_the_nearest_surviving_ancestor_directory_when_the_file_vanishes() {
         let mut app = test_app();
-        // Select a file this refresh's incoming diff won't contain at all.
         app.files_selection = app
-            .files
+            .visible_rows
             .iter()
-            .position(|f| f.display_path() == "src/old_module.rs")
+            .position(|r| r.id.path == "src/old_module.rs")
             .unwrap();
         let narrowed = parse_unified_diff(FIXTURE)
             .into_iter()
@@ -3261,9 +3468,35 @@ index 1111111..2222222 100644\n\
             .collect::<Vec<_>>();
         app.apply_refresh(narrowed);
         assert_eq!(
-            app.files_selection,
-            app.diff_file(),
-            "a vanished selection must fall back to the restored diff cursor's file"
+            selected_path(&app),
+            Some("src"),
+            "the vanished file's parent directory still exists, so the ancestor-walk \
+             tier lands there ahead of falling back to the diff cursor's file"
+        );
+    }
+
+    /// The plain fallback-to-diff-cursor tier only fires once the
+    /// ancestor-walk tier has nothing left to land on either — a refresh
+    /// whose new diff shares no path prefix with the vanished selection at
+    /// all.
+    #[test]
+    fn refresh_falls_back_to_the_diff_file_when_no_ancestor_survives_either() {
+        let mut app = test_app();
+        app.files_selection = app
+            .visible_rows
+            .iter()
+            .position(|r| r.id.path == "src/old_module.rs")
+            .unwrap();
+        let files = vec![DiffFile {
+            new_path: Some("other.rs".to_owned()),
+            old_path: Some("other.rs".to_owned()),
+            ..Default::default()
+        }];
+        app.apply_refresh(files);
+        assert_eq!(
+            selected_file_idx(&app),
+            Some(app.diff_file()),
+            "with no ancestor to land on, the selection falls back to the diff cursor's file"
         );
     }
 
@@ -3271,15 +3504,15 @@ index 1111111..2222222 100644\n\
     fn scope_swap_preserves_the_files_selection_by_path_despite_resetting_the_cursor() {
         let mut app = test_app();
         app.files_selection = app
-            .files
+            .visible_rows
             .iter()
-            .position(|f| f.display_path() == "src/new_module.rs")
+            .position(|r| r.id.path == "src/new_module.rs")
             .unwrap();
         app.apply_scope_swap(parse_unified_diff(FIXTURE), true, false, None);
         assert_eq!(app.cursor, 0, "the diff cursor always resets to the top");
         assert_eq!(
-            app.files[app.files_selection].display_path(),
-            "src/new_module.rs",
+            selected_path(&app),
+            Some("src/new_module.rs"),
             "but the files-pane selection tries to survive by path"
         );
     }
@@ -3289,9 +3522,9 @@ index 1111111..2222222 100644\n\
         let mut app = test_app();
         let target_path = "src/new_module.rs".to_owned();
         app.files_selection = app
-            .files
+            .visible_rows
             .iter()
-            .position(|f| f.display_path() == target_path)
+            .position(|r| r.id.path == target_path)
             .unwrap();
         let hunk_id = crate::groups::enumerate_hunks(&app.files)
             .into_iter()
@@ -3306,15 +3539,345 @@ index 1111111..2222222 100644\n\
             hunk_ids: HashSet::from([hunk_id]),
         });
         assert!(
-            app.files_selection < app.files.len(),
-            "the selection must never point past the narrowed files list"
+            app.files_selection < app.visible_rows.len(),
+            "the selection must never point past the narrowed tree"
         );
-        assert_eq!(app.files[app.files_selection].display_path(), target_path);
+        assert_eq!(selected_path(&app), Some(target_path.as_str()));
 
         assert!(app.clear_unit_filter());
         assert!(
-            app.files_selection < app.files.len(),
+            app.files_selection < app.visible_rows.len(),
             "widening back must also leave the selection in bounds"
         );
+    }
+
+    // ---- collapsible tree integration (issue #15) ------------------------
+
+    /// A three-file, two-directory fixture for tests that need real
+    /// collapse/expand behavior — `FIXTURE`'s files all share one `src`
+    /// prefix, too flat to exercise nesting.
+    fn nested_app() -> App {
+        let files = vec![
+            crate::diff::DiffFile {
+                new_path: Some("src/a.rs".to_owned()),
+                old_path: Some("src/a.rs".to_owned()),
+                ..Default::default()
+            },
+            crate::diff::DiffFile {
+                new_path: Some("src/nested/b.rs".to_owned()),
+                old_path: Some("src/nested/b.rs".to_owned()),
+                ..Default::default()
+            },
+            crate::diff::DiffFile {
+                new_path: Some("other.rs".to_owned()),
+                old_path: Some("other.rs".to_owned()),
+                ..Default::default()
+            },
+        ];
+        App::new("test-repo".to_owned(), PathBuf::from("/repo"), files)
+    }
+
+    #[test]
+    fn toggle_directory_collapses_and_re_expands_a_row() {
+        let mut app = nested_app();
+        let src_idx = app
+            .visible_rows
+            .iter()
+            .position(|r| r.id.path == "src" && r.id.is_directory)
+            .unwrap();
+        assert!(matches!(
+            app.visible_rows[src_idx].kind,
+            file_tree::VisibleKind::Directory { expanded: true, .. }
+        ));
+        let before_len = app.visible_rows.len();
+
+        app.toggle_directory("src");
+        assert!(matches!(
+            app.visible_rows[src_idx].kind,
+            file_tree::VisibleKind::Directory {
+                expanded: false,
+                ..
+            }
+        ));
+        assert!(
+            app.visible_rows.len() < before_len,
+            "collapsing must hide src's descendants"
+        );
+
+        app.toggle_directory("src");
+        assert_eq!(
+            app.visible_rows.len(),
+            before_len,
+            "expanding must restore every descendant row"
+        );
+    }
+
+    /// req 7: collapsing a directory that contains the current selection
+    /// must move the selection onto that directory, not leave it pointing
+    /// at a row that no longer exists.
+    #[test]
+    fn collapsing_a_directory_containing_the_selection_reselects_that_directory() {
+        let mut app = nested_app();
+        app.focus = MainPaneFocus::Files;
+        let nested_file_idx = app
+            .visible_rows
+            .iter()
+            .position(|r| r.id.path == "src/nested/b.rs")
+            .unwrap();
+        app.files_selection = nested_file_idx;
+
+        app.toggle_directory("src/nested");
+
+        assert_eq!(
+            selected_path(&app),
+            Some("src/nested"),
+            "the selection must land on the collapsed directory"
+        );
+    }
+
+    #[test]
+    fn confirm_on_a_directory_row_toggles_without_moving_focus_or_the_diff_cursor() {
+        let mut app = nested_app();
+        app.focus = MainPaneFocus::Files;
+        app.files_selection = app
+            .visible_rows
+            .iter()
+            .position(|r| r.id.path == "src" && r.id.is_directory)
+            .unwrap();
+        let cursor_before = app.cursor;
+
+        let outcome = app.confirm_files_selection();
+        assert_eq!(outcome, crate::ui::navigation::FilesConfirmOutcome::Toggled);
+        assert_eq!(app.focus, MainPaneFocus::Files);
+        assert_eq!(app.cursor, cursor_before);
+    }
+
+    #[test]
+    fn confirm_on_a_file_row_opens_it_and_focuses_diff() {
+        let mut app = nested_app();
+        app.focus = MainPaneFocus::Files;
+        app.files_selection = app
+            .visible_rows
+            .iter()
+            .position(|r| r.id.path == "other.rs")
+            .unwrap();
+
+        let outcome = app.confirm_files_selection();
+        assert!(matches!(
+            outcome,
+            crate::ui::navigation::FilesConfirmOutcome::Opened(_)
+        ));
+        assert_eq!(app.focus, MainPaneFocus::Diff);
+    }
+
+    #[test]
+    fn toggle_action_is_a_no_op_on_a_file_row_or_outside_files_focus() {
+        let mut app = nested_app();
+        app.focus = MainPaneFocus::Files;
+        app.files_selection = app
+            .visible_rows
+            .iter()
+            .position(|r| r.id.path == "other.rs")
+            .unwrap();
+        let before = app.visible_rows.len();
+        app.update(Action::ToggleDirectory);
+        assert_eq!(
+            app.visible_rows.len(),
+            before,
+            "a file row has nothing to toggle"
+        );
+
+        app.focus = MainPaneFocus::Diff;
+        app.files_selection = app
+            .visible_rows
+            .iter()
+            .position(|r| r.id.path == "src" && r.id.is_directory)
+            .unwrap();
+        app.update(Action::ToggleDirectory);
+        assert_eq!(
+            app.visible_rows.len(),
+            before,
+            "ToggleDirectory must do nothing outside Files focus"
+        );
+    }
+
+    #[test]
+    fn refresh_prunes_a_collapsed_directory_path_that_no_longer_exists() {
+        let mut app = nested_app();
+        app.toggle_directory("src/nested");
+        assert!(app.visible_rows.iter().any(|r| r.id.path == "src/nested"
+            && !matches!(
+                r.kind,
+                file_tree::VisibleKind::Directory { expanded: true, .. }
+            )));
+
+        // A refresh whose new diff no longer touches anything under
+        // `src/nested` at all — the collapsed path must be pruned rather
+        // than lingering as dead state forever.
+        let files = vec![crate::diff::DiffFile {
+            new_path: Some("other.rs".to_owned()),
+            old_path: Some("other.rs".to_owned()),
+            ..Default::default()
+        }];
+        app.apply_refresh(files);
+        assert!(
+            app.visible_rows.iter().all(|r| r.id.path != "src/nested"),
+            "src/nested no longer exists in the refreshed tree"
+        );
+
+        // Rebuilding a tree that reintroduces `src/nested` must start
+        // expanded again — pruning drops the stale collapse entry rather
+        // than somehow resurrecting it later.
+        let files_again = vec![crate::diff::DiffFile {
+            new_path: Some("src/nested/b.rs".to_owned()),
+            old_path: Some("src/nested/b.rs".to_owned()),
+            ..Default::default()
+        }];
+        app.apply_refresh(files_again);
+        let nested_row = app
+            .visible_rows
+            .iter()
+            .find(|r| r.id.path == "src/nested")
+            .expect("src/nested exists again");
+        assert!(matches!(
+            nested_row.kind,
+            file_tree::VisibleKind::Directory { expanded: true, .. }
+        ));
+    }
+
+    #[test]
+    fn refresh_keeps_a_collapsed_directory_whose_files_survive() {
+        // The other half of req 8 / epic decision 5, pinned on the
+        // *live-watch* entry point specifically: `apply_refresh` is what
+        // `ui::mod`'s watch path actually calls, and it is a different
+        // function from `apply_scope_swap` (different anchor/search/fold
+        // handling around the same rederive), so the scope-swap test below
+        // can't stand in for it.
+        let mut app = nested_app();
+        app.toggle_directory("src/nested");
+
+        app.apply_refresh(vec![
+            crate::diff::DiffFile {
+                new_path: Some("src/a.rs".to_owned()),
+                old_path: Some("src/a.rs".to_owned()),
+                ..Default::default()
+            },
+            crate::diff::DiffFile {
+                new_path: Some("src/nested/b.rs".to_owned()),
+                old_path: Some("src/nested/b.rs".to_owned()),
+                ..Default::default()
+            },
+        ]);
+
+        let nested_row = app
+            .visible_rows
+            .iter()
+            .find(|r| r.id.path == "src/nested")
+            .expect("src/nested still exists after the refresh");
+        assert!(
+            matches!(
+                nested_row.kind,
+                file_tree::VisibleKind::Directory {
+                    expanded: false,
+                    ..
+                }
+            ),
+            "a refresh that keeps the directory must keep it collapsed"
+        );
+        assert!(
+            app.visible_rows
+                .iter()
+                .all(|r| r.id.path != "src/nested/b.rs"),
+            "descendants of the still-collapsed directory stay hidden"
+        );
+    }
+
+    #[test]
+    fn scope_swap_keeps_collapsed_directory_state() {
+        // Epic decision 5 / plan-15 §5: unlike `expanded_folds`/
+        // `unit_filter`, a scope swap deliberately does *not* clear
+        // `collapsed_dirs` — a reviewer's "which directories I like folded"
+        // preference plausibly carries over even into an unrelated diff.
+        let mut app = nested_app();
+        app.toggle_directory("src/nested");
+
+        app.apply_scope_swap(
+            vec![
+                crate::diff::DiffFile {
+                    new_path: Some("src/a.rs".to_owned()),
+                    old_path: Some("src/a.rs".to_owned()),
+                    ..Default::default()
+                },
+                crate::diff::DiffFile {
+                    new_path: Some("src/nested/b.rs".to_owned()),
+                    old_path: Some("src/nested/b.rs".to_owned()),
+                    ..Default::default()
+                },
+            ],
+            true,
+            false,
+            None,
+        );
+
+        let nested_row = app
+            .visible_rows
+            .iter()
+            .find(|r| r.id.path == "src/nested")
+            .expect("src/nested still exists after the swap");
+        assert!(
+            matches!(
+                nested_row.kind,
+                file_tree::VisibleKind::Directory {
+                    expanded: false,
+                    ..
+                }
+            ),
+            "a scope swap must keep collapsed_dirs, unlike fold/unit state"
+        );
+    }
+
+    #[test]
+    fn rename_is_addressable_at_its_new_path() {
+        let files = parse_unified_diff(FIXTURE);
+        let app = App::new("test-repo".to_owned(), PathBuf::from("/repo"), files);
+        let renamed = app
+            .visible_rows
+            .iter()
+            .find(|r| r.id.path == "src/renamed_to.rs")
+            .expect("the rename appears at its new path in the tree");
+        assert!(matches!(renamed.kind, file_tree::VisibleKind::File { .. }));
+        assert!(
+            app.visible_rows
+                .iter()
+                .all(|r| r.id.path != "src/renamed_from.rs"),
+            "the old path must not appear as its own tree row"
+        );
+    }
+
+    #[test]
+    fn confirm_opens_a_renamed_file_at_its_new_path_header() {
+        // Beyond the row merely existing (the test above): the acceptance
+        // criterion is that every visible file can be *opened* — drive the
+        // rename through the same confirm path Enter uses and land on its
+        // header row in the diff.
+        let files = parse_unified_diff(FIXTURE);
+        let mut app = App::new("test-repo".to_owned(), PathBuf::from("/repo"), files);
+        app.focus = MainPaneFocus::Files;
+        app.files_selection = app
+            .visible_rows
+            .iter()
+            .position(|r| r.id.path == "src/renamed_to.rs")
+            .expect("rename row present");
+
+        let outcome = app.confirm_files_selection();
+        let crate::ui::navigation::FilesConfirmOutcome::Opened(entry) = outcome else {
+            panic!("expected Opened, got {outcome:?}");
+        };
+        assert_eq!(entry.line, None, "a tree jump targets the file header");
+        let RenderRow::FileHeader { file_idx } = app.rows[app.cursor] else {
+            panic!("cursor must land on the file header row");
+        };
+        assert_eq!(app.files[file_idx].display_path(), "src/renamed_to.rs");
+        assert_eq!(app.focus, MainPaneFocus::Diff);
     }
 }

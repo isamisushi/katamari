@@ -356,6 +356,7 @@ between.
 | Next / prev symbol on line | `l` / `h` | `M-f` / `M-b` |
 | Confirm / cancel | `Enter` / `Esc` | `Enter` / `Esc` |
 | Toggle sidebar | `b` | `b` |
+| Toggle directory (files pane) | `Space` | `Space` |
 | Toggle unified/side-by-side | `s` | `s` |
 | Toggle timeline | `t` | `t` |
 | Toggle log view | `L` | `L` |

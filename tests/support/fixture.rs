@@ -290,6 +290,64 @@ pub fn python3_available() -> bool {
         .is_ok()
 }
 
+/// A repo shaped for issue #15's file-tree PTY coverage: a changed file
+/// nested at least two directories deep, a deleted file, a renamed file,
+/// and a large padding file placed alphabetically (and therefore
+/// diff-order) first. `tests/e2e/file_tree.rs` spawns `ktmr diff --staged`
+/// against this fixture, not the plain working-tree default: katamari's own
+/// `GitSource::working_tree_diff` combines plain `git diff` (tracked,
+/// unstaged changes) with a *separate* `--no-index` diff per untracked
+/// file, so an unstaged rename (an untracked new path plus a missing
+/// tracked one) can never pair up into one `rename from`/`rename to` entry
+/// the way a *staged* rename does — only `git diff --cached` (what
+/// `--staged` shows) ever produces one.
+///
+/// `src/aaa_padding.txt`'s only job is bulk: 60 added lines, sorted (and
+/// therefore diffed) ahead of everything else, so the nested marker file's
+/// own `FileHeader` row lands well below a real terminal's initial diff-pane
+/// viewport at the default `SpawnOptions` size. That's what makes
+/// "`NESTED_MARKER_UNIQUE` leaves the screen when its directory collapses"
+/// an unambiguous witness for the *sidebar's* own collapse state rather
+/// than a coincidence of whatever the diff pane happens to have scrolled to
+/// — collapsing a tree row never changes the diff pane's own content, only
+/// the sidebar's.
+pub fn tree_repo() -> FixtureRepo {
+    let dir = init_repo();
+    let root = dir.path();
+    let src = root.join("src");
+    let nested = src.join("nested").join("deep");
+    std::fs::create_dir_all(&nested).unwrap();
+
+    std::fs::write(src.join("doomed.txt"), "going away soon\n").unwrap();
+    std::fs::write(
+        src.join("old_name.txt"),
+        "renamed content\nline two\nline three\n",
+    )
+    .unwrap();
+    std::fs::write(nested.join("NESTED_MARKER_UNIQUE.txt"), "before\nafter\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "initial commit"]);
+
+    let padding: String = (1..=60).map(|n| format!("padding line {n}\n")).collect();
+    std::fs::write(src.join("aaa_padding.txt"), padding).unwrap();
+
+    std::fs::remove_file(src.join("doomed.txt")).unwrap();
+
+    std::fs::write(
+        nested.join("NESTED_MARKER_UNIQUE.txt"),
+        "before\nMARKER_CONTENT_LINE_UNIQUE\nafter\n",
+    )
+    .unwrap();
+
+    std::fs::rename(src.join("old_name.txt"), src.join("new_name.txt")).unwrap();
+
+    // Everything above must be staged — see this function's own docs on
+    // why a rename only survives as one diff entry once it's in the index.
+    git(root, &["add", "-A"]);
+
+    FixtureRepo { dir }
+}
+
 pub fn lsp_readiness_repo(init_delay_secs: f64, definition_delay_secs: f64) -> FixtureRepo {
     lsp_readiness_repo_inner(init_delay_secs, definition_delay_secs, false)
 }

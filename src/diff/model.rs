@@ -53,6 +53,20 @@ pub struct DiffHunk {
     pub known_eof: bool,
 }
 
+/// A changed file's high-level status, for the sidebar's file-tree badge
+/// (issue #15) — a small, closed classification rather than exposing
+/// [`DiffFile`]'s three raw booleans directly, so a rendering site (or a
+/// future consumer, e.g. a mouse tooltip) matches on one value instead of
+/// re-deriving the same priority order [`DiffFile::status`] already
+/// centralizes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileStatus {
+    Added,
+    Deleted,
+    Renamed,
+    Modified,
+}
+
 /// All hunks belonging to one file entry in the diff, plus the file-level
 /// metadata git prints outside of any hunk (rename, new/deleted status).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -77,6 +91,41 @@ impl DiffFile {
             .as_deref()
             .or(self.old_path.as_deref())
             .unwrap_or("<unknown>")
+    }
+
+    /// This file's change kind, for [`Self::badge`] and anything else that
+    /// needs the classification without the single-letter rendering
+    /// attached. Priority `is_deleted` > `is_renamed` > `is_new` >
+    /// `Modified` (the fallback for a plain content change, or for none of
+    /// the three flags being set at all): `parse_unified_diff` only ever
+    /// sets one of the three per real git diff, but every `DiffFile` this
+    /// module's own tests construct builds one directly rather than through
+    /// the parser, so a defensive order still matters — `is_deleted` wins
+    /// over `is_renamed` because a reviewer needs to know the file is gone
+    /// before they need to know what it used to be called, and git itself
+    /// can't actually produce a diff with both flags set together to
+    /// disagree with that ordering anyway.
+    pub fn status(&self) -> FileStatus {
+        if self.is_deleted {
+            FileStatus::Deleted
+        } else if self.is_renamed {
+            FileStatus::Renamed
+        } else if self.is_new {
+            FileStatus::Added
+        } else {
+            FileStatus::Modified
+        }
+    }
+
+    /// The single-letter status badge [`crate::ui::sidebar`] renders in the
+    /// file tree's marker column, matching [`Self::status`]'s priority.
+    pub fn badge(&self) -> char {
+        match self.status() {
+            FileStatus::Added => 'A',
+            FileStatus::Deleted => 'D',
+            FileStatus::Renamed => 'R',
+            FileStatus::Modified => 'M',
+        }
     }
 
     /// `(added, deleted)` line counts across all hunks, for the sidebar stat
@@ -850,6 +899,7 @@ mod tests {
             .find(|f| f.display_path() == "src/lib.rs")
             .expect("modified file present");
         assert!(!modified.is_new && !modified.is_deleted && !modified.is_renamed);
+        assert_eq!(modified.status(), FileStatus::Modified);
         assert_eq!(modified.hunks.len(), 1);
         let hunk = &modified.hunks[0];
         assert_eq!((hunk.old_start, hunk.old_lines), (1, 4));
@@ -892,6 +942,7 @@ mod tests {
             .expect("new file present");
         assert!(new_file.is_new);
         assert!(!new_file.is_deleted);
+        assert_eq!(new_file.status(), FileStatus::Added);
         assert_eq!(new_file.old_path, None);
         let (added, deleted) = new_file.stat();
         assert_eq!((added, deleted), (2, 0));
@@ -906,6 +957,7 @@ mod tests {
             .expect("deleted file present");
         assert!(deleted.is_deleted);
         assert!(!deleted.is_new);
+        assert_eq!(deleted.status(), FileStatus::Deleted);
         let (added, removed) = deleted.stat();
         assert_eq!((added, removed), (0, 2));
     }
@@ -919,6 +971,7 @@ mod tests {
             .expect("renamed file present");
         assert_eq!(renamed.old_path.as_deref(), Some("src/renamed_from.rs"));
         assert_eq!(renamed.new_path.as_deref(), Some("src/renamed_to.rs"));
+        assert_eq!(renamed.status(), FileStatus::Renamed);
     }
 
     #[test]
@@ -1597,5 +1650,71 @@ index 1111111..2222222 100644\n\
             rows[gap_positions[1]],
             RenderRow::Gap { gap_idx: 1, .. }
         ));
+    }
+
+    // -- Status badges (issue #15) -----------------------------------------
+
+    #[test]
+    fn status_defaults_to_modified_when_no_flag_is_set() {
+        let file = DiffFile {
+            new_path: Some("src/lib.rs".to_owned()),
+            old_path: Some("src/lib.rs".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(file.status(), FileStatus::Modified);
+        assert_eq!(file.badge(), 'M');
+    }
+
+    #[test]
+    fn status_reads_added_deleted_and_renamed_flags() {
+        let added = DiffFile {
+            is_new: true,
+            ..Default::default()
+        };
+        assert_eq!(added.status(), FileStatus::Added);
+        assert_eq!(added.badge(), 'A');
+
+        let deleted = DiffFile {
+            is_deleted: true,
+            ..Default::default()
+        };
+        assert_eq!(deleted.status(), FileStatus::Deleted);
+        assert_eq!(deleted.badge(), 'D');
+
+        let renamed = DiffFile {
+            is_renamed: true,
+            ..Default::default()
+        };
+        assert_eq!(renamed.status(), FileStatus::Renamed);
+        assert_eq!(renamed.badge(), 'R');
+    }
+
+    /// `parse_unified_diff` only ever sets one of `is_new`/`is_deleted`/
+    /// `is_renamed` per real diff, but [`DiffFile::status`]'s priority order
+    /// still needs pinning down for whatever combination a directly
+    /// constructed `DiffFile` (every other fixture in this module included)
+    /// might carry — see that method's own docs for why `is_deleted` wins.
+    #[test]
+    fn status_prioritizes_deleted_over_renamed_over_added_when_multiple_flags_are_set() {
+        let deleted_and_renamed = DiffFile {
+            is_deleted: true,
+            is_renamed: true,
+            ..Default::default()
+        };
+        assert_eq!(deleted_and_renamed.status(), FileStatus::Deleted);
+
+        let renamed_and_new = DiffFile {
+            is_renamed: true,
+            is_new: true,
+            ..Default::default()
+        };
+        assert_eq!(renamed_and_new.status(), FileStatus::Renamed);
+
+        let deleted_and_new = DiffFile {
+            is_deleted: true,
+            is_new: true,
+            ..Default::default()
+        };
+        assert_eq!(deleted_and_new.status(), FileStatus::Deleted);
     }
 }

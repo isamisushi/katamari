@@ -16,6 +16,7 @@
 pub mod app;
 pub mod compose;
 pub mod diff_view;
+pub mod file_tree;
 pub mod file_view;
 pub mod help;
 pub mod hints;
@@ -61,7 +62,7 @@ use crate::skill;
 use crate::ui::compose::{ComposeOutcome, ComposeState};
 use crate::ui::help::{HelpOutcome, HelpState};
 use crate::ui::log_view::LogView;
-use crate::ui::navigation::{JumpEntry, JumpStack, navigate_to, record_jump};
+use crate::ui::navigation::{FilesConfirmOutcome, JumpEntry, JumpStack, navigate_to, record_jump};
 use crate::ui::refs_panel::RefsPanel;
 use crate::ui::scope_menu::{
     RevisionInputOutcome, ScopeMenuEntry, ScopeMenuState, handle_revision_key,
@@ -2268,24 +2269,29 @@ fn handle_action(
                 *goto_status = Some("scope: only available in the diff view".to_owned());
             }
         },
-        // Issue #14: Enter while `Files` has focus jumps the diff cursor to
-        // the selected file's header, hands focus to `Diff`, and records
-        // the jump in the general history exactly like every other
-        // significant navigation does (`from` captured *before*
-        // `confirm_files_selection` moves the cursor, so a header/`Del`-row
-        // starting point that has no source location of its own naturally
-        // records nothing — see `record_jump`'s docs). Checked ahead of the
-        // `stack.top_mut()` match below rather than as another arm inside
-        // it, since this needs an immutable `jump_entry()` read of the
-        // *pre-jump* cursor before the mutable call that moves it.
+        // Issue #14 (extended by #15's tree): Enter while `Files` has focus
+        // either opens the selected file (jumps the diff cursor to its
+        // header, hands focus to `Diff`, and records the jump in the
+        // general history exactly like every other significant navigation
+        // does — `from` captured *before* `confirm_files_selection` moves
+        // the cursor, so a header/`Del`-row starting point that has no
+        // source location of its own naturally records nothing, see
+        // `record_jump`'s docs) or toggles the selected directory, which
+        // records no jump and invalidates no hover popup at all — nothing
+        // under the diff cursor changed, so there's nothing for an open
+        // hover to have drifted from. Checked ahead of the `stack.top_mut()`
+        // match below rather than as another arm inside it, since this
+        // needs an immutable `jump_entry()` read of the *pre-jump* cursor
+        // before the mutable call that moves it.
         Action::Confirm if matches!(stack.top(), View::Diff(app) if app.focus == app::MainPaneFocus::Files) =>
         {
             let from = stack.top().jump_entry();
-            let to = match stack.top_mut() {
+            let outcome = match stack.top_mut() {
                 View::Diff(app) => app.confirm_files_selection(),
-                _ => None, // unreachable — the guard above already matched View::Diff
+                // unreachable — the guard above already matched View::Diff
+                _ => FilesConfirmOutcome::NoSelection,
             };
-            if let Some(to) = to {
+            if let FilesConfirmOutcome::Opened(to) = outcome {
                 record_jump(jump_stack, from, Some(to));
                 hover_state.invalidate();
             }

@@ -223,6 +223,18 @@ pub enum Action {
     NextMatch,
     /// `N`: as `NextMatch`, the previous match.
     PrevMatch,
+    /// Issue #15: toggles a directory row's expanded/collapsed state in the
+    /// files pane's tree — the same action `Confirm`/Enter already performs
+    /// on a directory row (see `App::confirm_files_selection`'s
+    /// `FilesConfirmOutcome::Toggled`), bound separately to plain `Space` so
+    /// a reviewer can collapse/expand without also handing focus back to
+    /// `Diff` the way confirming a *file* row does. Handled entirely inside
+    /// `App::update`, gated on `Files` focus and the selected row actually
+    /// being a directory (a no-op on a file row, or outside `Files` focus —
+    /// see that gate's own docs) — unlike most `ui::mod`-intercepted
+    /// actions, there's no LSP/IO/overlay concern here, just a pure state
+    /// flip over `App`'s own tree/collapse state.
+    ToggleDirectory,
 }
 
 /// One key press, normalized for matching: the SHIFT modifier is dropped
@@ -605,6 +617,7 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
     bindings.push(("M-Right", Action::JumpForward));
     bindings.extend([
         ("Enter", Action::Confirm),
+        ("Space", Action::ToggleDirectory),
         ("Tab", Action::FocusNextPane),
         ("BackTab", Action::FocusPrevPane),
         ("Esc", Action::Cancel),
@@ -690,6 +703,12 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
     bindings.push(("M-Right", Action::JumpForward));
     bindings.extend([
         ("Enter", Action::Confirm),
+        // Same vim-keys-for-things-with-no-emacs-identity rule as `q`/`b`/
+        // `s` below: `C-Space` already means `set-mark-command`
+        // (`ToggleRangeSelect`), so plain `Space` for the files-pane tree's
+        // expand/collapse has no competing emacs convention to defer to
+        // either.
+        ("Space", Action::ToggleDirectory),
         ("Tab", Action::FocusNextPane),
         ("BackTab", Action::FocusPrevPane),
         ("Esc", Action::Cancel),
@@ -793,6 +812,7 @@ pub fn action_name(action: Action) -> &'static str {
         Action::OpenSearch => "open-search",
         Action::NextMatch => "next-match",
         Action::PrevMatch => "prev-match",
+        Action::ToggleDirectory => "toggle-directory",
     }
 }
 
@@ -844,6 +864,7 @@ pub fn action_by_name(name: &str) -> Option<Action> {
         "open-search" => Action::OpenSearch,
         "next-match" => Action::NextMatch,
         "prev-match" => Action::PrevMatch,
+        "toggle-directory" => Action::ToggleDirectory,
         _ => return None,
     })
 }
@@ -1270,6 +1291,7 @@ mod tests {
             Action::ToggleUnits,
             Action::RegenerateUnits,
             Action::ToggleHints,
+            Action::ToggleDirectory,
         ];
         for action in all {
             let name = action_name(action);
@@ -1428,14 +1450,14 @@ mod tests {
         assert_eq!(KeySeq::parse("q").compact_notation(), "q");
     }
 
-    /// The 42 actions (see the `action_name_and_action_by_name_round_trip…`
+    /// The 43 actions (see the `action_name_and_action_by_name_round_trip…`
     /// test's `all` list) each get exactly one binding — except `JumpBack`,
     /// which always gets a second one (`M-Left`), and `JumpForward`, which
     /// gets a second one (`C-i`) precisely when `ci_distinguishable` is set
     /// (per [`vim_preset`]/[`emacs_preset`]'s docs, `M-Right` *replaces* the
     /// pre-#12 `C-t` as `JumpForward`'s own single baseline binding rather
     /// than adding to it). So this checks two things per preset: every
-    /// action is still reachable (`actions.len() == 42` after dedup), and
+    /// action is still reachable (`actions.len() == 43` after dedup), and
     /// the raw entry count is exactly one more than that (`JumpBack`'s
     /// unconditional `M-Left` alias) plus one more still when the extra
     /// `C-i` alias is present. As a side effect, this also forces
@@ -1447,7 +1469,7 @@ mod tests {
     /// `open_help_binds_to_plain_question_mark_in_both_presets` test.
     #[test]
     fn every_vim_and_emacs_binding_covers_every_action_exactly_once() {
-        const ACTION_COUNT: usize = 42;
+        const ACTION_COUNT: usize = 43;
         for ci_distinguishable in [false, true] {
             for preset in [
                 vim_preset(ci_distinguishable),
