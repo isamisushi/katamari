@@ -242,7 +242,8 @@ An AI coding agent addresses them with:
 ```
 ktmr comments list --json           # or: ktmr comments export --format=md
 ktmr comments resolve <id>          # after addressing one (reopen <id> undoes it)
-ktmr comments add <file> <line> <body>   # leave a comment from a script/agent
+ktmr comments add <file> <line> <body>                    # leave a comment from a script/agent
+ktmr comments add <file> <start> <body> --end-line <end>  # ...or on a line range
 ```
 
 ...making the requested changes and resolving each comment it handles —

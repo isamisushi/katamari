@@ -36,6 +36,13 @@ resolved — this skill is that workflow.
    (katamari's own UI relocates comments live as the file changes; this CLI
    output always reports the comment's last known anchor.)
 
+   A comment can also cover a contiguous range instead of one line: when
+   that's the case, the object also has an `end_anchor` with the same shape
+   as `anchor`, and the two together mean "every line from `anchor.new_line`
+   to `end_anchor.new_line`, inclusive." Treat the comment as being about
+   that *whole* range — read and address every line in it, not just the
+   first one.
+
 2. For each open comment, make the requested change in the working tree.
 
 3. Mark it resolved:
@@ -61,14 +68,16 @@ resolved — this skill is that workflow.
   paste-ready markdown report, grouped by file, if you need to hand a
   summary back to the reviewer instead of (or alongside) resolving inline.
 - `ktmr comments add <file> <line> <body>` — leave a comment yourself
-  (e.g. to flag something you noticed but aren't fixing right now).
+  (e.g. to flag something you noticed but aren't fixing right now). Add
+  `--end-line <line>` to comment on a range instead of a single line, e.g.
+  `ktmr comments add src/lib.rs 10 "extract this" --end-line 18`.
 - `ktmr comments reopen <id>` — undo an accidental resolve.
 
 ## Notes
 
-- Comment anchors are always `file:line` in the *working tree*, never a
-  commit or a diff hunk — they describe "this line, as it exists on disk
-  right now."
+- Comment anchors are always `file:line` (or `file:start-end` for a range)
+  in the *working tree*, never a commit or a diff hunk — they describe
+  "this line (or these lines), as they exist on disk right now."
 - All of this reads and writes a single file,
   `<repo_root>/.katamari/comments.jsonl` — there's no daemon or server
   involved, so these commands work the same whether or not a `ktmr diff`

@@ -88,7 +88,8 @@ address review feedback:
    session picks this up immediately, no restart needed.
 
 You can leave your own comments the same way, e.g. to flag something you
-noticed but aren't fixing now: `ktmr comments add <file> <line> <body>`.
+noticed but aren't fixing now: `ktmr comments add <file> <line> <body>`
+(add `--end-line <line>` to comment on a range).
 
 Full workflow, JSON shape, and other commands:
 `.agents/skills/katamari-review/SKILL.md`.
@@ -731,6 +732,15 @@ mod tests {
 
     // --- M17: AGENTS.md / CLAUDE.md -------------------------------------
 
+    /// The bundled skill body (not just the short `AGENTS_MD_SECTION`
+    /// pointer) must also document `--end-line`, since it's the copy an
+    /// agent actually reads once it follows `AGENTS_MD_SECTION`'s "full
+    /// workflow" link.
+    #[test]
+    fn skill_md_documents_the_end_line_range_flag() {
+        assert!(SKILL_MD.contains("--end-line"));
+    }
+
     #[test]
     fn fresh_install_writes_agents_md_and_links_claude_md_to_it() {
         let repo = repo();
@@ -741,6 +751,10 @@ mod tests {
         assert!(agents_md.contains(AGENTS_MD_BEGIN));
         assert!(agents_md.contains(AGENTS_MD_END));
         assert!(agents_md.contains("ktmr comments list --json"));
+        assert!(
+            agents_md.contains("--end-line"),
+            "the katamari section must mention range comments"
+        );
 
         assert!(matches!(report.claude_md, ClaudeMdOutcome::Created));
         let claude_md = repo.path().join("CLAUDE.md");

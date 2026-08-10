@@ -1376,6 +1376,9 @@ fn save_comment(repo_root: &Path, state: &ComposeState) -> std::result::Result<C
         created_at: comments::now_unix(),
         file: state.file.clone(),
         anchor,
+        // The TUI compose overlay has no range-selection UI yet (that's a
+        // later milestone) — every comment it saves is single-line.
+        end_anchor: None,
         body: state.buffer().text(),
         status: comments::Status::Open,
         resolved_at: None,

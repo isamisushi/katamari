@@ -377,8 +377,15 @@ enum CommentsCommand {
     Add {
         /// Repo-relative path, as it appears in `ktmr diff`.
         file: String,
-        /// 1-based line number in the file's current working-tree content.
+        /// 1-based line number in the file's current working-tree content —
+        /// the range's start when `--end-line` is given, otherwise the
+        /// comment's only line.
         line: u32,
+        /// Inclusive end line of a same-file range, also 1-based against the
+        /// current working-tree content. Omit for the ordinary single-line
+        /// shape; when given, must not be before `line`.
+        #[arg(long)]
+        end_line: Option<u32>,
         body: String,
     },
     /// Marks a comment resolved.
@@ -1062,7 +1069,12 @@ fn run_comments(action: CommentsCommand) -> Result<()> {
     match action {
         CommentsCommand::List { json, status } => run_comments_list(json, status),
         CommentsCommand::Export { format, status } => run_comments_export(format, status),
-        CommentsCommand::Add { file, line, body } => run_comments_add(file, line, body),
+        CommentsCommand::Add {
+            file,
+            line,
+            end_line,
+            body,
+        } => run_comments_add(file, line, end_line, body),
         CommentsCommand::Resolve { id } => run_comments_set_status(id, CommentStatus::Resolved),
         CommentsCommand::Reopen { id } => run_comments_set_status(id, CommentStatus::Open),
     }
@@ -1089,7 +1101,10 @@ fn run_comments_list(json: bool, status: StatusFilter) -> Result<()> {
     }
     println!("{:<10} {:<9} {:<32} comment", "id", "status", "location");
     for comment in &filtered {
-        let location = format!("{}:{}", comment.file, comment.anchor.new_line);
+        let end = comment
+            .end_anchor
+            .map_or(comment.anchor.new_line, |a| a.new_line);
+        let location = location_label(&comment.file, comment.anchor.new_line, end);
         let first_line = comment.body.lines().next().unwrap_or("");
         println!(
             "{:<10} {:<9} {:<32} {first_line}",
@@ -1116,13 +1131,30 @@ fn run_comments_export(format: ExportFormat, status: StatusFilter) -> Result<()>
     Ok(())
 }
 
+/// `file:line` for a single-line comment, `file:start-end` for a range
+/// (`start == end` is what makes it single-line, regardless of whether a
+/// range was ever requested — a `--end-line` equal to the start line is a
+/// degenerate one-line range and reads identically to a plain comment).
+/// Shared by `ktmr comments list`'s table, `ktmr comments add`'s
+/// confirmation line, and [`format_export_markdown`]'s headings, so the
+/// three can never drift on how a range's location reads.
+fn location_label(file: &str, start: u32, end: u32) -> String {
+    if start == end {
+        format!("{file}:{start}")
+    } else {
+        format!("{file}:{start}-{end}")
+    }
+}
+
 /// Groups `comments` by file (in first-appearance order) and renders each as
-/// a `### file:line` heading, the anchored line's current text (relocated
-/// against `repo_root`'s on-disk content, so the quoted line matches what
-/// the agent will actually see when it opens the file), the comment body,
-/// and an id/status footer — directly pasteable into an AI coding agent's
-/// prompt, per the milestone spec, opening with an instruction line to that
-/// effect.
+/// a `### file:line`/`### file:start-end` heading, a fenced block quoting
+/// every relocated line the comment currently covers (relocated against
+/// `repo_root`'s on-disk content, so the quoted text matches what the agent
+/// will actually see when it opens the file — for a single-line comment
+/// that's a one-line fence, unified onto the same shape a range uses rather
+/// than a separate `> quoted` form), the comment body, and an id/status
+/// footer — directly pasteable into an AI coding agent's prompt, per the
+/// milestone spec, opening with an instruction line to that effect.
 fn format_export_markdown(repo_root: &Path, comments: &[Comment]) -> String {
     let mut out = String::from(
         "Address the following review comments; after fixing each, run `ktmr comments resolve <id>`.\n\n",
@@ -1148,21 +1180,44 @@ fn format_export_markdown(repo_root: &Path, comments: &[Comment]) -> String {
             .unwrap_or_default();
 
         for comment in &by_file[file] {
-            let (line, quoted) = match comments::relocate(comment, &lines) {
-                Some(line) => (
-                    line,
-                    lines
-                        .get((line - 1) as usize)
-                        .map_or_else(String::new, |l| l.trim().to_owned()),
-                ),
-                None => (
-                    comment.anchor.new_line,
-                    "(line not found — the file has changed since this comment was written)"
-                        .to_owned(),
-                ),
-            };
-            out.push_str(&format!("### {file}:{line}\n"));
-            out.push_str(&format!("> {quoted}\n\n"));
+            let relocated = comments::relocate_range(comment, &lines);
+            out.push_str(&format!(
+                "### {}\n",
+                location_label(file, relocated.start, relocated.end)
+            ));
+            if relocated.detached {
+                let noun = if relocated.start == relocated.end {
+                    "line"
+                } else {
+                    "range"
+                };
+                out.push_str(&format!(
+                    "> ({noun} not found — the file has changed since this comment was written)\n\n"
+                ));
+            } else {
+                // A quoted source line can itself open or close a ``` fence
+                // (this repo's own README is full of column-0 ``` lines).
+                // CommonMark only closes a fence on a backtick run at least
+                // as long as the opener, so size the opener one longer than
+                // the longest run that starts a quoted line — the quoted
+                // fence then stays inert inside the block instead of
+                // splitting the export mid-comment. Mid-line backticks
+                // can't close a fence and are ignored.
+                let longest_inner_fence = (relocated.start..=relocated.end)
+                    .filter_map(|line1| lines.get((line1 - 1) as usize))
+                    .map(|line| line.trim_start().chars().take_while(|&c| c == '`').count())
+                    .max()
+                    .unwrap_or(0);
+                let fence = "`".repeat((longest_inner_fence + 1).max(3));
+                out.push_str(&fence);
+                out.push('\n');
+                for line1 in relocated.start..=relocated.end {
+                    out.push_str(lines.get((line1 - 1) as usize).copied().unwrap_or(""));
+                    out.push('\n');
+                }
+                out.push_str(&fence);
+                out.push_str("\n\n");
+            }
             out.push_str(&comment.body);
             out.push_str(&format!(
                 "\n\n_id: {} · status: {}_\n\n",
@@ -1174,25 +1229,67 @@ fn format_export_markdown(repo_root: &Path, comments: &[Comment]) -> String {
     out
 }
 
-fn run_comments_add(file: String, line: u32, body: String) -> Result<()> {
-    let repo_root = comments_repo_root()?;
-    let content = std::fs::read_to_string(repo_root.join(&file))
+/// Builds (but does not append) the [`Comment`] `ktmr comments add` would
+/// write for `file`/`line`/`body`, plus `end_line` when the caller wants a
+/// range — split out from [`run_comments_add`] so every rejection (missing
+/// start or end line, a reversed range) is unit-testable without touching
+/// the filesystem's comment log, and so the command itself has exactly one
+/// `append_comment` call, at the very end: no sequence of checks here can
+/// ever leave a half-written record, because nothing is written until this
+/// function has already returned a fully valid `Comment`.
+///
+/// The ordering check runs *before* resolving the end line's anchor
+/// (`anchor_for` would `None` out on an out-of-file end line and return the
+/// less useful "no line N" message first) so a reversed range always reports
+/// as reversed, even when its end line also happens to not exist.
+fn build_add_comment(
+    repo_root: &Path,
+    file: &str,
+    line: u32,
+    end_line: Option<u32>,
+    body: String,
+) -> Result<Comment> {
+    let content = std::fs::read_to_string(repo_root.join(file))
         .with_context(|| format!("failed to read {file}"))?;
     let lines: Vec<&str> = content.lines().collect();
     let anchor =
         comments::anchor_for(&lines, line).with_context(|| format!("{file} has no line {line}"))?;
 
-    let comment = Comment {
+    let end_anchor = match end_line {
+        None => None,
+        Some(end_line) => {
+            if end_line < line {
+                bail!("--end-line {end_line} must not be before the start line {line}");
+            }
+            Some(
+                comments::anchor_for(&lines, end_line)
+                    .with_context(|| format!("{file} has no line {end_line}"))?,
+            )
+        }
+    };
+
+    Ok(Comment {
         id: comments::generate_id(),
         created_at: comments::now_unix(),
-        file: file.clone(),
+        file: file.to_owned(),
         anchor,
+        end_anchor,
         body,
         status: CommentStatus::Open,
         resolved_at: None,
-    };
+    })
+}
+
+fn run_comments_add(file: String, line: u32, end_line: Option<u32>, body: String) -> Result<()> {
+    let repo_root = comments_repo_root()?;
+    let comment = build_add_comment(&repo_root, &file, line, end_line, body)?;
+    let end = comment.end_anchor.map_or(line, |a| a.new_line);
     CommentStore::new(&repo_root).append_comment(&comment)?;
-    println!("added comment {} on {file}:{line}", comment.id);
+    println!(
+        "added comment {} on {}",
+        comment.id,
+        location_label(&file, line, end)
+    );
     Ok(())
 }
 
@@ -2486,5 +2583,176 @@ index 1111111..2222222 100644\n\
             }
             other => panic!("expected a terminal Io error, got {other:?}"),
         }
+    }
+
+    // --- #18: range comments (`--end-line`, location labels, markdown export) ---
+
+    /// A tempdir with `file` containing one line per element of `lines` —
+    /// the fixture every `build_add_comment`/`format_export_markdown` test
+    /// below anchors against, since both read the file straight off disk
+    /// rather than taking line content as an argument.
+    fn repo_with_file(file: &str, lines: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let mut content = lines.join("\n");
+        content.push('\n');
+        std::fs::write(dir.path().join(file), content).unwrap();
+        dir
+    }
+
+    #[test]
+    fn build_add_comment_creates_a_single_line_comment_when_end_line_is_omitted() {
+        let dir = repo_with_file("a.rs", &["one", "two", "three"]);
+        let comment =
+            build_add_comment(dir.path(), "a.rs", 2, None, "look here".to_owned()).unwrap();
+        assert_eq!(comment.anchor.new_line, 2);
+        assert_eq!(comment.end_anchor, None);
+        assert_eq!(comment.body, "look here");
+    }
+
+    #[test]
+    fn build_add_comment_creates_a_range_comment_when_end_line_is_given() {
+        let dir = repo_with_file("a.rs", &["one", "two", "three", "four"]);
+        let comment =
+            build_add_comment(dir.path(), "a.rs", 2, Some(3), "extract this".to_owned()).unwrap();
+        assert_eq!(comment.anchor.new_line, 2);
+        assert_eq!(comment.end_anchor.unwrap().new_line, 3);
+    }
+
+    /// `--end-line` equal to the start line is a degenerate but valid
+    /// one-line range — not an error, and not indistinguishable from a
+    /// plain single-line comment at the data-model level (it still sets
+    /// `end_anchor`), even though it renders identically.
+    #[test]
+    fn build_add_comment_accepts_an_end_line_equal_to_the_start_line() {
+        let dir = repo_with_file("a.rs", &["one", "two", "three"]);
+        let comment = build_add_comment(dir.path(), "a.rs", 2, Some(2), "note".to_owned()).unwrap();
+        assert_eq!(comment.end_anchor.unwrap().new_line, 2);
+    }
+
+    #[test]
+    fn build_add_comment_rejects_an_end_line_before_the_start_line() {
+        let dir = repo_with_file("a.rs", &["one", "two", "three", "four"]);
+        let err = build_add_comment(dir.path(), "a.rs", 3, Some(2), "body".to_owned())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--end-line 2") && err.contains("start line 3"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn build_add_comment_rejects_a_start_line_of_zero() {
+        let dir = repo_with_file("a.rs", &["one", "two"]);
+        assert!(build_add_comment(dir.path(), "a.rs", 0, None, "body".to_owned()).is_err());
+    }
+
+    #[test]
+    fn build_add_comment_rejects_an_out_of_file_start_line() {
+        let dir = repo_with_file("a.rs", &["one", "two"]);
+        assert!(build_add_comment(dir.path(), "a.rs", 5, None, "body".to_owned()).is_err());
+    }
+
+    /// An end line past the file's last line must be rejected even though
+    /// the start line is perfectly valid — a partial-range comment (start
+    /// anchored, end missing) is exactly the "half-written record" the
+    /// single-append design in `build_add_comment`'s docs exists to
+    /// prevent.
+    #[test]
+    fn build_add_comment_rejects_an_out_of_file_end_line() {
+        let dir = repo_with_file("a.rs", &["one", "two", "three"]);
+        let result = build_add_comment(dir.path(), "a.rs", 1, Some(10), "body".to_owned());
+        assert!(result.is_err());
+    }
+
+    /// The ordering check must fire before the end line's own existence is
+    /// checked, so a reversed *and* out-of-file end line still reports as
+    /// reversed — the more actionable of the two problems, and the one
+    /// `--end-line`'s docs promise gets checked first.
+    #[test]
+    fn build_add_comment_reports_reversed_before_out_of_file_when_both_are_true() {
+        let dir = repo_with_file("a.rs", &["one", "two", "three"]);
+        // end_line 0 is both before the start line (3) and not a real line
+        // in the file — the ordering check must win and report "reversed",
+        // never reaching the `anchor_for` call that would otherwise report
+        // "no line 0".
+        let err = build_add_comment(dir.path(), "a.rs", 3, Some(0), "body".to_owned())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must not be before"), "{err}");
+    }
+
+    #[test]
+    fn location_label_formats_a_single_line_as_file_colon_line() {
+        assert_eq!(location_label("a.rs", 5, 5), "a.rs:5");
+    }
+
+    #[test]
+    fn location_label_formats_a_range_as_file_colon_start_dash_end() {
+        assert_eq!(location_label("a.rs", 5, 8), "a.rs:5-8");
+    }
+
+    #[test]
+    fn format_export_markdown_quotes_every_line_of_an_attached_range_in_a_fenced_block() {
+        let dir = repo_with_file("a.rs", &["one", "two", "three", "four"]);
+        let comment = build_add_comment(dir.path(), "a.rs", 2, Some(3), "fix".to_owned()).unwrap();
+
+        let out = format_export_markdown(dir.path(), std::slice::from_ref(&comment));
+        assert!(out.contains("### a.rs:2-3\n"), "{out}");
+        assert!(out.contains("```\ntwo\nthree\n```\n"), "{out}");
+    }
+
+    #[test]
+    fn format_export_markdown_sizes_the_fence_past_backtick_runs_in_quoted_lines() {
+        // Quoting a line that is itself a ``` fence opener (README-style)
+        // must not close the export's own fence mid-comment: the outer
+        // fence grows one backtick longer than the longest run starting a
+        // quoted line, which CommonMark then treats as the only closer.
+        let dir = repo_with_file("doc.md", &["intro", "```toml", "key = 1", "```", "outro"]);
+        let comment =
+            build_add_comment(dir.path(), "doc.md", 2, Some(4), "fix".to_owned()).unwrap();
+
+        let out = format_export_markdown(dir.path(), std::slice::from_ref(&comment));
+        assert!(out.contains("````\n```toml\nkey = 1\n```\n````\n"), "{out}");
+        // And the sizing is content-driven, not a blanket widening: a
+        // backtick-free quote keeps the ordinary three-backtick fence.
+        let plain = build_add_comment(dir.path(), "doc.md", 1, None, "fix".to_owned()).unwrap();
+        let plain_out = format_export_markdown(dir.path(), std::slice::from_ref(&plain));
+        assert!(plain_out.contains("```\nintro\n```\n"), "{plain_out}");
+    }
+
+    #[test]
+    fn format_export_markdown_keeps_a_stable_heading_shape_for_a_single_line_comment() {
+        let dir = repo_with_file("a.rs", &["one", "two", "three"]);
+        let comment = build_add_comment(dir.path(), "a.rs", 2, None, "fix".to_owned()).unwrap();
+
+        let out = format_export_markdown(dir.path(), std::slice::from_ref(&comment));
+        assert!(out.contains("### a.rs:2\n"), "{out}");
+        assert!(out.contains("```\ntwo\n```\n"), "{out}");
+    }
+
+    /// A comment whose file has changed enough that the whole range detaches
+    /// must say so distinctly for a range versus a single line ("range"
+    /// versus "line" in the placeholder text) rather than a single generic
+    /// message that reads oddly for one of the two shapes.
+    #[test]
+    fn format_export_markdown_reports_a_detached_range_distinctly_from_a_detached_single_line() {
+        let dir = repo_with_file("a.rs", &["one", "two", "three"]);
+        let range_comment =
+            build_add_comment(dir.path(), "a.rs", 2, Some(3), "fix".to_owned()).unwrap();
+        let single_comment =
+            build_add_comment(dir.path(), "a.rs", 1, None, "fix".to_owned()).unwrap();
+
+        // Rewrite the file so every anchored line is gone.
+        std::fs::write(dir.path().join("a.rs"), "unrelated\ncontent\n").unwrap();
+
+        let range_out = format_export_markdown(dir.path(), std::slice::from_ref(&range_comment));
+        assert!(range_out.contains("range not found"), "range: {range_out}");
+
+        let single_out = format_export_markdown(dir.path(), std::slice::from_ref(&single_comment));
+        assert!(
+            single_out.contains("line not found"),
+            "single: {single_out}"
+        );
     }
 }

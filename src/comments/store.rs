@@ -310,6 +310,7 @@ mod tests {
             created_at: now_unix(),
             file: "src/main.rs".to_owned(),
             anchor: anchor_for(&lines, 1).unwrap(),
+            end_anchor: None,
             body: "please rename this".to_owned(),
             status,
             resolved_at: None,
@@ -440,6 +441,97 @@ mod tests {
             !store.path().exists(),
             "a rejected set_status must not create the file"
         );
+    }
+
+    fn sample_range_comment(id: &str, status: Status) -> Comment {
+        let lines = ["one", "two", "three"];
+        Comment {
+            end_anchor: Some(anchor_for(&lines, 2).unwrap()),
+            ..sample_comment_with_lines(id, status, &lines)
+        }
+    }
+
+    fn sample_comment_with_lines(id: &str, status: Status, lines: &[&str]) -> Comment {
+        Comment {
+            id: id.to_owned(),
+            created_at: now_unix(),
+            file: "src/main.rs".to_owned(),
+            anchor: anchor_for(lines, 1).unwrap(),
+            end_anchor: None,
+            body: "please rename this".to_owned(),
+            status,
+            resolved_at: None,
+        }
+    }
+
+    /// A creation record written before `end_anchor` existed — no such key
+    /// in the JSON at all — must still parse through `Record`'s untagged
+    /// dispatch: `end_anchor` being optional (`#[serde(default, ...)]`)
+    /// means the required-field set `Record::Create` matches on is
+    /// unchanged from before this field was added.
+    #[test]
+    fn a_pre_range_creation_record_loads_through_the_untagged_record_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CommentStore::new(dir.path());
+        store.ensure_dir().unwrap();
+        // A single physical line, matching the real JSONL format: the store
+        // splits the file on newlines before parsing each record, so an
+        // embedded newline inside the JSON object itself (harmless for a
+        // direct `serde_json::from_str`) would corrupt this test.
+        let json = r#"{"id":"legacy01","created_at":0,"file":"src/main.rs","anchor":{"new_line":1,"content_hash":1,"context_hash":2},"body":"old-style record","status":"open"}"#;
+        fs::write(store.path(), format!("{json}\n")).unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "legacy01");
+        assert_eq!(loaded[0].end_anchor, None);
+    }
+
+    #[test]
+    fn a_range_creation_record_round_trips_through_append_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CommentStore::new(dir.path());
+        let comment = sample_range_comment("range001", Status::Open);
+        store.append_comment(&comment).unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded, vec![comment]);
+    }
+
+    #[test]
+    fn load_folds_a_resolve_amendment_onto_a_range_creation_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CommentStore::new(dir.path());
+        let comment = sample_range_comment("range002", Status::Open);
+        store.append_comment(&comment).unwrap();
+        store
+            .append_status("range002", Status::Resolved, Some(100))
+            .unwrap();
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].status, Status::Resolved);
+        assert_eq!(loaded[0].end_anchor, comment.end_anchor);
+    }
+
+    #[test]
+    fn load_preserves_creation_order_for_legacy_and_range_records_mixed_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CommentStore::new(dir.path());
+        store
+            .append_comment(&sample_comment("legacy-a", Status::Open))
+            .unwrap();
+        store
+            .append_comment(&sample_range_comment("range-b", Status::Open))
+            .unwrap();
+        store
+            .append_comment(&sample_comment("legacy-c", Status::Open))
+            .unwrap();
+
+        let loaded = store.load().unwrap();
+        let ids: Vec<&str> = loaded.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["legacy-a", "range-b", "legacy-c"]);
+        assert!(loaded[1].end_anchor.is_some());
     }
 
     #[test]
