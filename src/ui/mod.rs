@@ -80,7 +80,7 @@ use crate::vcs::jj::{self, JjRepo};
 use crate::watch::{self, WatchSignal};
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
@@ -1300,17 +1300,70 @@ fn event_loop(
                     // the whole frame, so the DiffFiles-only guard inside
                     // `handle_left_click` already makes such clicks
                     // no-ops.)
+                    // The references/units panels follow the keyboard's
+                    // own convention for them ("any other key closes the
+                    // panel"): the first click anywhere dismisses the
+                    // panel and is consumed — it must not also act on the
+                    // pane behind it, whose rect stays hittable above the
+                    // panel's own bottom strip and would otherwise let a
+                    // click silently move the cursor beneath an open
+                    // panel, a state no keyboard sequence can produce.
+                    MouseEventKind::Down(MouseButton::Left)
+                        if refs_panel.is_some() || units_panel.is_some() =>
+                    {
+                        refs_panel = None;
+                        units_panel = None;
+                    }
                     MouseEventKind::Down(MouseButton::Left)
                         if compose.is_none() && scope_menu.is_none() && units_setup.is_none() =>
                     {
-                        mouse::handle_left_click(
+                        let identifier_hit = mouse::handle_left_click(
                             &geometry,
                             stack,
                             &mut jump_stack,
                             &mut hover_state,
                             mouse_event.column,
                             mouse_event.row,
+                            mouse_event.modifiers.contains(KeyModifiers::SHIFT),
                         );
+                        // Issue #22: an eligible identifier click chases
+                        // go-to-definition through the exact same
+                        // `handle_action` dispatch keyboard `gd` uses —
+                        // `handle_left_click` already positioned the cursor
+                        // and active symbol, so this call's own
+                        // `stack.top().hover_query()` re-derivation resolves
+                        // the identifier the click just landed on, getting
+                        // readiness/supersession/jump-history/status for
+                        // free rather than a second copy of any of it here.
+                        if identifier_hit {
+                            handle_action(
+                                Action::GotoDefinition,
+                                stack,
+                                &mut hover_state,
+                                &mut pending_hover,
+                                &mut pending_goto,
+                                &mut refs_panel,
+                                &mut units_panel,
+                                &mut units_setup,
+                                &mut pending_units,
+                                &mut units_status,
+                                &mut jump_stack,
+                                &diagnostics,
+                                &mut goto_status,
+                                lsp_manager,
+                                jj_repo.as_ref(),
+                                &mut compose,
+                                &mut scope_menu,
+                                &mut help,
+                                &mut search_prompt,
+                                highlighter,
+                                &mut watch_paused,
+                                watch_active,
+                                &mut watch_status,
+                                &mut hints_expanded,
+                                &observer,
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -3289,7 +3342,7 @@ fn draw(
             // not diff content — doesn't scroll content it isn't over.
             geometry.record(diff_area, mouse::ScrollTarget::DiffPane);
             let effective_layout = diff_view::effective_layout(app.layout, diff_area.width);
-            diff_view::render_focusable(
+            let diff_hits = diff_view::render_focusable(
                 frame,
                 diff_area,
                 app,
@@ -3300,6 +3353,14 @@ fn draw(
                 app.focus == app::MainPaneFocus::Diff,
                 &hints::diff_pane_hints(keymap, app.sidebar_visible),
             );
+            // Issue #22: the *content* rect (inside `render_focusable`'s own
+            // border) paired with the `HitRow`s it just drew, for click
+            // resolution — `pane::inner_rect` reproduces exactly the same
+            // inner rect `render_focusable`'s own `PaneChrome::block().inner(area)`
+            // computed internally (see that function's docs), so this is
+            // the one border-geometry function, not a second hand-counted
+            // rect independently at risk of drifting from the real one.
+            geometry.record_diff_content(pane::inner_rect(diff_area.width, diff_area), diff_hits);
             status_bar::render(
                 frame,
                 areas.status,
@@ -3343,7 +3404,11 @@ fn draw(
             let hint_items = hints::file_view_items(keymap, hints_expanded);
             let status_height = hints::required_height(&hint_items, frame.area().width);
             let areas = file_view::layout(frame.area(), status_height);
-            file_view::render(frame, areas.content, file, diagnostics, geometry);
+            let file_hits = file_view::render(frame, areas.content, file, diagnostics, geometry);
+            // As the diff pane's `record_diff_content` above —
+            // `file_view::content_rect` reproduces the exact inner rect
+            // `render` itself carved out of `areas.content`.
+            geometry.record_file_content(file_view::content_rect(areas.content), file_hits);
             file_view::render_status(frame, areas.status, file, status_note, &hint_items);
             if let Some(row) = view.cursor_screen_row() {
                 hover_popup::render(frame, areas.content, row, hover_state, geometry);

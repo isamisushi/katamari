@@ -34,21 +34,28 @@ pub enum MouseKey {
     },
     /// Issue #21: a primary/secondary press — `super::Harness::send_mouse`
     /// with this is what a click test body sends to land on a tree row.
+    /// `shift` is SGR's own `Cb` shift-modifier bit (issue #22 req 4's
+    /// shift-click) — `false` for every pre-#22 click, which never touched
+    /// a modifier at all.
     Down {
         button: MouseButton,
         column: u16,
         row: u16,
+        shift: bool,
     },
     /// The matching release. Katamari's own dispatch only ever reacts to
     /// `Down` (see `ui::mod`'s `Event::Mouse` arm — there's no drag/
     /// double-click in scope), so no test sends this on its own; it exists
     /// so a click test can send a complete press-then-release pair the way
     /// a real terminal always would, in case a future harness assertion
-    /// ever needs the `Up` byte to have been seen at all.
+    /// ever needs the `Up` byte to have been seen at all. Carries `shift`
+    /// too, purely so a press/release pair can share one literal shape —
+    /// katamari's dispatch never reads it off an `Up` byte.
     Up {
         button: MouseButton,
         column: u16,
         row: u16,
+        shift: bool,
     },
 }
 
@@ -71,8 +78,12 @@ impl MouseKey {
     /// (this module only ever sends `0`/`2`, see [`MouseButton`]'s docs),
     /// the same `cb & 3` decode with none of the wheel/motion bits (`0x40`/
     /// `0x20`) set — with the press/release distinction carried entirely by
-    /// the trailing byte instead (`M` press, `m` release).
+    /// the trailing byte instead (`M` press, `m` release). `shift` sets
+    /// `Cb`'s `0x04` bit (crossterm's `parse_cb`: `cb & 0b0000_0100 ==
+    /// 0b0000_0100` decodes to `KeyModifiers::SHIFT`) — never set for a
+    /// wheel tick, which has no modifier vocabulary this suite uses.
     pub fn encode(self) -> Vec<u8> {
+        const SHIFT_BIT: u8 = 0b0000_0100;
         let (cb, column, row, trailing) = match self {
             MouseKey::ScrollUp { column, row } => (64, column, row, 'M'),
             MouseKey::ScrollDown { column, row } => (65, column, row, 'M'),
@@ -80,12 +91,24 @@ impl MouseKey {
                 button,
                 column,
                 row,
-            } => (button.cb(), column, row, 'M'),
+                shift,
+            } => (
+                button.cb() | if shift { SHIFT_BIT } else { 0 },
+                column,
+                row,
+                'M',
+            ),
             MouseKey::Up {
                 button,
                 column,
                 row,
-            } => (button.cb(), column, row, 'm'),
+                shift,
+            } => (
+                button.cb() | if shift { SHIFT_BIT } else { 0 },
+                column,
+                row,
+                'm',
+            ),
         };
         format!("\x1b[<{cb};{};{}{trailing}", column + 1, row + 1).into_bytes()
     }
@@ -126,7 +149,8 @@ mod tests {
             MouseKey::Down {
                 button: MouseButton::Left,
                 column: 5,
-                row: 10
+                row: 10,
+                shift: false,
             }
             .encode(),
             b"\x1b[<0;6;11M".to_vec()
@@ -139,7 +163,8 @@ mod tests {
             MouseKey::Up {
                 button: MouseButton::Left,
                 column: 0,
-                row: 0
+                row: 0,
+                shift: false,
             }
             .encode(),
             b"\x1b[<0;1;1m".to_vec()
@@ -152,10 +177,25 @@ mod tests {
             MouseKey::Down {
                 button: MouseButton::Right,
                 column: 0,
-                row: 0
+                row: 0,
+                shift: false,
             }
             .encode(),
             b"\x1b[<2;1;1M".to_vec()
+        );
+    }
+
+    #[test]
+    fn shift_left_down_sets_cbs_shift_bit() {
+        assert_eq!(
+            MouseKey::Down {
+                button: MouseButton::Left,
+                column: 0,
+                row: 0,
+                shift: true,
+            }
+            .encode(),
+            b"\x1b[<4;1;1M".to_vec()
         );
     }
 }

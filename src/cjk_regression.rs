@@ -523,4 +523,290 @@ mod tests {
             "every \u{524d} must survive tab+wrap+selection"
         );
     }
+
+    /// Issue #22: walks every terminal `(x, y)` a wrapped, tab-and-CJK
+    /// content row actually renders into, resolving each through
+    /// `mouse::resolve_hit` (the exact same pipeline a real click goes
+    /// through — `FrameGeometry::diff_row_hit` then `resolve_hit`, see
+    /// `ui::mouse`'s own doc comment on why there's no second wrap/layout
+    /// algorithm) and asserts the resolved `display_col` selects the
+    /// *identical* `ui::symbols::scan` entry `App::position_cursor_from_click`
+    /// (the same resolution `jump_cursor_to`/keyboard `gd` uses) would
+    /// select from that same column — the coordinate-space agreement this
+    /// module exists to pin down, extended from hover's read-only column
+    /// math (`hover_query_display_column_is_unaffected_by_wrapping_a_line_with_a_cjk_prefix`
+    /// above) to the click path's own gutter-subtraction + wrap-offset
+    /// math. A leading tab (M7.3's tab-stop rule) and four CJK/ASCII
+    /// symbols separated by punctuation, long enough to wrap several times
+    /// over at a narrow pane, exercise both together rather than either in
+    /// isolation.
+    #[test]
+    fn every_terminal_column_of_a_wrapped_tab_and_cjk_line_resolves_the_same_symbol_keyboard_navigation_would()
+     {
+        use crate::diff::{DiffFile, DiffHunk, DiffLineKind, DiffRow};
+        use crate::keymap::Action;
+        use crate::lsp::DiagnosticsStore;
+        use crate::ui::app::{App, Layout};
+        use crate::ui::diff_view;
+        use crate::ui::mouse::{self, HitRow};
+        use ratatui::backend::TestBackend;
+        use std::path::PathBuf;
+
+        // Four distinct symbols ("alpha", the CJK run, "beta_gamma", and the
+        // padding run), separated by non-word punctuation/space so
+        // `symbols::scan` never merges them into one token — `_` itself is
+        // a word character (see that module's docs), which is exactly why
+        // "beta_gamma" stays one symbol rather than two.
+        let cjk = "\u{540d}\u{524d}".repeat(5); // "名前" x5
+        let padding = "x".repeat(80);
+        let line = format!("\talpha({cjk}) beta_gamma({padding})");
+
+        let file = DiffFile {
+            old_path: Some("f.rs".to_owned()),
+            new_path: Some("f.rs".to_owned()),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                known_eof: true,
+                rows: vec![DiffRow {
+                    kind: DiffLineKind::Context,
+                    text: line.clone(),
+                    old_line: Some(1),
+                    new_line: Some(1),
+                }],
+            }],
+            ..Default::default()
+        };
+        let mut app = App::new("repo".to_owned(), PathBuf::from("/repo"), vec![file]);
+        // Narrow enough that the line wraps many times over; tall enough
+        // that every one of those wrapped rows actually renders (headers +
+        // enough visual rows for a ~100-display-column line at this width).
+        app.set_viewport_height(40);
+        app.update(Action::Top);
+        app.update(Action::CursorDown); // hunk header
+        app.update(Action::CursorDown); // the content row
+        assert_eq!(app.cursor, 2, "sanity: cursor is on the content row");
+
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let comments = crate::comments::CommentIndex::default();
+        let backend = TestBackend::new(40, 40);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let area = ratatui::layout::Rect::new(0, 0, 40, 40);
+        // `Terminal::draw`'s closure returns `()` — `render_focusable`'s own
+        // `Vec<HitRow>` is captured into `hits` from inside it rather than
+        // through `draw`'s own return value (a `CompletedFrame`, which
+        // carries no room for a caller-defined payload).
+        let mut hits: Vec<HitRow> = Vec::new();
+        terminal
+            .draw(|frame| {
+                hits = diff_view::render_focusable(
+                    frame,
+                    area,
+                    &app,
+                    &mut highlighter,
+                    Layout::Unified,
+                    &diagnostics,
+                    &comments,
+                    false,
+                    &[],
+                );
+            })
+            .unwrap();
+
+        // Walked across the *whole* pane width, not just the real content
+        // rect (`pane::inner_rect` isn't reachable from outside `ui` — `mod
+        // pane;` is private — and `resolve_hit` is a pure function of `hit`/
+        // `local_x` alone anyway, so a handful of columns past the true
+        // content edge just resolve past the row's own text harmlessly).
+        let gutter_width = diff_view::gutter_width();
+
+        let symbols = symbols::scan(&line);
+        let mut wrapped_rows_seen = 0usize;
+        let mut checked_a_content_click = false;
+
+        // Reuses `app` itself as the probe: `position_cursor_from_click`
+        // fully overwrites `cursor`/`active_symbol` from its own arguments
+        // (see its docs — nothing about the row it's *currently* on
+        // matters), so there's exactly one row this diff has to land on
+        // regardless of the walk's iteration order.
+        for (local_y, hit) in hits.iter().enumerate() {
+            let HitRow::Unified(_) = hit else { continue };
+            wrapped_rows_seen += 1;
+            for local_x in 0..area.width {
+                let Some(resolved) = mouse::resolve_hit(*hit, gutter_width, local_x) else {
+                    continue;
+                };
+                let expected = symbols.iter().position(|s| {
+                    s.display_start <= resolved.display_col && resolved.display_col < s.display_end
+                });
+                let matched =
+                    app.position_cursor_from_click(resolved.row_idx, resolved.display_col);
+
+                match expected {
+                    Some(idx) => {
+                        assert!(
+                            matched,
+                            "column {local_x} on visual row {local_y} (display_col {}) \
+                             should have matched symbol {idx}",
+                            resolved.display_col
+                        );
+                        assert_eq!(
+                            app.active_symbol, idx,
+                            "column {local_x} on visual row {local_y} resolved a different \
+                             symbol than symbols::scan itself picks for display_col {}",
+                            resolved.display_col
+                        );
+                        checked_a_content_click = true;
+                    }
+                    None => {
+                        assert!(
+                            !matched,
+                            "column {local_x} on visual row {local_y} (display_col {}) \
+                             matched a symbol keyboard navigation wouldn't pick",
+                            resolved.display_col
+                        );
+                    }
+                }
+            }
+        }
+
+        assert!(
+            wrapped_rows_seen >= 4,
+            "the line must actually wrap into several visual rows for this test to mean \
+             anything (got {wrapped_rows_seen})"
+        );
+        assert!(
+            checked_a_content_click,
+            "at least one walked column must have landed on a real symbol"
+        );
+    }
+
+    /// As the wrapped tab+CJK walk above, but for a single unwrapped row
+    /// combining a multi-codepoint combining-mark grapheme cluster ("é" as
+    /// `e` + U+0301 COMBINING ACUTE ACCENT — one grapheme, two codepoints —
+    /// see `ui::symbols::scan`'s own doc on combining marks staying part of
+    /// their base word) and a multi-codepoint ZWJ emoji sequence (a
+    /// family emoji — several codepoints, one grapheme, no word character
+    /// among them, so `symbols::scan` treats it as a boundary, not a
+    /// symbol). Walks every terminal column, same coordinate-space
+    /// agreement this module's other click test pins down, for the
+    /// grapheme-cluster half of issue #22's acceptance criteria the wrap
+    /// test above doesn't itself exercise (this line never wraps).
+    #[test]
+    fn every_terminal_column_of_a_grapheme_cluster_line_resolves_the_same_symbol_keyboard_navigation_would()
+     {
+        use crate::diff::{DiffFile, DiffHunk, DiffLineKind, DiffRow};
+        use crate::keymap::Action;
+        use crate::lsp::DiagnosticsStore;
+        use crate::ui::app::{App, Layout};
+        use crate::ui::diff_view;
+        use crate::ui::mouse::{self, HitRow};
+        use ratatui::backend::TestBackend;
+        use std::path::PathBuf;
+
+        // "café" (4 graphemes: c, a, f, é — the last a 2-codepoint cluster),
+        // then a 7-codepoint ZWJ family emoji (👨‍👩‍👧, no word codepoint in
+        // it at all — a boundary, not a symbol of its own), then "bar".
+        let line = "caf\u{65}\u{301}(\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}) bar";
+
+        let file = DiffFile {
+            old_path: Some("f.rs".to_owned()),
+            new_path: Some("f.rs".to_owned()),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                known_eof: true,
+                rows: vec![DiffRow {
+                    kind: DiffLineKind::Context,
+                    text: line.to_owned(),
+                    old_line: Some(1),
+                    new_line: Some(1),
+                }],
+            }],
+            ..Default::default()
+        };
+        let mut app = App::new("repo".to_owned(), PathBuf::from("/repo"), vec![file]);
+        app.set_viewport_height(10);
+        app.update(Action::Top);
+        app.update(Action::CursorDown); // hunk header
+        app.update(Action::CursorDown); // the content row
+        assert_eq!(app.cursor, 2, "sanity: cursor is on the content row");
+
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let comments = crate::comments::CommentIndex::default();
+        // Wide enough that this short line never wraps — a single visual
+        // row is exactly what this test wants to walk.
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let area = ratatui::layout::Rect::new(0, 0, 80, 10);
+        let mut hits: Vec<HitRow> = Vec::new();
+        terminal
+            .draw(|frame| {
+                hits = diff_view::render_focusable(
+                    frame,
+                    area,
+                    &app,
+                    &mut highlighter,
+                    Layout::Unified,
+                    &diagnostics,
+                    &comments,
+                    false,
+                    &[],
+                );
+            })
+            .unwrap();
+
+        let gutter_width = diff_view::gutter_width();
+        let symbols = symbols::scan(line);
+        assert_eq!(
+            symbols.len(),
+            2,
+            "\"café\" and \"bar\" — the emoji is never a symbol"
+        );
+
+        // Row 2 (0=FileHeader,1=HunkHeader,2=this content row); unwrapped,
+        // so exactly one `HitRow::Unified` entry.
+        let content_hit = hits[2];
+        assert!(matches!(content_hit, HitRow::Unified(_)));
+
+        let mut checked_a_content_click = false;
+        for local_x in 0..area.width {
+            let Some(resolved) = mouse::resolve_hit(content_hit, gutter_width, local_x) else {
+                continue;
+            };
+            let expected = symbols.iter().position(|s| {
+                s.display_start <= resolved.display_col && resolved.display_col < s.display_end
+            });
+            let matched = app.position_cursor_from_click(resolved.row_idx, resolved.display_col);
+
+            match expected {
+                Some(idx) => {
+                    assert!(
+                        matched,
+                        "column {local_x} (display_col {}) should have matched symbol {idx}",
+                        resolved.display_col
+                    );
+                    assert_eq!(
+                        app.active_symbol, idx,
+                        "column {local_x} resolved the wrong symbol"
+                    );
+                    checked_a_content_click = true;
+                }
+                None => assert!(
+                    !matched,
+                    "column {local_x} (display_col {}) matched a symbol keyboard navigation wouldn't pick",
+                    resolved.display_col
+                ),
+            }
+        }
+        assert!(checked_a_content_click);
+    }
 }

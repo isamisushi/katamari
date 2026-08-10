@@ -395,8 +395,19 @@ Wheel scrolling works out of the box (`[ui] mouse = true`, the default):
 scrolling over the files pane, the diff pane, a pushed file/timeline/log/
 inspector view, or an open hover/references/help overlay scrolls whichever
 one is under the pointer, without moving the keyboard cursor or changing
-which pane has keyboard focus. Click, drag, and hover are not implemented
-yet. While capture is on, a terminal's plain click-and-drag text selection
+which pane has keyboard focus. A click in the changed-files tree selects a
+row, jumps the diff to it, and expands/collapses a directory, the same way
+`Enter` does from the keyboard. A click in the diff or a pushed file pane
+moves the cursor to the clicked row/column; clicking an identifier on an
+interactive new-side/context/add row runs go-to-definition (the same
+readiness-gated action `gd` does — a click while the server is still
+starting shows the same "not ready" status rather than queuing a surprise
+later jump), while a gutter, whitespace, a deletion, a side-by-side old
+cell, or a non-interactive historical diff only positions the cursor.
+Shift-click extends an active visual selection (`V`) instead, without
+triggering go-to-definition. Drag selection, double-click word selection,
+right-click menus, and passive hover are not implemented yet. While capture
+is on, a terminal's plain click-and-drag text selection
 goes to katamari instead of the terminal — most terminals still offer
 native selection by holding Shift while dragging. Set `[ui] mouse = false`
 to leave capture off entirely and get plain, unshifted drag selection

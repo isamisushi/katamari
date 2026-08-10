@@ -21,6 +21,7 @@ use crate::diff::{
 use crate::highlight::{HighlightKind, Language, LineHighlighter, Span as HlSpan};
 use crate::lsp::DiagnosticsStore;
 use crate::ui::app::{App, Layout};
+use crate::ui::mouse::{HitRow, LineHit};
 use crate::ui::pane::{self, Hint as PaneHint, PaneChrome};
 // Only the tests below construct a `search::SearchHighlight`/call
 // `search::compute_matches` directly — `content_line`'s own render path
@@ -83,7 +84,13 @@ pub fn render(
     let block = Block::default().borders(Borders::LEFT).title(" diff ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    render_content(
+    // Discards the `HitRow`s `render_content` hands back — issue #22's
+    // click hit-testing is scoped to the top-level `View::Diff`/`View::File`
+    // panes only (see `FrameGeometry::diff_content`'s docs on that
+    // assumption); `TimelineView`'s nested diff pane, the only caller that
+    // reaches this plain (non-focusable) `render` rather than
+    // `render_focusable`, has no seam to record them into.
+    let _ = render_content(
         frame,
         inner,
         app,
@@ -102,9 +109,19 @@ pub fn render(
 /// diff pane deliberately keeps using the plain version instead.
 ///
 /// [`TimelineView`]: crate::ui::timeline_view::TimelineView
-#[allow(clippy::too_many_arguments)] // mirrors `render`'s own shape plus
+#[allow(clippy::too_many_arguments)]
+// mirrors `render`'s own shape plus
 // the two focus/hint parameters `PaneChrome` needs; splitting this into a
 // struct would just move the same fields one level down.
+///
+/// Returns one [`HitRow`] per rendered terminal row of the content pane, in
+/// the same viewport-clamped order [`render_content`] pushed the matching
+/// `Line`s — `ui::mod::draw`'s `View::Diff` arm pairs this with the same
+/// content rect [`pane::inner_rect`] recomputes from `area` and hands both
+/// to [`crate::ui::mouse::FrameGeometry::record_diff_content`], so issue
+/// #22's click resolution shares this exact render pass rather than a
+/// second wrap/layout computation (see `crate::ui::mouse`'s own doc
+/// comment).
 pub fn render_focusable(
     frame: &mut Frame,
     area: Rect,
@@ -115,7 +132,7 @@ pub fn render_focusable(
     comments: &CommentIndex,
     focused: bool,
     hints: &[PaneHint<'_>],
-) {
+) -> Vec<HitRow> {
     let block = PaneChrome::new(" diff ", area.width)
         .focused(focused)
         .hints(hints)
@@ -130,7 +147,7 @@ pub fn render_focusable(
         layout,
         diagnostics,
         comments,
-    );
+    )
 }
 
 fn render_content(
@@ -141,7 +158,7 @@ fn render_content(
     layout: Layout,
     diagnostics: &DiagnosticsStore,
     comments: &CommentIndex,
-) {
+) -> Vec<HitRow> {
     match layout {
         Layout::Unified => render_unified(frame, inner, app, highlighter, diagnostics, comments),
         Layout::SideBySide => {
@@ -217,6 +234,28 @@ fn comments_starting_at_row<'a>(
 /// uncommented one would, a deliberate simplification over teaching the
 /// scroll/cursor model about sub-row lines (see M6's notes for a possible
 /// M7 revisit if that trade-off proves visually confusing in practice).
+/// Tags one [`render_row`] output line with its structural [`HitRow`] kind
+/// for the *unified* layout — the only layout where a
+/// [`crate::diff::RenderRow::Line`] produces a row of its own rather than
+/// being folded into a [`crate::diff::SideBySideRow::Paired`] cell (see
+/// `flatten_side_by_side`'s docs); a header/gap row maps the same way
+/// whichever layout it renders under, since `flatten_side_by_side` always
+/// puts those behind `SideBySideRow::Full` (see [`side_by_side_row_line`]'s
+/// `Full` arm, which reuses this too).
+fn hit_row_for(row: RenderRow, line: LineHit) -> HitRow {
+    match row {
+        RenderRow::Line { .. } => HitRow::Unified(line),
+        RenderRow::Gap { .. } => HitRow::Gap {
+            flat_idx: line.row_idx,
+        },
+        RenderRow::FileHeader { .. }
+        | RenderRow::BinaryNotice { .. }
+        | RenderRow::HunkHeader { .. } => HitRow::Structural {
+            flat_idx: line.row_idx,
+        },
+    }
+}
+
 fn render_unified(
     frame: &mut Frame,
     inner: Rect,
@@ -224,16 +263,17 @@ fn render_unified(
     highlighter: &mut LineHighlighter,
     diagnostics: &DiagnosticsStore,
     comments: &CommentIndex,
-) {
+) -> Vec<HitRow> {
     let content_width = inner.width as usize;
     let viewport_height = inner.height as usize;
     let wrap = crate::config::wrap_enabled();
     let mut lines: Vec<Line> = Vec::with_capacity(viewport_height);
+    let mut hits: Vec<HitRow> = Vec::with_capacity(viewport_height);
 
     let mut idx = app.scroll_offset;
     while lines.len() < viewport_height && idx < app.rows.len() {
         let row = app.rows[idx];
-        for line in render_row(
+        for (line, line_hit) in render_row(
             app,
             row,
             idx,
@@ -248,21 +288,26 @@ fn render_unified(
                 break;
             }
             lines.push(line);
+            hits.push(hit_row_for(row, line_hit));
         }
         if app.comments_visible {
-            for block_line in
-                comment_block_lines(comments_starting_at_row(app, row, comments), content_width)
-            {
+            for (block_line, hit) in comment_block_lines(
+                comments_starting_at_row(app, row, comments),
+                content_width,
+                idx,
+            ) {
                 if lines.len() >= viewport_height {
                     break;
                 }
                 lines.push(block_line);
+                hits.push(hit);
             }
         }
         idx += 1;
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
+    hits
 }
 
 /// Renders each hunk's deletions and insertions in row-aligned old/new
@@ -277,7 +322,7 @@ fn render_side_by_side(
     highlighter: &mut LineHighlighter,
     diagnostics: &DiagnosticsStore,
     comments: &CommentIndex,
-) {
+) -> Vec<HitRow> {
     let width = inner.width as usize;
     let divider_width = 1;
     let left_width = width.saturating_sub(divider_width) / 2;
@@ -287,11 +332,12 @@ fn render_side_by_side(
     let start = side_by_side_scroll_start(&app.side_by_side_rows, app.scroll_offset);
     let wrap = crate::config::wrap_enabled();
     let mut lines: Vec<Line> = Vec::with_capacity(viewport_height);
+    let mut hits: Vec<HitRow> = Vec::with_capacity(viewport_height);
 
     let mut idx = start;
     while lines.len() < viewport_height && idx < app.side_by_side_rows.len() {
         let row = app.side_by_side_rows[idx];
-        for line in side_by_side_row_line(
+        for (line, hit) in side_by_side_row_line(
             app,
             row,
             left_width,
@@ -305,20 +351,24 @@ fn render_side_by_side(
                 break;
             }
             lines.push(line);
+            hits.push(hit);
         }
         if app.comments_visible {
-            let annotations = side_by_side_row_comments_starting_at(app, row, comments);
-            for block_line in comment_block_lines(annotations, width) {
+            let (anchor_flat_idx, annotations) =
+                side_by_side_row_comments_starting_at(app, row, comments);
+            for (block_line, hit) in comment_block_lines(annotations, width, anchor_flat_idx) {
                 if lines.len() >= viewport_height {
                     break;
                 }
                 lines.push(block_line);
+                hits.push(hit);
             }
         }
         idx += 1;
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
+    hits
 }
 
 /// As [`comments_starting_at_row`], for one [`SideBySideRow`] — the
@@ -330,11 +380,18 @@ fn render_side_by_side(
 /// consulted here — req 8's "new-cell-only" rule falls out of this for free,
 /// the same way it already does for [`render_row`]'s marker (called through
 /// `comments_for_row`, unaffected by this function).
+///
+/// Also returns the resolved `flat_idx` alongside the slice (`0` when
+/// there's nothing to anchor to — never read in that case, since an empty
+/// slice makes `comment_block_lines` a no-op regardless): issue #22's
+/// `HitRow::CommentBody` needs the same anchor row `comment_block_lines` is
+/// about to render a body block for, and re-deriving it a second time at
+/// the call site would just repeat this match.
 fn side_by_side_row_comments_starting_at<'a>(
     app: &App,
     row: SideBySideRow,
     comments: &'a CommentIndex,
-) -> &'a [CommentAnnotation] {
+) -> (usize, &'a [CommentAnnotation]) {
     let flat_idx = match row {
         SideBySideRow::Full { flat_idx } => Some(flat_idx),
         SideBySideRow::Paired {
@@ -347,8 +404,11 @@ fn side_by_side_row_comments_starting_at<'a>(
         } => None,
     };
     match flat_idx {
-        Some(flat_idx) => comments_starting_at_row(app, app.rows[flat_idx], comments),
-        None => &[],
+        Some(flat_idx) => (
+            flat_idx,
+            comments_starting_at_row(app, app.rows[flat_idx], comments),
+        ),
+        None => (0, &[]),
     }
 }
 
@@ -372,8 +432,13 @@ fn side_by_side_row_line(
     diagnostics: &DiagnosticsStore,
     comments: &CommentIndex,
     wrap: bool,
-) -> Vec<Line<'static>> {
+) -> Vec<(Line<'static>, HitRow)> {
     match row {
+        // `flatten_side_by_side` never puts a `RenderRow::Line` behind
+        // `Full` (see its own docs) — `render_row`'s output here is always
+        // a header/gap, so `hit_row_for` (shared with `render_unified`)
+        // never actually reaches its `Unified` arm from this call site, but
+        // it's still the correct tag if that invariant ever changed.
         SideBySideRow::Full { flat_idx } => render_row(
             app,
             app.rows[flat_idx],
@@ -384,7 +449,10 @@ fn side_by_side_row_line(
             diagnostics,
             comments,
             wrap,
-        ),
+        )
+        .into_iter()
+        .map(|(line, line_hit)| (line, hit_row_for(app.rows[flat_idx], line_hit)))
+        .collect(),
         SideBySideRow::Paired { old, new } => {
             let left_lines = side_cell_lines(
                 app,
@@ -405,17 +473,24 @@ fn side_by_side_row_line(
                 wrap,
             );
             let pair_height = left_lines.len().max(right_lines.len());
-            let blank_left = Line::from(Span::raw(" ".repeat(left_width)));
-            let blank_right = Line::from(Span::raw(" ".repeat(right_width)));
+            let blank_left = (Line::from(Span::raw(" ".repeat(left_width))), None);
+            let blank_right = (Line::from(Span::raw(" ".repeat(right_width))), None);
             (0..pair_height)
                 .map(|i| {
-                    let mut spans = left_lines.get(i).unwrap_or(&blank_left).spans.clone();
+                    let (left_line, old_hit) = left_lines.get(i).unwrap_or(&blank_left);
+                    let (right_line, new_hit) = right_lines.get(i).unwrap_or(&blank_right);
+                    let mut spans = left_line.spans.clone();
                     spans.push(Span::styled(
                         "\u{2502}",
                         Style::default().fg(Color::DarkGray),
                     ));
-                    spans.extend(right_lines.get(i).unwrap_or(&blank_right).spans.clone());
-                    Line::from(spans)
+                    spans.extend(right_line.spans.clone());
+                    let hit = HitRow::SideBySide {
+                        left_width,
+                        old: *old_hit,
+                        new: *new_hit,
+                    };
+                    (Line::from(spans), hit)
                 })
                 .collect()
         }
@@ -424,10 +499,11 @@ fn side_by_side_row_line(
 
 /// One column's worth of visual rows for a [`SideCell`]: the same
 /// rendering [`render_row`] already produces for that flat row when
-/// populated (one row, or more if it wrapped), or a single blank filler
-/// line at `width` when the other side has no counterpart here — pairing
-/// this up against the other side's row count is [`side_by_side_row_line`]'s
-/// job, not this function's.
+/// populated (one row, or more if it wrapped), each paired with its own
+/// [`LineHit`], or a single blank filler line at `width` paired with `None`
+/// (nothing to hit-test — see [`HitRow::SideBySide`]'s docs) when the other
+/// side has no counterpart here. Pairing this up against the other side's
+/// row count is [`side_by_side_row_line`]'s job, not this function's.
 #[allow(clippy::too_many_arguments)] // see `content_line`'s comment
 fn side_cell_lines(
     app: &App,
@@ -437,7 +513,7 @@ fn side_cell_lines(
     diagnostics: &DiagnosticsStore,
     comments: &CommentIndex,
     wrap: bool,
-) -> Vec<Line<'static>> {
+) -> Vec<(Line<'static>, Option<LineHit>)> {
     match cell {
         SideCell::Line { flat_idx } => render_row(
             app,
@@ -449,8 +525,11 @@ fn side_cell_lines(
             diagnostics,
             comments,
             wrap,
-        ),
-        SideCell::Empty => vec![Line::from(Span::raw(" ".repeat(width)))],
+        )
+        .into_iter()
+        .map(|(line, hit)| (line, Some(hit)))
+        .collect(),
+        SideCell::Empty => vec![(Line::from(Span::raw(" ".repeat(width))), None)],
     }
 }
 
@@ -468,6 +547,14 @@ fn side_cell_lines(
 /// on hand. The only thing it's for is keying a search match back to the
 /// row it belongs to (see [`content_line`]'s search-mark handling) — every
 /// other piece of this function ignores it entirely.
+/// Every non-`Line` row is exactly one visual row whose whole width is a
+/// single rendered line with nothing to sub-divide by column — its
+/// [`LineHit`] is always `content_start_col: 0` (there's no wrap to
+/// accumulate an offset across). Callers (`render_unified`'s loop,
+/// `side_by_side_row_line`'s `Full` arm) turn this into the right
+/// structural [`HitRow`] via [`hit_row_for`], which is what actually cares
+/// which `RenderRow` variant this was — this function stays a plain
+/// `LineHit` producer regardless.
 #[allow(clippy::too_many_arguments)] // see `content_line`'s comment
 fn render_row(
     app: &App,
@@ -479,16 +566,25 @@ fn render_row(
     diagnostics: &DiagnosticsStore,
     comments: &CommentIndex,
     wrap: bool,
-) -> Vec<Line<'static>> {
+) -> Vec<(Line<'static>, LineHit)> {
+    let single = |line: Line<'static>| {
+        vec![(
+            line,
+            LineHit {
+                row_idx: flat_idx,
+                content_start_col: 0,
+            },
+        )]
+    };
     match row {
         RenderRow::FileHeader { file_idx } => {
-            vec![file_header_line(app, file_idx, width, is_cursor)]
+            single(file_header_line(app, file_idx, width, is_cursor))
         }
         RenderRow::BinaryNotice { file_idx } => {
-            vec![binary_notice_line(app, file_idx, width, is_cursor)]
+            single(binary_notice_line(app, file_idx, width, is_cursor))
         }
         RenderRow::HunkHeader { file_idx, hunk_idx } => {
-            vec![hunk_header_line(app, file_idx, hunk_idx, width, is_cursor)]
+            single(hunk_header_line(app, file_idx, hunk_idx, width, is_cursor))
         }
         RenderRow::Line {
             file_idx,
@@ -508,7 +604,7 @@ fn render_row(
             wrap,
         ),
         RenderRow::Gap { file_idx, gap_idx } => {
-            vec![gap_line(app, file_idx, gap_idx, width, is_cursor)]
+            single(gap_line(app, file_idx, gap_idx, width, is_cursor))
         }
     }
 }
@@ -615,10 +711,20 @@ fn comment_marker_span(annotations: &[CommentAnnotation], bg: Option<Color>) -> 
 /// [`comments_starting_at_row`]'s output, never [`comments_for_row`]'s —
 /// see that function's docs — so `annotations` here is never more than one
 /// row's worth of *range starts*, not every line a range happens to cover.
-fn comment_block_lines(annotations: &[CommentAnnotation], width: usize) -> Vec<Line<'static>> {
+///
+/// Every line this produces is tagged [`HitRow::CommentBody`] with
+/// `anchor_flat_idx` — issue #22: clicking anywhere in the block (header or
+/// wrapped body text alike) positions the cursor on the row the comment is
+/// anchored to, never a column within the block itself (there's no
+/// `symbols::scan`-addressable source line here to resolve one against).
+fn comment_block_lines(
+    annotations: &[CommentAnnotation],
+    width: usize,
+    anchor_flat_idx: usize,
+) -> Vec<(Line<'static>, HitRow)> {
     const INDENT: &str = "      ";
     let body_width = width.saturating_sub(display_width(INDENT));
-    let mut out = Vec::new();
+    let mut out: Vec<Line<'static>> = Vec::new();
 
     for annotation in annotations {
         let label = if annotation.detached {
@@ -661,7 +767,9 @@ fn comment_block_lines(annotations: &[CommentAnnotation], width: usize) -> Vec<L
             )));
         }
     }
-    out
+    out.into_iter()
+        .map(|line| (line, HitRow::CommentBody { anchor_flat_idx }))
+        .collect()
 }
 
 fn cursor_style(base: Style, is_cursor: bool) -> Style {
@@ -740,7 +848,7 @@ fn binary_notice_line(
 /// [`content_line`] derives its highlighted-text budget from this, and
 /// [`unified_content_width`] reuses it so scroll math's wrap-height lookups
 /// (`App::row_visual_height`) agree with what actually renders.
-fn gutter_width() -> usize {
+pub(crate) fn gutter_width() -> usize {
     const DIAG_WIDTH: usize = 2; // glyph + trailing space, see `diagnostic_glyph_span`
     const COMMENT_WIDTH: usize = 1; // see `comment_marker_span`
     // marker + space + old# + space + new# + space + │ + space
@@ -811,7 +919,7 @@ fn content_line(
     diagnostics: &DiagnosticsStore,
     comments: &[CommentAnnotation],
     wrap: bool,
-) -> Vec<Line<'static>> {
+) -> Vec<(Line<'static>, LineHit)> {
     let file = &app.files[file_idx];
     let row = &file.hunks[hunk_idx].rows[row_idx];
 
@@ -1004,7 +1112,13 @@ fn content_line(
         if is_cursor {
             line = line.patch_style(Style::default().add_modifier(Modifier::REVERSED));
         }
-        out.push(line);
+        out.push((
+            line,
+            LineHit {
+                row_idx: flat_idx,
+                content_start_col: col_offset,
+            },
+        ));
         col_offset += row_width;
     }
     out
@@ -1188,6 +1302,16 @@ mod tests {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    /// Strips issue #22's `HitRow`/`LineHit` half off `content_line`/
+    /// `render_row`/`side_by_side_row_line`/`comment_block_lines`'s output
+    /// so every render test written before #22 keeps asserting on plain
+    /// `Vec<Line>` exactly as it did — the hit-row half gets its own
+    /// dedicated tests (below) rather than every existing rendering
+    /// assertion needing to destructure a tuple it doesn't care about.
+    fn lines_only<T>(pairs: Vec<(Line<'static>, T)>) -> Vec<Line<'static>> {
+        pairs.into_iter().map(|(line, _)| line).collect()
+    }
+
     /// Renders `app` through `render_unified`/`render_side_by_side`
     /// directly (bypassing `render`/`render_focusable`'s border chrome, so
     /// `width`/`height` map onto content rows one-to-one) into an offscreen
@@ -1206,7 +1330,7 @@ mod tests {
                     &mut highlighter,
                     &diagnostics,
                     comments,
-                )
+                );
             })
             .unwrap();
         terminal.backend().buffer().clone()
@@ -1227,7 +1351,7 @@ mod tests {
                     &mut highlighter,
                     &diagnostics,
                     comments,
-                )
+                );
             })
             .unwrap();
         terminal.backend().buffer().clone()
@@ -1389,7 +1513,7 @@ mod tests {
         )]);
         let mut highlighter = LineHighlighter::new();
         let diagnostics = DiagnosticsStore::new();
-        let lines = content_line(
+        let lines = lines_only(content_line(
             &app,
             0,
             0,
@@ -1401,7 +1525,7 @@ mod tests {
             &diagnostics,
             &[],
             false, // wrap = false
-        );
+        ));
         assert_eq!(
             lines.len(),
             1,
@@ -1419,7 +1543,7 @@ mod tests {
         )]);
         let mut highlighter = LineHighlighter::new();
         let diagnostics = DiagnosticsStore::new();
-        let lines = content_line(
+        let lines = lines_only(content_line(
             &app,
             0,
             0,
@@ -1431,7 +1555,7 @@ mod tests {
             &diagnostics,
             &[],
             true,
-        );
+        ));
         assert!(
             lines.len() > 1,
             "50 columns of content at a much narrower pane must wrap onto continuation rows"
@@ -1464,7 +1588,7 @@ mod tests {
         )]);
         let mut highlighter = LineHighlighter::new();
         let diagnostics = DiagnosticsStore::new();
-        let lines = content_line(
+        let lines = lines_only(content_line(
             &app,
             0,
             0,
@@ -1476,7 +1600,7 @@ mod tests {
             &diagnostics,
             &[],
             true,
-        );
+        ));
         assert!(lines.len() > 1);
         for line in &lines {
             assert!(
@@ -1511,7 +1635,7 @@ mod tests {
         // that has no content budget left at all, which isn't a
         // configuration `MIN_SIDE_BY_SIDE_WIDTH` ever actually allows.
         let (left_width, right_width) = (30, 25);
-        let lines = side_by_side_row_line(
+        let lines = lines_only(side_by_side_row_line(
             &app,
             pair,
             left_width,
@@ -1520,7 +1644,7 @@ mod tests {
             &diagnostics,
             &comments,
             true,
-        );
+        ));
 
         assert!(
             lines.len() > 1,
@@ -1573,7 +1697,7 @@ mod tests {
         let diagnostics = DiagnosticsStore::new();
         let comments = CommentIndex::default();
 
-        let lines = side_by_side_row_line(
+        let lines = lines_only(side_by_side_row_line(
             &app,
             SideBySideRow::Full { flat_idx: 0 }, // the file header row
             20,
@@ -1582,7 +1706,7 @@ mod tests {
             &diagnostics,
             &comments,
             true,
-        );
+        ));
         assert_eq!(lines.len(), 1);
     }
 
@@ -1662,7 +1786,7 @@ mod tests {
         let mut highlighter = LineHighlighter::new();
         let diagnostics = DiagnosticsStore::new();
         let comments = CommentIndex::default();
-        let lines = render_row(
+        let lines = lines_only(render_row(
             &app,
             RenderRow::Gap {
                 file_idx: 0,
@@ -1675,7 +1799,7 @@ mod tests {
             &diagnostics,
             &comments,
             true,
-        );
+        ));
         assert_eq!(lines.len(), 1);
     }
 
@@ -1699,7 +1823,7 @@ mod tests {
 
         let mut highlighter = LineHighlighter::new();
         let diagnostics = DiagnosticsStore::new();
-        let lines = content_line(
+        let lines = lines_only(content_line(
             &app,
             0,
             0,
@@ -1711,7 +1835,7 @@ mod tests {
             &diagnostics,
             &[],
             true,
-        );
+        ));
         assert_eq!(lines.len(), 1);
 
         let is_current = |s: &Span| {
@@ -1775,7 +1899,7 @@ mod tests {
 
         let mut highlighter = LineHighlighter::new();
         let diagnostics = DiagnosticsStore::new();
-        let lines = content_line(
+        let lines = lines_only(content_line(
             &app,
             0,
             0,
@@ -1787,7 +1911,7 @@ mod tests {
             &diagnostics,
             &[],
             true,
-        );
+        ));
         assert_eq!(lines.len(), 1);
 
         let is_current = |s: &Span| {
@@ -1828,7 +1952,7 @@ mod tests {
         let mut highlighter = LineHighlighter::new();
         let diagnostics = DiagnosticsStore::new();
         let content_width = 22;
-        let lines = content_line(
+        let lines = lines_only(content_line(
             &app,
             0,
             0,
@@ -1840,7 +1964,7 @@ mod tests {
             &diagnostics,
             &[],
             true,
-        );
+        ));
         assert!(
             lines.len() >= 2,
             "the match itself straddles the wrap point, so this needs at least two visual rows"
@@ -1889,7 +2013,7 @@ mod tests {
         // Wide enough on the new side that "alpha needle beta" never wraps
         // (`gutter_width()` alone eats a fixed chunk of whatever width is
         // requested — see that function's docs).
-        let lines = side_by_side_row_line(
+        let lines = lines_only(side_by_side_row_line(
             &app,
             pair,
             20,
@@ -1898,7 +2022,7 @@ mod tests {
             &diagnostics,
             &comments,
             true,
-        );
+        ));
         assert_eq!(lines.len(), 1);
 
         let divider_idx = lines[0]
@@ -1924,6 +2048,91 @@ mod tests {
     }
 
     #[test]
+    fn content_line_emits_one_hit_per_wrap_row_with_accumulated_start_columns() {
+        // The real renderer's LineHit output, not a hand-built fixture:
+        // `content_start_col` must be the display column each wrap row
+        // *starts* at (captured before the width increment), or every
+        // continuation-row click resolves one row's width off.
+        let app_rows = vec![row(
+            DiffLineKind::Context,
+            &"x".repeat(50),
+            Some(1),
+            Some(1),
+        )];
+        let app = app_with_rows(app_rows);
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let width = 30;
+        let content_width = width - gutter_width();
+
+        let pairs = content_line(
+            &app,
+            0,
+            0,
+            0,
+            2,
+            width,
+            false,
+            &mut highlighter,
+            &diagnostics,
+            &[],
+            true,
+        );
+        assert!(pairs.len() >= 2, "50 columns must wrap at width {width}");
+        for (i, (_, hit)) in pairs.iter().enumerate() {
+            assert_eq!(hit.row_idx, 2, "every wrap row belongs to flat row 2");
+            assert_eq!(
+                hit.content_start_col,
+                i * content_width,
+                "wrap row {i} starts where the previous row's width ended"
+            );
+        }
+    }
+
+    #[test]
+    fn side_by_side_unequal_wrap_leaves_the_exhausted_side_without_a_hit() {
+        // Real `side_by_side_row_line` output for a Paired row whose old
+        // side wraps taller than its new side: the new cell's overflow
+        // rows must carry `None` (blank filler is non-actionable), while
+        // the old cell keeps its per-row hits.
+        let app_rows = vec![
+            row(DiffLineKind::Del, &"o".repeat(45), Some(1), None),
+            row(DiffLineKind::Add, "short", None, Some(1)),
+        ];
+        let app = app_with_rows(app_rows);
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let comments = CommentIndex::default();
+
+        let pairs = side_by_side_row_line(
+            &app,
+            SideBySideRow::Paired {
+                old: crate::diff::SideCell::Line { flat_idx: 2 },
+                new: crate::diff::SideCell::Line { flat_idx: 3 },
+            },
+            30,
+            30,
+            &mut highlighter,
+            &diagnostics,
+            &comments,
+            true,
+        );
+        assert!(pairs.len() >= 2, "the old side must wrap at width 30");
+        let HitRow::SideBySide { old, new, .. } = &pairs[0].1 else {
+            panic!("paired rows emit SideBySide hits, got {:?}", pairs[0].1);
+        };
+        assert!(old.is_some() && new.is_some(), "row 0 has both cells");
+        let HitRow::SideBySide { old, new, .. } = &pairs[1].1 else {
+            panic!("paired rows emit SideBySide hits, got {:?}", pairs[1].1);
+        };
+        assert!(old.is_some(), "the taller old side still has content");
+        assert!(
+            new.is_none(),
+            "the exhausted new side's filler row must be non-actionable"
+        );
+    }
+
+    #[test]
     fn content_line_marks_every_visual_row_of_a_selected_wrapped_line() {
         let app_rows = vec![row(
             DiffLineKind::Context,
@@ -1941,7 +2150,7 @@ mod tests {
 
         let mut highlighter = LineHighlighter::new();
         let diagnostics = DiagnosticsStore::new();
-        let lines = content_line(
+        let lines = lines_only(content_line(
             &app,
             0,
             0,
@@ -1953,7 +2162,7 @@ mod tests {
             &diagnostics,
             &[],
             true,
-        );
+        ));
         assert!(lines.len() > 1, "sanity: this line must wrap at width 30");
         for (i, line) in lines.iter().enumerate() {
             assert!(
@@ -1983,7 +2192,7 @@ mod tests {
         // (`row_width == 0`, so `mark_range` has nothing to mark) — the
         // padding itself must carry the selection background, or a
         // contiguous selection shows a hole in the middle (req 7).
-        let blank = content_line(
+        let blank = lines_only(content_line(
             &app,
             0,
             0,
@@ -1995,7 +2204,7 @@ mod tests {
             &diagnostics,
             &[],
             true,
-        );
+        ));
         assert_eq!(blank.len(), 1, "an empty line renders one visual row");
         assert!(
             blank[0].spans.iter().any(is_visual_selected),
@@ -2005,7 +2214,7 @@ mod tests {
 
         // A short selected row: the fill past its last character continues
         // the selection bar to the pane edge instead of cutting it off.
-        let short = content_line(
+        let short = lines_only(content_line(
             &app,
             0,
             0,
@@ -2017,7 +2226,7 @@ mod tests {
             &diagnostics,
             &[],
             true,
-        );
+        ));
         let pad = short[0].spans.last().expect("trailing pad span exists");
         assert!(
             is_visual_selected(pad),
@@ -2047,7 +2256,7 @@ mod tests {
 
         let mut highlighter = LineHighlighter::new();
         let diagnostics = DiagnosticsStore::new();
-        let lines = content_line(
+        let lines = lines_only(content_line(
             &app,
             0,
             0,
@@ -2059,7 +2268,7 @@ mod tests {
             &diagnostics,
             &[],
             true,
-        );
+        ));
         assert_eq!(lines.len(), 1);
 
         let needle_span = lines[0]
@@ -2093,7 +2302,7 @@ mod tests {
 
         let mut highlighter = LineHighlighter::new();
         let diagnostics = DiagnosticsStore::new();
-        let lines = content_line(
+        let lines = lines_only(content_line(
             &app,
             0,
             0,
@@ -2105,7 +2314,7 @@ mod tests {
             &diagnostics,
             &[],
             true,
-        );
+        ));
         assert_eq!(lines.len(), 1);
         assert!(
             lines[0].style.add_modifier.contains(Modifier::REVERSED),
@@ -2137,7 +2346,7 @@ mod tests {
         // — `gutter_width()` alone eats a fixed chunk of whatever width is
         // requested (see `side_by_side_row_line_marks_a_search_match_on_the_new_side_only`'s
         // own comment for the same margin).
-        let lines = side_by_side_row_line(
+        let lines = lines_only(side_by_side_row_line(
             &app,
             pair,
             gutter_width() + 20,
@@ -2146,7 +2355,7 @@ mod tests {
             &diagnostics,
             &comments,
             true,
-        );
+        ));
         assert_eq!(lines.len(), 1);
         let divider_idx = lines[0]
             .spans
@@ -2191,7 +2400,7 @@ mod tests {
             old: SideCell::Line { flat_idx: 2 },
             new: SideCell::Line { flat_idx: 2 },
         };
-        let lines = side_by_side_row_line(
+        let lines = lines_only(side_by_side_row_line(
             &app,
             pair,
             gutter_width() + 20,
@@ -2200,7 +2409,7 @@ mod tests {
             &diagnostics,
             &comments,
             true,
-        );
+        ));
         assert_eq!(lines.len(), 1);
         let divider_idx = lines[0]
             .spans
@@ -2401,7 +2610,7 @@ mod tests {
         // Both comments start at line 2 — creation order preserves `range`
         // (pushed first) ahead of `single`.
         assert_eq!(range_annotations.len(), 2);
-        let rendered = comment_block_lines(range_annotations, 80);
+        let rendered = lines_only(comment_block_lines(range_annotations, 80, 0));
         let header_texts: Vec<String> = rendered.iter().map(line_text).collect();
         let range_header = header_texts
             .iter()
@@ -2440,7 +2649,7 @@ mod tests {
 
         let annotations = index.starting_at("f.rs", 2);
         assert_eq!(annotations.len(), 1);
-        let rendered = comment_block_lines(annotations, 80);
+        let rendered = lines_only(comment_block_lines(annotations, 80, 0));
 
         let header = &rendered[0];
         assert!(line_text(header).contains("resolved"));
@@ -2544,7 +2753,7 @@ mod tests {
         assert_eq!(annotations[0].id, "firstid1");
         assert_eq!(annotations[1].id, "secondid");
 
-        let rendered = comment_block_lines(annotations, 80);
+        let rendered = lines_only(comment_block_lines(annotations, 80, 0));
         let texts: Vec<String> = rendered.iter().map(line_text).collect();
         let first_idx = texts
             .iter()

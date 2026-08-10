@@ -19,10 +19,21 @@
 //! changed-file tree row a click landed on), so [`FrameGeometry::hit_rect`]
 //! hands back the recorded [`Rect`] itself alongside its target rather than
 //! just the target [`FrameGeometry::hit`] returns — [`files_row_at`] turns
-//! that rect plus the click point into a `visible_rows` index. #22 (code-
-//! pane clicks) is expected to do the same against `ScrollTarget::DiffPane`.
+//! that rect plus the click point into a `visible_rows` index. Issue #22
+//! (code-pane clicks) does the same against `ScrollTarget::DiffPane`/
+//! `FilePane`, but a diff/file row can wrap, pair up side-by-side, or stand
+//! for a header/gap/comment block — a single `Rect` plus a row count isn't
+//! enough to map a click back to a logical row and display column, so it
+//! adds a second, parallel piece of per-frame state: [`FrameGeometry::diff_content`]/
+//! [`file_content`], a content [`Rect`] paired with a [`HitRow`] per
+//! rendered terminal row, built by the *same* render loops that push
+//! [`ratatui::text::Line`]s (`diff_view::render_unified`/`render_side_by_side`,
+//! `file_view::render`) rather than a second wrap/layout algorithm re-deriving
+//! the same rows here — see [`HitRow`]'s own docs.
 
 use crate::keymap::Keymap;
+use crate::ui::diff_view;
+use crate::ui::file_view;
 use crate::ui::help::{self, HelpState};
 use crate::ui::hover_popup::HoverState;
 use crate::ui::navigation::{FilesConfirmOutcome, JumpStack, record_jump};
@@ -74,6 +85,192 @@ pub enum ScrollTarget {
     ComposeModal,
 }
 
+/// One rendered *visual* row's mapping back to its logical source line:
+/// which row of `App::rows` (or `FileView`'s own 0-based line index) it
+/// belongs to, and the display column (in that logical line's tab-expanded
+/// column space — the same space [`crate::diff::ColumnMap`]/
+/// [`crate::ui::symbols::scan`] use) the first rendered character of *this*
+/// visual row starts at. Row 0 of an unwrapped line, or the first visual row
+/// of a wrapped one, always has `content_start_col == 0`; a continuation row
+/// carries however many columns of the logical line already wrapped away
+/// above it — exactly `content_line`'s own `col_offset` accumulator (see
+/// `diff_view::content_line`/`file_view::content_line`), which is what
+/// produces this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineHit {
+    pub row_idx: usize,
+    pub content_start_col: usize,
+}
+
+/// One rendered terminal row's hit-test tag, alongside its [`ratatui::text::Line`]
+/// in the `Vec` a content render loop builds — the vocabulary #22's
+/// "architecture guidance" asks for: every row a click could land on, kept
+/// distinct enough that [`resolve_hit`] never has to guess what a row
+/// *means* from its geometry alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HitRow {
+    /// A content line in the unified layout — the only layout where a
+    /// [`crate::diff::RenderRow::Line`] produces a row of its own, rather
+    /// than being folded into a [`Self::SideBySide`] cell (see
+    /// `crate::diff::flatten_side_by_side`'s docs).
+    Unified(LineHit),
+    /// One visual row of a [`crate::diff::SideBySideRow::Paired`] pair.
+    /// `left_width` is the divider's column within the pane's content rect
+    /// (constant for the whole pane, not just this row) — [`resolve_hit`]
+    /// needs it to decide which cell `local_x` fell in without a second
+    /// layout computation. `old`/`new` are `None` for the blank filler a
+    /// shorter side pads out with when the other side wrapped to more
+    /// visual rows (see `diff_view::side_by_side_row_line`'s docs) — padding
+    /// with nothing to hit-test, not a row this variant can resolve.
+    SideBySide {
+        left_width: usize,
+        old: Option<LineHit>,
+        new: Option<LineHit>,
+    },
+    /// A file/hunk header or binary notice — [`crate::diff::RenderRow::FileHeader`]/
+    /// `BinaryNotice`/`HunkHeader`. Cursor-addressable (see `App::cursor`'s
+    /// docs) but has no display column or symbol of its own to resolve.
+    Structural { flat_idx: usize },
+    /// A fold row ([`crate::diff::RenderRow::Gap`]) — cursor-addressable,
+    /// same reasoning as [`Self::Structural`].
+    Gap { flat_idx: usize },
+    /// One line of an inline comment's rendered body block — maps back to
+    /// the flat row the comment is anchored to (its range's *start*, for a
+    /// multi-line range — see `diff_view::comments_starting_at_row`'s docs),
+    /// never to a row/column of its own; clicking anywhere in the block
+    /// positions the cursor on the anchor row.
+    CommentBody { anchor_flat_idx: usize },
+    /// A content line in [`crate::ui::file_view::FileView`]'s single-column
+    /// layout — [`Self::Unified`]'s file-view counterpart; kept as a
+    /// separate variant (rather than reusing `Unified`) so a caller can
+    /// never accidentally feed a diff-pane hit through file-view resolution
+    /// or vice versa.
+    FileLine(LineHit),
+}
+
+/// One click's column resolved against a single [`LineHit`]: `(display_col,
+/// content_click)`. `content_click` is `false` when `local_x` lands in the
+/// row's gutter (`local_x < gutter_width`) — a position-only click (issue
+/// #22 req 3) — in which case `display_col` is `hit.content_start_col`
+/// (this visual row's own first column) rather than a value derived from
+/// `local_x`, since there's no on-content `local_x` to derive it from.
+/// `gutter_width` is the *same* constant for a row's first visual row and
+/// every continuation row after it (`diff_view::continuation_gutter`'s doc
+/// guarantees this — see this module's own doc on why that means one
+/// subtraction here, never a second per-row-kind width table).
+fn resolve_line_column(hit: LineHit, gutter_width: usize, local_x: u16) -> (usize, bool) {
+    let x = local_x as usize;
+    if x < gutter_width {
+        (hit.content_start_col, false)
+    } else {
+        (hit.content_start_col + (x - gutter_width), true)
+    }
+}
+
+/// A click resolved against one recorded [`HitRow`]: which logical row to
+/// move the cursor to, the display column to resolve the active symbol
+/// against, whether this was an on-content click at all (`false` for a
+/// gutter click or a structural/gap/comment-body row — position only, never
+/// an identifier hit regardless of what `display_col` happens to overlap),
+/// and whether this side is even eligible for go-to-definition
+/// (`new_or_unified_side`, `false` only for a side-by-side *old* cell — see
+/// its own docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedClick {
+    pub row_idx: usize,
+    pub display_col: usize,
+    pub content_click: bool,
+    pub new_or_unified_side: bool,
+}
+
+/// Resolves a click at local content-rect column `local_x` against one
+/// already-looked-up [`HitRow`] — the row lookup itself (`local_y` indexing
+/// into a frame's `Vec<HitRow>`, out-of-range past the last rendered row)
+/// is [`FrameGeometry::diff_row_hit`]/[`file_row_hit`]'s job, not this
+/// function's; this is the pure per-row half, independently testable
+/// against a hand-built [`HitRow`] with no [`FrameGeometry`]/[`Rect`] in the
+/// picture at all. `None` for a side-by-side divider column, or a
+/// side-by-side cell whose [`LineHit`] is itself `None` (blank filler — see
+/// [`HitRow::SideBySide`]'s docs) — both "nothing here to hit," not a row
+/// this function can resolve *and* say "position only" about, unlike a
+/// gutter click (see [`ResolvedClick::content_click`]).
+///
+/// No display-width walk of its own anywhere in here — every column
+/// decision is a plain subtraction against `content_start_col`/`left_width`,
+/// both already computed by the render loop that produced `hit` in the
+/// line's own tab-expanded, grapheme-aware display-column space. That's the
+/// "no second wrap/layout algorithm" the issue's architecture guidance asks
+/// for (see this module's own doc comment).
+pub fn resolve_hit(hit: HitRow, gutter_width: usize, local_x: u16) -> Option<ResolvedClick> {
+    Some(match hit {
+        HitRow::Unified(line) | HitRow::FileLine(line) => {
+            let (display_col, content_click) = resolve_line_column(line, gutter_width, local_x);
+            ResolvedClick {
+                row_idx: line.row_idx,
+                display_col,
+                content_click,
+                new_or_unified_side: true,
+            }
+        }
+        HitRow::SideBySide {
+            left_width,
+            old,
+            new,
+        } => {
+            let x = local_x as usize;
+            if x < left_width {
+                let line = old?;
+                let (display_col, content_click) = resolve_line_column(line, gutter_width, local_x);
+                ResolvedClick {
+                    row_idx: line.row_idx,
+                    display_col,
+                    content_click,
+                    new_or_unified_side: false,
+                }
+            } else if x == left_width {
+                return None; // the divider itself — non-actionable (req 7)
+            } else {
+                let line = new?;
+                // Shift past the left column and the one-column divider
+                // before re-running the same gutter subtraction the left
+                // cell just used — the new cell's own `local_x` space starts
+                // fresh at its own gutter, exactly as if it were rendered on
+                // its own (see `side_by_side_row_line`'s docs on how the two
+                // cells' spans get concatenated with a divider between).
+                let shifted = local_x - (left_width as u16 + 1);
+                let (display_col, content_click) = resolve_line_column(line, gutter_width, shifted);
+                ResolvedClick {
+                    row_idx: line.row_idx,
+                    display_col,
+                    content_click,
+                    new_or_unified_side: true,
+                }
+            }
+        }
+        // Neither carries a column to resolve — see `HitRow::Structural`/
+        // `Gap`/`CommentBody`'s own docs — so `display_col` is a placeholder
+        // `0` an `App`/`FileView` positioning call ignores anyway (neither
+        // has a symbol to select on a header/gap/comment-body row: see
+        // `App::cursor_row_text`'s `None` fallback for anything but a
+        // `RenderRow::Line`). `new_or_unified_side: false` keeps these out
+        // of identifier-hit consideration unconditionally, on top of
+        // `content_click: false` already doing so — belt and suspenders
+        // against a future caller that only checks one of the two.
+        HitRow::Structural { flat_idx } | HitRow::Gap { flat_idx } => ResolvedClick {
+            row_idx: flat_idx,
+            display_col: 0,
+            content_click: false,
+            new_or_unified_side: false,
+        },
+        HitRow::CommentBody { anchor_flat_idx } => ResolvedClick {
+            row_idx: anchor_flat_idx,
+            display_col: 0,
+            content_click: false,
+            new_or_unified_side: false,
+        },
+    })
+}
+
 /// One frame's worth of "what's drawn where," rebuilt fresh every render —
 /// see this module's docs for why a fresh build beats caching across
 /// frames (every rect can move: resize, a toggled sidebar, a popup opening).
@@ -84,11 +281,61 @@ pub struct FrameGeometry {
     /// a linear reverse scan in [`Self::hit`] is simpler than any tree and
     /// costs nothing measurable.
     entries: Vec<(Rect, ScrollTarget)>,
+    /// Issue #22: the main diff pane's *content* rect (inside its border —
+    /// see `diff_view::render_focusable`'s `PaneChrome` — never the outer
+    /// rect [`ScrollTarget::DiffPane`] records for wheel containment) paired
+    /// with one [`HitRow`] per rendered terminal row within it. `None` when
+    /// nothing was drawn to record against (`View::Diff` isn't on top this
+    /// frame) — kept as a field parallel to `entries`, not folded into it,
+    /// since a `HitRow` needs a `local_y`-indexed `Vec` alongside its rect,
+    /// not just a target tag (see [`resolve_hit`]). A single `Option` rather
+    /// than something keyed by view assumes one top-level content pane needs
+    /// hit-testing per frame — true for both `View::Diff` and `View::File`
+    /// today (they're never both on top at once), flagged here for whoever
+    /// adds a second concurrently-hit-testable pane later.
+    diff_content: Option<(Rect, Vec<HitRow>)>,
+    /// As [`Self::diff_content`], for `View::File`'s single content pane.
+    file_content: Option<(Rect, Vec<HitRow>)>,
 }
 
 impl FrameGeometry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Records the diff pane's content rect and per-row [`HitRow`]s for this
+    /// frame — called once from `draw`'s `View::Diff` arm, after
+    /// `diff_view::render_focusable` has both drawn the content and handed
+    /// back the exact `HitRow`s it drew alongside (see this module's doc
+    /// comment on why the render loop itself is the one source of this,
+    /// never a second computation here).
+    pub fn record_diff_content(&mut self, rect: Rect, hits: Vec<HitRow>) {
+        self.diff_content = Some((rect, hits));
+    }
+
+    /// As [`Self::record_diff_content`], for `View::File`.
+    pub fn record_file_content(&mut self, rect: Rect, hits: Vec<HitRow>) {
+        self.file_content = Some((rect, hits));
+    }
+
+    /// `(local_x, local_y, hit)` for a click at `(col, row)` landing inside
+    /// the diff pane's recorded content rect this frame, on a row `hits`
+    /// actually has an entry for — `None` outside the rect, past the last
+    /// rendered row (a click into the content rect's own blank remainder),
+    /// or when nothing was recorded at all this frame (see
+    /// [`Self::diff_content`]'s docs). `local_x`/`local_y` are `(col, row)`
+    /// translated into the content rect's own coordinate space (`0` at the
+    /// rect's own top-left) — what [`resolve_hit`] expects as its own
+    /// `local_x`, alongside the `hit` this already looked up for the
+    /// caller so `resolve_hit` itself never needs the whole `Vec<HitRow>`
+    /// or a row index to search it with.
+    pub fn diff_row_hit(&self, col: u16, row: u16) -> Option<(u16, u16, &HitRow)> {
+        content_row_hit(self.diff_content.as_ref(), col, row)
+    }
+
+    /// As [`Self::diff_row_hit`], for `View::File`'s content rect.
+    pub fn file_row_hit(&self, col: u16, row: u16) -> Option<(u16, u16, &HitRow)> {
+        content_row_hit(self.file_content.as_ref(), col, row)
     }
 
     /// Records `rect` as belonging to `target` — a no-op for a zero-width
@@ -129,6 +376,31 @@ impl FrameGeometry {
     }
 }
 
+/// Shared body of [`FrameGeometry::diff_row_hit`]/[`FrameGeometry::file_row_hit`]:
+/// `(col, row)` translated into `content`'s own coordinate space and handed
+/// back alongside the `HitRow` at that local row, or `None` outside the
+/// rect (or when `content` itself is `None` — nothing recorded this frame).
+/// Column translation only, never row-index resolution: `hits[local_y]`
+/// (via direct indexing, not [`resolve_hit`]) is the row itself, since a
+/// caller needing the *resolved* click also needs `local_x`, which this
+/// returns raw for [`resolve_hit`] to consume — folding the two together
+/// would mean this function taking a `gutter_width` it has no other use
+/// for.
+fn content_row_hit(
+    content: Option<&(Rect, Vec<HitRow>)>,
+    col: u16,
+    row: u16,
+) -> Option<(u16, u16, &HitRow)> {
+    let (rect, hits) = content?;
+    if !rect.contains(Position { x: col, y: row }) {
+        return None;
+    }
+    let local_x = col - rect.x;
+    let local_y = row - rect.y;
+    hits.get(local_y as usize)
+        .map(|hit| (local_x, local_y, hit))
+}
+
 /// Which changed-files tree row — an index into `App::visible_rows` — sits
 /// under `(col, row)`, given `outer`: the same *outer*, border-inclusive
 /// [`Rect`] `draw` recorded under [`ScrollTarget::DiffFiles`] (see this
@@ -159,20 +431,32 @@ pub fn files_row_at(
     (idx < visible_row_count).then_some(idx)
 }
 
-/// A primary click at `(col, row)` (issue #21): the only target this issue
-/// wires up is the changed-files tree, so anything [`FrameGeometry::hit_rect`]
-/// resolves to besides [`ScrollTarget::DiffFiles`] — the diff pane, an
-/// overlay, unrecorded chrome — is a no-op here by construction. #22 (code-
-/// pane clicks) is expected to add its own `ScrollTarget::DiffPane` arm
-/// alongside this rather than folding into one function that tries to
-/// guess every target's meaning.
+/// A primary click at `(col, row)`. `shift` is the SGR mouse report's own
+/// shift-modifier bit (issue #20 req 4's `Cb` decode, forwarded straight
+/// from crossterm's `MouseEvent::modifiers`) — issue #22 req 4's
+/// shift-click-extends-selection-never-definition rule.
 ///
-/// `from` is read *before* the click can move anything — mirroring
-/// `ui::mod`'s `Action::Confirm`-while-`Files` arm, whose `from`-then-
-/// mutate ordering this is the mouse equivalent of — so a valid prior
-/// source location still round-trips through `Ctrl-o` afterward, and
-/// `record_jump`'s own equality check quietly declines to record a
-/// same-position "jump" (clicking the row the cursor's already on).
+/// [`FrameGeometry::hit_rect`]'s last-drawn-wins scan is the *entire*
+/// dispatch here: which arm below runs is decided purely by whichever
+/// [`ScrollTarget`] the click's `(col, row)` resolves to, so an overlay
+/// drawn on top of the diff/file pane (a hover popup, the references/units
+/// panel, help, a fully-modal scope-menu/units-setup/compose rect) already
+/// wins that scan and never reaches [`handle_diff_pane_click`]/
+/// [`handle_file_pane_click`] at all (req 8) — no second "is something on
+/// top of this point" check needed here. Anything besides
+/// [`ScrollTarget::DiffFiles`]/[`ScrollTarget::DiffPane`]/`FilePane` is a
+/// no-op by construction: #23 owns richer overlay-click behavior (dismiss,
+/// context menus), so a click landing on one of those today simply does
+/// nothing rather than guessing at behavior this issue doesn't own.
+///
+/// Returns whether the click landed on an eligible identifier — `true`
+/// means the caller (`ui::mod`'s `Event::Mouse` arm) should now dispatch
+/// `Action::GotoDefinition` through the ordinary `handle_action` pipeline,
+/// exactly as keyboard `gd` would, so readiness/supersession/jump-history/
+/// status stay single-sourced (see this module's own doc comment on why
+/// that dispatch happens one level up rather than being threaded through
+/// here — `handle_action` needs roughly twenty pieces of event-loop state
+/// this function has no reason to also take).
 pub fn handle_left_click(
     geometry: &FrameGeometry,
     stack: &mut ViewStack,
@@ -180,10 +464,37 @@ pub fn handle_left_click(
     hover_state: &mut HoverState,
     col: u16,
     row: u16,
+    shift: bool,
+) -> bool {
+    match geometry.hit_rect(col, row) {
+        Some((rect, ScrollTarget::DiffFiles)) => {
+            handle_files_click(rect, stack, jump_stack, hover_state, col, row);
+            false
+        }
+        Some((_, ScrollTarget::DiffPane)) => {
+            handle_diff_pane_click(geometry, stack, jump_stack, hover_state, col, row, shift)
+        }
+        Some((_, ScrollTarget::FilePane)) => {
+            handle_file_pane_click(geometry, stack, jump_stack, hover_state, col, row, shift)
+        }
+        _ => false,
+    }
+}
+
+/// `from` is read *before* the click can move anything — mirroring
+/// `ui::mod`'s `Action::Confirm`-while-`Files` arm, whose `from`-then-
+/// mutate ordering this is the mouse equivalent of — so a valid prior
+/// source location still round-trips through `Ctrl-o` afterward, and
+/// `record_jump`'s own equality check quietly declines to record a
+/// same-position "jump" (clicking the row the cursor's already on).
+fn handle_files_click(
+    rect: Rect,
+    stack: &mut ViewStack,
+    jump_stack: &mut JumpStack,
+    hover_state: &mut HoverState,
+    col: u16,
+    row: u16,
 ) {
-    let Some((rect, ScrollTarget::DiffFiles)) = geometry.hit_rect(col, row) else {
-        return; // #22 adds a `ScrollTarget::DiffPane` arm here later.
-    };
     let Some(idx) = (match stack.top() {
         View::Diff(app) => files_row_at(
             rect,
@@ -209,6 +520,114 @@ pub fn handle_left_click(
         record_jump(jump_stack, from, Some(to));
         hover_state.invalidate();
     }
+}
+
+/// Issue #22's code-pane click: resolves `(col, row)` against the diff
+/// pane's recorded [`HitRow`]s, positions the cursor the same way keyboard
+/// navigation would (`before`/`from`/`record_jump` bracketing mirrors the
+/// `Action::NextDiagnostic`/`NextMatch` arms in `ui::mod::handle_action` —
+/// see those for the same shape), and reports whether the click should
+/// chase go-to-definition.
+///
+/// `shift` blocks identifier-hit unconditionally (req 4: shift-click only
+/// ever extends the existing visual selection — riding
+/// `position_cursor_from_click`'s ordinary cursor movement, since
+/// `App::visual_bounds` already recomputes from the cursor on every call —
+/// never definition, even when the click actually lands on a symbol).
+/// `resolved.content_click` blocks it for a gutter click, and
+/// `resolved.new_or_unified_side` blocks it for a side-by-side *old* cell —
+/// both position-only per req 3. A plain identifier click ends an active
+/// visual selection first (issue #16's selection-invalidation rule) — a
+/// click-path-only quirk keyboard `gd` doesn't share; see `App::cancel_visual`'s
+/// docs and this issue's own accepted-decisions note on the deliberate
+/// asymmetry.
+fn handle_diff_pane_click(
+    geometry: &FrameGeometry,
+    stack: &mut ViewStack,
+    jump_stack: &mut JumpStack,
+    hover_state: &mut HoverState,
+    col: u16,
+    row: u16,
+    shift: bool,
+) -> bool {
+    let Some((local_x, _local_y, hit)) = geometry.diff_row_hit(col, row) else {
+        return false;
+    };
+    let Some(resolved) = resolve_hit(*hit, diff_view::gutter_width(), local_x) else {
+        return false;
+    };
+
+    let before_hover = stack.top().hover_cursor_key();
+    let from = stack.top().jump_entry();
+    let matched = match stack.top_mut() {
+        View::Diff(app) => app.position_cursor_from_click(resolved.row_idx, resolved.display_col),
+        // `ScrollTarget::DiffPane`/`diff_content` are only ever recorded
+        // from `draw`'s `View::Diff` arm — unreachable in practice, same
+        // defensiveness as `handle_files_click`'s identical `View::File`
+        // fallback above.
+        View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => return false,
+    };
+    if stack.top().hover_cursor_key() != before_hover {
+        hover_state.invalidate();
+    }
+    let identifier_hit =
+        !shift && resolved.content_click && resolved.new_or_unified_side && matched;
+    // An identifier click deliberately skips the positioning record: the
+    // definition flow it's about to dispatch records the just-clicked
+    // position as its own origin (via `navigate_to`), so recording here
+    // too would give the same click two history entries where keyboard
+    // `gd` produces one — the acceptance criterion is "exactly like
+    // keyboard gd." A non-symbol click records normally (mouse-triggered
+    // positioning is a significant jump per the epic's decision 2).
+    if !identifier_hit {
+        record_jump(jump_stack, from, stack.top().jump_entry());
+    }
+    if identifier_hit && let View::Diff(app) = stack.top_mut() {
+        // A no-op (returns `false`, touches nothing) when visual mode isn't
+        // active — safe to call unconditionally rather than checking
+        // `visual_active()` first.
+        app.cancel_visual();
+    }
+    identifier_hit
+}
+
+/// As [`handle_diff_pane_click`], for `View::File` — no visual-selection
+/// concept to cancel (see `FileView::update`'s `ToggleVisualLine` no-op
+/// arm), so `shift` here only ever suppresses identifier-hit; there is
+/// nothing else for it to extend.
+fn handle_file_pane_click(
+    geometry: &FrameGeometry,
+    stack: &mut ViewStack,
+    jump_stack: &mut JumpStack,
+    hover_state: &mut HoverState,
+    col: u16,
+    row: u16,
+    shift: bool,
+) -> bool {
+    let Some((local_x, _local_y, hit)) = geometry.file_row_hit(col, row) else {
+        return false;
+    };
+    let Some(resolved) = resolve_hit(*hit, file_view::gutter_width(), local_x) else {
+        return false;
+    };
+
+    let before_hover = stack.top().hover_cursor_key();
+    let from = stack.top().jump_entry();
+    let matched = match stack.top_mut() {
+        View::File(file) => file.position_cursor_from_click(resolved.row_idx, resolved.display_col),
+        View::Diff(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => return false,
+    };
+    if stack.top().hover_cursor_key() != before_hover {
+        hover_state.invalidate();
+    }
+    let identifier_hit =
+        !shift && resolved.content_click && resolved.new_or_unified_side && matched;
+    // Same one-entry-per-click rule as `handle_diff_pane_click` — see the
+    // doc there.
+    if !identifier_hit {
+        record_jump(jump_stack, from, stack.top().jump_entry());
+    }
+    identifier_hit
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -529,5 +948,475 @@ mod tests {
         let mut downs = 0;
         scroll_n(3, |up| if up { ups += 1 } else { downs += 1 });
         assert_eq!((ups, downs), (0, 3));
+    }
+
+    // ---- HitRow / resolve_hit (issue #22) ---------------------------------
+
+    /// A representative gutter width — arbitrary but nontrivial, so a test
+    /// clicking inside vs. past it exercises a real subtraction rather than
+    /// `0` trivially always being "on content."
+    const GUTTER: usize = 8;
+
+    #[test]
+    fn a_gutter_click_on_a_unified_row_is_position_only() {
+        let hit = HitRow::Unified(LineHit {
+            row_idx: 4,
+            content_start_col: 0,
+        });
+        let resolved = resolve_hit(hit, GUTTER, 3).unwrap();
+        assert_eq!(resolved.row_idx, 4);
+        assert!(!resolved.content_click);
+        assert!(resolved.new_or_unified_side);
+        // Position value is the row's own start column, not a value
+        // derived from `local_x` — see `resolve_line_column`'s docs.
+        assert_eq!(resolved.display_col, 0);
+    }
+
+    #[test]
+    fn an_on_content_unified_click_maps_local_x_through_the_gutter_and_wrap_offset() {
+        let hit = HitRow::Unified(LineHit {
+            row_idx: 4,
+            // A continuation row of a wrapped line: 20 columns of the
+            // logical line already wrapped away above it.
+            content_start_col: 20,
+        });
+        let resolved = resolve_hit(hit, GUTTER, (GUTTER + 5) as u16).unwrap();
+        assert_eq!(resolved.row_idx, 4);
+        assert!(resolved.content_click);
+        assert!(resolved.new_or_unified_side);
+        assert_eq!(resolved.display_col, 25); // 20 + (GUTTER+5 - GUTTER)
+    }
+
+    #[test]
+    fn a_side_by_side_old_cell_click_is_never_the_new_or_unified_side() {
+        let hit = HitRow::SideBySide {
+            left_width: 15,
+            old: Some(LineHit {
+                row_idx: 2,
+                content_start_col: 0,
+            }),
+            new: Some(LineHit {
+                row_idx: 2,
+                content_start_col: 0,
+            }),
+        };
+        let resolved = resolve_hit(hit, GUTTER, (GUTTER + 3) as u16).unwrap();
+        assert_eq!(resolved.row_idx, 2);
+        assert!(resolved.content_click);
+        assert!(
+            !resolved.new_or_unified_side,
+            "old cell must never be identifier-eligible, even on a real content click"
+        );
+    }
+
+    #[test]
+    fn a_side_by_side_new_cell_click_shifts_local_x_past_the_left_column_and_divider() {
+        let hit = HitRow::SideBySide {
+            left_width: 15,
+            old: None,
+            new: Some(LineHit {
+                row_idx: 3,
+                content_start_col: 0,
+            }),
+        };
+        // Columns 0..15 are the left cell (`left_width` = 15); column 15
+        // itself is the divider (`x == left_width`); the new cell's own
+        // local space starts fresh at column 16 (`left_width + 1`) — which
+        // is exactly the `16` in the literal below.
+        let resolved = resolve_hit(hit, GUTTER, (16 + GUTTER + 2) as u16).unwrap();
+        assert_eq!(resolved.row_idx, 3);
+        assert!(resolved.content_click);
+        assert!(resolved.new_or_unified_side);
+        assert_eq!(resolved.display_col, 2);
+    }
+
+    #[test]
+    fn the_side_by_side_divider_column_itself_is_non_actionable() {
+        let hit = HitRow::SideBySide {
+            left_width: 15,
+            old: Some(LineHit {
+                row_idx: 2,
+                content_start_col: 0,
+            }),
+            new: Some(LineHit {
+                row_idx: 2,
+                content_start_col: 0,
+            }),
+        };
+        assert_eq!(resolve_hit(hit, GUTTER, 15), None);
+    }
+
+    #[test]
+    fn side_by_side_blank_filler_padding_is_non_actionable() {
+        // A `Paired` row where one side wrapped to more visual rows than
+        // the other — the shorter side's overflow rows carry `None` (see
+        // `HitRow::SideBySide`'s docs).
+        let hit = HitRow::SideBySide {
+            left_width: 15,
+            old: None,
+            new: None,
+        };
+        assert_eq!(resolve_hit(hit, GUTTER, 3), None);
+        assert_eq!(resolve_hit(hit, GUTTER, 20), None);
+    }
+
+    #[test]
+    fn structural_gap_and_comment_body_rows_position_only_never_identifier_eligible() {
+        let cases = [
+            (HitRow::Structural { flat_idx: 7 }, 7),
+            (HitRow::Gap { flat_idx: 9 }, 9),
+            (HitRow::CommentBody { anchor_flat_idx: 3 }, 3),
+        ];
+        for (hit, expected_row) in cases {
+            let resolved = resolve_hit(hit, GUTTER, 50).unwrap();
+            assert_eq!(resolved.row_idx, expected_row);
+            assert!(!resolved.content_click);
+            assert!(!resolved.new_or_unified_side);
+        }
+    }
+
+    #[test]
+    fn a_file_line_click_resolves_the_same_way_a_unified_click_does() {
+        let hit = HitRow::FileLine(LineHit {
+            row_idx: 12,
+            content_start_col: 0,
+        });
+        let resolved = resolve_hit(hit, GUTTER, (GUTTER + 4) as u16).unwrap();
+        assert_eq!(resolved.row_idx, 12);
+        assert_eq!(resolved.display_col, 4);
+        assert!(resolved.content_click);
+        assert!(resolved.new_or_unified_side);
+    }
+
+    #[test]
+    fn diff_row_hit_looks_up_the_row_resolve_hit_needs_by_local_y() {
+        let mut geometry = FrameGeometry::new();
+        geometry.record_diff_content(
+            rect(0, 0, 20, 10),
+            vec![
+                HitRow::Structural { flat_idx: 0 },
+                HitRow::Unified(LineHit {
+                    row_idx: 1,
+                    content_start_col: 0,
+                }),
+            ],
+        );
+        let (_, _, hit) = geometry.diff_row_hit(0, 0).unwrap();
+        assert_eq!(resolve_hit(*hit, GUTTER, 0).unwrap().row_idx, 0);
+        let (_, _, hit) = geometry.diff_row_hit(0, 1).unwrap();
+        assert_eq!(resolve_hit(*hit, GUTTER, 0).unwrap().row_idx, 1);
+        // Past the last recorded row — the content rect's own blank
+        // remainder — has no `HitRow` to resolve at all.
+        assert_eq!(geometry.diff_row_hit(0, 2), None);
+    }
+
+    // ---- FrameGeometry::diff_row_hit / file_row_hit (issue #22) -----------
+
+    #[test]
+    fn diff_row_hit_is_none_before_any_content_is_recorded() {
+        let geometry = FrameGeometry::new();
+        assert_eq!(geometry.diff_row_hit(0, 0), None);
+        assert_eq!(geometry.file_row_hit(0, 0), None);
+    }
+
+    #[test]
+    fn diff_row_hit_translates_screen_coordinates_into_the_content_rects_own_space() {
+        let mut geometry = FrameGeometry::new();
+        let content_rect = rect(5, 2, 20, 10);
+        let hits = vec![
+            HitRow::Structural { flat_idx: 0 },
+            HitRow::Unified(LineHit {
+                row_idx: 1,
+                content_start_col: 0,
+            }),
+        ];
+        geometry.record_diff_content(content_rect, hits);
+
+        // Screen (5, 3) is the content rect's own (0, 1) — row 1 of `hits`.
+        let (local_x, local_y, hit) = geometry.diff_row_hit(5, 3).unwrap();
+        assert_eq!((local_x, local_y), (0, 1));
+        assert!(matches!(hit, HitRow::Unified(_)));
+
+        // Outside the recorded rect entirely.
+        assert_eq!(geometry.diff_row_hit(100, 100), None);
+    }
+
+    #[test]
+    fn file_row_hit_is_independent_of_diff_content() {
+        let mut geometry = FrameGeometry::new();
+        geometry.record_diff_content(rect(0, 0, 10, 10), vec![HitRow::Structural { flat_idx: 0 }]);
+        // Nothing recorded for the file pane this frame — a diff-only frame
+        // (`View::Diff` on top) must never leak into `file_row_hit`.
+        assert_eq!(geometry.file_row_hit(0, 0), None);
+
+        geometry.record_file_content(
+            rect(0, 0, 10, 10),
+            vec![HitRow::FileLine(LineHit {
+                row_idx: 0,
+                content_start_col: 0,
+            })],
+        );
+        assert!(geometry.file_row_hit(0, 0).is_some());
+    }
+
+    // ---- handle_left_click / action resolution (issue #22) ----------------
+    //
+    // Exercises `handle_left_click`'s `DiffPane` branch end to end against a
+    // real `App` and a hand-built `Vec<HitRow>` matching its rows exactly —
+    // the same shape `diff_view::render_unified` would really produce, but
+    // constructed by hand here so these tests stay independent of the
+    // renderer (see this module's own doc comment). `identifier_hit` alone
+    // is a *necessary*, not *sufficient*, condition for LSP work: a Del row
+    // or a non-interactive `App` can still resolve `identifier_hit: true`
+    // (the click really did land on a symbol) while `App::hover_query`
+    // — the gate `ui::mod`'s `handle_action` re-derives from the cursor/
+    // active-symbol `handle_left_click` just set — reports `None`, so no
+    // request ever gets queued. These tests check both halves: the mouse
+    // layer's own `identifier_hit` verdict, and the resulting
+    // `hover_query()` outcome it would actually gate.
+
+    fn app_with_rows(rows: Vec<crate::diff::DiffRow>) -> crate::ui::app::App {
+        let file = crate::diff::DiffFile {
+            old_path: Some("a.rs".to_owned()),
+            new_path: Some("a.rs".to_owned()),
+            hunks: vec![crate::diff::DiffHunk {
+                old_start: 1,
+                old_lines: rows.len() as u32,
+                new_start: 1,
+                new_lines: rows.len() as u32,
+                header: String::new(),
+                known_eof: true,
+                rows,
+            }],
+            ..Default::default()
+        };
+        crate::ui::app::App::new(
+            "test-repo".to_owned(),
+            std::path::PathBuf::from("/repo"),
+            vec![file],
+        )
+    }
+
+    fn row(
+        kind: crate::diff::DiffLineKind,
+        text: &str,
+        old: Option<u32>,
+        new: Option<u32>,
+    ) -> crate::diff::DiffRow {
+        crate::diff::DiffRow {
+            kind,
+            text: text.to_owned(),
+            old_line: old,
+            new_line: new,
+        }
+    }
+
+    /// `app`'s rows, flattened the same way `diff_view::render_unified`
+    /// would: `Structural`/`Gap` for every non-`Line` row, `Unified` for
+    /// every content row (`content_start_col: 0` — none of these test
+    /// fixtures wrap).
+    fn unified_hits(app: &crate::ui::app::App) -> Vec<HitRow> {
+        app.rows
+            .iter()
+            .enumerate()
+            .map(|(idx, r)| match r {
+                crate::diff::RenderRow::Line { .. } => HitRow::Unified(LineHit {
+                    row_idx: idx,
+                    content_start_col: 0,
+                }),
+                crate::diff::RenderRow::Gap { .. } => HitRow::Gap { flat_idx: idx },
+                _ => HitRow::Structural { flat_idx: idx },
+            })
+            .collect()
+    }
+
+    /// A 5-row fixture: file/hunk headers, a `Context` row ("alpha"), a
+    /// `Del` row ("removed"), and an `Add` row ("hello world") — enough row
+    /// kinds to cover every non-interactive class this issue's acceptance
+    /// criteria lists except side-by-side's old-cell suppression (already
+    /// pinned above by `a_side_by_side_old_cell_click_is_never_the_new_or_unified_side`,
+    /// which needs no real `App` at all) and binary/gap rows (both collapse
+    /// to `HitRow::Structural`/`Gap`, already proven position-only by
+    /// `structural_gap_and_comment_body_rows_position_only_never_identifier_eligible`).
+    fn fixture_app() -> crate::ui::app::App {
+        app_with_rows(vec![
+            row(
+                crate::diff::DiffLineKind::Context,
+                "alpha",
+                Some(1),
+                Some(1),
+            ),
+            row(crate::diff::DiffLineKind::Del, "removed", Some(2), None),
+            row(crate::diff::DiffLineKind::Add, "hello world", None, Some(2)),
+        ])
+    }
+
+    fn geometry_over(hits: Vec<HitRow>) -> FrameGeometry {
+        let mut geometry = FrameGeometry::new();
+        geometry.record(rect(0, 0, 60, hits.len() as u16), ScrollTarget::DiffPane);
+        geometry.record_diff_content(rect(0, 0, 60, hits.len() as u16), hits);
+        geometry
+    }
+
+    fn click(
+        geometry: &FrameGeometry,
+        stack: &mut ViewStack,
+        col: u16,
+        row: u16,
+        shift: bool,
+    ) -> bool {
+        let mut jump_stack = JumpStack::new();
+        let mut hover_state = HoverState::default();
+        handle_left_click(
+            geometry,
+            stack,
+            &mut jump_stack,
+            &mut hover_state,
+            col,
+            row,
+            shift,
+        )
+    }
+
+    #[test]
+    fn an_add_row_identifier_click_is_eligible_and_a_real_go_to_definition_target() {
+        let app = fixture_app();
+        let hits = unified_hits(&app);
+        let geometry = geometry_over(hits);
+        let mut stack = ViewStack::new(View::Diff(app));
+
+        // Row 4 (0=FileHeader,1=HunkHeader,2=Context,3=Del,4=Add): "hello"
+        // starts at the gutter's own end (`content_start_col: 0`).
+        let hit = click(
+            &geometry,
+            &mut stack,
+            diff_view::gutter_width() as u16,
+            4,
+            false,
+        );
+        assert!(hit, "an identifier click on an Add row must be eligible");
+        let View::Diff(app) = stack.top() else {
+            unreachable!()
+        };
+        assert_eq!(app.cursor, 4);
+        assert!(
+            app.hover_query().is_some(),
+            "the exact target `handle_action`'s GotoDefinition arm would dispatch on"
+        );
+    }
+
+    #[test]
+    fn a_del_row_identifier_click_matches_a_symbol_but_hover_query_still_refuses_it() {
+        let app = fixture_app();
+        let hits = unified_hits(&app);
+        let geometry = geometry_over(hits);
+        let mut stack = ViewStack::new(View::Diff(app));
+
+        // Row 3 is the Del row ("removed") — a real symbol sits at column 0
+        // just like the Add row's does, so `identifier_hit` still resolves
+        // `true` (the click really did land on a token); `lsp_target`
+        // refusing `Del` rows is what actually stops any LSP work, proven
+        // via `hover_query` here exactly as `handle_action` would see it.
+        let hit = click(
+            &geometry,
+            &mut stack,
+            diff_view::gutter_width() as u16,
+            3,
+            false,
+        );
+        assert!(hit);
+        let View::Diff(app) = stack.top() else {
+            unreachable!()
+        };
+        assert_eq!(app.cursor, 3);
+        assert!(
+            app.hover_query().is_none(),
+            "a Del row must never resolve an LSP target, even though the click matched a symbol"
+        );
+    }
+
+    #[test]
+    fn a_gutter_click_on_an_eligible_row_only_positions_the_cursor() {
+        let app = fixture_app();
+        let hits = unified_hits(&app);
+        let geometry = geometry_over(hits);
+        let mut stack = ViewStack::new(View::Diff(app));
+
+        let hit = click(&geometry, &mut stack, 0, 4, false);
+        assert!(!hit, "a gutter click must never be identifier-eligible");
+        let View::Diff(app) = stack.top() else {
+            unreachable!()
+        };
+        assert_eq!(
+            app.cursor, 4,
+            "the row still positions, only the identifier chase is skipped"
+        );
+    }
+
+    #[test]
+    fn a_header_row_click_positions_the_cursor_with_no_identifier_to_resolve() {
+        let app = fixture_app();
+        let hits = unified_hits(&app);
+        let geometry = geometry_over(hits);
+        let mut stack = ViewStack::new(View::Diff(app));
+
+        let hit = click(&geometry, &mut stack, 5, 0, false);
+        assert!(!hit);
+        let View::Diff(app) = stack.top() else {
+            unreachable!()
+        };
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn shift_click_on_an_eligible_identifier_positions_but_never_chases_definition() {
+        let app = fixture_app();
+        let hits = unified_hits(&app);
+        let geometry = geometry_over(hits);
+        let mut stack = ViewStack::new(View::Diff(app));
+
+        let hit = click(
+            &geometry,
+            &mut stack,
+            diff_view::gutter_width() as u16,
+            4,
+            true,
+        );
+        assert!(
+            !hit,
+            "req 4: shift-click extends selection, never definition, even on a real identifier"
+        );
+        let View::Diff(app) = stack.top() else {
+            unreachable!()
+        };
+        assert_eq!(
+            app.cursor, 4,
+            "positioning (and therefore selection extension) still happens"
+        );
+    }
+
+    #[test]
+    fn a_non_interactive_apps_identifier_click_still_matches_but_hover_query_refuses_it() {
+        let mut app = fixture_app();
+        app.interactive = false;
+        let hits = unified_hits(&app);
+        let geometry = geometry_over(hits);
+        let mut stack = ViewStack::new(View::Diff(app));
+
+        let hit = click(
+            &geometry,
+            &mut stack,
+            diff_view::gutter_width() as u16,
+            4,
+            false,
+        );
+        assert!(hit);
+        let View::Diff(app) = stack.top() else {
+            unreachable!()
+        };
+        assert!(
+            app.hover_query().is_none(),
+            "a historical/non-interactive diff must never resolve an LSP target"
+        );
     }
 }

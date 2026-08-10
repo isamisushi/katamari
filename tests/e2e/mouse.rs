@@ -9,7 +9,7 @@
 //! needs its own app-level gate (see that arm's docs in `ui::mod`) rather
 //! than relying solely on `EnableMouseCapture` never having been sent.
 
-use crate::support::screen::row_has_reversed_cell;
+use crate::support::screen::{row_has_reversed_cell, underlined_cells};
 use crate::support::{Harness, Key, MouseButton, MouseKey, SpawnOptions, fixture};
 use std::time::Duration;
 
@@ -250,11 +250,31 @@ fn click(h: &Harness, button: MouseButton, column: u16, row: u16) {
         button,
         column,
         row,
+        shift: false,
     });
     h.send_mouse(MouseKey::Up {
         button,
         column,
         row,
+        shift: false,
+    });
+}
+
+/// As [`click`], with SGR's shift-modifier bit set — issue #22 req 4's
+/// shift-click, which extends a visual selection but never chases
+/// definition even when it lands on an identifier.
+fn shift_click(h: &Harness, column: u16, row: u16) {
+    h.send_mouse(MouseKey::Down {
+        button: MouseButton::Left,
+        column,
+        row,
+        shift: true,
+    });
+    h.send_mouse(MouseKey::Up {
+        button: MouseButton::Left,
+        column,
+        row,
+        shift: true,
     });
 }
 
@@ -567,6 +587,301 @@ fn a_truncated_label_still_resolves_to_the_right_row() {
 
     click(&h, MouseButton::Left, TREE_CLICK_COL, 4);
     h.wait_for_text("MARKER_CONTENT_LINE_UNIQUE");
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+// ---- issue #22: code-pane clicks and definitions --------------------------
+
+/// The screen `(row, col)` of the first cell showing `App::active_symbol`'s
+/// underline once the cursor is known to be sitting on it — the harness's
+/// own way of asking "where does this identifier actually render," rather
+/// than hand-computing gutter/sidebar widths (see `a_truncated_label_...`
+/// above for why this suite avoids that). Callers park the cursor on the
+/// target row via plain keyboard navigation first, read this, then move the
+/// cursor away again before clicking — so the click under test is the only
+/// thing that ever puts the cursor there.
+fn active_symbol_cell(h: &Harness) -> (u16, u16) {
+    h.with_screen(|screen| {
+        underlined_cells(screen)
+            .first()
+            .copied()
+            .expect("cursor's active symbol must render at least one underlined cell")
+    })
+}
+
+#[test]
+fn a_plain_click_past_any_identifier_only_positions_the_cursor() {
+    let repo = fixture::many_files_repo(3);
+    let mut h = Harness::spawn(repo.path(), SpawnOptions::default());
+    h.wait_for_text("FIRST_MARKER");
+    // `wait_for_settled_diff_render` checks for `many_files_repo(30)`'s own
+    // `file003.txt` marker, absent from this smaller 3-file fixture —
+    // "LAST_MARKER" (file002's own marker) is this fixture's equivalent
+    // "the whole diff has rendered" witness.
+    h.wait_for_text("LAST_MARKER");
+
+    // file000's own add row ("+alpha FIRST_MARKER"), reached purely by
+    // keyboard: FileHeader(0)/HunkHeader(1)/Del(2)/Add(3) — the position to
+    // prove `Ctrl-o` returns to.
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.wait_for_text("\u{b7} 4/");
+
+    // file001's own add row ("+alpha CHANGED") sits at flat index 10 (seven
+    // rows per file: FileHeader/HunkHeader/Del/Add/Context/Context/a
+    // trailing fold row — this 3-line file's hunk doesn't know it's already
+    // at EOF, see `RenderRow::Gap`'s docs), screen row 11 (one border row
+    // above the first flat row). Column 90 is deep in the pane's blank
+    // trailing space — well past "alpha CHANGED" and its gutter, so no
+    // symbol can possibly sit under it regardless of exact gutter
+    // arithmetic.
+    click(&h, MouseButton::Left, 90, 11);
+    h.wait_for_text("\u{b7} 11/");
+
+    std::thread::sleep(Duration::from_millis(300));
+    let after_click = h.screen_contents();
+    assert!(
+        !after_click.contains("goto:"),
+        "a gutter/whitespace-past-text click must never attempt LSP work; screen:\n{after_click}"
+    );
+
+    // The click's own jump reverses cleanly, same as a keyboard move would.
+    h.send(Key::CtrlO);
+    h.wait_for_text("\u{b7} 4/");
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
+fn clicking_an_identifier_on_an_add_row_activates_go_to_definition() {
+    if !fixture::python3_available() {
+        eprintln!("skipping: python3 not on PATH (fake LSP server fixture needs it)");
+        return;
+    }
+    let repo = fixture::lsp_readiness_repo_with_definition_target(0.0, 0.0);
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            cols: 160,
+            ..Default::default()
+        },
+    );
+
+    h.wait_for_text("GOTO_TARGET_TOKEN");
+    h.wait_for_text("\u{b7} 1/");
+
+    // Land on the GOTO_TARGET_TOKEN add row (FileHeader/HunkHeader/Context/
+    // Context/Add) to read where its one identifier actually renders...
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.wait_for_text("\u{b7} 5/");
+    let (row, col) = active_symbol_cell(&h);
+
+    // ...then move the cursor away again, so the click below is the only
+    // thing that ever lands it back there.
+    h.send(Key::Char('g'));
+    h.send(Key::Char('g'));
+    h.wait_for_text("\u{b7} 1/");
+
+    // Even with both fixture delays at `0.0`, the fake server's
+    // `initialize` handshake still takes real wall-clock time — retry the
+    // click for a bit rather than asserting the very first one wins that
+    // race, same reasoning as `esc_pops_a_definition_opened_file_view_back_to_the_diff`.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        click(&h, MouseButton::Left, col, row);
+        std::thread::sleep(Duration::from_millis(100));
+        if h.screen_contents().contains("other.stub") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "click never reached a Ready server within 5s; screen:\n{}",
+            h.screen_contents()
+        );
+    }
+    h.wait_for_text("target line one");
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
+fn a_click_while_the_server_is_still_starting_reports_not_ready_and_never_fires_late() {
+    if !fixture::python3_available() {
+        eprintln!("skipping: python3 not on PATH (fake LSP server fixture needs it)");
+        return;
+    }
+    let repo = fixture::lsp_readiness_repo(5.0, 0.0);
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            cols: 160,
+            ..Default::default()
+        },
+    );
+
+    h.wait_for_text("GOTO_TARGET_TOKEN");
+    h.wait_for_text("\u{b7} 1/");
+
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.wait_for_text("\u{b7} 5/");
+    let (row, col) = active_symbol_cell(&h);
+
+    h.send(Key::Char('g'));
+    h.send(Key::Char('g'));
+    h.wait_for_text("\u{b7} 1/");
+
+    click(&h, MouseButton::Left, col, row);
+    // The click still positions the cursor even though the server isn't
+    // ready — only the LSP action itself is gated.
+    h.wait_for_text("\u{b7} 5/");
+    h.wait_for_text("is starting");
+    h.wait_for_text("not ready yet");
+    assert!(
+        !h.screen_contents().contains("goto: \u{2026}"),
+        "a not-ready click must not be overwritten by the generic in-flight \
+         ellipsis; screen:\n{}",
+        h.screen_contents()
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
+fn a_side_by_side_old_cell_click_positions_but_never_chases_definition() {
+    if !fixture::python3_available() {
+        eprintln!("skipping: python3 not on PATH (fake LSP server fixture needs it)");
+        return;
+    }
+    let repo = fixture::lsp_readiness_repo_with_definition_target(0.0, 0.0);
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            cols: 160,
+            ..Default::default()
+        },
+    );
+
+    h.wait_for_text("GOTO_TARGET_TOKEN");
+    h.wait_for_text("\u{b7} 1/");
+
+    h.send(Key::Char('s')); // side-by-side layout
+
+    // The first Context row ("alpha") — unchanged, so it renders
+    // identically (and at the same flat index) on both the old and new
+    // side; a real symbol either side could otherwise resolve.
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.wait_for_text("\u{b7} 3/");
+    let mut cells = h.with_screen(underlined_cells);
+    cells.sort_by_key(|&(_, col)| col);
+    assert!(
+        cells.len() >= 2,
+        "the same Context row must underline its identifier on both sides; got {cells:?}"
+    );
+    let (old_row, old_col) = cells[0]; // leftmost = the old/left column
+
+    h.send(Key::Char('g'));
+    h.send(Key::Char('g'));
+    h.wait_for_text("\u{b7} 1/");
+
+    click(&h, MouseButton::Left, old_col, old_row);
+    h.wait_for_text("\u{b7} 3/");
+
+    std::thread::sleep(Duration::from_millis(300));
+    let after_click = h.screen_contents();
+    assert!(
+        !after_click.contains("goto:"),
+        "an old-side click must never chase go-to-definition; screen:\n{after_click}"
+    );
+    assert!(
+        !after_click.contains("other.stub") && !after_click.contains("target line one"),
+        "an old-side click must never navigate anywhere; screen:\n{after_click}"
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
+fn shift_click_extends_the_visual_selection_and_never_chases_definition() {
+    if !fixture::python3_available() {
+        eprintln!("skipping: python3 not on PATH (fake LSP server fixture needs it)");
+        return;
+    }
+    let repo = fixture::lsp_readiness_repo_with_definition_target(0.0, 0.0);
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            cols: 160,
+            ..Default::default()
+        },
+    );
+
+    h.wait_for_text("GOTO_TARGET_TOKEN");
+    h.wait_for_text("\u{b7} 1/");
+
+    // Where the GOTO_TARGET_TOKEN add row's own identifier renders.
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.wait_for_text("\u{b7} 5/");
+    let (row, col) = active_symbol_cell(&h);
+
+    // The anchor: back to the top, down onto the first Context row
+    // ("alpha"), then `V` to start a selection there.
+    h.send(Key::Char('g'));
+    h.send(Key::Char('g'));
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.wait_for_text("\u{b7} 3/");
+    h.send(Key::Char('V'));
+    h.wait_for_text("VISUAL");
+
+    shift_click(&h, col, row);
+    h.wait_for_text("\u{b7} 5/");
+
+    let after_click = h.screen_contents();
+    assert!(
+        !after_click.contains("goto:"),
+        "req 4: shift-click must never chase definition, even on a real identifier; \
+         screen:\n{after_click}"
+    );
+    assert!(
+        !after_click.contains("other.stub") && !after_click.contains("target line one"),
+        "req 4: shift-click must never navigate; screen:\n{after_click}"
+    );
+
+    // The selection itself extended down to the clicked row: `y` reports
+    // exactly the 3 rows between (and including) the anchor and the
+    // shift-clicked target ("alpha", "beta", "GOTO_TARGET_TOKEN") — proof
+    // this was a real extension, not just a plain reposition that would
+    // have left (or cancelled) a 1-line selection.
+    h.send(Key::Char('y'));
+    h.wait_for_text("via OSC 52; terminal support required");
+    assert!(
+        h.screen_contents()
+            .contains("yanked 3 line(s) across 1 file(s)"),
+        "screen:\n{}",
+        h.screen_contents()
+    );
 
     h.send(Key::Char('q'));
     let status = h.wait_exit(Duration::from_secs(5));

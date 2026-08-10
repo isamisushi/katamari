@@ -15,7 +15,7 @@ use crate::keymap::Action;
 use crate::lsp::DiagnosticsStore;
 use crate::ui::hints::{self, HintItem};
 use crate::ui::hover_popup::HoverQuery;
-use crate::ui::mouse::{FrameGeometry, ScrollTarget};
+use crate::ui::mouse::{FrameGeometry, HitRow, LineHit, ScrollTarget};
 use crate::ui::scroll;
 use crate::ui::symbols;
 use crate::ui::text::{
@@ -347,20 +347,41 @@ impl FileView {
         );
     }
 
+    /// As [`crate::ui::app::App::resolve_active_symbol`] — see that
+    /// method's docs.
+    fn resolve_active_symbol(&self, display_col: usize) -> (usize, bool) {
+        let symbols = symbols::scan(&self.cursor_line_text());
+        match symbols
+            .iter()
+            .position(|s| s.display_start <= display_col && display_col < s.display_end)
+        {
+            Some(idx) => (idx, true),
+            None => (0, false),
+        }
+    }
+
     /// Moves the cursor to `line` and, if the active symbol there covers
     /// `display_col`, selects it — mirrors [`crate::ui::app::App::jump_cursor_to`];
     /// see that method's docs for why centering rather than clamping.
     pub fn jump_cursor_to(&mut self, line: usize, display_col: usize) {
         self.cursor = line.min(self.line_count().saturating_sub(1));
-        let text = self.cursor_line_text();
-        self.active_symbol = symbols::scan(&text)
-            .iter()
-            .position(|s| s.display_start <= display_col && display_col < s.display_end)
-            .unwrap_or(0);
+        self.active_symbol = self.resolve_active_symbol(display_col).0;
         self.scroll_offset = scroll::center(self.cursor, self.viewport_height, |i| {
             self.row_visual_height(i)
         });
         self.clamp_scroll();
+    }
+
+    /// As [`crate::ui::app::App::position_cursor_from_click`] — a mouse
+    /// click's cursor landing, without `jump_cursor_to`'s `scroll::center`
+    /// (see that method's docs on why), returning whether the click landed
+    /// on a symbol.
+    pub fn position_cursor_from_click(&mut self, line: usize, display_col: usize) -> bool {
+        self.cursor = line.min(self.line_count().saturating_sub(1));
+        let (active_symbol, matched) = self.resolve_active_symbol(display_col);
+        self.active_symbol = active_symbol;
+        self.clamp_scroll();
+        matched
     }
 
     /// As [`crate::ui::app::App::jump_to_diagnostic`], for this single-file
@@ -419,13 +440,31 @@ pub fn layout(area: Rect, status_height: u16) -> Areas {
     }
 }
 
+/// The real content [`Rect`] [`render`] draws into, carved out of `area` by
+/// the same `Borders::LEFT` block `render` itself renders — issue #22 needs
+/// this a second time (`ui::mod`'s `draw`, to record alongside the `HitRow`s
+/// [`render`] hands back) without recomputing the border math by hand, the
+/// same "one border-geometry function, not a second hand-counted literal"
+/// rule `pane::inner_rect` follows for the diff pane (see that function's
+/// docs).
+pub fn content_rect(area: Rect) -> Rect {
+    Block::default().borders(Borders::LEFT).inner(area)
+}
+
+/// Renders the file pane and returns one [`crate::ui::mouse::HitRow`] per
+/// rendered terminal row within it, in the same viewport-clamped order the
+/// `Line`s themselves were pushed — `ui::mod::draw` pairs this with
+/// [`content_rect`] and hands both to [`FrameGeometry::record_file_content`]
+/// so issue #22's click resolution shares this exact render loop rather than
+/// re-deriving line wrapping a second time (see this module's `mouse` import
+/// and `crate::ui::mouse`'s own doc comment).
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     view: &FileView,
     diagnostics: &DiagnosticsStore,
     geometry: &mut FrameGeometry,
-) {
+) -> Vec<HitRow> {
     geometry.record(area, ScrollTarget::FilePane);
     let block = Block::default().borders(Borders::LEFT).title(" file ");
     let inner = block.inner(area);
@@ -436,18 +475,21 @@ pub fn render(
     let wrap = crate::config::wrap_enabled();
 
     let mut lines: Vec<Line> = Vec::with_capacity(viewport_height);
+    let mut hits: Vec<HitRow> = Vec::with_capacity(viewport_height);
     let mut idx = view.scroll_offset;
     while lines.len() < viewport_height && idx < view.line_count() {
-        for line in content_line(view, idx, idx == view.cursor, width, diagnostics, wrap) {
+        for (line, hit) in content_line(view, idx, idx == view.cursor, width, diagnostics, wrap) {
             if lines.len() >= viewport_height {
                 break;
             }
             lines.push(line);
+            hits.push(HitRow::FileLine(hit));
         }
         idx += 1;
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
+    hits
 }
 
 /// As `diff_view`'s glyph of the same name — see that module's docs. Kept
@@ -471,7 +513,7 @@ fn diagnostic_glyph_span(severity: Option<DiagnosticSeverity>) -> Span<'static> 
 /// actual line number or diagnostic state — see `diff_view::gutter_width`'s
 /// identical "always reserve the width" rationale, which this mirrors for
 /// the file view's simpler (single line-number, no add/del marker) gutter.
-fn gutter_width() -> usize {
+pub(crate) fn gutter_width() -> usize {
     const DIAG_WIDTH: usize = 2; // glyph + trailing space, see `diagnostic_glyph_span`
     LINE_NUMBER_WIDTH + 1 + 1 + 1 + DIAG_WIDTH // number + space + │ + space
 }
@@ -504,6 +546,12 @@ fn continuation_gutter() -> Vec<Span<'static>> {
     ]
 }
 
+/// Issue #22: returns each visual row's [`Line`] paired with the
+/// [`LineHit`] locating it back in `idx`'s own logical line (`row_idx ==
+/// idx`, `content_start_col` accumulating across wrap the same way
+/// `col_offset` below always has) — [`render`] wraps each pair as a
+/// [`HitRow::FileLine`] and threads it alongside the `Line` itself into its
+/// own parallel `Vec`, never a second computation.
 fn content_line(
     view: &FileView,
     idx: usize,
@@ -511,7 +559,7 @@ fn content_line(
     width: usize,
     diagnostics: &DiagnosticsStore,
     wrap: bool,
-) -> Vec<Line<'static>> {
+) -> Vec<(Line<'static>, LineHit)> {
     let severity = view
         .file_path()
         .and_then(|file| diagnostics.severity_at(file, idx as u32));
@@ -581,7 +629,13 @@ fn content_line(
         if is_cursor {
             line = line.patch_style(Style::default().add_modifier(Modifier::REVERSED));
         }
-        out.push(line);
+        out.push((
+            line,
+            LineHit {
+                row_idx: idx,
+                content_start_col: col_offset,
+            },
+        ));
         col_offset += row_width;
     }
     out
@@ -646,6 +700,74 @@ mod tests {
         let mut view = FileView::with_hover_target("src/main.rs".to_owned(), source, None);
         view.set_viewport_height(2);
         view
+    }
+
+    /// End-to-end through the *real* pipeline — `render`'s emitted
+    /// `HitRow`s + `content_rect` recorded into a `FrameGeometry`, a click
+    /// resolved via `file_row_hit`/`resolve_hit`, then applied with
+    /// `position_cursor_from_click` — rather than hand-built `HitRow`
+    /// fixtures, which can quietly encode the same wrong assumption twice
+    /// (e.g. `content_start_col` captured after the width increment
+    /// instead of before, or `content_rect` drifting from `render`'s own
+    /// `Block::inner`). A wrapped continuation row is the case where every
+    /// one of those mistakes shows.
+    #[test]
+    fn a_click_resolved_through_the_real_render_pipeline_lands_on_wrapped_rows() {
+        use crate::ui::mouse::{self, FrameGeometry};
+        use ratatui::backend::TestBackend;
+
+        // Line 0 wraps (its tail lands on a continuation row); line 1 is a
+        // plain second line rendered after the continuation.
+        let source = format!("{}tail_symbol\nlet second = 2;\n", "a".repeat(40));
+        let mut view = FileView::with_hover_target("src/main.rs".to_owned(), &source, None);
+        let area = Rect {
+            x: 5,
+            y: 2,
+            width: 40,
+            height: 8,
+        };
+        view.set_viewport_height(content_rect(area).height as usize);
+        view.set_content_width(content_width_for_pane(area.width));
+
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let diagnostics = DiagnosticsStore::new();
+        let mut geometry = FrameGeometry::new();
+        let mut hits = Vec::new();
+        terminal
+            .draw(|frame| {
+                hits = render(frame, area, &view, &diagnostics, &mut geometry);
+            })
+            .unwrap();
+        geometry.record_file_content(content_rect(area), hits);
+
+        // The second terminal row inside the pane is line 0's continuation
+        // row (line 0's text exceeds the ~30-column content budget once).
+        // Click on it, past the gutter, at the column where "tail_symbol"
+        // renders — the resolver must map that back to line 0 and a
+        // display column *inside* the tail, not to a fresh row-1 position.
+        let inner = content_rect(area);
+        let content_width = content_width_for_pane(area.width);
+        let tail_start_in_row = 40 % content_width; // columns of 'a' on the continuation row
+        let click_col = inner.x + (gutter_width() + tail_start_in_row + 2) as u16;
+        let click_row = inner.y + 1;
+        let (local_x, _y, hit) = geometry
+            .file_row_hit(click_col, click_row)
+            .expect("the continuation row is a recorded hit row");
+        let resolved = mouse::resolve_hit(*hit, gutter_width(), local_x)
+            .expect("a continuation content cell resolves");
+        assert_eq!(resolved.row_idx, 0, "continuation rows belong to line 0");
+        assert_eq!(
+            resolved.display_col,
+            40 + 2,
+            "display column continues the logical line across the wrap"
+        );
+
+        assert!(
+            view.position_cursor_from_click(resolved.row_idx, resolved.display_col),
+            "the click lands inside tail_symbol — a real symbol match"
+        );
+        assert_eq!(view.cursor, 0);
     }
 
     #[test]
@@ -776,5 +898,74 @@ mod tests {
         view.update(Action::NextSymbol);
         let query = view.hover_query().expect("still line 0");
         assert_eq!(query.display_col, 3); // "main"
+    }
+
+    // ---- resolve_active_symbol / position_cursor_from_click (issue #22) --
+
+    /// A source tall enough for `position_cursor_from_click_never_recenters_unlike_jump_cursor_to`
+    /// to exercise a real divergence between `scroll::center` and plain
+    /// `clamp_scroll` — see `App`'s identical test for why a too-small
+    /// viewport/line-count makes the two coincide by accident.
+    fn tall_source() -> String {
+        (0..30).map(|i| format!("line_{i} value\n")).collect()
+    }
+
+    #[test]
+    fn resolve_active_symbol_matches_the_symbol_a_column_falls_within() {
+        let mut view = test_view();
+        view.update(Action::CursorDown); // "    let x = 1;"
+        // "let" spans [4, 7); pick a column inside it, not just its start.
+        assert_eq!(view.resolve_active_symbol(5), (0, true));
+    }
+
+    #[test]
+    fn resolve_active_symbol_falls_back_to_symbol_zero_on_whitespace() {
+        let view = test_view();
+        // Column 2 of "fn main() {" is still inside the leading "fn" — use
+        // column 11, the trailing brace, which no symbol covers.
+        assert_eq!(view.resolve_active_symbol(11), (0, false));
+    }
+
+    #[test]
+    fn position_cursor_from_click_moves_the_cursor_and_reports_whether_it_matched() {
+        // "fn main() {" — "fn" spans [0, 2), "main" spans [3, 7).
+        let mut view = test_view();
+        let matched = view.position_cursor_from_click(0, 3); // "main"
+        assert!(matched);
+        assert_eq!(view.cursor, 0);
+        assert_eq!(view.active_symbol, 1);
+
+        let matched = view.position_cursor_from_click(0, 1); // still inside "fn"
+        assert!(matched);
+        assert_eq!(view.active_symbol, 0);
+
+        let matched = view.position_cursor_from_click(0, 2); // the space before "main"
+        assert!(!matched);
+        assert_eq!(
+            view.active_symbol, 0,
+            "falls back to symbol 0, same as jump_cursor_to"
+        );
+    }
+
+    #[test]
+    fn position_cursor_from_click_never_recenters_unlike_jump_cursor_to() {
+        let source = tall_source();
+        let mut clicked = FileView::with_hover_target("f.rs".to_owned(), &source, None);
+        clicked.set_viewport_height(6);
+        let mut centered = FileView::with_hover_target("f.rs".to_owned(), &source, None);
+        centered.set_viewport_height(6);
+
+        let target = clicked.line_count() / 2;
+        centered.jump_cursor_to(target, 0);
+        clicked.position_cursor_from_click(target, 0);
+
+        assert_eq!(
+            clicked.cursor, centered.cursor,
+            "both land on the same line"
+        );
+        assert_ne!(
+            clicked.scroll_offset, centered.scroll_offset,
+            "position_cursor_from_click must not recenter the way jump_cursor_to does"
+        );
     }
 }

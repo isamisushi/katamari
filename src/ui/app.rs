@@ -1831,6 +1831,33 @@ impl App {
         }
     }
 
+    /// Which symbol on the cursor's *current* row (see `Self::cursor_row_text`)
+    /// contains `display_col`, and whether one actually does — the shared
+    /// lookup behind [`Self::jump_cursor_to`] (keyboard `gd`/`gr`/`]d`/`[d`
+    /// landing) and [`Self::position_cursor_from_click`] (issue #22's mouse
+    /// landing). Falls back to symbol `0` when nothing matches, the same
+    /// fallback `jump_cursor_to` always used — a whitespace/gutter click (or
+    /// a `Ctrl-o` return a few columns off from where the symbol used to be)
+    /// still leaves *some* active symbol selected rather than an
+    /// out-of-range index — but also reports whether the fallback fired,
+    /// which `jump_cursor_to`'s callers never needed to know and a mouse
+    /// click does: `hover_query` alone can't tell a click that actually
+    /// landed on a symbol apart from `active_symbol` merely sitting on `0`
+    /// by default (see `position_cursor_from_click`'s docs).
+    fn resolve_active_symbol(&self, display_col: usize) -> (usize, bool) {
+        let symbols = self
+            .cursor_row_text()
+            .map(symbols::scan)
+            .unwrap_or_default();
+        match symbols
+            .iter()
+            .position(|s| s.display_start <= display_col && display_col < s.display_end)
+        {
+            Some(idx) => (idx, true),
+            None => (0, false),
+        }
+    }
+
     /// Moves the cursor to `row_idx` and, if the active symbol at that row
     /// covers `display_col`, selects it — the destination of a
     /// go-to-definition/references jump, or of `]d`/`[d`. Centers the
@@ -1851,19 +1878,40 @@ impl App {
     pub fn jump_cursor_to(&mut self, row_idx: usize, display_col: usize) {
         self.focus = MainPaneFocus::Diff;
         self.cursor = row_idx.min(self.rows.len().saturating_sub(1));
-        self.active_symbol = self
-            .cursor_row_text()
-            .map(symbols::scan)
-            .and_then(|syms| {
-                syms.iter()
-                    .position(|s| s.display_start <= display_col && display_col < s.display_end)
-            })
-            .unwrap_or(0);
+        self.active_symbol = self.resolve_active_symbol(display_col).0;
         self.scroll_offset = scroll::center(self.cursor, self.viewport_height, |i| {
             self.row_visual_height(i)
         });
         self.clamp_scroll();
         self.sync_files_selection();
+    }
+
+    /// As [`Self::jump_cursor_to`], for a mouse click (issue #22) — same
+    /// cursor/focus/active-symbol resolution and `sync_files_selection`
+    /// call, but deliberately *without* `scroll::center`: the clicked row is
+    /// already on screen (that's how the reviewer clicked it), so
+    /// recentering would visibly yank it to mid-viewport for no reason —
+    /// `clamp_scroll` alone still keeps a wrapped multi-row cursor fully
+    /// visible without moving anything else already in view. This is a
+    /// deliberate divergence from `jump_cursor_to`, pinned by
+    /// `position_cursor_from_click_never_recenters_unlike_jump_cursor_to`
+    /// below rather than left to bit-rot silently if a future refactor tries
+    /// to unify the two.
+    ///
+    /// Returns whether the click actually landed *on* a symbol (see
+    /// `Self::resolve_active_symbol`) — `ui::mouse`'s click orchestration
+    /// uses this, not `Self::hover_query`, to decide whether an identifier
+    /// click should chase go-to-definition: `hover_query` would happily
+    /// return `Some` for a whitespace click that fell back to symbol `0`,
+    /// as long as symbol `0` itself is LSP-eligible.
+    pub fn position_cursor_from_click(&mut self, row_idx: usize, display_col: usize) -> bool {
+        self.focus = MainPaneFocus::Diff;
+        self.cursor = row_idx.min(self.rows.len().saturating_sub(1));
+        let (active_symbol, matched) = self.resolve_active_symbol(display_col);
+        self.active_symbol = active_symbol;
+        self.clamp_scroll();
+        self.sync_files_selection();
+        matched
     }
 
     /// Moves the cursor to the next (`forward`) or previous row whose
@@ -2680,6 +2728,86 @@ mod tests {
         assert_eq!(
             app.active_symbol, 0,
             "moving to a new row resets the active symbol"
+        );
+    }
+
+    // ---- resolve_active_symbol / position_cursor_from_click (issue #22) --
+
+    #[test]
+    fn resolve_active_symbol_matches_the_symbol_a_column_falls_within() {
+        let mut app = test_app();
+        app.update(Action::Top);
+        app.update(Action::CursorDown); // hunk header
+        app.update(Action::CursorDown); // row 2: "fn helper() {}"
+
+        // "fn" spans [0, 2); "helper" spans [3, 9) — pick a column inside
+        // each, not just its start, to prove this is a real range match.
+        assert_eq!(app.resolve_active_symbol(1), (0, true));
+        assert_eq!(app.resolve_active_symbol(5), (1, true));
+    }
+
+    #[test]
+    fn resolve_active_symbol_falls_back_to_symbol_zero_on_whitespace() {
+        let mut app = test_app();
+        app.update(Action::Top);
+        app.update(Action::CursorDown);
+        app.update(Action::CursorDown); // row 2: "fn helper() {}"
+
+        // Column 2 is the space between "fn" and "helper" — no symbol
+        // covers it, so this falls back to symbol 0 rather than matching,
+        // and reports that it did (the `false` half of the pair) — the one
+        // thing `hover_query` alone can't tell apart from a real match on
+        // symbol 0 itself.
+        assert_eq!(app.resolve_active_symbol(2), (0, false));
+    }
+
+    #[test]
+    fn position_cursor_from_click_moves_the_cursor_and_reports_whether_it_matched() {
+        let mut app = test_app();
+        let matched = app.position_cursor_from_click(4, 3); // "new_name" on the add row
+        assert!(matched);
+        assert_eq!(app.cursor, 4);
+        assert_eq!(app.active_symbol, 1);
+        assert_eq!(app.focus, MainPaneFocus::Diff);
+
+        let matched = app.position_cursor_from_click(4, 2); // whitespace before "new_name"
+        assert!(!matched);
+        assert_eq!(
+            app.active_symbol, 0,
+            "falls back to symbol 0, same as jump_cursor_to"
+        );
+    }
+
+    #[test]
+    fn position_cursor_from_click_never_recenters_unlike_jump_cursor_to() {
+        // A target row with plenty of rows both above and below it, and a
+        // small enough viewport, that `scroll::center` would actually
+        // settle on a different offset than clamping alone would — proving
+        // the divergence needs a case where the two methods visibly
+        // disagree, not just one (e.g. the very first/last row) where
+        // clamping happens to produce the same answer either way.
+        let mut app = test_app();
+        app.set_viewport_height(6);
+        assert!(
+            app.rows.len() >= 12,
+            "fixture must be tall enough for a real mid-diff target"
+        );
+        let target = app.rows.len() / 2;
+
+        let mut centered = App::new(
+            app.repo_name.clone(),
+            app.repo_root.clone(),
+            app.files.clone(),
+        );
+        centered.set_viewport_height(6);
+        centered.jump_cursor_to(target, 0);
+
+        app.position_cursor_from_click(target, 0);
+
+        assert_eq!(app.cursor, centered.cursor, "both land on the same row");
+        assert_ne!(
+            app.scroll_offset, centered.scroll_offset,
+            "position_cursor_from_click must not recenter the way jump_cursor_to does"
         );
     }
 
