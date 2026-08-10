@@ -6,7 +6,7 @@
 //! [`Check`] an [`Status`]/label/detail triple) by calling into the same
 //! logic `ktmr lsp doctor` and a live session already use — never a second,
 //! independently-written copy of it — and [`render_text`]/`serde_json` turn
-//! that data into either a human-readable report or `--json`. Four
+//! that data into either a human-readable report or `--json`. Five
 //! sections, always in this order:
 //!
 //! - **vcs**: is `git` on `PATH`, is the current directory actually inside a
@@ -30,6 +30,12 @@
 //!   TypeScript/Python project with only a project-local server install
 //!   could be reported "not found" here and "running fine" two sections
 //!   later, for the identical language, in the identical run.
+//! - **agents**: which agent CLI (`claude`/`codex`) the semantic-units
+//!   grouping (`u` in `ktmr diff`) would spawn — a PATH probe via
+//!   [`crate::groups::agent::detect_all`], the same resolution the feature
+//!   itself uses, so the report and the live session can't disagree. A
+//!   warning, never an error, when none is found: grouping is an optional
+//!   feature, and a katamari without it is still fully functional.
 //! - **lsp (live probe)**: the feature's whole point — for every built-in or
 //!   custom language with at least one matching file in the repository
 //!   (tracked or untracked-and-not-ignored — see [`scan_repo_files`]) *and*
@@ -320,6 +326,7 @@ pub(crate) fn build_report(cwd: &Path, options: DoctorOptions) -> Result<HealthR
                 &custom_extensions,
             ),
         },
+        agents_section(&config.units),
     ];
 
     if !options.no_live {
@@ -390,6 +397,41 @@ fn vcs_section(cwd: &Path) -> (Section, RepoContext) {
             effective_root,
         },
     )
+}
+
+/// See the module docs' **agents** entry. One row per detected CLI plus,
+/// when more than one is present, the first row is the one grouping will
+/// actually use — [`crate::groups::agent::detect_all`] returns them in
+/// preference order, and preserving that order here is the point.
+fn agents_section(units: &config::UnitsConfig) -> Section {
+    let found = crate::groups::agent::detect_all();
+    // The very resolution grouping itself runs — including the user's
+    // `[units] agent` preference — so the "(used for grouping)" marker
+    // can't drift from what `u` would actually spawn.
+    let chosen = crate::groups::agent::detect_preferring(units.agent.as_deref());
+    let checks = if found.is_empty() {
+        vec![Check::warn(
+            "agent CLI",
+            "none found — semantic-units grouping (u) needs `claude` or `codex` on PATH",
+        )]
+    } else {
+        found
+            .iter()
+            .map(|cli| {
+                let is_chosen = chosen.as_ref().is_some_and(|c| c.kind == cli.kind);
+                let detail = if is_chosen && found.len() > 1 {
+                    format!("{} (used for grouping)", cli.path.display())
+                } else {
+                    cli.path.display().to_string()
+                };
+                Check::ok(cli.kind.binary(), detail)
+            })
+            .collect()
+    };
+    Section {
+        title: "agents".to_owned(),
+        checks,
+    }
 }
 
 fn git_binary_check() -> Check {

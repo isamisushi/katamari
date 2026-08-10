@@ -156,6 +156,70 @@ pub struct Config {
     /// since this only gates the unprompted offer, not the explicit
     /// command. Defaults to `true`.
     pub offer_install: bool,
+    /// `[units]` — tuning for the semantic-units grouping's agent CLI
+    /// (see [`crate::groups::agent`]). Every field optional: unset means
+    /// "whatever the CLI's own configuration says", which is the right
+    /// default for a tool borrowing someone else's authenticated CLI.
+    pub units: UnitsConfig,
+    /// Whether *any* config file actually contained a `[units]` table —
+    /// as opposed to `units` above being pure defaults. This is what
+    /// gates the first-use setup popup (see [`crate::ui::units_setup`]):
+    /// grouping spawns a metered CLI, so the first spawn should be a
+    /// choice, not a surprise — but only until the user has said
+    /// *something*, in config or through that popup (which writes
+    /// config), after which asking again would be nagging.
+    pub units_configured: bool,
+}
+
+/// `[units] claude_model`'s default. The evergreen alias, not a pinned
+/// full model name, so this never goes stale on Anthropic's release
+/// schedule; today it resolves to Sonnet 5. A katamari-side default at
+/// all — overriding the user's own CLI default, unlike every other field
+/// here — because grouping is a classification-shaped task where the fast
+/// tier is the right cost/latency call, while a CLI's default is often
+/// the *top* tier (someone's `claude` set to opus would silently pay
+/// opus prices for every `u`).
+pub const DEFAULT_CLAUDE_MODEL: &str = "sonnet";
+
+/// The `[units]` table. Model/effort are per-CLI rather than one shared
+/// pair because the two CLIs share neither model names ("opus" vs
+/// "gpt-5-codex") nor an effort vocabulary, so a single key would be a
+/// trap for anyone with both installed. Values are passed through to the
+/// CLI verbatim — katamari has no model list of its own to validate
+/// against, and going stale on someone else's release schedule would be
+/// worse than letting the CLI report its own "unknown model" error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitsConfig {
+    /// `"claude"` or `"codex"` — which CLI grouping should prefer when
+    /// both are on PATH. Unset keeps
+    /// [`crate::groups::agent::detect_preferring`]'s claude-first order; a
+    /// preference for a CLI that isn't installed falls back to that order
+    /// rather than failing.
+    pub agent: Option<String>,
+    /// `claude --model <…>` (alias or full model name). Defaults to
+    /// [`DEFAULT_CLAUDE_MODEL`]; an explicit `claude_model = ""` opts out
+    /// of any `--model` flag entirely, deferring to the CLI's own default.
+    pub claude_model: Option<String>,
+    /// `claude --effort <…>`.
+    pub claude_effort: Option<String>,
+    /// `codex exec --model <…>`.
+    pub codex_model: Option<String>,
+    /// `codex exec -c model_reasoning_effort=<…>` — codex has no
+    /// dedicated effort flag; its config-override channel is the stable
+    /// way in.
+    pub codex_effort: Option<String>,
+}
+
+impl Default for UnitsConfig {
+    fn default() -> Self {
+        Self {
+            agent: None,
+            claude_model: Some(DEFAULT_CLAUDE_MODEL.to_owned()),
+            claude_effort: None,
+            codex_model: None,
+            codex_effort: None,
+        }
+    }
 }
 
 impl Default for Config {
@@ -172,6 +236,8 @@ impl Default for Config {
             debounce_ms: DEFAULT_DEBOUNCE_MS,
             update_check: true,
             offer_install: true,
+            units: UnitsConfig::default(),
+            units_configured: false,
         }
     }
 }
@@ -202,6 +268,7 @@ pub(crate) struct RawFile {
     watch: Option<RawWatch>,
     update: Option<RawUpdate>,
     skill: Option<RawSkill>,
+    units: Option<RawUnits>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -238,7 +305,19 @@ struct RawSkill {
     offer_install: Option<bool>,
 }
 
-const TOP_LEVEL_KEYS: &[&str] = &["keymap", "keys", "lsp", "ui", "watch", "update", "skill"];
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawUnits {
+    agent: Option<String>,
+    claude_model: Option<String>,
+    claude_effort: Option<String>,
+    codex_model: Option<String>,
+    codex_effort: Option<String>,
+}
+
+const TOP_LEVEL_KEYS: &[&str] = &[
+    "keymap", "keys", "lsp", "ui", "watch", "update", "skill", "units",
+];
 const LSP_KEYS: &[&str] = &["servers", "auto_install"];
 const SERVER_KEYS: &[&str] = &[
     "command",
@@ -252,6 +331,13 @@ const UI_KEYS: &[&str] = &["tab_width", "highlight_max_lines", "wrap", "show_key
 const WATCH_KEYS: &[&str] = &["debounce_ms"];
 const UPDATE_KEYS: &[&str] = &["check"];
 const SKILL_KEYS: &[&str] = &["offer_install"];
+const UNITS_KEYS: &[&str] = &[
+    "agent",
+    "claude_model",
+    "claude_effort",
+    "codex_model",
+    "codex_effort",
+];
 
 /// Merges `overlay`'s present fields onto `base`, in place — the field-level
 /// (not whole-file) precedence rule the module docs describe: a file that
@@ -306,6 +392,24 @@ fn merge_raw(base: &mut RawFile, overlay: RawFile) {
         let base_skill = base.skill.get_or_insert_with(RawSkill::default);
         if overlay_skill.offer_install.is_some() {
             base_skill.offer_install = overlay_skill.offer_install;
+        }
+    }
+    if let Some(overlay_units) = overlay.units {
+        let base_units = base.units.get_or_insert_with(RawUnits::default);
+        if overlay_units.agent.is_some() {
+            base_units.agent = overlay_units.agent;
+        }
+        if overlay_units.claude_model.is_some() {
+            base_units.claude_model = overlay_units.claude_model;
+        }
+        if overlay_units.claude_effort.is_some() {
+            base_units.claude_effort = overlay_units.claude_effort;
+        }
+        if overlay_units.codex_model.is_some() {
+            base_units.codex_model = overlay_units.codex_model;
+        }
+        if overlay_units.codex_effort.is_some() {
+            base_units.codex_effort = overlay_units.codex_effort;
         }
     }
 }
@@ -433,6 +537,9 @@ fn warn_unknown_keys(path: &Path, table: &toml::Table, warnings: &mut Vec<String
     if let Some(skill) = table.get("skill").and_then(toml::Value::as_table) {
         warn_extra(path, "skill.", skill, SKILL_KEYS, warnings);
     }
+    if let Some(units) = table.get("units").and_then(toml::Value::as_table) {
+        warn_extra(path, "units.", units, UNITS_KEYS, warnings);
+    }
 }
 
 fn warn_extra(
@@ -468,6 +575,34 @@ fn finalize(raw: RawFile) -> Config {
     let lsp = raw.lsp.unwrap_or_default();
     let update = raw.update.unwrap_or_default();
     let skill = raw.skill.unwrap_or_default();
+    let units_configured = raw.units.is_some();
+    let units_raw = raw.units.unwrap_or_default();
+    // Same warn-and-degrade treatment as an unknown `keymap` preset: a
+    // typo'd CLI name would otherwise silently never match anything in
+    // `groups::agent::detect_all` and read as "config ignored".
+    let units_agent = match units_raw.agent.as_deref() {
+        None | Some("claude") | Some("codex") => units_raw.agent,
+        Some(other) => {
+            eprintln!(
+                "katamari: warning: unknown `units.agent` {other:?} (expected \"claude\" or \"codex\"); using detection order"
+            );
+            None
+        }
+    };
+    // Unset → katamari's default alias; explicit `""` → no `--model` flag
+    // at all (the one way to say "let the CLI's own default decide").
+    let claude_model = match units_raw.claude_model {
+        None => Some(DEFAULT_CLAUDE_MODEL.to_owned()),
+        Some(model) if model.is_empty() => None,
+        model => model,
+    };
+    let units = UnitsConfig {
+        agent: units_agent,
+        claude_model,
+        claude_effort: units_raw.claude_effort,
+        codex_model: units_raw.codex_model,
+        codex_effort: units_raw.codex_effort,
+    };
     Config {
         keymap,
         key_overrides: raw.keys.unwrap_or_default(),
@@ -482,7 +617,30 @@ fn finalize(raw: RawFile) -> Config {
         debounce_ms: watch.debounce_ms.unwrap_or(DEFAULT_DEBOUNCE_MS),
         update_check: update.check.unwrap_or(true),
         offer_install: skill.offer_install.unwrap_or(true),
+        units,
+        units_configured,
     }
+}
+
+/// Appends `section` (a complete, newline-led `[units]`-style TOML block)
+/// to the home config file, creating it — and `~/.config/katamari/` —
+/// if needed. Append, never rewrite: the file may hold hand-written
+/// comments and formatting a parse-and-reserialize round trip would
+/// destroy, and the only caller ([`crate::ui::units_setup`]) runs
+/// precisely when no `[units]` table exists anywhere, so appending one
+/// can't produce a duplicate.
+pub fn append_to_home_config(section: &str) -> std::io::Result<PathBuf> {
+    let path = home_config_path().ok_or_else(|| std::io::Error::other("HOME is not set"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    file.write_all(section.as_bytes())?;
+    Ok(path)
 }
 
 /// Rebinds each `overrides` entry's action to its given key sequence,
@@ -688,6 +846,85 @@ mod tests {
         let keys = base.keys.unwrap();
         assert_eq!(keys.get("quit").map(String::as_str), Some("q"));
         assert_eq!(keys.get("hover").map(String::as_str), Some("K"));
+    }
+
+    #[test]
+    fn units_section_parses_agent_preference_and_per_cli_tuning() {
+        let repo = fixture_repo();
+        write_repo_config(
+            &repo,
+            "[units]\nagent = \"codex\"\nclaude_model = \"opus\"\nclaude_effort = \"high\"\n\
+             codex_model = \"gpt-5-codex\"\ncodex_effort = \"low\"\n",
+        );
+        let config = load_merged(&repo);
+        assert_eq!(
+            config.units,
+            UnitsConfig {
+                agent: Some("codex".to_owned()),
+                claude_model: Some("opus".to_owned()),
+                claude_effort: Some("high".to_owned()),
+                codex_model: Some("gpt-5-codex".to_owned()),
+                codex_effort: Some("low".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn claude_model_defaults_to_sonnet_and_empty_string_opts_out() {
+        let repo = fixture_repo();
+        assert_eq!(
+            load_merged(&repo).units.claude_model.as_deref(),
+            Some(DEFAULT_CLAUDE_MODEL),
+            "no config at all still gets the default model"
+        );
+
+        write_repo_config(&repo, "[units]\nclaude_model = \"\"\n");
+        assert_eq!(
+            load_merged(&repo).units.claude_model,
+            None,
+            "explicit empty string is the deliberate opt-out"
+        );
+    }
+
+    #[test]
+    fn an_unknown_units_agent_degrades_to_detection_order() {
+        let repo = fixture_repo();
+        write_repo_config(
+            &repo,
+            "[units]\nagent = \"gemini\"\nclaude_model = \"opus\"\n",
+        );
+        let config = load_merged(&repo);
+        assert_eq!(
+            config.units.agent, None,
+            "typo'd CLI must not silently persist"
+        );
+        assert_eq!(
+            config.units.claude_model.as_deref(),
+            Some("opus"),
+            "the rest of the section still applies"
+        );
+    }
+
+    #[test]
+    fn units_fields_merge_field_by_field() {
+        let mut base = RawFile {
+            units: Some(RawUnits {
+                claude_model: Some("opus".to_owned()),
+                ..RawUnits::default()
+            }),
+            ..RawFile::default()
+        };
+        let overlay = RawFile {
+            units: Some(RawUnits {
+                codex_effort: Some("high".to_owned()),
+                ..RawUnits::default()
+            }),
+            ..RawFile::default()
+        };
+        merge_raw(&mut base, overlay);
+        let config = finalize(base);
+        assert_eq!(config.units.claude_model.as_deref(), Some("opus"));
+        assert_eq!(config.units.codex_effort.as_deref(), Some("high"));
     }
 
     #[test]

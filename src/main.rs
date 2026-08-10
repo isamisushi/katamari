@@ -4,6 +4,7 @@ mod comments;
 mod config;
 mod diff;
 mod doctor;
+mod groups;
 mod highlight;
 mod keymap;
 mod lsp;
