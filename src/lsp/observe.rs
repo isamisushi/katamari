@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Maximum number of in-memory events retained for the inspector.  The
 /// journal is a diagnostic aid, not a second unbounded copy of protocol data.
@@ -25,6 +25,10 @@ pub const MEMORY_EVENT_CAP: usize = 4096;
 /// the disk queue.  This keeps one malformed stderr/log/progress notification
 /// from turning a bounded event count into an unbounded memory or disk cost.
 pub const MAX_OBSERVATION_MESSAGE_BYTES: usize = 16 * 1024;
+/// Byte budget for the in-memory ring, on top of [`MEMORY_EVENT_CAP`]. The
+/// entry cap alone admits ~64 MiB of maximal stderr lines; typical sessions
+/// (short messages) never notice this second ceiling.
+pub const MEMORY_EVENT_BYTES_CAP: usize = 8 * 1024 * 1024;
 /// A server can begin progress for arbitrary tokens; keep the current-state
 /// view bounded even when a server never sends matching `end` notifications.
 pub const MAX_ACTIVE_PROGRESS_TOKENS: usize = 64;
@@ -384,11 +388,75 @@ struct Inner {
     /// scanning also re-inserts the marker forever once it scrolls off the
     /// capped deque.
     disk_error_recorded: bool,
+    /// Running total of `events`' message bytes, maintained by
+    /// [`append_memory_event`] so the byte ceiling never needs a ring scan.
+    events_bytes: usize,
 }
 
 struct DiskWriter {
     tx: SyncSender<DiskCommand>,
     handle: Option<JoinHandle<()>>,
+    /// Signalled (or disconnected) when `writer_loop` returns — the only
+    /// way to bound the join below, since [`JoinHandle::join`] has no
+    /// timeout of its own.
+    done_rx: Receiver<()>,
+}
+
+/// How long teardown will wait for the journal to drain. Generous for a
+/// healthy local disk (the queue holds at most 512 short lines), short
+/// enough that quitting katamari never feels hung.
+const WRITER_STOP_TIMEOUT: Duration = Duration::from_secs(3);
+
+impl DiskWriter {
+    /// Bounded teardown. A writer wedged inside `write_all` — the journal
+    /// living on a dead network filesystem is the realistic case — never
+    /// drains its queue, so a blocking `send(Stop)` plus an untimed `join`
+    /// would wedge `q` right along with it. Everything here carries a
+    /// deadline; on timeout the thread is detached instead of joined, which
+    /// is safe because it only ever appends to its own session's segments
+    /// and process exit reaps it.
+    fn stop_within(mut self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let flushed = send_by(&self.tx, DiskCommand::Flush, deadline)
+            && send_by(&self.tx, DiskCommand::Stop, deadline);
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        // Even when `Stop` never fit into the queue, dropping the sender
+        // disconnects the channel, so a writer that later unwedges still
+        // exits at its next `recv` instead of leaking permanently.
+        drop(self.tx);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match self.done_rx.recv_timeout(remaining) {
+            // Signalled or already gone (a panicked writer drops the
+            // sender): the thread has returned, so this join is instant.
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = handle.join();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => drop(handle),
+        }
+        let _ = flushed;
+    }
+}
+
+/// `try_send` with a deadline instead of a blocking `send`: full-queue means
+/// retry until the writer drains a slot or the deadline passes, never wait
+/// forever on a writer that may be wedged in filesystem I/O.
+fn send_by(tx: &SyncSender<DiskCommand>, command: DiskCommand, deadline: Instant) -> bool {
+    let mut command = command;
+    loop {
+        match tx.try_send(command) {
+            Ok(()) => return true,
+            Err(TrySendError::Disconnected(_)) => return false,
+            Err(TrySendError::Full(returned)) => {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                command = returned;
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
 }
 
 enum DiskCommand {
@@ -590,12 +658,7 @@ impl ObservationStore {
         );
         marker.sequence = inner.next_sequence;
         marker.elapsed_ms = marker.at_ms.saturating_sub(self.session_start_ms);
-        if inner.events.len() == MEMORY_EVENT_CAP {
-            inner.events.pop_front();
-        }
-        inner.events.push_back(marker);
-        inner.revision = inner.revision.saturating_add(1);
-        inner.event_revision = inner.event_revision.saturating_add(1);
+        append_memory_event(&mut inner, marker);
     }
 
     #[allow(
@@ -1130,15 +1193,14 @@ impl ObservationStore {
     /// releasing the active lock. Dropping the store also performs this best
     /// effort shutdown, but an explicit call is useful before terminal restore.
     pub fn shutdown(&self) {
-        let mut disk = self.disk.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(mut writer) = disk.take() {
-            let _ = writer.tx.send(DiskCommand::Flush);
-            let _ = writer.tx.send(DiskCommand::Stop);
-            if let Some(handle) = writer.handle.take() {
-                let _ = handle.join();
-            }
+        // Take the writer out and release the lock before the (bounded)
+        // drain wait, so late `record()` calls from detached LSP threads
+        // fall through to the disconnected-channel path instead of piling
+        // up on `disk` behind a slow flush.
+        let writer = self.disk.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(writer) = writer {
+            writer.stop_within(WRITER_STOP_TIMEOUT);
         }
-        drop(disk);
         // Unlock before retention so this just-finished session is treated as
         // inactive and can be counted against the global budget normally.
         let _ = self
@@ -1154,13 +1216,22 @@ impl ObservationStore {
 
 impl Drop for ObservationStore {
     fn drop(&mut self) {
-        if let Some(mut writer) = self.disk.get_mut().ok().and_then(Option::take) {
-            let _ = writer.tx.send(DiskCommand::Stop);
-            if let Some(handle) = writer.handle.take() {
-                let _ = handle.join();
-            }
+        // `into_inner` on poison, matching every other lock site: a
+        // panic-unwind teardown should still flush what it can rather than
+        // silently dropping the final buffered events.
+        if let Some(writer) = self
+            .disk
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            writer.stop_within(WRITER_STOP_TIMEOUT);
         }
-        let _ = self._session_lock.get_mut().ok().and_then(Option::take);
+        let _ = self
+            ._session_lock
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 }
 
@@ -1246,17 +1317,22 @@ fn setup_disk(
         file,
     };
     let (tx, rx) = mpsc::sync_channel(WRITER_QUEUE_CAP);
+    let (done_tx, done_rx) = mpsc::channel();
     let session = session_root.clone();
     let cfg = config.clone();
     let writer_error = Arc::clone(&disk_error);
     let handle = thread::Builder::new()
         .name("katamari-lsp-journal".to_owned())
-        .spawn(move || writer_loop(rx, session, start_ms, cfg, writer_error))
+        .spawn(move || {
+            writer_loop(rx, session, start_ms, cfg, writer_error);
+            let _ = done_tx.send(());
+        })
         .map_err(|error| error.to_string());
     let writer = match handle {
         Ok(handle) => Some(DiskWriter {
             tx,
             handle: Some(handle),
+            done_rx,
         }),
         Err(error) => return (None, Some(session_lock), Some(error), Some(session_root)),
     };
@@ -1489,10 +1565,21 @@ fn clock_hms(ms: u128) -> String {
 }
 
 fn append_memory_event(inner: &mut Inner, event: JournalEvent) {
-    if inner.events.len() == MEMORY_EVENT_CAP {
-        inner.events.pop_front();
-    }
+    inner.events_bytes = inner.events_bytes.saturating_add(event.message.len());
     inner.events.push_back(event);
+    // Two ceilings, evict-oldest under either: the entry cap alone leaves a
+    // ~64 MiB worst case (4096 × 16 KiB stderr lines from a spamming
+    // server), every byte of which `events()` clones under the `inner`
+    // lock. The `len() > 1` guard is defensive — no single capped message
+    // can exceed the byte budget today, but the newest event must survive
+    // even if that invariant ever breaks.
+    while inner.events.len() > MEMORY_EVENT_CAP
+        || (inner.events_bytes > MEMORY_EVENT_BYTES_CAP && inner.events.len() > 1)
+    {
+        if let Some(evicted) = inner.events.pop_front() {
+            inner.events_bytes = inner.events_bytes.saturating_sub(evicted.message.len());
+        }
+    }
     inner.revision = inner.revision.saturating_add(1);
     inner.event_revision = inner.event_revision.saturating_add(1);
 }
@@ -1555,6 +1642,28 @@ mod tests {
         let events = store.events();
         assert_eq!(events.len(), MEMORY_EVENT_CAP);
         assert_eq!(events.first().unwrap().message, "10");
+    }
+
+    #[test]
+    fn memory_ring_is_capped_by_total_bytes_not_just_entry_count() {
+        let store = ObservationStore::in_memory();
+        let big = "x".repeat(MAX_OBSERVATION_MESSAGE_BYTES);
+        let rounds = MEMORY_EVENT_BYTES_CAP / MAX_OBSERVATION_MESSAGE_BYTES + 100;
+        for _ in 0..rounds {
+            store.record(JournalEvent::simple(
+                EventSource::Stderr,
+                EventLevel::Info,
+                None,
+                big.clone(),
+            ));
+        }
+        let events = store.events();
+        assert!(events.len() < MEMORY_EVENT_CAP, "byte cap never engaged");
+        let total: usize = events.iter().map(|event| event.message.len()).sum();
+        assert!(
+            total <= MEMORY_EVENT_BYTES_CAP,
+            "ring holds {total} bytes, budget is {MEMORY_EVENT_BYTES_CAP}"
+        );
     }
 
     #[test]
