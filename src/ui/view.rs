@@ -28,10 +28,18 @@ pub enum View {
 }
 
 impl View {
+    /// Whether this pushed view's own toggle/confirm/cancel key has asked
+    /// to close *itself* — `ui::mod`'s event loop pops it if so (see
+    /// `event_loop`'s bottom-of-loop check). `q` is never involved: global
+    /// quit is intercepted at the keymap resolver, before a matched action
+    /// ever reaches a view's `update` (see
+    /// `ui::mod::event_loop`'s `StepResult::Matched(Action::Quit)` arm), so
+    /// [`View::Diff`]/[`View::File`] — which have no view-local toggle key
+    /// of their own to close *themselves* with — never have anything to
+    /// report here and are unconditionally `false`.
     pub fn should_quit(&self) -> bool {
         match self {
-            View::Diff(app) => app.should_quit,
-            View::File(file) => file.should_quit,
+            View::Diff(_) | View::File(_) => false,
             View::Timeline(timeline) => timeline.should_quit,
             View::Log(log) => log.should_quit,
             View::LspInspector(inspector) => inspector.should_quit,

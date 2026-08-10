@@ -60,7 +60,6 @@ pub struct FileView {
     /// [`crate::ui::app::App::active_symbol`]; see that field's docs.
     pub active_symbol: usize,
     pub pending_keys: String,
-    pub should_quit: bool,
     viewport_height: usize,
     /// This pane's per-row wrap width — see [`crate::ui::app::App`]'s field
     /// of the same purpose for why it's refreshed every frame rather than
@@ -101,7 +100,6 @@ impl FileView {
             scroll_offset: 0,
             active_symbol: 0,
             pending_keys: String::new(),
-            should_quit: false,
             viewport_height: 1,
             content_width: usize::MAX, // see `App::content_width`'s docs
         }
@@ -199,7 +197,6 @@ impl FileView {
 
     pub fn update(&mut self, action: Action) {
         if self.line_count() == 0 {
-            self.should_quit |= action == Action::Quit;
             return;
         }
         let last = self.line_count() - 1;
@@ -222,9 +219,14 @@ impl FileView {
             Action::Bottom => self.cursor = last,
             Action::NextSymbol => self.cycle_symbol(1),
             Action::PrevSymbol => self.cycle_symbol(-1),
-            Action::Quit => self.should_quit = true,
             // `ui::mod` intercepts all of these before they reach here,
-            // same as in `App::update` — see that method's comment.
+            // same as in `App::update` — see that method's comment. `Quit`
+            // joins this bucket rather than `TimelineView`/`LogView`'s own
+            // should_quit-setting arms: it's intercepted even earlier, at
+            // the keymap resolver, before a matched action is dispatched
+            // anywhere (see `ui::mod::event_loop`'s
+            // `StepResult::Matched(Action::Quit)` arm) — global quit, not a
+            // per-view "close."
             Action::Hover
             | Action::Cancel
             | Action::GotoDefinition
@@ -233,7 +235,8 @@ impl FileView {
             | Action::PrevDiagnostic
             | Action::JumpBack
             | Action::JumpForward
-            | Action::Confirm => {}
+            | Action::Confirm
+            | Action::Quit => {}
             // A single file has no hunks, no other files, no sidebar, and
             // only one column — these diff-view actions are no-ops here
             // rather than unreachable, so the shared keymap doesn't need a
@@ -606,14 +609,6 @@ mod tests {
         assert_eq!(view.cursor, 3);
         view.update(Action::Top);
         assert_eq!(view.cursor, 0);
-    }
-
-    #[test]
-    fn quit_sets_should_quit() {
-        let mut view = test_view();
-        assert!(!view.should_quit);
-        view.update(Action::Quit);
-        assert!(view.should_quit);
     }
 
     #[test]

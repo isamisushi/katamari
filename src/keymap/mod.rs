@@ -62,16 +62,21 @@ pub enum Action {
     NextDiagnostic,
     PrevDiagnostic,
     /// Retraces the jump history one step back/forward — `Ctrl-o`/`Ctrl-i`'s
-    /// vim-familiar direction. Forward's *canonical* binding depends on
-    /// whether the terminal can tell a literal Tab from `Ctrl-i` apart: with
-    /// the kitty keyboard protocol's `DISAMBIGUATE_ESCAPE_CODES` flag active
-    /// they arrive as different [`crate::keymap::KeyChord`]s, so
-    /// [`vim_preset`]/[`emacs_preset`] bind `C-i` (matching neovim) with
-    /// `C-t` kept as a still-working alias; without it, both share the same
-    /// byte on the wire, so only `C-t` is bound at all — binding `C-i`
-    /// there would silently steal every Tab press meant for
-    /// [`NextSymbol`](Action::NextSymbol). See `ui::mod`'s kitty-protocol
-    /// startup probe and [`crate::ui::navigation::JumpStack`].
+    /// vim-familiar direction, with `Alt-Left`/`Alt-Right` bound
+    /// unconditionally in both presets as terminal-agnostic aliases (issue
+    /// #12). Forward's *canonical* binding depends on whether the terminal
+    /// can tell a literal Tab from `Ctrl-i` apart: with the kitty keyboard
+    /// protocol's `DISAMBIGUATE_ESCAPE_CODES` flag active they arrive as
+    /// different [`crate::keymap::KeyChord`]s, so [`vim_preset`]/
+    /// [`emacs_preset`] bind `C-i` (matching neovim) ahead of `Alt-Right`;
+    /// without it, both share the same byte on the wire, so `C-i` is left
+    /// unbound entirely — binding it there would silently steal every Tab
+    /// press meant for [`NextSymbol`](Action::NextSymbol) — and `Alt-Right`
+    /// becomes forward's sole, canonical binding instead. `Ctrl-t` (the
+    /// pre-#12 legacy-terminal fallback) and `Ctrl-]` (vim's tag-stack key)
+    /// are both deliberately left unbound — see the roadmap issue's "Why
+    /// there is no tag stack." See `ui::mod`'s kitty-protocol startup probe
+    /// and [`crate::ui::navigation::JumpStack`].
     JumpBack,
     JumpForward,
     /// Selects the highlighted entry in an open references panel and
@@ -530,14 +535,16 @@ impl<'a> Resolver<'a> {
 ///
 /// `ci_distinguishable` is `ui::run`'s kitty-protocol startup probe result
 /// (see [`Action::JumpBack`]'s docs): when `true`, `C-i` is inserted ahead
-/// of `C-t` in the list below so [`Keymap::binding_for`]'s first-match rule
-/// picks it as `JumpForward`'s canonical, hinted binding, while `C-t` stays
-/// bound as a working alias (both entries resolve to the same action; the
-/// trie has no trouble with two distinct key sequences mapping to one
-/// action, only with one sequence mapping to two). When `false`, `C-i` is
-/// left unbound entirely — the terminal delivers the identical byte for a
-/// literal Tab and `Ctrl-i` in that case, and Tab already means
-/// [`Action::NextSymbol`].
+/// of `M-Right` in the list below so [`Keymap::binding_for`]'s first-match
+/// rule picks it as `JumpForward`'s canonical, hinted binding, while
+/// `M-Right` stays bound as a working alias (both entries resolve to the
+/// same action; the trie has no trouble with two distinct key sequences
+/// mapping to one action, only with one sequence mapping to two). When
+/// `false`, `C-i` is left unbound entirely — the terminal delivers the
+/// identical byte for a literal Tab and `Ctrl-i` in that case, and Tab
+/// already means [`Action::NextSymbol`] — so `M-Right` becomes forward's
+/// sole, canonical binding. `M-Left` is `JumpBack`'s alias unconditionally,
+/// alongside `C-o`, in both branches.
 pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
     let mut bindings = vec![
         ("j", Action::CursorDown),
@@ -558,11 +565,12 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("] d", Action::NextDiagnostic),
         ("[ d", Action::PrevDiagnostic),
         ("C-o", Action::JumpBack),
+        ("M-Left", Action::JumpBack),
     ];
     if ci_distinguishable {
         bindings.push(("C-i", Action::JumpForward));
     }
-    bindings.push(("C-t", Action::JumpForward));
+    bindings.push(("M-Right", Action::JumpForward));
     bindings.extend([
         ("Enter", Action::Confirm),
         ("Tab", Action::NextSymbol),
@@ -635,11 +643,12 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("M-g M-n", Action::NextDiagnostic),
         ("M-g M-p", Action::PrevDiagnostic),
         ("C-o", Action::JumpBack),
+        ("M-Left", Action::JumpBack),
     ];
     if ci_distinguishable {
         bindings.push(("C-i", Action::JumpForward));
     }
-    bindings.push(("C-t", Action::JumpForward));
+    bindings.push(("M-Right", Action::JumpForward));
     bindings.extend([
         ("Enter", Action::Confirm),
         ("Tab", Action::NextSymbol),
@@ -965,6 +974,14 @@ mod tests {
         KeyChord::new(KeyCode::Char(c), KeyModifiers::ALT)
     }
 
+    fn alt_left() -> KeyChord {
+        KeyChord::new(KeyCode::Left, KeyModifiers::ALT)
+    }
+
+    fn alt_right() -> KeyChord {
+        KeyChord::new(KeyCode::Right, KeyModifiers::ALT)
+    }
+
     #[test]
     fn open_help_binds_to_plain_question_mark_in_both_presets() {
         for preset_fn in [vim_preset, emacs_preset] {
@@ -1286,15 +1303,17 @@ mod tests {
     }
 
     /// The 40 actions (see the `action_name_and_action_by_name_round_trip…`
-    /// test's `all` list) each get exactly one binding — except
-    /// `JumpForward`, which gets a *second* one (`C-i`) precisely when
-    /// `ci_distinguishable` is set, per [`vim_preset`]/[`emacs_preset`]'s
+    /// test's `all` list) each get exactly one binding — except `JumpBack`,
+    /// which always gets a second one (`M-Left`), and `JumpForward`, which
+    /// gets `M-Right` unconditionally plus a *third* one (`C-i`) precisely
+    /// when `ci_distinguishable` is set, per [`vim_preset`]/[`emacs_preset`]'s
     /// docs. So this checks two things per preset: every action is still
     /// reachable (`actions.len() == 40` after dedup), and the raw entry
-    /// count is exactly one more than that when the extra `C-i` alias is
-    /// present, exactly equal otherwise. As a side effect, this also forces
-    /// `?`/`/`/`n`/`N` to be bound in both presets the moment `ACTION_COUNT`
-    /// bumps — [`Action::OpenHelp`]/[`Action::OpenSearch`]/[`Action::NextMatch`]/
+    /// count is exactly two more than that (the unconditional `M-Left`/
+    /// `M-Right` aliases) plus one more still when the extra `C-i` alias is
+    /// present. As a side effect, this also forces `?`/`/`/`n`/`N` to be
+    /// bound in both presets the moment `ACTION_COUNT` bumps —
+    /// [`Action::OpenHelp`]/[`Action::OpenSearch`]/[`Action::NextMatch`]/
     /// [`Action::PrevMatch`] with no binding in either preset would fail
     /// the `actions.len() == ACTION_COUNT` assertion below, not just the
     /// dedicated `open_help_binds_to_plain_question_mark_in_both_presets`
@@ -1315,11 +1334,12 @@ mod tests {
                     ACTION_COUNT,
                     "every action should be reachable regardless of ci_distinguishable"
                 );
-                let expected_len = ACTION_COUNT + usize::from(ci_distinguishable);
+                let expected_len = ACTION_COUNT + 1 + usize::from(ci_distinguishable);
                 assert_eq!(
                     preset.len(),
                     expected_len,
-                    "ci_distinguishable={ci_distinguishable} should add exactly the C-i alias"
+                    "ci_distinguishable={ci_distinguishable} should add exactly the \
+                     M-Left/M-Right aliases, plus the C-i alias when set"
                 );
             }
         }
@@ -1340,24 +1360,41 @@ mod tests {
     }
 
     #[test]
-    fn ci_distinguishable_keeps_c_t_working_as_an_alias_via_the_trie() {
+    fn ci_distinguishable_leaves_c_t_unbound_and_resolves_c_i_plus_m_left_m_right() {
         for preset_fn in [vim_preset, emacs_preset] {
             let keymap = Keymap::from_bindings(&preset_fn(true));
+
+            // `Ctrl-]`/`Ctrl-t` have no default binding at all now (#12) —
+            // neither was ever a tag-stack key here, and `C-t`'s old
+            // fallback role is gone.
+            let mut resolver = keymap.resolver();
+            assert_eq!(resolver.feed(ctrl('t')), StepResult::Cancelled);
+
             let mut resolver = keymap.resolver();
             assert_eq!(
-                resolver.feed(ctrl('t')),
+                resolver.feed(ctrl('i')),
                 StepResult::Matched(Action::JumpForward)
             );
             let mut resolver = keymap.resolver();
             assert_eq!(
-                resolver.feed(ctrl('i')),
+                resolver.feed(ctrl('o')),
+                StepResult::Matched(Action::JumpBack)
+            );
+            let mut resolver = keymap.resolver();
+            assert_eq!(
+                resolver.feed(alt_left()),
+                StepResult::Matched(Action::JumpBack)
+            );
+            let mut resolver = keymap.resolver();
+            assert_eq!(
+                resolver.feed(alt_right()),
                 StepResult::Matched(Action::JumpForward)
             );
         }
     }
 
     #[test]
-    fn not_ci_distinguishable_binds_only_c_t_and_leaves_c_i_unbound() {
+    fn not_ci_distinguishable_binds_m_right_as_canonical_forward_and_leaves_c_i_c_t_unbound() {
         for preset_fn in [vim_preset, emacs_preset] {
             let keymap = Keymap::from_bindings(&preset_fn(false));
             assert_eq!(
@@ -1365,13 +1402,34 @@ mod tests {
                     .binding_for(Action::JumpForward)
                     .unwrap()
                     .compact_notation(),
-                "C-t"
+                "M-Right"
+            );
+            assert_eq!(
+                keymap
+                    .binding_for(Action::JumpBack)
+                    .unwrap()
+                    .compact_notation(),
+                "C-o"
             );
             // `C-i` was never inserted into the trie in this mode — feeding
             // it cancels like any other unbound key, rather than resolving
             // to whatever it happened to fall through to.
             let mut resolver = keymap.resolver();
             assert_eq!(resolver.feed(ctrl('i')), StepResult::Cancelled);
+            // Nor was `C-t` — it has no default binding in either mode.
+            let mut resolver = keymap.resolver();
+            assert_eq!(resolver.feed(ctrl('t')), StepResult::Cancelled);
+
+            let mut resolver = keymap.resolver();
+            assert_eq!(
+                resolver.feed(alt_left()),
+                StepResult::Matched(Action::JumpBack)
+            );
+            let mut resolver = keymap.resolver();
+            assert_eq!(
+                resolver.feed(alt_right()),
+                StepResult::Matched(Action::JumpForward)
+            );
         }
     }
 

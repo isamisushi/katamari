@@ -7,15 +7,16 @@
 //! auto-install) or a locally installed toolchain would be flaky in exactly
 //! the ways this milestone is trying to eliminate.
 //!
-//! [`lsp_readiness_repo`] is the one deliberate exception: issue #11's
-//! readiness coverage needs a real, controllable server lifecycle to press
-//! hover/definition/references against while it's still starting, which no
-//! built-in language could give this suite without an auto-install,
-//! network access, or a locally installed toolchain — exactly what every
-//! other fixture here exists to avoid. It stays safe the same way a custom
-//! `[lsp.servers.<id>]` entry always is: a fabricated file extension no
-//! built-in [`katamari`'s `Language::detect`] has ever heard of, routed to
-//! a small script this repository controls end to end (see
+//! [`lsp_readiness_repo`]/[`lsp_readiness_repo_with_definition_target`] are
+//! the one deliberate exception: issue #11's readiness coverage needs a
+//! real, controllable server lifecycle to press hover/definition/references
+//! against while it's still starting, which no built-in language could give
+//! this suite without an auto-install, network access, or a locally
+//! installed toolchain — exactly what every other fixture here exists to
+//! avoid. They stay safe the same way a custom `[lsp.servers.<id>]` entry
+//! always is: a fabricated file extension no built-in
+//! [`katamari`'s `Language::detect`] has ever heard of, routed to a small
+//! script this repository controls end to end (see
 //! `support::fake_lsp_server`'s docs) rather than a real language server.
 
 use std::path::Path;
@@ -279,10 +280,46 @@ pub fn python3_available() -> bool {
 }
 
 pub fn lsp_readiness_repo(init_delay_secs: f64, definition_delay_secs: f64) -> FixtureRepo {
+    lsp_readiness_repo_inner(init_delay_secs, definition_delay_secs, false)
+}
+
+/// As [`lsp_readiness_repo`], but `textDocument/definition` answers with a
+/// real [`lsp_types::Location`] in a second, unmodified file (`other.stub`)
+/// instead of `None` — issue #12's Esc-from-a-definition-opened-`FileView`
+/// PTY coverage needs a genuine `FileView` push, which a `null` result (or
+/// a location inside `main.stub` itself, already part of this diff — see
+/// `App::row_for_target`) can't produce. Kept as a separate function rather
+/// than a third parameter every existing caller would have to thread
+/// through: issue #11's not-ready/no-result assertions never have to think
+/// about this at all.
+///
+/// [`lsp_types::Location`]: https://docs.rs/lsp-types/latest/lsp_types/struct.Location.html
+pub fn lsp_readiness_repo_with_definition_target(
+    init_delay_secs: f64,
+    definition_delay_secs: f64,
+) -> FixtureRepo {
+    lsp_readiness_repo_inner(init_delay_secs, definition_delay_secs, true)
+}
+
+fn lsp_readiness_repo_inner(
+    init_delay_secs: f64,
+    definition_delay_secs: f64,
+    definition_target: bool,
+) -> FixtureRepo {
     let dir = init_repo();
     let root = dir.path();
 
     std::fs::write(root.join("main.stub"), "alpha\nbeta\n").unwrap();
+    // Committed once, never touched again — absent from the working-tree
+    // diff `main.stub`'s own edit below produces, so a jump into it can
+    // only ever be a real navigation target, never "coincidentally already
+    // part of this diff" (see `lsp_readiness_repo_with_definition_target`'s
+    // docs).
+    std::fs::write(
+        root.join("other.stub"),
+        "target line one\ntarget line two\n",
+    )
+    .unwrap();
     git(root, &["add", "-A"]);
     git(root, &["commit", "-q", "-m", "initial commit"]);
 
@@ -298,8 +335,9 @@ pub fn lsp_readiness_repo(init_delay_secs: f64, definition_delay_secs: f64) -> F
         format!(
             "[lsp.servers.stubls]\n\
              command = \"python3\"\n\
-             args = [\"{server_script}\", \"{init_delay_secs}\", \"{definition_delay_secs}\"]\n\
-             extensions = [\"stub\"]\n"
+             args = [\"{server_script}\", \"{init_delay_secs}\", \"{definition_delay_secs}\", \"{}\"]\n\
+             extensions = [\"stub\"]\n",
+            if definition_target { "1" } else { "0" },
         ),
     )
     .unwrap();

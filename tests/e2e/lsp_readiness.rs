@@ -69,6 +69,81 @@ fn movement_help_and_quit_respond_before_the_server_initializes() {
     assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
 }
 
+/// Issue #12's Esc-from-a-definition-opened-`FileView` PTY coverage. Chose
+/// the fake-LSP fixture over the git-only `LogView`-nested-`Diff` fallback
+/// the issue's plan also allowed: `ui::mod::cancel_diff_view` pops a pushed
+/// `File`/`Diff`/`Timeline`/`Log` through the exact same branch, so a
+/// nested-`Diff` test (see `tests/e2e/log.rs`) already covers that code
+/// path — but a real `FileView` push only ever happens through
+/// `ui::navigation::navigate_to`'s "push a fresh view" branch, which a
+/// nested-diff jump never reaches. This is the one test in the suite that
+/// exercises it end to end.
+#[test]
+fn esc_pops_a_definition_opened_file_view_back_to_the_diff() {
+    if !fixture::python3_available() {
+        eprintln!("skipping: python3 not on PATH (fake LSP server fixture needs it)");
+        return;
+    }
+    let repo = fixture::lsp_readiness_repo_with_definition_target(0.0, 0.0);
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            cols: 160,
+            ..Default::default()
+        },
+    );
+
+    h.wait_for_text("GOTO_TARGET_TOKEN");
+    h.wait_for_text("\u{b7} 1/");
+
+    // Land on `main.stub`'s added row — a valid go-to-definition target.
+    h.send(Key::Char('j'));
+    h.wait_for_text("\u{b7} 2/");
+    h.send(Key::Char('j'));
+    h.wait_for_text("\u{b7} 3/");
+
+    // `gd` — the fake server (configured with a definition target) points
+    // at `other.stub`, a file that's part of this repo but not part of
+    // this diff, so `navigate_to` must push a fresh `FileView` rather than
+    // moving the cursor within the diff already on screen.
+    //
+    // Even with both delays at `0.0`, the fake server's `initialize`
+    // handshake still takes real wall-clock time (process spawn, a stdio
+    // round trip) — this is issue #11's readiness gate working correctly,
+    // not a bug, so retry `gd` for a bit rather than asserting the very
+    // first press wins that race.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        h.send(Key::Char('g'));
+        h.send(Key::Char('d'));
+        std::thread::sleep(Duration::from_millis(100));
+        if h.screen_contents().contains("other.stub") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gd never reached a Ready server within 5s; screen:\n{}",
+            h.screen_contents()
+        );
+    }
+    h.wait_for_text("target line one");
+
+    // `Esc` pops exactly the pushed `FileView`, landing back on the diff
+    // being reviewed — not quitting, not clearing anything else. The root
+    // diff's own cursor was never touched while the `FileView` was on top,
+    // so it's still on the same row it left from.
+    h.send(Key::Esc);
+    h.wait_for_text("GOTO_TARGET_TOKEN");
+    h.wait_for_text("\u{b7} 3/");
+    h.wait_until(Duration::from_secs(3), |screen| {
+        !screen.contents().contains("target line one")
+    });
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
 #[test]
 fn a_not_ready_definition_press_never_fires_late_and_a_retry_after_ready_dispatches() {
     if !fixture::python3_available() {

@@ -88,9 +88,9 @@ pub fn describe(action: Action) -> (&'static str, &'static str) {
         Action::ToggleHints => ("View", "Show all status-bar hints, or just the minimal set"),
         Action::ToggleLspInspector => ("View", "Open or close the live LSP inspector"),
         Action::ToggleRangeSelect => ("View", "Toggle range-select (timeline/log)"),
-        Action::Cancel => ("General", "Close a popup, or dismiss the hover"),
+        Action::Cancel => ("General", "Close a popup/hover, or return from a view"),
         Action::Confirm => ("General", "Confirm the selection"),
-        Action::Quit => ("General", "Quit, or close the current view"),
+        Action::Quit => ("General", "Quit katamari"),
         Action::OpenHelp => ("General", "Show this help window"),
     }
 }

@@ -305,7 +305,11 @@ impl LspInspectorView {
     pub fn update(&mut self, action: Action) {
         self.refresh();
         match action {
-            Action::ToggleLspInspector | Action::Quit => {
+            // `q` never reaches here as `Action::Quit`: it's intercepted as
+            // a global quit at the keymap resolver, before a matched action
+            // is ever dispatched to a view (see `ui::mod::event_loop`'s
+            // `StepResult::Matched(Action::Quit)` arm).
+            Action::ToggleLspInspector => {
                 self.should_quit = true;
             }
             Action::Cancel => {
@@ -553,7 +557,13 @@ impl LspInspectorView {
         };
         let outer_hints = [
             PaneHint::new("Tab/BackTab", "focus", true),
-            PaneHint::new("I/Esc/q", "close", true),
+            PaneHint::new("I/Esc", "close", true),
+            // Split from the `I/Esc` hint above rather than folded into
+            // one combined "close" label the way it used to read: `q` now
+            // quits the whole katamari session (issue #12), not just this
+            // pane — a materially different outcome from `I`/`Esc` popping
+            // back to whatever's underneath, so it earns its own label.
+            PaneHint::new("q", "quit", true),
         ];
         let outer = PaneChrome::new(outer_title, area.width)
             .focused(false)
@@ -570,7 +580,7 @@ impl LspInspectorView {
                 Line::from(
                     "Server startup is lazy: hover, definition, references, or diagnostics warm-up will create an instance.",
                 ),
-                Line::from("Press I, Esc, or q to close."),
+                Line::from("Press I or Esc to close, q to quit katamari."),
             ];
             if let Some(error) = self.observer.setup_error() {
                 message.push(Line::from(Span::styled(
@@ -1522,7 +1532,8 @@ mod tests {
             };
             let lines = rendered_lines(&terminal);
             assert!(lines.iter().any(|line| line.contains("Tab/BackTab")));
-            assert!(lines.iter().any(|line| line.contains("I/Esc/q")));
+            assert!(lines.iter().any(|line| line.contains("I/Esc")));
+            assert!(lines.iter().any(|line| line.contains("q quit")));
             assert!(lines.iter().any(|line| line.contains("j/k select")));
             assert!(lines.iter().all(|line| !line.contains("controls")));
             assert!(lines.iter().all(|line| !line.contains("journal keys")));

@@ -1,7 +1,8 @@
 //! Turns the *active* keymap into the compact, curated hint lists every
 //! status bar shows, and wraps them to fit the terminal instead of
 //! truncating. Both fix the same underlying report: a user who didn't know
-//! `Ctrl-o`/`Ctrl-t` (jump back/forward) existed, because the hint that
+//! `Ctrl-o`/`Ctrl-i` (jump back/forward — `Alt-Right` in a terminal that
+//! can't tell `Ctrl-i` from a plain Tab) existed, because the hint that
 //! names them sat mid-line in a fixed single-row status bar and got cut off
 //! on anything but a wide terminal — and, separately, that the hint text was
 //! hardcoded vim notation, so it kept showing `gd`/`gr` even under
@@ -213,7 +214,8 @@ fn toggle_item(keymap: &Keymap, expanded: bool) -> Option<HintItem> {
 /// keys a reviewer needs constantly or couldn't otherwise discover —
 /// movement, the units view, help, quit — plus the `". more"` toggle;
 /// one calm line instead of three busy ones. Expanded shows the full
-/// curated list. Jump back/forward (`Ctrl-o`/`Ctrl-t`) sits second there,
+/// curated list. Jump back/forward (`Ctrl-o`/`Ctrl-i`, or `Alt-Right` as
+/// forward's fallback — see [`Action::JumpBack`]'s docs) sits second there,
 /// right after basic cursor movement — the M9 discoverability fix: the
 /// binding always existed, but the old fixed-width, non-wrapping status
 /// bar buried it eleventh out of sixteen items, past where most terminals
@@ -336,7 +338,7 @@ pub fn file_view_items(keymap: &Keymap, expanded: bool) -> Vec<HintItem> {
 }
 
 /// [`View::Timeline`](crate::ui::View::Timeline)'s curated hints. No jump
-/// item here — unlike the diff/file views, `Ctrl-o`/`Ctrl-t` have nothing to
+/// item here — unlike the diff/file views, `Ctrl-o`/`Ctrl-i` have nothing to
 /// retrace from a read-only timeline (see `View::jump_entry`'s docs on why
 /// it always returns `None` for this view). Same collapsed/expanded split
 /// as [`diff_view_items`].
@@ -345,11 +347,8 @@ pub fn timeline_view_items(keymap: &Keymap, expanded: bool) -> Vec<HintItem> {
         return [
             HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "select"),
             HintItem::for_actions(keymap, &[Action::OpenHelp], "help"),
-            HintItem::for_actions(
-                keymap,
-                &[Action::Quit, Action::Cancel, Action::ToggleTimeline],
-                "close",
-            ),
+            HintItem::for_actions(keymap, &[Action::Cancel, Action::ToggleTimeline], "close"),
+            HintItem::for_actions(keymap, &[Action::Quit], "quit"),
             toggle_item(keymap, false),
         ]
         .into_iter()
@@ -363,11 +362,8 @@ pub fn timeline_view_items(keymap: &Keymap, expanded: bool) -> Vec<HintItem> {
         HintItem::for_actions(keymap, &[Action::NextSymbol], "focus"),
         HintItem::for_actions(keymap, &[Action::ToggleRangeSelect], "range"),
         HintItem::for_actions(keymap, &[Action::Confirm], "back to diff"),
-        HintItem::for_actions(
-            keymap,
-            &[Action::Quit, Action::Cancel, Action::ToggleTimeline],
-            "close",
-        ),
+        HintItem::for_actions(keymap, &[Action::Cancel, Action::ToggleTimeline], "close"),
+        HintItem::for_actions(keymap, &[Action::Quit], "quit"),
         toggle_item(keymap, true),
     ]
     .into_iter()
@@ -386,11 +382,8 @@ pub fn log_view_items(keymap: &Keymap, expanded: bool) -> Vec<HintItem> {
             HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "select"),
             HintItem::for_actions(keymap, &[Action::Confirm], "open diff"),
             HintItem::for_actions(keymap, &[Action::OpenHelp], "help"),
-            HintItem::for_actions(
-                keymap,
-                &[Action::Quit, Action::Cancel, Action::ToggleLogView],
-                "close",
-            ),
+            HintItem::for_actions(keymap, &[Action::Cancel, Action::ToggleLogView], "close"),
+            HintItem::for_actions(keymap, &[Action::Quit], "quit"),
             toggle_item(keymap, false),
         ]
         .into_iter()
@@ -403,11 +396,8 @@ pub fn log_view_items(keymap: &Keymap, expanded: bool) -> Vec<HintItem> {
         HintItem::for_actions(keymap, &[Action::ToggleLspInspector], "LSP log"),
         HintItem::for_actions(keymap, &[Action::Confirm], "open diff"),
         HintItem::for_actions(keymap, &[Action::ToggleRangeSelect], "range"),
-        HintItem::for_actions(
-            keymap,
-            &[Action::Quit, Action::Cancel, Action::ToggleLogView],
-            "close",
-        ),
+        HintItem::for_actions(keymap, &[Action::Cancel, Action::ToggleLogView], "close"),
+        HintItem::for_actions(keymap, &[Action::Quit], "quit"),
         toggle_item(keymap, true),
     ]
     .into_iter()
@@ -582,7 +572,7 @@ mod tests {
         let keymap = Keymap::from_bindings(&vim_preset(false));
         let items = diff_view_items(&keymap, true);
         assert_eq!(items[0].display(), "j/k move");
-        assert_eq!(items[1].display(), "C-o/C-t jump");
+        assert_eq!(items[1].display(), "C-o/M-Right jump");
     }
 
     #[test]
@@ -590,7 +580,7 @@ mod tests {
         let keymap = Keymap::from_bindings(&vim_preset(false));
         let items = file_view_items(&keymap, true);
         assert_eq!(items[0].display(), "j/k move");
-        assert_eq!(items[1].display(), "C-o/C-t jump");
+        assert_eq!(items[1].display(), "C-o/M-Right jump");
     }
 
     #[test]
@@ -750,7 +740,7 @@ mod tests {
     /// first-match-wins docs), with zero hint-side special-casing — a
     /// kitty-protocol-capable session's hint reads `C-o/C-i`, matching
     /// neovim, purely because `vim_preset(true)` lists `C-i` ahead of
-    /// `C-t` for that action.
+    /// `M-Right` for that action.
     #[test]
     fn diff_view_items_jump_hint_shows_c_i_when_ci_distinguishable() {
         let keymap = Keymap::from_bindings(&vim_preset(true));
@@ -759,10 +749,10 @@ mod tests {
     }
 
     #[test]
-    fn diff_view_items_jump_hint_shows_c_t_when_not_ci_distinguishable() {
+    fn diff_view_items_jump_hint_shows_m_right_when_not_ci_distinguishable() {
         let keymap = Keymap::from_bindings(&vim_preset(false));
         let items = diff_view_items(&keymap, true);
-        assert_eq!(items[1].display(), "C-o/C-t jump");
+        assert_eq!(items[1].display(), "C-o/M-Right jump");
     }
 
     #[test]

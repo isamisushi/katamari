@@ -31,6 +31,7 @@
 //! submits) is specific to this module.
 
 use crate::diff::{DiffFile, RenderRow};
+use crate::ui::navigation::JumpEntry;
 use crate::ui::refresh::Anchor;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -331,6 +332,17 @@ pub fn handle_prompt_key(input: &mut SearchInput, key: KeyEvent) -> SearchPrompt
 pub struct SearchPromptState {
     pub input: SearchInput,
     pub origin: Anchor,
+    /// Where the cursor was the instant `/` was pressed, for
+    /// [`crate::ui::navigation::record_jump`] to record on confirm — `None`
+    /// when there was nowhere a jump could usefully return to (see
+    /// [`crate::ui::view::View::jump_entry`]'s docs), the same as any other
+    /// jump's origin. Captured once, here, rather than re-derived at
+    /// confirm time: the live incremental preview (`recompute_search_live`,
+    /// on every keystroke while the prompt is open) already moves the
+    /// cursor as the reviewer types, so by the time Enter confirms, "where
+    /// the search leaves from" has to mean where `/` was actually pressed,
+    /// not wherever the preview happens to have landed most recently.
+    pub jump_from: Option<JumpEntry>,
 }
 
 #[cfg(test)]

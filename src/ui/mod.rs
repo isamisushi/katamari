@@ -61,7 +61,7 @@ use crate::skill;
 use crate::ui::compose::{ComposeOutcome, ComposeState};
 use crate::ui::help::{HelpOutcome, HelpState};
 use crate::ui::log_view::LogView;
-use crate::ui::navigation::{JumpEntry, JumpStack, navigate_to};
+use crate::ui::navigation::{JumpEntry, JumpStack, navigate_to, record_jump};
 use crate::ui::refs_panel::RefsPanel;
 use crate::ui::scope_menu::{
     RevisionInputOutcome, ScopeMenuEntry, ScopeMenuState, handle_revision_key,
@@ -1024,9 +1024,24 @@ fn event_loop(
                             // whatever search was already active before
                             // this `/` press.
                             let query = prompt.input.text().to_owned();
+                            let jump_from = prompt.jump_from.clone();
                             if let View::Diff(app) = stack.top_mut() {
                                 goto_status = app.confirm_search(&query, &origin);
                             }
+                            // `confirm_search` itself never moves the
+                            // cursor — the live incremental preview
+                            // already did, on every keystroke while the
+                            // prompt was open — so this records the whole
+                            // `/` session (from wherever it was pressed to
+                            // wherever Enter leaves the cursor now) as one
+                            // significant jump, not each keystroke's own
+                            // preview move. A query that resolved to zero
+                            // matches, or was cancelled via
+                            // `App::cancel_search` above, leaves the cursor
+                            // back where it started — `record_jump`'s
+                            // equality check quietly declines to record
+                            // that case, same as everywhere else.
+                            record_jump(&mut jump_stack, jump_from, stack.top().jump_entry());
                             search_prompt = None;
                         }
                     }
@@ -1147,6 +1162,25 @@ fn event_loop(
                         let step = resolver.feed(chord);
                         key_display.record_step(chord, step, Instant::now());
                         match step {
+                            // Global quit, intercepted here rather than
+                            // taught to every pushed view: reached only via
+                            // this `else` branch's resolver (see the long
+                            // comment chain above — compose/help/search
+                            // prompt/the scope-menu's revision input all
+                            // bypass the resolver entirely while they own
+                            // input, so a plain `q` typed into any of them
+                            // never resolves to `Action::Quit` in the first
+                            // place), and unconditionally on whatever view
+                            // is on top — a pushed `File`/`Timeline`/`Log`/
+                            // `LspInspector`, the units-setup wizard, an
+                            // open hover/references/scope-menu overlay, all
+                            // included. `handle_action` never even sees
+                            // this action: terminal restore, LSP shutdown,
+                            // observer shutdown, and the update-exit notice
+                            // all live in `run` after `event_loop` returns,
+                            // so returning `Ok(())` here runs every one of
+                            // them exactly as a normal exit would.
+                            StepResult::Matched(Action::Quit) => return Ok(()),
                             StepResult::Matched(action) => {
                                 stack.top_mut().clear_pending_keys();
                                 goto_status = None;
@@ -1635,7 +1669,7 @@ fn handle_action(
                     let target = JumpEntry {
                         file: entry.file.clone(),
                         git_root: state.git_root.clone(),
-                        line: entry.line,
+                        line: Some(entry.line),
                         col: entry.match_range.0,
                     };
                     let from = stack.top().jump_entry();
@@ -1972,54 +2006,78 @@ fn handle_action(
         // the `hover_state.is_open()` interception above, whose wildcard
         // arm closes-then-falls-through for any action it doesn't
         // specifically handle — see that block's docs.
-        Action::OpenSearch => match stack.top_mut() {
-            View::Diff(app) => {
-                let origin =
-                    refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
-                *search_prompt = Some(search::SearchPromptState {
-                    input: search::SearchInput::new(),
-                    origin,
-                });
+        Action::OpenSearch => {
+            let jump_from = stack.top().jump_entry();
+            match stack.top_mut() {
+                View::Diff(app) => {
+                    let origin = refresh::capture_anchor(
+                        &app.files,
+                        &app.rows,
+                        app.cursor,
+                        app.scroll_offset,
+                    );
+                    *search_prompt = Some(search::SearchPromptState {
+                        input: search::SearchInput::new(),
+                        origin,
+                        jump_from,
+                    });
+                }
+                View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+                    *goto_status = Some("search: only available in the diff view".to_owned());
+                }
             }
-            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
-                *goto_status = Some("search: only available in the diff view".to_owned());
-            }
-        },
+        }
         // `n`/`N`: real navigation lives here (an `App` method), not in
         // `App::update` — see `App::next_match`'s docs on why keeping the
         // logic out of `App::update` matters even though this arm already
         // gates on `View::Diff` on its own (defense in depth: it also keeps
         // `TimelineView`'s nested `diff_app.update(action)` fallthrough,
         // see `timeline_view::TimelineView::update`, from ever running real
-        // search navigation against its embedded diff pane).
-        Action::NextMatch | Action::PrevMatch => match stack.top_mut() {
-            View::Diff(app) => {
-                let before = (app.cursor, app.active_symbol);
-                let result = if action == Action::NextMatch {
-                    app.next_match()
-                } else {
-                    app.prev_match()
-                };
-                *goto_status = match result {
-                    Some(true) => Some("search wrapped".to_owned()),
-                    Some(false) => None,
-                    None => Some(app.search_status_note()),
-                };
-                if (app.cursor, app.active_symbol) != before {
-                    hover_state.invalidate();
+        // search navigation against its embedded diff pane). `from`/`to`
+        // bracket the whole step — including the no-`View::Diff`/no-active-
+        // search/zero-match cases, where the cursor provably didn't move
+        // and `from == to` suppresses the record on its own (see
+        // `record_jump`'s docs) — so every successful `n`/`N` counts as a
+        // significant jump (decision 2 of the roadmap issue) without a
+        // separate "did this actually move" check here.
+        Action::NextMatch | Action::PrevMatch => {
+            let from = stack.top().jump_entry();
+            match stack.top_mut() {
+                View::Diff(app) => {
+                    let before = (app.cursor, app.active_symbol);
+                    let result = if action == Action::NextMatch {
+                        app.next_match()
+                    } else {
+                        app.prev_match()
+                    };
+                    *goto_status = match result {
+                        Some(true) => Some("search wrapped".to_owned()),
+                        Some(false) => None,
+                        None => Some(app.search_status_note()),
+                    };
+                    if (app.cursor, app.active_symbol) != before {
+                        hover_state.invalidate();
+                    }
+                }
+                View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+                    *goto_status = Some("search: only available in the diff view".to_owned());
                 }
             }
-            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
-                *goto_status = Some("search: only available in the diff view".to_owned());
-            }
-        },
+            record_jump(jump_stack, from, stack.top().jump_entry());
+        }
+        // `]d`/`[d`: same `from`/`to` bracketing as `n`/`N` above, for the
+        // same reason — no diagnostic to jump to leaves the cursor exactly
+        // where it was, so `record_jump`'s equality check is what actually
+        // decides "was this significant," not a bespoke check here.
         Action::NextDiagnostic | Action::PrevDiagnostic => {
             let forward = action == Action::NextDiagnostic;
             let before = stack.top().hover_cursor_key();
+            let from = stack.top().jump_entry();
             stack.top_mut().jump_to_diagnostic(diagnostics, forward);
             if stack.top().hover_cursor_key() != before {
                 hover_state.invalidate();
             }
+            record_jump(jump_stack, from, stack.top().jump_entry());
         }
         Action::JumpBack => {
             let current = stack.top().jump_entry();
@@ -2041,39 +2099,22 @@ fn handle_action(
                 None => *goto_status = Some("jump: no later position".to_owned()),
             }
         }
-        // vim's `:noh`: with nothing else open to cancel (hover/the refs
-        // panel/the scope-menu list already intercepted `Cancel` above if
-        // any of those *were* open — reaching here means none was), a
-        // plain `Esc` in the ordinary diff view clears an active
-        // *confirmed* search's highlight, if any. This is a different
-        // `Esc` from the prompt's own (cancel-and-restore-the-cursor,
-        // handled entirely inside `run`'s raw-key bypass arm before an
-        // `Action` is ever resolved) — this one only ever fires once the
-        // prompt has already closed, on whatever highlight Enter left
-        // behind. A no-op on any other view, and a no-op with nothing
-        // active either way (`App::clear_search`'s own guard).
+        // With nothing else open to cancel (hover/the refs panel/the
+        // scope-menu list/the units picker/the LSP inspector already
+        // intercepted `Cancel` above if any of those *were* open — reaching
+        // here means none was), `Esc`'s one remaining job is generic view
+        // unwinding — see `cancel_diff_view`'s docs for the precedence this
+        // implements. This is a different `Esc` from the search prompt's
+        // own (cancel-and-restore-the-cursor, handled entirely inside
+        // `run`'s raw-key bypass arm before an `Action` is ever resolved)
+        // — this one only ever fires once the prompt has already closed.
         Action::Cancel => {
-            if let View::Diff(app) = stack.top_mut() {
-                // Two `Esc` meanings in the plain diff view, most-modal
-                // first: an active unit scope widens back to the full
-                // diff; only with none active does `Esc` fall through to
-                // its `:noh` role of clearing a search highlight.
-                if app.clear_unit_filter() {
-                    hover_state.invalidate();
-                } else {
-                    app.clear_search();
-                }
-            }
+            cancel_diff_view(stack, hover_state, pending_hover, pending_goto, observer)
         }
         Action::ToggleTimeline => open_or_close_timeline(stack, jj_repo, goto_status),
         Action::ToggleLogView => open_or_close_log(stack, goto_status),
         Action::ToggleLspInspector => {
-            cancel_pending_lsp_requests_for_help(
-                hover_state,
-                pending_hover,
-                pending_goto,
-                observer,
-            );
+            cancel_pending_lsp_requests(hover_state, pending_hover, pending_goto, observer);
             open_or_close_lsp_inspector(stack, observer, lsp_manager);
         }
         // Pure chrome: works identically in every view, which is why it
@@ -2144,17 +2185,12 @@ fn handle_action(
         // what backstops it.
         //
         // Cancels any in-flight hover/goto request first — see
-        // `cancel_pending_lsp_requests_for_help`'s docs for why a response
+        // `cancel_pending_lsp_requests`'s docs for why a response
         // that arrived while the modal was up would otherwise be able to
         // mutate `stack`/`refs_panel` or draw a hover popup with the
         // reviewer unable to even see it happen, let alone react.
         Action::OpenHelp => {
-            cancel_pending_lsp_requests_for_help(
-                hover_state,
-                pending_hover,
-                pending_goto,
-                observer,
-            );
+            cancel_pending_lsp_requests(hover_state, pending_hover, pending_goto, observer);
             *help = Some(HelpState::new());
         }
         Action::OpenScopeMenu => match stack.top() {
@@ -2192,19 +2228,79 @@ fn handle_action(
     }
 }
 
+/// `Action::Cancel`'s handling once every earlier-precedence overlay
+/// (compose/search/help/hover/references panel/scope menu/units picker —
+/// all intercepted above in `handle_action`, and the LSP inspector earlier
+/// still, via its own local `Cancel` handling) has already had first
+/// refusal and declined to consume it. Two outcomes, chosen by whether the
+/// stack is already at its root:
+///
+/// - At the root, on the root [`View::Diff`]: clears an active unit scope
+///   first (widening back to the full diff), or failing that clears a
+///   confirmed search's highlight (vim's `:noh`) — unchanged from before
+///   this issue. Every other root view (`File`/`Timeline`/`Log` reached via
+///   `ktmr open`/`ktmr timeline`/`ktmr log`) has nothing local left to
+///   cancel, so `Esc` there is simply a no-op (tier 6 of the issue's
+///   precedence list) — [`ViewStack::pop`]'s own refusal to pop the last
+///   view makes that fall out for free rather than needing a separate
+///   check here.
+/// - Anywhere else — a pushed `File`/nested `Diff`/`Timeline`/`Log`,
+///   *including* a pushed `Diff` that itself has an active search or unit
+///   scope — pops exactly that one view, revealing whatever was
+///   underneath. A pushed diff's own search/unit-filter state is
+///   deliberately *not* cleared first: the issue's precedence list reserves
+///   that clearing role for "at the root," and popping already discards the
+///   pushed view's state wholesale.
+///
+/// Cancels any hover/goto-definition/references request still in flight
+/// only when a pop actually happened — a response answering a request
+/// issued from the view that just disappeared has nowhere sensible left to
+/// navigate or draw a popup over.
+fn cancel_diff_view(
+    stack: &mut ViewStack,
+    hover_state: &mut hover_popup::HoverState,
+    pending_hover: &mut Option<PendingHover>,
+    pending_goto: &mut Option<(JumpEntry, PendingGoto)>,
+    observer: &crate::lsp::ObservationHandle,
+) {
+    let at_root = stack.is_at_root();
+    match stack.top_mut() {
+        View::Diff(app) if at_root => {
+            if app.clear_unit_filter() {
+                hover_state.invalidate();
+            } else {
+                app.clear_search();
+            }
+        }
+        View::Diff(_) | View::File(_) | View::Timeline(_) | View::Log(_) => {
+            if stack.pop() {
+                cancel_pending_lsp_requests(hover_state, pending_hover, pending_goto, observer);
+            }
+        }
+        View::LspInspector(_) => unreachable!(
+            "Cancel on an open LspInspector is routed to inspector.update() \
+             earlier in handle_action, before this arm is ever reached"
+        ),
+    }
+}
+
 /// Cancels whatever hover/goto-definition/find-references request is still
-/// in flight the instant the help modal opens, so a response arriving
-/// while (or after) it's up can never mutate `stack`/`refs_panel` or draw a
-/// hover popup out from under it. This matters specifically because the
-/// modal intercepts every keystroke until it closes (see `run`'s `help`
-/// arm) — the reviewer would have no way to even notice, let alone
-/// dismiss, whatever changed underneath.
+/// in flight, so a response arriving after the reviewer has already moved
+/// on can never mutate `stack`/`refs_panel` or draw a hover popup out from
+/// under something else. Two callers: the instant the help modal opens (it
+/// intercepts every keystroke until it closes — see `run`'s `help` arm —
+/// so the reviewer would have no way to even notice, let alone dismiss,
+/// whatever changed underneath), and the instant `Esc` actually pops a
+/// pushed view (see [`cancel_diff_view`]) — a request issued from a `gd`/
+/// `gr`/hover press against the view that's about to disappear has nowhere
+/// sensible left to land once it does.
 ///
 /// The manager keeps working after a receiver is dropped, so each discarded
 /// operation gets an explicit cancellation event while its eventual server
 /// response can still be recorded independently. Dropping the receivers is
-/// what prevents a late answer from mutating the view when the modal closes.
-fn cancel_pending_lsp_requests_for_help(
+/// what prevents a late answer from mutating whatever view is on top once
+/// the modal closes or the pop has happened.
+fn cancel_pending_lsp_requests(
     hover_state: &mut hover_popup::HoverState,
     pending_hover: &mut Option<PendingHover>,
     pending_goto: &mut Option<(JumpEntry, PendingGoto)>,
@@ -2992,8 +3088,9 @@ fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 /// wait (2s) and turns "no response," "not a tty" (e.g. output piped in a
 /// test harness), or any other I/O hiccup into `Ok(false)`/`Err` — both
 /// treated identically here as "not supported," so a plain terminal or a
-/// pipe never makes startup fail or hang, it just keeps `C-t` as the sole
-/// working binding.
+/// pipe never makes startup fail or hang, it just keeps `M-Right` as the
+/// sole working binding for `JumpForward` (see [`Action::JumpBack`]'s
+/// docs).
 fn enable_kitty_keyboard_protocol() -> bool {
     let Ok(true) = supports_keyboard_enhancement() else {
         return false;
@@ -3077,7 +3174,155 @@ mod tests {
         assert_eq!(watch_pause_decision(true, true, false), Some(true));
     }
 
-    // ---- cancel_pending_lsp_requests_for_help ------------------------------
+    // ---- cancel_diff_view -------------------------------------------------
+
+    fn empty_diff_app() -> App {
+        App::new("test-repo".to_owned(), PathBuf::from("/repo"), Vec::new())
+    }
+
+    fn empty_file_view() -> FileView {
+        FileView::with_hover_target("f.txt".to_owned(), "hello\n", None)
+    }
+
+    #[test]
+    fn cancel_pops_a_pushed_file_view_and_reveals_the_diff_below() {
+        let mut stack = ViewStack::new(View::Diff(empty_diff_app()));
+        stack.push(View::File(empty_file_view()));
+        let mut hover_state = hover_popup::HoverState::default();
+        let mut pending_hover: Option<PendingHover> = None;
+        let mut pending_goto: Option<(JumpEntry, PendingGoto)> = None;
+
+        cancel_diff_view(
+            &mut stack,
+            &mut hover_state,
+            &mut pending_hover,
+            &mut pending_goto,
+            &crate::lsp::ObservationStore::in_memory(),
+        );
+
+        assert!(stack.is_at_root(), "exactly one view must be popped");
+        assert!(matches!(stack.top(), View::Diff(_)));
+    }
+
+    #[test]
+    fn cancel_pops_exactly_one_pushed_nested_diff() {
+        // A `Diff` pushed on top of another `Diff` — the shape `LogView`'s
+        // `Confirm` produces (see `ui::mod::handle_action`'s `Action::Confirm`
+        // arm) — pops the same way a pushed `File`/`Timeline`/`Log` does,
+        // without first clearing its own search/unit filter: that clearing
+        // role is reserved for the root (see `cancel_diff_view`'s docs).
+        let mut stack = ViewStack::new(View::Diff(empty_diff_app()));
+        stack.push(View::Diff(empty_diff_app()));
+        let mut hover_state = hover_popup::HoverState::default();
+        let mut pending_hover: Option<PendingHover> = None;
+        let mut pending_goto: Option<(JumpEntry, PendingGoto)> = None;
+
+        cancel_diff_view(
+            &mut stack,
+            &mut hover_state,
+            &mut pending_hover,
+            &mut pending_goto,
+            &crate::lsp::ObservationStore::in_memory(),
+        );
+
+        assert!(stack.is_at_root());
+    }
+
+    #[test]
+    fn cancel_at_the_root_file_view_is_a_no_op() {
+        let mut stack = ViewStack::new(View::File(empty_file_view()));
+        let mut hover_state = hover_popup::HoverState::default();
+        let mut pending_hover: Option<PendingHover> = None;
+        let mut pending_goto: Option<(JumpEntry, PendingGoto)> = None;
+
+        cancel_diff_view(
+            &mut stack,
+            &mut hover_state,
+            &mut pending_hover,
+            &mut pending_goto,
+            &crate::lsp::ObservationStore::in_memory(),
+        );
+
+        // `ViewStack::pop` refuses to pop the last remaining view — the
+        // root `File` is still there, and there was never anything else
+        // this arm could do with it (no search/unit-filter concept
+        // outside `View::Diff`).
+        assert!(stack.is_at_root());
+        assert!(matches!(stack.top(), View::File(_)));
+    }
+
+    #[test]
+    fn cancel_at_the_root_diff_clears_the_search_instead_of_popping() {
+        let mut app = empty_diff_app();
+        // A confirmed (if immediately match-less, on an empty diff) search
+        // is enough to exercise `App::clear_search`'s guard without needing
+        // real diff content — `cancel_diff_view` only needs to prove it
+        // *tried* to clear something at the root rather than popping.
+        let origin = refresh::capture_anchor(&app.files, &app.rows, app.cursor, app.scroll_offset);
+        app.recompute_search_live("anything", &origin);
+        assert!(app.search.as_ref().unwrap().highlight_visible);
+
+        let mut stack = ViewStack::new(View::Diff(app));
+        let mut hover_state = hover_popup::HoverState::default();
+        let mut pending_hover: Option<PendingHover> = None;
+        let mut pending_goto: Option<(JumpEntry, PendingGoto)> = None;
+
+        cancel_diff_view(
+            &mut stack,
+            &mut hover_state,
+            &mut pending_hover,
+            &mut pending_goto,
+            &crate::lsp::ObservationStore::in_memory(),
+        );
+
+        assert!(stack.is_at_root(), "the root view is never popped");
+        let View::Diff(app) = stack.top() else {
+            panic!("expected the root diff");
+        };
+        assert!(
+            !app.search.as_ref().unwrap().highlight_visible,
+            "Esc at the root must clear the confirmed search, not pop anything"
+        );
+    }
+
+    #[test]
+    fn cancel_that_pops_also_cancels_an_in_flight_hover_and_goto_request() {
+        let mut stack = ViewStack::new(View::Diff(empty_diff_app()));
+        stack.push(View::File(empty_file_view()));
+
+        let mut hover_state = hover_popup::HoverState::default();
+        hover_state.set_pending();
+        let generation_before = hover_state.generation();
+
+        let (_tx, rx) = mpsc::channel();
+        let mut pending_hover: Option<PendingHover> = None;
+        let mut pending_goto: Option<(JumpEntry, PendingGoto)> = Some((
+            JumpEntry {
+                file: PathBuf::from("a.rs"),
+                git_root: PathBuf::from("."),
+                line: Some(0),
+                col: 0,
+            },
+            PendingGoto::Definition {
+                operation_id: 1,
+                rx,
+            },
+        ));
+
+        cancel_diff_view(
+            &mut stack,
+            &mut hover_state,
+            &mut pending_hover,
+            &mut pending_goto,
+            &crate::lsp::ObservationStore::in_memory(),
+        );
+
+        assert!(stack.is_at_root(), "the pushed FileView must have popped");
+        assert_ne!(generation_before, hover_state.generation());
+        assert!(pending_goto.is_none());
+    }
+
+    // ---- cancel_pending_lsp_requests ------------------------------
 
     #[test]
     fn opening_help_invalidates_a_pending_hover_and_drops_a_pending_goto() {
@@ -3091,7 +3336,7 @@ mod tests {
             JumpEntry {
                 file: PathBuf::from("a.rs"),
                 git_root: PathBuf::from("."),
-                line: 0,
+                line: Some(0),
                 col: 0,
             },
             PendingGoto::Definition {
@@ -3100,7 +3345,7 @@ mod tests {
             },
         ));
 
-        cancel_pending_lsp_requests_for_help(
+        cancel_pending_lsp_requests(
             &mut hover_state,
             &mut pending_hover,
             &mut pending_goto,
@@ -3253,7 +3498,7 @@ mod tests {
             JumpEntry {
                 file: PathBuf::from("a.rs"),
                 git_root: PathBuf::from("."),
-                line: 0,
+                line: Some(0),
                 col: 0,
             },
             PendingGoto::Definition {

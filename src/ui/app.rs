@@ -144,7 +144,6 @@ pub struct App {
     pub sidebar_visible: bool,
     pub layout: Layout,
     pub pending_keys: String,
-    pub should_quit: bool,
     /// Whether this session's root diff has live filesystem refresh enabled —
     /// purely a display flag for the status bar's "⦿ watch" indicator;
     /// `ui::mod`'s event loop decides independently (via whether it was
@@ -283,7 +282,6 @@ impl App {
             sidebar_visible: true,
             layout: Layout::default(),
             pending_keys: String::new(),
-            should_quit: false,
             watch_mode: false,
             comments_visible: true,
             interactive: true,
@@ -774,7 +772,6 @@ impl App {
 
     pub fn update(&mut self, action: Action) {
         if self.rows.is_empty() {
-            self.should_quit |= action == Action::Quit;
             return;
         }
         let last = self.rows.len() - 1;
@@ -870,7 +867,14 @@ impl App {
             // those three) it opens from *any* view rather than gating on
             // `View::Diff` — see `Action::OpenHelp`'s docs.
             Action::OpenHelp => {}
-            Action::Quit => self.should_quit = true,
+            // `ui::mod`'s event loop intercepts `q` at the keymap resolver,
+            // before a matched action is ever dispatched anywhere (see
+            // `ui::mod::event_loop`'s `StepResult::Matched(Action::Quit)`
+            // arm) — global quit, not a per-view "close" — so this can never
+            // actually reach here; kept as an explicit no-op arm (rather
+            // than folded into `other` below) so `Action`'s exhaustive match
+            // stays a compile-time reminder if that ever stops being true.
+            Action::Quit => {}
         }
         if self.cursor != cursor_before {
             self.active_symbol = 0;
@@ -878,31 +882,44 @@ impl App {
         self.clamp_scroll();
     }
 
-    /// The row index whose `(file, new_line)` matches `target_file`/
-    /// `target_line` (0-based), if this diff has one — how a
-    /// go-to-definition/references jump decides to move the cursor within
-    /// the diff already being reviewed instead of pushing a new `FileView`
-    /// on top of it. `target_file` is compared as an absolute path, the
-    /// same coordinate space [`Self::hover_query`] reports.
-    pub fn row_for_target(&self, target_file: &Path, target_line: u32) -> Option<usize> {
-        self.rows.iter().position(|row| {
-            let RenderRow::Line {
-                file_idx,
-                hunk_idx,
-                row_idx,
-            } = row
-            else {
-                return false;
-            };
-            let file = &self.files[*file_idx];
-            let line_row = &file.hunks[*hunk_idx].rows[*row_idx];
-            match lsp_target(line_row, file) {
-                Some((relative, line)) => {
-                    line == target_line && self.repo_root.join(&relative) == target_file
-                }
-                None => false,
-            }
-        })
+    /// The row index a `(target_file, target_line)` jump should land on
+    /// within this diff, if it has one — how a go-to-definition/references
+    /// jump (or `Ctrl-o`/`Ctrl-i`) decides to move the cursor within the
+    /// diff already being reviewed instead of pushing a new `FileView` on
+    /// top of it. `target_file` is compared as an absolute path, the same
+    /// coordinate space [`Self::hover_query`] reports; `target_line` is
+    /// `None` for a structural target (a diff file header) — see
+    /// [`crate::ui::navigation::JumpEntry::line`]'s docs.
+    ///
+    /// A thin wrapper around [`refresh::locate_in_diff`] /
+    /// [`refresh::locate_exact_in_diff`], which do the actual row search in
+    /// display-path space: strips `repo_root` off `target_file` (its
+    /// absence — a target outside this repo entirely — simply can't match
+    /// anything here, same as before) and hands the rest straight through.
+    ///
+    /// `drift_tolerant` picks the lookup: a history return (`Ctrl-o` back
+    /// to a definition a few lines have since shifted away from) should
+    /// still land close by via the nearest-line tier rather than silently
+    /// push a redundant `FileView` over content already on screen; a fresh
+    /// definition/reference jump must *not* get that tolerance — its target
+    /// line was just resolved by the server, and if this diff doesn't
+    /// render it, landing on the numerically-nearest rendered row (possibly
+    /// an unrelated hunk far away) would silently show the reviewer the
+    /// wrong code. `None` from the exact lookup makes
+    /// [`crate::ui::navigation::navigate_to`] open the real file instead.
+    pub fn row_for_target(
+        &self,
+        target_file: &Path,
+        target_line: Option<u32>,
+        drift_tolerant: bool,
+    ) -> Option<usize> {
+        let display_path = target_file.strip_prefix(&self.repo_root).ok()?;
+        let display_path = display_path.display().to_string();
+        if drift_tolerant {
+            refresh::locate_in_diff(&self.files, &self.rows, &display_path, target_line)
+        } else {
+            refresh::locate_exact_in_diff(&self.files, &self.rows, &display_path, target_line)
+        }
     }
 
     /// Moves the cursor to `row_idx` and, if the active symbol at that row
@@ -1622,14 +1639,6 @@ mod tests {
         assert_eq!(app.layout, Layout::SideBySide);
         app.update(Action::ToggleLayout);
         assert_eq!(app.layout, Layout::Unified);
-    }
-
-    #[test]
-    fn quit_sets_should_quit() {
-        let mut app = test_app();
-        assert!(!app.should_quit);
-        app.update(Action::Quit);
-        assert!(app.should_quit);
     }
 
     #[test]
@@ -2634,5 +2643,69 @@ index 1111111..2222222 100644\n\
             !app.trailing_probed_empty.contains("f.txt"),
             "drifted boundary content must not be recorded as probed-empty"
         );
+    }
+
+    // ---- row_for_target ---------------------------------------------------
+
+    #[test]
+    fn row_for_target_finds_the_row_matching_file_and_line() {
+        let app = test_app();
+        // "fn new_name() {}" is src/lib.rs's new_line 2, 0-based line 1 —
+        // see `hover_query_targets_the_active_symbol_on_an_add_row` above.
+        let idx = app
+            .row_for_target(Path::new("/repo/src/lib.rs"), Some(1), false)
+            .expect("src/lib.rs line 1 is in this diff");
+        let RenderRow::Line { file_idx, .. } = app.rows[idx] else {
+            panic!("expected a line row");
+        };
+        assert_eq!(app.files[file_idx].display_path(), "src/lib.rs");
+    }
+
+    #[test]
+    fn row_for_target_with_no_line_lands_on_the_files_header_row() {
+        let app = test_app();
+        let idx = app
+            .row_for_target(Path::new("/repo/src/lib.rs"), None, false)
+            .expect("src/lib.rs is in this diff");
+        assert!(matches!(app.rows[idx], RenderRow::FileHeader { .. }));
+    }
+
+    #[test]
+    fn row_for_target_outside_the_repo_root_or_diff_is_none() {
+        let app = test_app();
+        // Not under `/repo` at all — `strip_prefix` fails before
+        // `refresh::locate_in_diff` is even reached.
+        assert_eq!(
+            app.row_for_target(Path::new("/elsewhere/src/lib.rs"), Some(0), true),
+            None
+        );
+        // Under `/repo`, but not a path this diff touches.
+        assert_eq!(
+            app.row_for_target(Path::new("/repo/src/untouched.rs"), Some(0), true),
+            None
+        );
+    }
+
+    #[test]
+    fn row_for_target_reserves_the_nearest_fallback_for_history_returns() {
+        let app = test_app();
+        // 0-based line 50 is nowhere in this diff's hunks: a fresh jump
+        // must report None (and open the real file), while a history
+        // return may settle for the nearest remaining row of the file.
+        assert_eq!(
+            app.row_for_target(Path::new("/repo/src/lib.rs"), Some(50), false),
+            None
+        );
+        let idx = app
+            .row_for_target(Path::new("/repo/src/lib.rs"), Some(50), true)
+            .expect("drift-tolerant lookup lands on the nearest row");
+        // The nearest row may be a `Line` or a fold `Gap` (a gap carries
+        // its `new_start` — see `refresh::row_line_and_text`); what matters
+        // is that it belongs to the requested file at all.
+        let file_idx = match app.rows[idx] {
+            RenderRow::Line { file_idx, .. } | RenderRow::Gap { file_idx, .. } => file_idx,
+            other => panic!("expected a line or gap row, got {other:?}"),
+        };
+        assert_eq!(app.files[file_idx].display_path(), "src/lib.rs");
     }
 }

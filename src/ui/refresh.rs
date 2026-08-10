@@ -198,7 +198,10 @@ pub(crate) fn find_exact_line(
 /// The same file's `Line` row whose `new_line` is numerically closest to
 /// `line` — ties broken toward whichever occurs first, matching
 /// [`Iterator::min_by_key`]'s documented tie-breaking.
-fn find_nearest_line(
+///
+/// `pub(crate)` alongside [`find_exact_line`] for the same reason: shared
+/// by [`locate_in_diff`] below.
+pub(crate) fn find_nearest_line(
     files: &[DiffFile],
     rows: &[RenderRow],
     file: &str,
@@ -217,9 +220,78 @@ fn find_nearest_line(
         .map(|(idx, _)| idx)
 }
 
-fn find_first_row_of_file(files: &[DiffFile], rows: &[RenderRow], file: &str) -> Option<usize> {
+/// `pub(crate)` for [`locate_in_diff`] below, and for a structural (no-line)
+/// jump target — a diff file header, say — whose row is exactly this: the
+/// first row belonging to `file`, whatever kind it is.
+pub(crate) fn find_first_row_of_file(
+    files: &[DiffFile],
+    rows: &[RenderRow],
+    file: &str,
+) -> Option<usize> {
     rows.iter()
         .position(|&row| files[row_file_idx(row)].display_path() == file)
+}
+
+/// Resolves a [`crate::ui::navigation::JumpEntry`]-style target (`file` as a
+/// diff display path, `line` in the same 0-based LSP convention
+/// [`JumpEntry::line`](crate::ui::navigation::JumpEntry) uses) against a
+/// diff's `files`/`rows`, in the same fallback order [`restore_anchor`]
+/// already established for a watch refresh's moved anchor: exact
+/// `(file, line)` match, else that file's nearest remaining line, else that
+/// file's first row (a `FileHeader`, in practice — also the only tier a
+/// `None` `line` ever reaches, since a structural target has no line to
+/// look for or drift from). Unlike [`restore_anchor`], this is a plain
+/// existence check with no clamp-to-something tier: `file` absent from this
+/// diff resolves to `None`, not a fallback guess — [`navigate_to`] needs to
+/// tell "already showing this" apart from "not part of this diff at all"
+/// cleanly, and a clamp tier that always succeeds would blur that.
+///
+/// [`DiffRow::new_line`] is 1-based (straight from the parsed diff text);
+/// `line` here is 0-based, so it's converted once at this boundary rather
+/// than teaching [`find_exact_line`]/[`find_nearest_line`] a second
+/// numbering.
+///
+/// [`navigate_to`]: crate::ui::navigation::navigate_to
+/// [`DiffRow::new_line`]: crate::diff::DiffRow::new_line
+pub(crate) fn locate_in_diff(
+    files: &[DiffFile],
+    rows: &[RenderRow],
+    file: &str,
+    line: Option<u32>,
+) -> Option<usize> {
+    if let Some(line) = line {
+        let one_based = line.saturating_add(1);
+        if let Some(idx) = find_exact_line(files, rows, file, one_based) {
+            return Some(idx);
+        }
+        if let Some(idx) = find_nearest_line(files, rows, file, one_based) {
+            return Some(idx);
+        }
+    }
+    find_first_row_of_file(files, rows, file)
+}
+
+/// [`locate_in_diff`] without the drift-tolerance tiers: an exact
+/// `(file, line)` row or nothing (a structural `None` target still resolves
+/// to the file's first row — there is no "exact line" for a header to miss).
+/// A *fresh* definition/reference jump carries a position the language
+/// server just resolved; if this diff doesn't render that exact line, the
+/// honest answer is the real file (a pushed `FileView` at the requested
+/// line), not whichever rendered row happens to be numerically nearest —
+/// possibly hundreds of lines away in an unrelated hunk, shown with no hint
+/// that the landing is approximate. The tolerant tiers exist for history
+/// returns to *remembered* positions the content may have drifted under —
+/// see [`crate::ui::navigation::navigate_to`] for which caller gets which.
+pub(crate) fn locate_exact_in_diff(
+    files: &[DiffFile],
+    rows: &[RenderRow],
+    file: &str,
+    line: Option<u32>,
+) -> Option<usize> {
+    match line {
+        Some(line) => find_exact_line(files, rows, file, line.saturating_add(1)),
+        None => find_first_row_of_file(files, rows, file),
+    }
 }
 
 fn hash_text(text: &str) -> u64 {
@@ -470,5 +542,55 @@ mod tests {
         let cursor = 3; // some row a few past the top
         let anchor = capture_anchor(&before, &before_rows, cursor, 1);
         assert_eq!(scroll_delta(&anchor), 2);
+    }
+
+    // ---- locate_in_diff -------------------------------------------------
+
+    #[test]
+    fn locate_in_diff_finds_the_exact_line() {
+        let files = vec![context_file("a.rs", &["one", "two", "three"])];
+        let rows = flatten(&files);
+        // "two" is new_line 2 (1-based), i.e. 0-based line 1.
+        let idx = locate_in_diff(&files, &rows, "a.rs", Some(1)).unwrap();
+        let RenderRow::Line { row_idx, .. } = rows[idx] else {
+            panic!("expected a line row");
+        };
+        assert_eq!(files[0].hunks[0].rows[row_idx].text, "two");
+    }
+
+    #[test]
+    fn locate_in_diff_falls_back_to_the_nearest_line_when_the_exact_one_is_gone() {
+        let files = vec![context_file("a.rs", &["one", "two", "three"])];
+        let rows = flatten(&files);
+        // 0-based line 10 (new_line 11) doesn't exist — nearest is "three"
+        // (new_line 3, 0-based line 2).
+        let idx = locate_in_diff(&files, &rows, "a.rs", Some(10)).unwrap();
+        let RenderRow::Line { row_idx, .. } = rows[idx] else {
+            panic!("expected a line row");
+        };
+        assert_eq!(files[0].hunks[0].rows[row_idx].text, "three");
+    }
+
+    #[test]
+    fn locate_in_diff_with_no_line_lands_on_the_files_first_row() {
+        let files = vec![
+            context_file("a.rs", &["a-one"]),
+            context_file("b.rs", &["b-one", "b-two"]),
+        ];
+        let rows = flatten(&files);
+        let idx = locate_in_diff(&files, &rows, "b.rs", None).unwrap();
+        assert!(
+            matches!(rows[idx], RenderRow::FileHeader { file_idx: 1 }),
+            "expected b.rs's own file header, got {:?}",
+            rows[idx]
+        );
+    }
+
+    #[test]
+    fn locate_in_diff_reports_none_for_a_file_absent_from_this_diff() {
+        let files = vec![context_file("a.rs", &["one"])];
+        let rows = flatten(&files);
+        assert_eq!(locate_in_diff(&files, &rows, "missing.rs", Some(0)), None);
+        assert_eq!(locate_in_diff(&files, &rows, "missing.rs", None), None);
     }
 }

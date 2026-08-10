@@ -29,11 +29,22 @@ const MAX_HISTORY: usize = 200;
 /// would. `col` is a *display* column (see [`crate::diff::ColumnMap`]), not
 /// an LSP-encoded one — it's read back by [`App::jump_cursor_to`]/
 /// [`FileView::jump_cursor_to`], never sent to a server.
+///
+/// `line` is `None` for a *structural* destination — a diff file header
+/// selected from the file tree, say — that has no source line of its own to
+/// land on. Every jump this module resolves ultimately reaches
+/// [`crate::ui::refresh::locate_in_diff`] (via [`App::row_for_target`]),
+/// which already has to fall back to "the file's first row" for a
+/// shifted/removed line; representing "there was never a line to begin
+/// with" the same way, rather than inventing a sentinel like `0`, means one
+/// lookup path serves both, and a `Ctrl-o`/`Ctrl-i` round trip through a
+/// header is exact instead of silently landing on line 0 there and then
+/// failing to round-trip back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JumpEntry {
     pub file: PathBuf,
     pub git_root: PathBuf,
-    pub line: u32,
+    pub line: Option<u32>,
     pub col: usize,
 }
 
@@ -42,7 +53,7 @@ impl From<&HoverQuery> for JumpEntry {
         Self {
             file: query.file.clone(),
             git_root: query.git_root.clone(),
-            line: query.line,
+            line: Some(query.line),
             col: query.display_col,
         }
     }
@@ -152,7 +163,7 @@ pub fn location_to_target(
     Some(JumpEntry {
         file,
         git_root: git_root.to_path_buf(),
-        line: location.range.start.line,
+        line: Some(location.range.start.line),
         col,
     })
 }
@@ -182,9 +193,13 @@ pub type Target = JumpEntry;
 ///
 /// When `record_history` is set, `from` (the position the jump leaves from,
 /// when there is one — see [`View::jump_entry`] on when there isn't) is
-/// pushed onto `jump_stack` first. `Ctrl-o`/`Ctrl-i` pass `false` here:
-/// they manage `jump_stack` themselves before calling this, via
-/// [`JumpStack::back`]/[`JumpStack::forward`].
+/// recorded via [`record_jump`] once the jump has actually landed somewhere
+/// — never before: a failed read or an unreachable target must leave
+/// `jump_stack` untouched, so the push happens after every fallible step,
+/// right before each success return, rather than unconditionally up front
+/// the way an earlier version of this function did. `Ctrl-o`/`Ctrl-i` pass
+/// `false` here: they manage `jump_stack` themselves before calling this,
+/// via [`JumpStack::back`]/[`JumpStack::forward`].
 pub fn navigate_to(
     stack: &mut ViewStack,
     jump_stack: &mut JumpStack,
@@ -193,12 +208,16 @@ pub fn navigate_to(
     target: Target,
     record_history: bool,
 ) -> Result<(), String> {
-    if record_history && let Some(from) = from {
-        jump_stack.push(from);
-    }
-
+    // `record_history` doubles as the lookup-precision selector, because
+    // the two caller classes split exactly along it today: a fresh
+    // definition/reference jump (recording) carries a position the server
+    // just resolved, so only an exact row may claim it — anything else
+    // falls through to opening the real file below. A history traversal
+    // (`Ctrl-o`/`Ctrl-i`, not recording) returns to a remembered position
+    // whose content may have drifted, where the nearest-line tolerance is
+    // the point — see `App::row_for_target`'s docs.
     let root_row = match stack.root_mut() {
-        View::Diff(app) => app.row_for_target(&target.file, target.line),
+        View::Diff(app) => app.row_for_target(&target.file, target.line, !record_history),
         // The root view is never `Timeline`/`Log` in practice — `ktmr
         // timeline`/`ktmr log`'s root is one of those, but neither entry
         // point ever calls `navigate_to` (no LSP, no jumps) — and `File`
@@ -210,13 +229,19 @@ pub fn navigate_to(
         if let View::Diff(app) = stack.top_mut() {
             app.jump_cursor_to(row_idx, target.col);
         }
+        if record_history {
+            record_jump(jump_stack, from, Some(target));
+        }
         return Ok(());
     }
 
     if let View::File(file) = stack.top_mut()
         && file.file_path() == Some(target.file.as_path())
     {
-        file.jump_cursor_to(target.line as usize, target.col);
+        file.jump_cursor_to(target.line.unwrap_or(0) as usize, target.col);
+        if record_history {
+            record_jump(jump_stack, from, Some(target));
+        }
         return Ok(());
     }
 
@@ -233,7 +258,7 @@ pub fn navigate_to(
         &content,
         Some((target.file.clone(), target.git_root.clone())),
     );
-    view.jump_cursor_to(target.line as usize, target.col);
+    view.jump_cursor_to(target.line.unwrap_or(0) as usize, target.col);
     let highlight_skipped = view.highlight_skipped;
     stack.push(View::File(view));
 
@@ -244,7 +269,33 @@ pub fn navigate_to(
     if !highlight_skipped {
         lsp_manager.warm_up(std::slice::from_ref(&target.file), &target.git_root);
     }
+    if record_history {
+        record_jump(jump_stack, from, Some(target));
+    }
     Ok(())
+}
+
+/// Centralizes "does this jump count as significant" for every source of a
+/// jump `ui::mod` records history for (definition/reference navigation via
+/// [`navigate_to`] itself, search confirm, diagnostic stepping): records
+/// `from` onto `jump_stack`'s back history only once `to` is known —
+/// callers only ever have a destination once a jump has actually landed
+/// somewhere, so a failed/no-result action naturally never reaches this at
+/// all — and only when `from` and `to` genuinely differ, which suppresses a
+/// redundant entry for a jump that resolves back to the position already
+/// current (including ordinary movement that produced no jump at all: `from`
+/// and `to` captured immediately before/after with nothing in between that
+/// moved the cursor are simply equal).
+pub(crate) fn record_jump(
+    jump_stack: &mut JumpStack,
+    from: Option<JumpEntry>,
+    to: Option<JumpEntry>,
+) {
+    if let (Some(from), Some(to)) = (from, to)
+        && from != to
+    {
+        jump_stack.push(from);
+    }
 }
 
 impl App {
@@ -296,7 +347,7 @@ impl View {
             View::Diff(app) => app.current_position().map(|(file, line, col)| JumpEntry {
                 file,
                 git_root: app.repo_root.clone(),
-                line,
+                line: Some(line),
                 col,
             }),
             View::File(file_view) => {
@@ -305,7 +356,7 @@ impl View {
                     .map(|(file, line, col)| JumpEntry {
                         file,
                         git_root: file_view.git_root().to_path_buf(),
-                        line,
+                        line: Some(line),
                         col,
                     })
             }
@@ -320,12 +371,26 @@ impl View {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diff::{DiffFile, DiffHunk, DiffLineKind, DiffRow};
+    use std::sync::Arc;
+    use std::sync::mpsc;
 
     fn entry(n: u32) -> JumpEntry {
         JumpEntry {
             file: PathBuf::from(format!("/repo/src/f{n}.rs")),
             git_root: PathBuf::from("/repo"),
-            line: n,
+            line: Some(n),
+            col: 0,
+        }
+    }
+
+    /// A structural destination — no source line at all, the shape a diff
+    /// file header (or any other future non-line jump target) takes.
+    fn header_entry() -> JumpEntry {
+        JumpEntry {
+            file: PathBuf::from("/repo/src/f1.rs"),
+            git_root: PathBuf::from("/repo"),
+            line: None,
             col: 0,
         }
     }
@@ -349,6 +414,24 @@ mod tests {
         stack.push(entry(1));
         let went_back_to = stack.back(Some(entry(2))).unwrap();
         assert_eq!(went_back_to, entry(1));
+        let went_forward_to = stack.forward(Some(went_back_to)).unwrap();
+        assert_eq!(went_forward_to, entry(2));
+    }
+
+    /// [`JumpStack`] itself never inspects `JumpEntry::line` — it stores
+    /// and returns whatever was pushed — so a structural entry (no source
+    /// line) round-trips through `back`/`forward` exactly like an ordinary
+    /// one. What #12 actually adds is [`JumpEntry::line`] being able to
+    /// hold `None` at all, plus [`navigate_to`] being able to resolve such
+    /// an entry as a target (see the `navigate_to_*` tests below); the
+    /// stack's own push/pop mechanics were already generic over the
+    /// entry's contents.
+    #[test]
+    fn a_structural_entry_with_no_line_round_trips_through_back_and_forward() {
+        let mut stack = JumpStack::new();
+        stack.push(header_entry());
+        let went_back_to = stack.back(Some(entry(2))).unwrap();
+        assert_eq!(went_back_to, header_entry());
         let went_forward_to = stack.forward(Some(went_back_to)).unwrap();
         assert_eq!(went_forward_to, entry(2));
     }
@@ -411,6 +494,331 @@ mod tests {
         assert_eq!(
             definition_locations(GotoDefinitionResponse::Link(vec![link])),
             vec![loc]
+        );
+    }
+
+    // ---- record_jump ---------------------------------------------------
+
+    #[test]
+    fn record_jump_pushes_from_when_positions_differ() {
+        let mut stack = JumpStack::new();
+        record_jump(&mut stack, Some(entry(1)), Some(entry(2)));
+        assert_eq!(stack.back(None), Some(entry(1)));
+    }
+
+    #[test]
+    fn record_jump_suppresses_a_jump_that_resolves_to_the_same_position() {
+        let mut stack = JumpStack::new();
+        record_jump(&mut stack, Some(entry(1)), Some(entry(1)));
+        assert_eq!(stack.back(None), None, "no-op jump must not create history");
+    }
+
+    #[test]
+    fn record_jump_does_nothing_without_both_a_from_and_a_to() {
+        let mut stack = JumpStack::new();
+        record_jump(&mut stack, None, Some(entry(1)));
+        record_jump(&mut stack, Some(entry(1)), None);
+        record_jump(&mut stack, None, None);
+        assert_eq!(stack.back(None), None);
+    }
+
+    /// `record_jump` is the one funnel every significant-jump source calls
+    /// through — `navigate_to` for definition/reference navigation,
+    /// `ui::mod::handle_action`'s search-confirm and
+    /// `NextDiagnostic`/`PrevDiagnostic` arms directly. From `record_jump`'s
+    /// own point of view a "definition" jump and a "diagnostic" jump are
+    /// indistinguishable, both just a `(from, to)` pair, so exercising it
+    /// directly with synthetic entries standing in for each source is a
+    /// faithful proxy for the mixed real-world sequence this pins down:
+    /// definition/reference, search, and diagnostic jumps, interleaved with
+    /// ordinary movement — which never calls `record_jump` at all (see
+    /// `App::update`'s `CursorDown`/`CursorUp`/... arms), so there's
+    /// nothing to simulate for it beyond its plain absence from history.
+    #[test]
+    fn record_jump_calls_from_different_sources_share_one_chronological_history() {
+        let mut stack = JumpStack::new();
+
+        // A "definition" jump: line 1 -> line 5.
+        record_jump(&mut stack, Some(entry(1)), Some(entry(5)));
+        // A "search" jump: line 5 -> line 9.
+        record_jump(&mut stack, Some(entry(5)), Some(entry(9)));
+        // A "diagnostic" jump: line 9 -> line 2.
+        record_jump(&mut stack, Some(entry(9)), Some(entry(2)));
+
+        // `Ctrl-o` three times retraces exactly these three jumps in
+        // reverse chronological order, regardless of which feature caused
+        // each one.
+        assert_eq!(stack.back(Some(entry(2))), Some(entry(9)));
+        assert_eq!(stack.back(Some(entry(9))), Some(entry(5)));
+        assert_eq!(stack.back(Some(entry(5))), Some(entry(1)));
+        assert_eq!(stack.back(Some(entry(1))), None, "history exhausted");
+    }
+
+    // ---- navigate_to -----------------------------------------------------
+
+    fn test_lsp_manager() -> LspManager {
+        let (tx, _rx) = mpsc::channel();
+        LspManager::new(tx, Arc::new(std::collections::HashMap::new()), false)
+    }
+
+    /// A one-file, one-hunk `App` wrapped in its own root [`ViewStack`] —
+    /// `flatten`'s row order for this shape is `[FileHeader, HunkHeader,
+    /// Line, Line, ...]`, so row `0` is always the file header and row
+    /// `i + 2` is `lines[i]`.
+    fn diff_app_stack(repo_root: &Path, file_name: &str, lines: &[&str]) -> ViewStack {
+        let rows: Vec<DiffRow> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, text)| DiffRow {
+                kind: DiffLineKind::Context,
+                text: (*text).to_owned(),
+                old_line: Some(i as u32 + 1),
+                new_line: Some(i as u32 + 1),
+            })
+            .collect();
+        let file = DiffFile {
+            old_path: Some(file_name.to_owned()),
+            new_path: Some(file_name.to_owned()),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: lines.len() as u32,
+                new_start: 1,
+                new_lines: lines.len() as u32,
+                header: String::new(),
+                known_eof: true,
+                rows,
+            }],
+            ..Default::default()
+        };
+        let app = App::new("repo".to_owned(), repo_root.to_path_buf(), vec![file]);
+        ViewStack::new(View::Diff(app))
+    }
+
+    #[test]
+    fn navigate_to_a_structural_target_lands_on_the_files_header_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stack = diff_app_stack(dir.path(), "a.rs", &["one", "two"]);
+        let mut jump_stack = JumpStack::new();
+        let lsp_manager = test_lsp_manager();
+
+        let target = JumpEntry {
+            file: dir.path().join("a.rs"),
+            git_root: dir.path().to_path_buf(),
+            line: None,
+            col: 0,
+        };
+        navigate_to(
+            &mut stack,
+            &mut jump_stack,
+            &lsp_manager,
+            None,
+            target,
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            stack.is_at_root(),
+            "a target already inside the root diff must never push a view"
+        );
+        let View::Diff(app) = stack.top() else {
+            panic!("expected the root diff");
+        };
+        assert_eq!(app.cursor, 0, "row 0 is the file header");
+    }
+
+    #[test]
+    fn navigate_to_a_present_line_moves_the_root_diffs_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stack = diff_app_stack(dir.path(), "a.rs", &["one", "two"]);
+        let mut jump_stack = JumpStack::new();
+        let lsp_manager = test_lsp_manager();
+
+        let target = JumpEntry {
+            file: dir.path().join("a.rs"),
+            git_root: dir.path().to_path_buf(),
+            line: Some(1), // "two" — new_line 2, 0-based
+            col: 0,
+        };
+        navigate_to(
+            &mut stack,
+            &mut jump_stack,
+            &lsp_manager,
+            None,
+            target,
+            false,
+        )
+        .unwrap();
+
+        assert!(stack.is_at_root());
+        let View::Diff(app) = stack.top() else {
+            panic!("expected the root diff");
+        };
+        assert_eq!(app.cursor, 3, "row 3 is the Line row for \"two\"");
+    }
+
+    #[test]
+    fn a_fresh_jump_outside_the_diffs_rows_opens_the_real_file_not_the_nearest_row() {
+        let dir = tempfile::tempdir().unwrap();
+        // The diff renders only lines 1-2 of a.rs; the definition target
+        // sits far outside them, at a line the on-disk file really has.
+        let mut stack = diff_app_stack(dir.path(), "a.rs", &["one", "two"]);
+        let disk: String = (1..=60).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(dir.path().join("a.rs"), disk).unwrap();
+        let mut jump_stack = JumpStack::new();
+        let lsp_manager = test_lsp_manager();
+
+        let target = JumpEntry {
+            file: dir.path().join("a.rs"),
+            git_root: dir.path().to_path_buf(),
+            line: Some(50),
+            col: 0,
+        };
+        navigate_to(
+            &mut stack,
+            &mut jump_stack,
+            &lsp_manager,
+            None,
+            target,
+            true, // a fresh jump: exact row or the real file, never "nearest"
+        )
+        .unwrap();
+
+        assert!(
+            matches!(stack.top(), View::File(_)),
+            "a fresh jump to a line this diff never rendered must open the \
+             real file, not silently land on the numerically-nearest row"
+        );
+    }
+
+    #[test]
+    fn a_history_return_to_a_drifted_line_lands_on_the_nearest_remaining_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stack = diff_app_stack(dir.path(), "a.rs", &["one", "two"]);
+        let mut jump_stack = JumpStack::new();
+        let lsp_manager = test_lsp_manager();
+
+        let target = JumpEntry {
+            file: dir.path().join("a.rs"),
+            git_root: dir.path().to_path_buf(),
+            line: Some(50), // a remembered position the content drifted from
+            col: 0,
+        };
+        navigate_to(
+            &mut stack,
+            &mut jump_stack,
+            &lsp_manager,
+            None,
+            target,
+            false, // Ctrl-o/Ctrl-i: drift tolerance is the point
+        )
+        .unwrap();
+
+        assert!(
+            stack.is_at_root(),
+            "a tolerant history return stays inside the diff already shown"
+        );
+        let View::Diff(app) = stack.top() else {
+            panic!("expected the root diff");
+        };
+        assert_eq!(
+            app.cursor, 3,
+            "row 3 (\"two\") is the nearest remaining row"
+        );
+    }
+
+    #[test]
+    fn navigate_to_records_history_only_once_the_jump_has_actually_landed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stack = diff_app_stack(dir.path(), "a.rs", &["one", "two"]);
+        let mut jump_stack = JumpStack::new();
+        let lsp_manager = test_lsp_manager();
+
+        let from = JumpEntry {
+            file: dir.path().join("a.rs"),
+            git_root: dir.path().to_path_buf(),
+            line: Some(0),
+            col: 0,
+        };
+        let target = JumpEntry {
+            file: dir.path().join("a.rs"),
+            git_root: dir.path().to_path_buf(),
+            line: Some(1),
+            col: 0,
+        };
+        navigate_to(
+            &mut stack,
+            &mut jump_stack,
+            &lsp_manager,
+            Some(from.clone()),
+            target,
+            true,
+        )
+        .unwrap();
+        assert_eq!(jump_stack.back(None), Some(from));
+    }
+
+    #[test]
+    fn navigate_to_does_not_record_a_jump_that_resolves_to_the_same_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stack = diff_app_stack(dir.path(), "a.rs", &["one", "two"]);
+        let mut jump_stack = JumpStack::new();
+        let lsp_manager = test_lsp_manager();
+
+        let here = JumpEntry {
+            file: dir.path().join("a.rs"),
+            git_root: dir.path().to_path_buf(),
+            line: Some(0),
+            col: 0,
+        };
+        navigate_to(
+            &mut stack,
+            &mut jump_stack,
+            &lsp_manager,
+            Some(here.clone()),
+            here,
+            true,
+        )
+        .unwrap();
+        assert_eq!(jump_stack.back(None), None);
+    }
+
+    #[test]
+    fn navigate_to_an_unreadable_file_fails_and_leaves_history_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut stack = diff_app_stack(dir.path(), "a.rs", &["one", "two"]);
+        let mut jump_stack = JumpStack::new();
+        let lsp_manager = test_lsp_manager();
+
+        let from = JumpEntry {
+            file: dir.path().join("a.rs"),
+            git_root: dir.path().to_path_buf(),
+            line: Some(0),
+            col: 0,
+        };
+        // Not present in the diff (so the root-diff branch declines) and
+        // not on disk either (so the "push a fresh `FileView`" branch's
+        // read fails) — a target that can't resolve any way `navigate_to`
+        // knows how to try.
+        let missing = JumpEntry {
+            file: dir.path().join("does-not-exist.rs"),
+            git_root: dir.path().to_path_buf(),
+            line: Some(0),
+            col: 0,
+        };
+        let result = navigate_to(
+            &mut stack,
+            &mut jump_stack,
+            &lsp_manager,
+            Some(from),
+            missing,
+            true,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            jump_stack.back(None),
+            None,
+            "a failed jump must not corrupt history"
         );
     }
 }

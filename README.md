@@ -174,8 +174,9 @@ repo, or `git log` commits — plus a synthetic "local changes" row while the
 working tree is dirty — otherwise. `j`/`k` select, `Enter` opens the
 selected revision's diff (the local-changes row opens the same interactive
 working-tree diff a plain `ktmr diff` would), `v` starts a 2-point range
-selection (a second `Enter` diffs between the two), `q`/`Esc` closes. Also
-reachable mid-session from `ktmr diff` with `L`.
+selection (a second `Enter` diffs between the two), `Esc` closes back to
+whatever's underneath (`q` quits katamari entirely, same as everywhere
+else). Also reachable mid-session from `ktmr diff` with `L`.
 
 Inside the diff: `K` hovers the identifier under the cursor, `gd`/`gr` go
 to its definition/references, `]d`/`[d` jump between diagnostics, and `I`
@@ -323,7 +324,19 @@ refresh loop (the watcher itself keeps running) until you swap back;
 ## Keybindings
 
 Vim bindings are the default; set `keymap = "emacs"` in config (see
-below) for the emacs column. `q` quits either way.
+below) for the emacs column. `q` quits katamari from anywhere — a pushed
+`FileView`/timeline/log/inspector included, never "back" to whatever's
+underneath. `Esc` is the generic "get me out of this": it dismisses the
+nearest open overlay (a popup, the hover card, the references panel), and
+with nothing local left open it pops exactly the one view a `gd`/`L`/`t`/`I`
+press pushed, revealing what was underneath — at the root diff, where
+there's nothing left to pop, it clears a confirmed search instead.
+`Ctrl-o`/`Ctrl-i` are a separate axis entirely: they retrace *chronological*
+cursor history — every significant jump (go to definition/references, a
+confirmed search, a diagnostic step, and later a file-tree or mouse jump),
+regardless of which feature caused it — not view stacking, so they keep
+working exactly the same whether or not `Esc` has popped anything in
+between.
 
 | Action | Vim | Emacs |
 | --- | --- | --- |
@@ -337,7 +350,7 @@ below) for the emacs column. `q` quits either way.
 | Hover | `K` | `C-h` |
 | Go to definition | `gd` | `M-.` |
 | Find references | `gr` | `M-?` |
-| Jump back / forward | `C-o` / `C-i`\* | `C-o` / `C-i`\* |
+| Jump back / forward | `C-o` / `C-i`\* (also `M-Left`/`M-Right`) | `C-o` / `C-i`\* (also `M-Left`/`M-Right`) |
 | Search diff / next / prev match | `/` / `n` / `N` | `/` / `n` / `N` |
 | Next / prev symbol on line | `Tab` / `BackTab` | `Tab` / `BackTab` |
 | Confirm / cancel | `Enter` / `Esc` | `Enter` / `Esc` |
@@ -358,9 +371,14 @@ below) for the emacs column. `q` quits either way.
 (Ghostty, kitty, WezTerm, iTerm2 3.5+, Alacritty), which lets katamari tell a
 literal Tab keypress apart from `Ctrl-i` on the wire — without it they arrive
 as the same byte, and Tab already means next-symbol-on-line, so katamari
-falls back to `C-t` there instead (notably Terminal.app, which doesn't
-implement the protocol). Detected once at startup; `C-t` also keeps working
-as an alias in terminals where `C-i` is active.
+uses `M-Right` as jump-forward's canonical binding there instead (notably
+Terminal.app, which doesn't implement the protocol). Detected once at
+startup. `M-Left`/`M-Right` are unconditional aliases for back/forward in
+both cases — the always-available, terminal-agnostic pair — while `C-i`
+itself is simply left unbound when the terminal can't distinguish it from
+Tab. `Ctrl-]` and `Ctrl-t` have no default binding at all: katamari has one
+general jump history rather than a separate vim-style tag stack, so there's
+no second "go back" key to bind.
 
 `?` from any view opens a floating help window listing every command,
 grouped, with its actual key next to it — the bindings shown are live
@@ -731,7 +749,8 @@ debug binary and runs `scripts/e2e-tmux.sh`, which drives `ktmr diff` inside
 an actual detached tmux session on a private socket — the one thing the PTY
 suite can't check for real, since tmux (unlike the PTY suite's fake
 terminal) genuinely doesn't speak the kitty keyboard protocol, so this is
-what proves the `C-o/C-t` fallback is what a reviewer actually sees there.
+what proves the `C-o`/`M-Right` fallback is what a reviewer actually sees
+there.
 
 ```
 mise run e2e-tmux

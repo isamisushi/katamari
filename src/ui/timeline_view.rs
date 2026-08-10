@@ -141,11 +141,17 @@ impl TimelineView {
                 self.reload_diff();
                 return;
             }
-            // Enter jumps back to the diff being reviewed; Esc/q close the
-            // same way (see `crate::ui::mod::handle_action`'s
-            // `ToggleTimeline` arm and `View::should_quit`/`ViewStack::pop`
-            // for how a "closed" timeline actually leaves the stack).
-            Action::Confirm | Action::Cancel | Action::Quit => {
+            // Enter jumps back to the diff being reviewed; `Esc` closes the
+            // same way (see `crate::ui::mod::handle_action`'s `Cancel` arm,
+            // which pops exactly one pushed view — this mirrors that
+            // outcome locally rather than relying on it, so `update` stays
+            // correct even if some future caller reaches it directly). `q`
+            // is not part of this: it's intercepted at the keymap resolver
+            // as a global quit before a matched action ever reaches here
+            // (see `ui::mod::event_loop`'s
+            // `StepResult::Matched(Action::Quit)` arm), so it would never
+            // arrive as `Action::Quit` in the first place.
+            Action::Confirm | Action::Cancel => {
                 self.should_quit = true;
                 return;
             }

@@ -117,8 +117,15 @@ impl LogView {
             Action::ToggleRangeSelect => self.toggle_range_select(),
             // `Confirm` is deliberately absent — see this module's docs on
             // why `ui::mod` calls `Self::confirm` directly instead of
-            // routing it through here.
-            Action::Cancel | Action::Quit => self.should_quit = true,
+            // routing it through here. `Cancel`/`Quit` are absent too, for
+            // two different reasons: `ui::mod::handle_action`'s `Cancel` arm
+            // pops a pushed `LogView` itself now (see its docs) rather than
+            // delegating here, and `q` never reaches any view's `update` at
+            // all — it's intercepted as a global quit at the keymap
+            // resolver (see `ui::mod::event_loop`'s
+            // `StepResult::Matched(Action::Quit)` arm). `should_quit` stays
+            // on this view only for `L`'s own toggle-close (see
+            // `ui::mod::open_or_close_log`).
             _ => {} // hunk/file nav, sidebar, layout — nothing here to act on
         }
     }

@@ -4,7 +4,7 @@
 # genuine terminal emulator, not `vt100`'s parser reading a raw PTY the way
 # `tests/e2e.rs` does) on a private socket, and checks the one thing only a
 # real terminal without kitty support can prove: that the fallback hint
-# (`C-o/C-t`) is what a reviewer actually sees in a tool tmux doesn't
+# (`C-o/M-Right`) is what a reviewer actually sees in a tool tmux doesn't
 # support the kitty protocol in.
 #
 # Usage: scripts/e2e-tmux.sh [path-to-ktmr-binary]
@@ -106,8 +106,8 @@ wait_for_pane_text "README.md"
 
 # (a) tmux has no kitty keyboard protocol — the hint bar must show the
 # always-available fallback binding, not the kitty-only C-i alias.
-if ! pane | grep -qF "C-o/C-t"; then
-    fail "expected hint bar to show the C-o/C-t fallback (tmux has no kitty protocol)"
+if ! pane | grep -qF "C-o/M-Right"; then
+    fail "expected hint bar to show the C-o/M-Right fallback (tmux has no kitty protocol)"
 fi
 
 # (b) a known diff line renders.

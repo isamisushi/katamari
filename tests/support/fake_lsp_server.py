@@ -9,6 +9,10 @@ hasn't come up yet — declare `definitionProvider`, then answer
 `textDocument/definition` with no result after sleeping `sys.argv[2]`
 seconds, so the same fixture can also prove movement stays responsive
 while a *Ready* server is deliberately slow to answer a real request.
+`sys.argv[3] == "1"` (issue #12) switches that last answer to a real
+`Location` in a sibling file instead, for a PTY test that needs an actual
+`FileView` push to prove `Esc` pops it — see
+`support::fixture::lsp_readiness_repo_with_definition_target`'s docs.
 Everything else (`initialized`, `textDocument/didOpen`, `shutdown`/`exit`)
 is handled just well enough that katamari's client doesn't see anything it
 would treat as a protocol violation; an unrecognized request gets an empty
@@ -63,6 +67,14 @@ def write_message(obj):
 def main():
     init_delay = float(sys.argv[1]) if len(sys.argv) > 1 else 0.0
     definition_delay = float(sys.argv[2]) if len(sys.argv) > 2 else 0.0
+    # Issue #12: when set, `textDocument/definition` answers with a real
+    # `Location` in a sibling file (`other.stub`, next to whichever file
+    # was asked about) instead of `None` — see
+    # `support::fixture::lsp_readiness_repo_with_definition_target`'s docs
+    # for why a *second* file, not just a non-null response, is what a
+    # genuine `FileView`-push test needs. Off by default so issue #11's
+    # existing not-ready/no-result assertions never have to think about it.
+    definition_target = len(sys.argv) > 3 and sys.argv[3] == "1"
 
     while True:
         message = read_message()
@@ -85,10 +97,33 @@ def main():
             )
         elif method == "textDocument/definition":
             time.sleep(definition_delay)
-            # `None` — no definition found — is enough to prove a request
-            # actually dispatched and answered; the readiness contract
-            # under test never depends on a real navigation target.
-            write_message({"jsonrpc": "2.0", "id": message_id, "result": None})
+            if definition_target:
+                # Derive `other.stub`'s URI from the request's own
+                # `textDocument.uri` rather than hardcoding a path this
+                # script was never told (no repo root is passed on argv) —
+                # the two files always sit side by side, so swapping the
+                # last path segment is exact, not a guess.
+                uri = message["params"]["textDocument"]["uri"]
+                base = uri.rsplit("/", 1)[0]
+                write_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": message_id,
+                        "result": {
+                            "uri": f"{base}/other.stub",
+                            "range": {
+                                "start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": 0},
+                            },
+                        },
+                    }
+                )
+            else:
+                # `None` — no definition found — is enough to prove a
+                # request actually dispatched and answered; issue #11's
+                # readiness contract never depends on a real navigation
+                # target.
+                write_message({"jsonrpc": "2.0", "id": message_id, "result": None})
         elif method == "shutdown":
             write_message({"jsonrpc": "2.0", "id": message_id, "result": None})
         elif method == "exit":
