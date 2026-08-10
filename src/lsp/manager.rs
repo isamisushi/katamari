@@ -1093,11 +1093,22 @@ impl LspManager {
                                     .and_then(serde_json::Value::as_str)
                                     .unwrap_or("server trace")
                                     .to_owned();
+                                // `verbose` is deliberately reduced to its
+                                // size: the spec says it carries full
+                                // request/response payloads — document text
+                                // included — which is exactly what the
+                                // journal promises never to persist.
+                                // Katamari never sends `$/setTrace`, so a
+                                // compliant server sends none of these; this
+                                // keeps the promise against noncompliant
+                                // ones too.
                                 if let Some(verbose) =
                                     params.get("verbose").and_then(serde_json::Value::as_str)
                                 {
-                                    message.push_str(" — ");
-                                    message.push_str(verbose);
+                                    message.push_str(&format!(
+                                        " — verbose payload withheld ({} bytes)",
+                                        verbose.len()
+                                    ));
                                 }
                                 observer.record_server_text(
                                     identity.clone(),

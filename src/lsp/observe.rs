@@ -376,6 +376,14 @@ struct Inner {
     servers: HashMap<ServerIdentity, ServerSnapshot>,
     setup_error: Option<String>,
     dropped: u64,
+    /// Whether the one-shot "journal error:" marker has been injected into
+    /// `events`. A flag rather than re-scanning the ring on every record:
+    /// once a disk error is latched the marker check runs on the hot
+    /// producer path (under `inner`, sometimes under the manager's server
+    /// lock too), where an O(cap) string scan per event is real money — and
+    /// scanning also re-inserts the marker forever once it scrolls off the
+    /// capped deque.
+    disk_error_recorded: bool,
 }
 
 struct DiskWriter {
@@ -569,11 +577,10 @@ impl ObservationStore {
             return;
         };
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if inner.events.iter().any(|event| {
-            event.source == EventSource::Journal && event.message.starts_with("journal error:")
-        }) {
+        if inner.disk_error_recorded {
             return;
         }
+        inner.disk_error_recorded = true;
         inner.next_sequence = inner.next_sequence.saturating_add(1);
         let mut marker = JournalEvent::simple(
             EventSource::Journal,
@@ -1792,6 +1799,50 @@ mod tests {
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
             events.len()
+        );
+        store.shutdown();
+    }
+
+    #[test]
+    fn disk_error_marker_is_injected_once_even_after_it_scrolls_off_the_ring() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ObservationStore::start_in(LoggingConfig::default(), root.path());
+        set_disk_error(&store.disk_error, "disk full");
+        store.record(JournalEvent::simple(
+            EventSource::Ui,
+            EventLevel::Info,
+            None,
+            "first",
+        ));
+        let markers = store
+            .events()
+            .iter()
+            .filter(|event| event.message.starts_with("journal error:"))
+            .count();
+        assert_eq!(markers, 1);
+        for i in 0..(MEMORY_EVENT_CAP + 10) {
+            store.record(JournalEvent::simple(
+                EventSource::Ui,
+                EventLevel::Info,
+                None,
+                format!("event {i}"),
+            ));
+        }
+        // The marker was pushed on the first post-error record and has long
+        // since been evicted by the cap — the latch must keep it from being
+        // re-injected on every later record.
+        let markers = store
+            .events()
+            .iter()
+            .filter(|event| event.message.starts_with("journal error:"))
+            .count();
+        assert_eq!(markers, 0);
+        assert!(
+            store
+                .inner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .disk_error_recorded
         );
         store.shutdown();
     }
