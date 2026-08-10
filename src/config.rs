@@ -799,8 +799,13 @@ mod tests {
 
     #[test]
     fn absent_config_files_yield_plain_defaults() {
-        let repo = fixture_repo();
-        let config = load_merged(&repo);
+        // Through `finalize` on an empty raw file rather than
+        // `load_merged` on a fixture repo: `load_merged` also reads the
+        // *real* `~/.config/katamari/config.toml`, so the whole-config
+        // equality this asserts would fail on any machine whose user has
+        // one (e.g. a `[units]` block written by the first-use wizard) —
+        // an environment fact, not a regression.
+        let config = finalize(RawFile::default());
         assert_eq!(config, Config::default());
     }
 
@@ -1013,10 +1018,14 @@ mod tests {
 
     #[test]
     fn malformed_toml_falls_back_to_defaults_instead_of_panicking() {
-        let repo = fixture_repo();
-        write_repo_config(&repo, "this is not [ valid toml");
-        let config = load_merged(&repo);
-        assert_eq!(config, Config::default());
+        // `parse_with_warnings` + `finalize`, not `load_merged`, for the
+        // same hermeticity reason as
+        // `absent_config_files_yield_plain_defaults` above — the malformed
+        // file degrading to an empty raw file is the behavior under test,
+        // and the real home config must not be able to change the answer.
+        let (raw, warnings) = parse_with_warnings(Path::new("x.toml"), "this is not [ valid toml");
+        assert!(!warnings.is_empty(), "the syntax error must be reported");
+        assert_eq!(finalize(raw), Config::default());
     }
 
     #[test]
