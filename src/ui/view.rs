@@ -11,6 +11,7 @@ use crate::ui::app::App;
 use crate::ui::file_view::FileView;
 use crate::ui::hover_popup::HoverQuery;
 use crate::ui::log_view::LogView;
+use crate::ui::lsp_inspector::LspInspectorView;
 use crate::ui::timeline_view::TimelineView;
 
 /// One screen's worth of state. The event loop talks to whichever variant
@@ -23,6 +24,7 @@ pub enum View {
     File(FileView),
     Timeline(TimelineView),
     Log(LogView),
+    LspInspector(LspInspectorView),
 }
 
 impl View {
@@ -32,6 +34,7 @@ impl View {
             View::File(file) => file.should_quit,
             View::Timeline(timeline) => timeline.should_quit,
             View::Log(log) => log.should_quit,
+            View::LspInspector(inspector) => inspector.should_quit,
         }
     }
 
@@ -41,6 +44,7 @@ impl View {
             View::File(file) => file.update(action),
             View::Timeline(timeline) => timeline.update(action),
             View::Log(log) => log.update(action),
+            View::LspInspector(inspector) => inspector.update(action),
         }
     }
 
@@ -50,6 +54,7 @@ impl View {
             View::File(file) => file.set_viewport_height(height),
             View::Timeline(timeline) => timeline.set_viewport_height(height),
             View::Log(log) => log.set_viewport_height(height),
+            View::LspInspector(inspector) => inspector.set_viewport_height(height),
         }
     }
 
@@ -64,6 +69,7 @@ impl View {
             View::Diff(app) => app.set_content_width(width),
             View::File(file) => file.set_content_width(width),
             View::Timeline(_) | View::Log(_) => {}
+            View::LspInspector(inspector) => inspector.set_content_width(width),
         }
     }
 
@@ -73,6 +79,7 @@ impl View {
             View::File(file) => file.pending_keys = keys,
             View::Timeline(timeline) => timeline.pending_keys = keys,
             View::Log(log) => log.pending_keys = keys,
+            View::LspInspector(inspector) => inspector.pending_keys = keys,
         }
     }
 
@@ -89,6 +96,7 @@ impl View {
             View::File(file) => file.hover_query(),
             View::Timeline(timeline) => timeline.hover_query(),
             View::Log(log) => log.hover_query(),
+            View::LspInspector(inspector) => inspector.hover_query(),
         }
     }
 
@@ -103,6 +111,7 @@ impl View {
             View::File(file) => (file.cursor, file.active_symbol),
             View::Timeline(timeline) => timeline.cursor_key(),
             View::Log(log) => log.cursor_key(),
+            View::LspInspector(inspector) => inspector.cursor_key(),
         }
     }
 
@@ -118,7 +127,7 @@ impl View {
             // Never opens a hover popup — see `TimelineView::hover_query`'s
             // / `LogView::hover_query`'s docs — so there's no anchor row to
             // report here.
-            View::Timeline(_) | View::Log(_) => return None,
+            View::Timeline(_) | View::Log(_) | View::LspInspector(_) => return None,
         };
         u16::try_from(cursor.checked_sub(scroll_offset)?).ok()
     }
@@ -131,7 +140,7 @@ impl View {
         match self {
             View::Diff(app) => app.jump_to_diagnostic(diagnostics, forward),
             View::File(file) => file.jump_to_diagnostic(diagnostics, forward),
-            View::Timeline(_) | View::Log(_) => {} // no diagnostics in a read-only list
+            View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {} // no diagnostics in a read-only list
         }
     }
 }

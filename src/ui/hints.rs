@@ -249,6 +249,7 @@ pub fn diff_view_items(keymap: &Keymap, expanded: bool) -> Vec<HintItem> {
         // policy is designed to drop first.
         HintItem::for_actions(keymap, &[Action::OpenHelp], "help"),
         units,
+        HintItem::for_actions(keymap, &[Action::ToggleLspInspector], "LSP log"),
         HintItem::for_actions(keymap, &[Action::GotoDefinition], "def"),
         HintItem::for_actions(keymap, &[Action::FindReferences], "refs"),
         HintItem::for_actions(keymap, &[Action::Top, Action::Bottom], "top/bottom"),
@@ -310,6 +311,7 @@ pub fn file_view_items(keymap: &Keymap, expanded: bool) -> Vec<HintItem> {
         HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "move"),
         HintItem::for_actions(keymap, &[Action::JumpBack, Action::JumpForward], "jump"),
         HintItem::for_actions(keymap, &[Action::OpenHelp], "help"),
+        HintItem::for_actions(keymap, &[Action::ToggleLspInspector], "LSP log"),
         HintItem::for_actions(keymap, &[Action::GotoDefinition], "def"),
         HintItem::for_actions(keymap, &[Action::FindReferences], "refs"),
         HintItem::for_actions(keymap, &[Action::Top, Action::Bottom], "top/bottom"),
@@ -357,6 +359,7 @@ pub fn timeline_view_items(keymap: &Keymap, expanded: bool) -> Vec<HintItem> {
     [
         HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "select"),
         HintItem::for_actions(keymap, &[Action::OpenHelp], "help"),
+        HintItem::for_actions(keymap, &[Action::ToggleLspInspector], "LSP log"),
         HintItem::for_actions(keymap, &[Action::NextSymbol], "focus"),
         HintItem::for_actions(keymap, &[Action::ToggleRangeSelect], "range"),
         HintItem::for_actions(keymap, &[Action::Confirm], "back to diff"),
@@ -397,6 +400,7 @@ pub fn log_view_items(keymap: &Keymap, expanded: bool) -> Vec<HintItem> {
     [
         HintItem::for_actions(keymap, &[Action::CursorDown, Action::CursorUp], "select"),
         HintItem::for_actions(keymap, &[Action::OpenHelp], "help"),
+        HintItem::for_actions(keymap, &[Action::ToggleLspInspector], "LSP log"),
         HintItem::for_actions(keymap, &[Action::Confirm], "open diff"),
         HintItem::for_actions(keymap, &[Action::ToggleRangeSelect], "range"),
         HintItem::for_actions(

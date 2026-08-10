@@ -18,6 +18,7 @@
 //! parameter instead, and does.
 
 use crate::keymap::{self, Action, KeySeq};
+use crate::lsp::observe::LoggingConfig;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -120,6 +121,10 @@ pub struct Config {
     /// VSCode/Zed-style "it just works" experience this exists for; `false`
     /// restores the pre-M8b behavior of a manual-install hint only.
     pub auto_install: bool,
+    /// `[lsp.logging]` controls the persistent TUI session journal. The
+    /// inspector's bounded in-memory feed remains available when disk logging
+    /// is disabled; headless LSP checks intentionally create neither one.
+    pub lsp_logging: LoggingConfig,
     pub tab_width: usize,
     pub highlight_max_lines: usize,
     /// `[ui] wrap` — whether a diff/file-view content line wider than its
@@ -229,6 +234,7 @@ impl Default for Config {
             key_overrides: HashMap::new(),
             lsp_servers: HashMap::new(),
             auto_install: true,
+            lsp_logging: LoggingConfig::default(),
             tab_width: DEFAULT_TAB_WIDTH,
             highlight_max_lines: DEFAULT_HIGHLIGHT_MAX_LINES,
             wrap: true,
@@ -276,6 +282,17 @@ pub(crate) struct RawFile {
 struct RawLsp {
     servers: HashMap<String, ServerOverride>,
     auto_install: Option<bool>,
+    logging: Option<RawLogging>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawLogging {
+    enabled: Option<bool>,
+    segment_bytes: Option<u64>,
+    segments_per_session: Option<usize>,
+    total_bytes: Option<u64>,
+    max_age_days: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -318,7 +335,14 @@ struct RawUnits {
 const TOP_LEVEL_KEYS: &[&str] = &[
     "keymap", "keys", "lsp", "ui", "watch", "update", "skill", "units",
 ];
-const LSP_KEYS: &[&str] = &["servers", "auto_install"];
+const LSP_KEYS: &[&str] = &["servers", "auto_install", "logging"];
+const LOGGING_KEYS: &[&str] = &[
+    "enabled",
+    "segment_bytes",
+    "segments_per_session",
+    "total_bytes",
+    "max_age_days",
+];
 const SERVER_KEYS: &[&str] = &[
     "command",
     "args",
@@ -359,6 +383,24 @@ fn merge_raw(base: &mut RawFile, overlay: RawFile) {
         base_lsp.servers.extend(overlay_lsp.servers);
         if overlay_lsp.auto_install.is_some() {
             base_lsp.auto_install = overlay_lsp.auto_install;
+        }
+        if let Some(overlay_logging) = overlay_lsp.logging {
+            let base_logging = base_lsp.logging.get_or_insert_with(RawLogging::default);
+            if overlay_logging.enabled.is_some() {
+                base_logging.enabled = overlay_logging.enabled;
+            }
+            if overlay_logging.segment_bytes.is_some() {
+                base_logging.segment_bytes = overlay_logging.segment_bytes;
+            }
+            if overlay_logging.segments_per_session.is_some() {
+                base_logging.segments_per_session = overlay_logging.segments_per_session;
+            }
+            if overlay_logging.total_bytes.is_some() {
+                base_logging.total_bytes = overlay_logging.total_bytes;
+            }
+            if overlay_logging.max_age_days.is_some() {
+                base_logging.max_age_days = overlay_logging.max_age_days;
+            }
         }
     }
     if let Some(overlay_ui) = overlay.ui {
@@ -511,6 +553,9 @@ fn warn_unknown_keys(path: &Path, table: &toml::Table, warnings: &mut Vec<String
     warn_extra(path, "", table, TOP_LEVEL_KEYS, warnings);
     if let Some(lsp) = table.get("lsp").and_then(toml::Value::as_table) {
         warn_extra(path, "lsp.", lsp, LSP_KEYS, warnings);
+        if let Some(logging) = lsp.get("logging").and_then(toml::Value::as_table) {
+            warn_extra(path, "lsp.logging.", logging, LOGGING_KEYS, warnings);
+        }
         if let Some(servers) = lsp.get("servers").and_then(toml::Value::as_table) {
             for (lang, server) in servers {
                 if let Some(server_table) = server.as_table() {
@@ -603,11 +648,19 @@ fn finalize(raw: RawFile) -> Config {
         codex_model: units_raw.codex_model,
         codex_effort: units_raw.codex_effort,
     };
+    let logging = lsp.logging.unwrap_or_default();
     Config {
         keymap,
         key_overrides: raw.keys.unwrap_or_default(),
         lsp_servers: lsp.servers,
         auto_install: lsp.auto_install.unwrap_or(true),
+        lsp_logging: LoggingConfig {
+            enabled: logging.enabled.unwrap_or(true),
+            segment_bytes: logging.segment_bytes.unwrap_or(5_242_880),
+            segments_per_session: logging.segments_per_session.unwrap_or(4),
+            total_bytes: logging.total_bytes.unwrap_or(104_857_600),
+            max_age_days: logging.max_age_days.unwrap_or(2),
+        },
         tab_width: ui.tab_width.unwrap_or(DEFAULT_TAB_WIDTH),
         highlight_max_lines: ui
             .highlight_max_lines
@@ -807,6 +860,62 @@ mod tests {
         // an environment fact, not a regression.
         let config = finalize(RawFile::default());
         assert_eq!(config, Config::default());
+    }
+
+    #[test]
+    fn lsp_logging_defaults_match_the_session_journal_policy() {
+        let logging = LoggingConfig::default();
+        assert!(logging.enabled);
+        assert_eq!(logging.segment_bytes, 5_242_880);
+        assert_eq!(logging.segments_per_session, 4);
+        assert_eq!(logging.total_bytes, 104_857_600);
+        assert_eq!(logging.max_age_days, 2);
+        assert_eq!(Config::default().lsp_logging, logging);
+    }
+
+    #[test]
+    fn lsp_logging_merges_each_nested_field_without_resetting_siblings() {
+        let mut base = RawFile {
+            lsp: Some(RawLsp {
+                logging: Some(RawLogging {
+                    enabled: Some(false),
+                    segment_bytes: Some(1024),
+                    segments_per_session: Some(2),
+                    total_bytes: Some(4096),
+                    max_age_days: Some(3),
+                }),
+                ..RawLsp::default()
+            }),
+            ..RawFile::default()
+        };
+        merge_raw(
+            &mut base,
+            RawFile {
+                lsp: Some(RawLsp {
+                    logging: Some(RawLogging {
+                        segment_bytes: Some(2048),
+                        ..RawLogging::default()
+                    }),
+                    ..RawLsp::default()
+                }),
+                ..RawFile::default()
+            },
+        );
+        let config = finalize(base);
+        assert!(!config.lsp_logging.enabled);
+        assert_eq!(config.lsp_logging.segment_bytes, 2048);
+        assert_eq!(config.lsp_logging.segments_per_session, 2);
+        assert_eq!(config.lsp_logging.total_bytes, 4096);
+        assert_eq!(config.lsp_logging.max_age_days, 3);
+    }
+
+    #[test]
+    fn lsp_logging_unknown_keys_are_reported_at_the_nested_path() {
+        let path = PathBuf::from("/fake/config.toml");
+        let (_, warnings) =
+            parse_with_warnings(&path, "[lsp.logging]\nsegment_bytes = 99\nretention = 1\n");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("lsp.logging.retention"));
     }
 
     #[test]
@@ -1273,6 +1382,7 @@ mod tests {
                     ),
                 ]),
                 auto_install: None,
+                logging: None,
             }),
             ..RawFile::default()
         };
@@ -1286,6 +1396,7 @@ mod tests {
                     },
                 )]),
                 auto_install: None,
+                logging: None,
             }),
             ..RawFile::default()
         };

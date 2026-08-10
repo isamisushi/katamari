@@ -857,6 +857,7 @@ impl App {
             // something inside `TimelineView`/`LogView` themselves.
             Action::ToggleTimeline
             | Action::ToggleLogView
+            | Action::ToggleLspInspector
             | Action::OpenScopeMenu
             | Action::ToggleUnits
             | Action::RegenerateUnits

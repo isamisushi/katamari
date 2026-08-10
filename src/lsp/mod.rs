@@ -19,11 +19,16 @@ pub mod client;
 pub mod diagnostics;
 pub mod install;
 pub mod manager;
+pub mod observe;
 pub mod transport;
 
 pub use client::{DefinitionResult, HoverResult, ReferencesResult};
 pub use diagnostics::{DiagnosticsStore, parse_publish_diagnostics};
 pub use manager::{LspManager, ServerEvent};
+pub use observe::{
+    EventLevel, EventOutcome, JournalEvent, ObservationHandle, ObservationStore, ServerIdentity,
+    ServerPhase, ServerSnapshot,
+};
 pub use transport::{LspError, LspEvent};
 
 /// A short human-readable summary of a `$/progress` notification's payload

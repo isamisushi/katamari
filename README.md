@@ -178,10 +178,45 @@ selection (a second `Enter` diffs between the two), `q`/`Esc` closes. Also
 reachable mid-session from `ktmr diff` with `L`.
 
 Inside the diff: `K` hovers the identifier under the cursor, `gd`/`gr` go
-to its definition/references, `]d`/`[d` jump between diagnostics. Language
+to its definition/references, `]d`/`[d` jump between diagnostics, and `I`
+opens the live, read-only LSP Inspector. The inspector keeps one entry per
+actual `(language, workspace root)` server, shows lifecycle state (running
+means only that `initialize` completed; it does not mean project indexing is
+ready), capabilities, progress tokens, process details, stderr, server log
+messages, and request/navigation outcomes. `Tab`/`BackTab` cycle the
+explicit `Servers`, read-only `Server detail`, and `Journal` focus targets;
+the focused pane is marked by a cyan/bold border and title styling. The
+Inspector frame shows `Tab`/`BackTab` focus and `I`/`Esc`/`q` close hints;
+each pane's bottom border lists only the controls for that pane. In
+`Servers`, `j`/`k` and half-page/top/bottom keys select a server. In
+`Server detail`, `j`/`k`, half-page, `gg`, and `G` scroll long read-only
+details. In `Journal`, `j`/`k`, `Ctrl-u`/`Ctrl-d`, `gg`, and `G` move the
+journal cursor/scroll; its border prioritizes `V select` and `y yank` even on
+narrow panes. Press `V` to start linewise visual selection, extend it with `j`/`k`, and press `y` to send
+the selected records through terminal-native OSC 52; whether the terminal or
+multiplexer accepts that sequence depends on its clipboard support/configuration.
+`Esc` cancels selection
+before closing the inspector. Wrapped display rows belonging to one record
+copy that complete record once, so a partial wrapped-row selection never
+truncates or duplicates a log message. Oversized selections are refused with
+an in-inspector status message. `q`/`I` close it. Language
 servers spawn lazily, the first time something asks, and auto-install
 themselves if missing — see [Language servers](#language-servers) if a
 feature reports a server as unavailable.
+
+Each TUI session also writes one combined, privacy-filtered journal under
+`$XDG_STATE_HOME/katamari/lsp/` (or `~/.local/state/katamari/lsp/`). Journal
+directories are unique per process; `events-0001.log` segments rotate at
+5 MiB, retain at most four segments per session, and inactive sessions are
+retained for 2 days within a 100 MiB global budget. Logs contain server
+identity/generation, stderr lines and LSP log/show/trace text (each captured
+message is bounded at 16 KiB and receives a UTF-8-safe truncation marker when
+needed), and method/outcome metadata, but not source lines, document contents,
+hover bodies, diagnostics bodies, initialization options, environment
+variables, or raw protocol JSON. Active progress is bounded to 64 tokens; the
+inspector shows the session directory so the physical segments are
+discoverable. Configure this under `[lsp.logging]` with `enabled`,
+`segment_bytes`, `segments_per_session`, `total_bytes`, and `max_age_days`.
 
 Wherever git omits unchanged context — between two hunks, before the first
 one, or after the last — a dim fold row shows `··· N unchanged lines ···`
@@ -400,6 +435,14 @@ next-hunk = "C-n"
 # katamari's own prefix instead of just reporting an install hint. Default
 # true; see "Language servers" below for what each language's strategy is.
 auto_install = true
+
+[lsp.logging]
+# TUI-only combined session journal; headless doctor/lsp-check do not create one.
+enabled = true
+segment_bytes = 5242880
+segments_per_session = 4
+total_bytes = 104857600
+max_age_days = 2
 
 [lsp.servers.rust]
 # Overrides how a language's server is resolved — highest priority, above
