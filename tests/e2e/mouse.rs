@@ -9,7 +9,8 @@
 //! needs its own app-level gate (see that arm's docs in `ui::mod`) rather
 //! than relying solely on `EnableMouseCapture` never having been sent.
 
-use crate::support::{Harness, Key, MouseKey, SpawnOptions, fixture};
+use crate::support::screen::row_has_reversed_cell;
+use crate::support::{Harness, Key, MouseButton, MouseKey, SpawnOptions, fixture};
 use std::time::Duration;
 
 /// The text every cell in columns `[col_start, col_end)` renders, one line
@@ -232,6 +233,340 @@ fn mouse_disabled_via_config_ignores_wheel_bytes() {
         after, before,
         "[ui] mouse = false must leave the screen completely unchanged by wheel bytes"
     );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+// ---- issue #21: file-tree clicks ------------------------------------------
+
+/// A full press-then-release pair — what a real terminal always sends for
+/// one click, and what `ui::mod`'s dispatch actually needs (only `Down`
+/// does anything; see that arm's own docs), so every click test below
+/// sends both rather than only the byte katamari happens to react to.
+fn click(h: &Harness, button: MouseButton, column: u16, row: u16) {
+    h.send_mouse(MouseKey::Down {
+        button,
+        column,
+        row,
+    });
+    h.send_mouse(MouseKey::Up {
+        button,
+        column,
+        row,
+    });
+}
+
+/// Spawns `fixture::tree_repo()` (staged) and waits for its tree to render
+/// fully expanded — every click test below that targets a specific row by
+/// screen position reasons from this exact, fixed layout: `sidebar::render`'s
+/// inner rect starts at screen row 1 (row 0 is the outer sidebar rect's own
+/// top border), and one `VisibleRow` is always exactly one screen row (see
+/// `ui::mouse`'s own docs on why — no wrapping), so row `1 + n` below is
+/// `visible_rows[n]`:
+///
+/// ```text
+/// row 1: src                                       (dir, depth 0)
+/// row 2: src/nested                                (dir, depth 1)
+/// row 3: src/nested/deep                           (dir, depth 2)
+/// row 4: src/nested/deep/NESTED_MARKER_UNIQUE.txt  (file, depth 3)
+/// row 5: src/aaa_padding.txt                       (file, depth 1)
+/// row 6: src/doomed.txt                            (file, depth 1, deleted)
+/// row 7: src/new_name.txt                          (file, depth 1, renamed)
+/// ```
+///
+/// `TREE_CLICK_COL` lands inside every one of these rows' own rendered
+/// content except `src`'s (whose 3-character label ends well before column
+/// 10) — clicking past a short label still hits that row, not a miss,
+/// since hit-testing is row-based, never text-based (`files_row_at`'s own
+/// docs).
+const TREE_CLICK_COL: u16 = 10;
+
+fn spawn_tree_repo() -> (fixture::FixtureRepo, Harness) {
+    let repo = fixture::tree_repo();
+    let h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            args: vec!["diff", "--staged"],
+            ..Default::default()
+        },
+    );
+    h.wait_for_text("new_name.txt");
+    h.wait_for_text("NESTED_MARKER_UNIQUE");
+    // `wait_for_text` only proves *some* substring landed, not that every
+    // still-in-flight initial-paint frame is done — the no-op click tests
+    // below take a "before" snapshot right after this returns, and a frame
+    // that lands moments later (unrelated to any click) would make that
+    // snapshot spuriously stale. Settling here, once, up front, is cheaper
+    // than every caller re-deriving its own guard.
+    wait_for_stable_screen(&h, Duration::from_secs(2));
+    (repo, h)
+}
+
+/// Polls until two reads of the full screen 50ms apart are identical
+/// (capped at `timeout`, after which it just returns whatever the last read
+/// was) — a stronger settle guard than `wait_for_text` alone; see
+/// `spawn_tree_repo`'s own docs on why the no-op click tests need it.
+fn wait_for_stable_screen(h: &Harness, timeout: Duration) -> String {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut previous = h.screen_contents();
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let current = h.screen_contents();
+        if current == previous || std::time::Instant::now() >= deadline {
+            return current;
+        }
+        previous = current;
+    }
+}
+
+#[test]
+fn clicking_a_directory_row_toggles_only_that_directory() {
+    let (_repo, mut h) = spawn_tree_repo();
+
+    // Row 2 is "nested" — collapsing it hides rows 3/4 ("deep" and the
+    // marker file) but must leave "src" (row 1, still expanded) and its
+    // other child "new_name.txt" (row 7, a sibling of "nested" — not a
+    // descendant) completely alone.
+    click(&h, MouseButton::Left, TREE_CLICK_COL, 2);
+    h.wait_until(Duration::from_secs(3), |screen| {
+        !screen.contents().contains("NESTED_MARKER_UNIQUE")
+    });
+    h.wait_for_text("\u{25b8}"); // the collapsed glyph now exists somewhere
+    assert!(
+        h.screen_contents().contains("new_name.txt"),
+        "a sibling of the collapsed directory must stay visible"
+    );
+    assert!(
+        h.with_screen(|screen| row_has_reversed_cell(screen, 2, SIDEBAR_COLS.0, SIDEBAR_COLS.1)),
+        "the clicked directory row must show as selected (reversed), proving focus moved to Files"
+    );
+
+    // Clicking the same screen position again re-expands it: "nested"
+    // itself never moved rows (only its descendants were hidden/shown).
+    click(&h, MouseButton::Left, TREE_CLICK_COL, 2);
+    h.wait_for_text("NESTED_MARKER_UNIQUE");
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
+fn clicking_a_file_row_opens_it_keeps_files_focus_and_ctrl_o_reverses_it() {
+    let (_repo, mut h) = spawn_tree_repo();
+
+    // A real source location to leave from, reached purely by keyboard:
+    // two `j` presses from the initial file-header cursor land on
+    // `aaa_padding.txt`'s own first content line (row 0 = FileHeader, row
+    // 1 = HunkHeader, row 2 = the first `Line`).
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.wait_for_text("padding line 1");
+
+    // Row 4 is the nested marker file — a different file entirely, so
+    // landing there should scroll `padding line 1` out of view.
+    click(&h, MouseButton::Left, TREE_CLICK_COL, 4);
+    h.wait_for_text("MARKER_CONTENT_LINE_UNIQUE");
+    h.wait_until(Duration::from_secs(3), |screen| {
+        !region_text(screen, DIFF_COLS.0, DIFF_COLS.1).contains("padding line 1")
+    });
+
+    // The req-2 crux: the clicked row reads as *selected* (reversed), not
+    // merely as the diff cursor's background file (which would render
+    // cyan/underlined instead — see `sidebar::render`'s own docs) — proof
+    // that the click left `Files` focused rather than handing it to `Diff`
+    // the way `Enter` does.
+    assert!(
+        h.with_screen(|screen| row_has_reversed_cell(screen, 4, SIDEBAR_COLS.0, SIDEBAR_COLS.1)),
+        "the clicked file row must still read as selected — focus stayed on Files"
+    );
+
+    // Ctrl-o retraces the click's own jump, landing back on the exact row
+    // it left from regardless of which pane currently has keyboard focus.
+    h.send(Key::CtrlO);
+    h.wait_for_text("padding line 1");
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
+fn clicking_an_ancestor_directory_of_the_selection_reselects_that_directory() {
+    let (_repo, mut h) = spawn_tree_repo();
+
+    // Tab + navigate onto the nested marker file's own row — req 4 needs a
+    // *pre-existing* selection on a descendant before the directory click.
+    h.send(Key::Tab);
+    h.send(Key::Char('g'));
+    h.send(Key::Char('g'));
+    h.send(Key::Char('j')); // "nested"
+    h.send(Key::Char('j')); // "deep"
+    h.send(Key::Char('j')); // the marker file itself
+
+    // Click "nested" (row 2) — its descendant (the marker file, currently
+    // selected) is about to be hidden by the collapse.
+    click(&h, MouseButton::Left, TREE_CLICK_COL, 2);
+    h.wait_until(Duration::from_secs(3), |screen| {
+        !screen.contents().contains("NESTED_MARKER_UNIQUE")
+    });
+    assert!(
+        h.with_screen(|screen| row_has_reversed_cell(screen, 2, SIDEBAR_COLS.0, SIDEBAR_COLS.1)),
+        "req 4: the directory itself must end up selected once its descendant is hidden"
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
+fn scrolled_tree_click_hits_the_right_row() {
+    let repo = fixture::many_files_repo(40);
+    let mut h = Harness::spawn(repo.path(), SpawnOptions::default());
+    h.wait_for_text("file000.txt");
+
+    // Two wheel ticks (3 rows each, per `mouse::WHEEL_SCROLL_ROWS`) shift
+    // the sidebar's scroll offset well clear of the top.
+    h.send_mouse(MouseKey::ScrollDown { column: 10, row: 8 });
+    h.send_mouse(MouseKey::ScrollDown { column: 10, row: 8 });
+    h.wait_until(Duration::from_secs(3), |screen| {
+        !region_text(screen, SIDEBAR_COLS.0, SIDEBAR_COLS.1).contains("file000.txt")
+    });
+    // The predicate above can already be true after just the *first* tick
+    // (one tick's 3-row offset alone is enough to scroll file000.txt out of
+    // view), so it alone doesn't prove the second tick has also landed —
+    // without this, reading `target_line` can race a still-in-flight event
+    // and see a row that shifts again before the click below reaches it.
+    // A short settle, the same fixed-wait idiom
+    // `mouse_disabled_via_config_ignores_wheel_bytes` uses, is far cheaper
+    // than a debounce-polling loop and comfortably outlasts two PTY writes.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Read whichever file the (now-scrolled) sidebar actually shows at
+    // screen row 5, rather than assuming the exact scroll-offset
+    // arithmetic — the click below must hit *this* row regardless.
+    let target_line = h.with_screen(|screen| {
+        region_text(screen, SIDEBAR_COLS.0, SIDEBAR_COLS.1)
+            .lines()
+            .nth(5)
+            .unwrap()
+            .to_owned()
+    });
+    let start = target_line.find("file").expect("row 5 shows a file name");
+    let target_file = target_line[start..start + "fileNNN.txt".len()].to_owned();
+
+    click(&h, MouseButton::Left, 10, 5);
+    h.wait_until(Duration::from_secs(3), |screen| {
+        region_text(screen, DIFF_COLS.0, DIFF_COLS.1).contains(&target_file)
+    });
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
+fn border_hint_status_and_blank_space_clicks_are_no_ops() {
+    let (_repo, mut h) = spawn_tree_repo();
+    let before = h.screen_contents();
+
+    click(&h, MouseButton::Left, TREE_CLICK_COL, 0); // sidebar's own top border/title
+    click(&h, MouseButton::Left, TREE_CLICK_COL, 8); // blank space below the last tree row (7)
+    click(&h, MouseButton::Left, TREE_CLICK_COL, 29); // the bottom status bar strip
+
+    // No "wait for a change" predicate makes sense here — the whole point
+    // is that nothing changes (mirrors `mouse_disabled_via_config_ignores_wheel_bytes`'s
+    // own reasoning for a short fixed wait instead).
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        h.screen_contents(),
+        before,
+        "border/blank/status clicks must leave the screen completely unchanged"
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
+fn right_click_on_a_real_tree_row_does_nothing() {
+    let (_repo, mut h) = spawn_tree_repo();
+    let before = h.screen_contents();
+
+    // Row 2 ("nested") is a perfectly valid left-click target elsewhere in
+    // this file — proving right-click is a no-op *there specifically*, not
+    // just over blank space, is what makes this req 8's real regression
+    // guard.
+    click(&h, MouseButton::Right, TREE_CLICK_COL, 2);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        h.screen_contents(),
+        before,
+        "a right click must not toggle/select/jump anything (issue #23's seam)"
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
+fn a_sidebar_click_cannot_reach_the_tree_through_an_open_modal() {
+    // The fully-modal overlays (scope menu here; compose/units-setup share
+    // the same event-loop gate) intercept every keystroke before it can
+    // reach the App — a sidebar click must be blocked the same way, or a
+    // mouse could produce a keyboard-unreachable state: tree
+    // selection/focus/diff cursor mutating beneath an open modal whose
+    // own rect only covers the diff pane.
+    let (_repo, mut h) = spawn_tree_repo();
+    h.send(Key::Char('o'));
+    h.wait_for_text("Working tree");
+    let before = wait_for_stable_screen(&h, Duration::from_secs(3));
+
+    click(&h, MouseButton::Left, TREE_CLICK_COL, 4);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        h.screen_contents(),
+        before,
+        "a tree click while the scope menu is open must change nothing — \
+         not the menu, not the selection, not the diff"
+    );
+
+    h.send(Key::Esc);
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
+fn a_truncated_label_still_resolves_to_the_right_row() {
+    // The sidebar's own width (`SIDEBAR_WIDTH`) is a fixed 30 columns
+    // regardless of the terminal's total width, so row 4's label —
+    // "NESTED_MARKER_UNIQUE.txt", 24 display columns wide, deep enough
+    // (depth 3) that indentation alone eats 6 of the inner rect's 28 — is
+    // already truncated at this harness's ordinary default width; no
+    // extra-narrow terminal needed to exercise it. `files_row_at` only
+    // ever does row arithmetic (see its own docs), never inspects rendered
+    // text, so hit-testing this row must succeed identically to any other.
+    let (_repo, mut h) = spawn_tree_repo();
+    let row4 = h.with_screen(|screen| {
+        region_text(screen, SIDEBAR_COLS.0, SIDEBAR_COLS.1)
+            .lines()
+            .nth(4)
+            .unwrap()
+            .to_owned()
+    });
+    assert!(
+        !row4.contains("NESTED_MARKER_UNIQUE.txt"),
+        "row 4's full label must not fit untruncated at the sidebar's fixed width: {row4:?}"
+    );
+
+    click(&h, MouseButton::Left, TREE_CLICK_COL, 4);
+    h.wait_for_text("MARKER_CONTENT_LINE_UNIQUE");
 
     h.send(Key::Char('q'));
     let status = h.wait_exit(Duration::from_secs(5));

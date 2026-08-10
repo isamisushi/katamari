@@ -46,6 +46,25 @@ pub fn underlined_cells(screen: &vt100::Screen) -> Vec<(u16, u16)> {
     cells
 }
 
+/// Whether any cell in `row`, within `[col_start, col_end)`, is currently
+/// rendered reverse-video — issue #21's screen-level proof that a clicked
+/// tree row is *selected* (`Modifier::REVERSED`, per `sidebar::render`'s
+/// own doc comment on why it patches that instead of `BOLD` while `Files`
+/// has focus) rather than merely "the background diff cursor's file,"
+/// which renders cyan/underlined instead. `col_end` is clamped to the
+/// screen's actual width, mirroring `region_text`'s own convenience for
+/// an oversized upper bound.
+pub fn row_has_reversed_cell(
+    screen: &vt100::Screen,
+    row: u16,
+    col_start: u16,
+    col_end: u16,
+) -> bool {
+    let (_, cols) = screen.size();
+    let col_end = col_end.min(cols);
+    (col_start..col_end).any(|col| screen.cell(row, col).is_some_and(vt100::Cell::inverse))
+}
+
 /// The text contents of every cell the terminal is currently rendering as
 /// the first half of a double-width character — the CJK rendering
 /// pipeline's actual end-to-end output, as opposed to the unit-level

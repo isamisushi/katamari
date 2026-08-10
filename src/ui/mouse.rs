@@ -14,13 +14,19 @@
 //! last-match-wins scan finds the overlay first without a second priority
 //! table to keep in sync.
 //!
-//! Row-level hit-testing (which logical row a click landed on) is
-//! deliberately out of scope here — wheel routing only needs pane
-//! *containment*, not a click target. #21/#22 extend this map with that.
+//! Wheel routing only ever needed pane *containment*; issue #21 is the
+//! first caller that needs an actual row within one of these rects (which
+//! changed-file tree row a click landed on), so [`FrameGeometry::hit_rect`]
+//! hands back the recorded [`Rect`] itself alongside its target rather than
+//! just the target [`FrameGeometry::hit`] returns — [`files_row_at`] turns
+//! that rect plus the click point into a `visible_rows` index. #22 (code-
+//! pane clicks) is expected to do the same against `ScrollTarget::DiffPane`.
 
 use crate::keymap::Keymap;
 use crate::ui::help::{self, HelpState};
 use crate::ui::hover_popup::HoverState;
+use crate::ui::navigation::{FilesConfirmOutcome, JumpStack, record_jump};
+use crate::ui::pane;
 use crate::ui::refs_panel::RefsPanel;
 use crate::ui::units_panel::UnitsPanel;
 use crate::ui::view::{View, ViewStack};
@@ -98,6 +104,20 @@ impl FrameGeometry {
         self.entries.push((rect, target));
     }
 
+    /// As [`Self::hit`], but also returns the exact [`Rect`] that matched —
+    /// issue #21's [`files_row_at`] needs the rect itself (to derive a row
+    /// index within it), not just which target it belongs to. `hit` is a
+    /// thin wrapper over this rather than the other way around, so wheel
+    /// routing's existing single-value return never had to change.
+    pub fn hit_rect(&self, col: u16, row: u16) -> Option<(Rect, ScrollTarget)> {
+        let point = Position { x: col, y: row };
+        self.entries
+            .iter()
+            .rev()
+            .find(|(rect, _)| rect.contains(point))
+            .copied()
+    }
+
     /// The target whose rect contains `(col, row)`, scanning most- to
     /// least-recently recorded — i.e. reverse draw order. Since draw order
     /// *is* modal precedence (see this module's docs), this is the entire
@@ -105,12 +125,89 @@ impl FrameGeometry {
     /// wheel event there scrolls, with no separate table of overlay
     /// z-order to keep in sync with `draw`'s own call order.
     pub fn hit(&self, col: u16, row: u16) -> Option<ScrollTarget> {
-        let point = Position { x: col, y: row };
-        self.entries
-            .iter()
-            .rev()
-            .find(|(rect, _)| rect.contains(point))
-            .map(|(_, target)| *target)
+        self.hit_rect(col, row).map(|(_, target)| target)
+    }
+}
+
+/// Which changed-files tree row — an index into `App::visible_rows` — sits
+/// under `(col, row)`, given `outer`: the same *outer*, border-inclusive
+/// [`Rect`] `draw` recorded under [`ScrollTarget::DiffFiles`] (see this
+/// module's `KEY ASSUMPTION` in plan-21's grounding: `sidebar::render`
+/// computes its own inner rect off exactly this rect via `Block::inner`, so
+/// deriving it again here with [`pane::inner_rect`] — the same border-math
+/// function, not a hand-counted literal — reproduces it exactly rather than
+/// risking drift between two independent border calculations). Excludes
+/// border/title/hint rows by simple non-containment (req 3) rather than
+/// listing them, and blank space below the last row by comparing the
+/// resulting index against `visible_row_count` (req 5) — `sidebar::render`
+/// never wraps a row (one [`crate::ui::file_tree::VisibleRow`] is always
+/// exactly one terminal line, no `Paragraph::wrap`), so `row - inner.y` is
+/// already a row *count* to add to the scroll offset, not a display
+/// position that needs unwrapping first.
+pub fn files_row_at(
+    outer: Rect,
+    scroll_offset: usize,
+    visible_row_count: usize,
+    col: u16,
+    row: u16,
+) -> Option<usize> {
+    let inner = pane::inner_rect(outer.width, outer);
+    if !inner.contains(Position { x: col, y: row }) {
+        return None;
+    }
+    let idx = scroll_offset + (row - inner.y) as usize;
+    (idx < visible_row_count).then_some(idx)
+}
+
+/// A primary click at `(col, row)` (issue #21): the only target this issue
+/// wires up is the changed-files tree, so anything [`FrameGeometry::hit_rect`]
+/// resolves to besides [`ScrollTarget::DiffFiles`] — the diff pane, an
+/// overlay, unrecorded chrome — is a no-op here by construction. #22 (code-
+/// pane clicks) is expected to add its own `ScrollTarget::DiffPane` arm
+/// alongside this rather than folding into one function that tries to
+/// guess every target's meaning.
+///
+/// `from` is read *before* the click can move anything — mirroring
+/// `ui::mod`'s `Action::Confirm`-while-`Files` arm, whose `from`-then-
+/// mutate ordering this is the mouse equivalent of — so a valid prior
+/// source location still round-trips through `Ctrl-o` afterward, and
+/// `record_jump`'s own equality check quietly declines to record a
+/// same-position "jump" (clicking the row the cursor's already on).
+pub fn handle_left_click(
+    geometry: &FrameGeometry,
+    stack: &mut ViewStack,
+    jump_stack: &mut JumpStack,
+    hover_state: &mut HoverState,
+    col: u16,
+    row: u16,
+) {
+    let Some((rect, ScrollTarget::DiffFiles)) = geometry.hit_rect(col, row) else {
+        return; // #22 adds a `ScrollTarget::DiffPane` arm here later.
+    };
+    let Some(idx) = (match stack.top() {
+        View::Diff(app) => files_row_at(
+            rect,
+            app.files_scroll_offset,
+            app.visible_rows.len(),
+            col,
+            row,
+        ),
+        View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => None,
+    }) else {
+        return;
+    };
+    let from = stack.top().jump_entry();
+    let outcome = match stack.top_mut() {
+        View::Diff(app) => app.click_files_row(idx),
+        // Unreachable in practice — `files_row_at` above only produced
+        // `Some` inside the `View::Diff` arm — but `stack.top_mut()` is a
+        // second, independent lookup, so this stays exhaustive rather than
+        // assuming the view didn't change between the two calls.
+        View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => return,
+    };
+    if let FilesConfirmOutcome::Opened(to) = outcome {
+        record_jump(jump_stack, from, Some(to));
+        hover_state.invalidate();
     }
 }
 
@@ -330,12 +427,95 @@ mod tests {
         assert_eq!(geometry.hit(1, 1), Some(ScrollTarget::DiffPane));
     }
 
+    /// [`FrameGeometry::hit`] is a thin wrapper over `hit_rect` (see its own
+    /// docs) — pin that `hit_rect` itself carries the same last-recorded-
+    /// wins precedence, not just the target `hit` strips down to.
+    #[test]
+    fn hit_rect_overlap_the_last_recorded_wins_and_carries_its_own_rect() {
+        let mut geometry = FrameGeometry::new();
+        geometry.record(rect(0, 0, 20, 20), ScrollTarget::DiffPane);
+        geometry.record(rect(5, 5, 10, 10), ScrollTarget::HoverPopup);
+        assert_eq!(
+            geometry.hit_rect(7, 7),
+            Some((rect(5, 5, 10, 10), ScrollTarget::HoverPopup))
+        );
+        assert_eq!(
+            geometry.hit_rect(1, 1),
+            Some((rect(0, 0, 20, 20), ScrollTarget::DiffPane))
+        );
+    }
+
     #[test]
     fn zero_size_rects_are_never_hit() {
         let mut geometry = FrameGeometry::new();
         geometry.record(rect(5, 5, 0, 10), ScrollTarget::DiffPane);
         geometry.record(rect(5, 5, 10, 0), ScrollTarget::DiffFiles);
         assert_eq!(geometry.hit(5, 5), None);
+    }
+
+    // ---- files_row_at (issue #21) -----------------------------------------
+
+    /// The outer, border-inclusive rect `draw` records for
+    /// `ScrollTarget::DiffFiles` — `pane::inner_rect(30, OUTER)` works out
+    /// to `(1, 1, 28, 8)` (one column/row shaved off every side by
+    /// `Borders::ALL`), so every test below reasons about that inner rect
+    /// by hand rather than re-deriving it.
+    const OUTER: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 30,
+        height: 10,
+    };
+
+    #[test]
+    fn files_row_at_the_top_border_row_is_none() {
+        // Row 0 is OUTER's own top border — outside the inner rect
+        // (`inner.y == 1`) regardless of scroll offset or row count.
+        assert_eq!(files_row_at(OUTER, 0, 100, 5, 0), None);
+    }
+
+    #[test]
+    fn files_row_at_the_bottom_hint_row_is_none() {
+        // Row 9 is OUTER's bottom border, where `sidebar::render`'s hint
+        // line draws (`title_bottom`, not an extra row) — still outside the
+        // inner rect (`inner.y + inner.height == 9`).
+        assert_eq!(files_row_at(OUTER, 0, 100, 5, 9), None);
+    }
+
+    #[test]
+    fn files_row_at_the_first_inner_row_is_index_zero_at_zero_scroll() {
+        assert_eq!(files_row_at(OUTER, 0, 5, 5, 1), Some(0));
+    }
+
+    #[test]
+    fn files_row_at_a_nonzero_scroll_offset_shifts_every_index() {
+        // Inner row 1 (the first content row) is `visible_rows[scroll_offset]`
+        // once the tree has been scrolled down 3 rows; inner row 3 is two
+        // rows further into that same scrolled view.
+        assert_eq!(files_row_at(OUTER, 3, 100, 5, 1), Some(3));
+        assert_eq!(files_row_at(OUTER, 3, 100, 5, 3), Some(5));
+    }
+
+    #[test]
+    fn files_row_at_past_the_visible_row_count_is_none() {
+        // Inner row 7 (the last row inside an 8-row-tall inner rect) would
+        // resolve to index 6 — past a 5-row tree, i.e. blank space below the
+        // final rendered row (req 5).
+        assert_eq!(files_row_at(OUTER, 0, 5, 5, 7), None);
+        // The row just above it is still in range.
+        assert_eq!(files_row_at(OUTER, 0, 5, 5, 2), Some(1));
+    }
+
+    #[test]
+    fn files_row_at_a_degenerate_outer_rect_never_panics() {
+        let zero_width = Rect { width: 0, ..OUTER };
+        let zero_height = Rect { height: 0, ..OUTER };
+        assert_eq!(files_row_at(zero_width, 0, 100, 0, 0), None);
+        assert_eq!(files_row_at(zero_height, 0, 100, 0, 0), None);
+        // A click above/left of a normal rect entirely — exercises the same
+        // "would underflow if not for the containment guard" path as the
+        // degenerate rects above.
+        assert_eq!(files_row_at(OUTER, 0, 100, 0, 0), None);
     }
 
     #[test]

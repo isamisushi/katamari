@@ -4355,6 +4355,196 @@ index 1111111..2222222 100644\n\
         );
     }
 
+    // ---- click_files_row (issue #21) --------------------------------------
+
+    #[test]
+    fn click_files_row_on_a_directory_focuses_files_and_selects_the_clicked_row() {
+        let mut app = nested_app();
+        app.focus = MainPaneFocus::Diff;
+        // A selection that has nothing to do with "src" — proves the click
+        // moves selection to the *clicked* row, not wherever it already was.
+        app.files_selection = app
+            .visible_rows
+            .iter()
+            .position(|r| r.id.path == "other.rs")
+            .unwrap();
+        let src_idx = app
+            .visible_rows
+            .iter()
+            .position(|r| r.id.path == "src" && r.id.is_directory)
+            .unwrap();
+
+        let outcome = app.click_files_row(src_idx);
+        assert_eq!(outcome, crate::ui::navigation::FilesConfirmOutcome::Toggled);
+        assert_eq!(app.focus, MainPaneFocus::Files);
+        assert_eq!(app.files_selection, src_idx);
+        assert!(matches!(
+            app.visible_rows[src_idx].kind,
+            file_tree::VisibleKind::Directory {
+                expanded: false,
+                ..
+            }
+        ));
+    }
+
+    /// The req-2 crux: unlike [`confirm_on_a_file_row_opens_it_and_focuses_diff`]
+    /// (`Enter`, which hands focus to `Diff`), a click on a file row must
+    /// leave `Files` focused so repeated clicks — or `j`/`k` right after
+    /// one — keep browsing the tree without an intervening Tab.
+    #[test]
+    fn click_files_row_on_a_file_opens_it_and_keeps_files_focused() {
+        let mut app = nested_app();
+        app.focus = MainPaneFocus::Diff;
+        let other_idx = app
+            .visible_rows
+            .iter()
+            .position(|r| r.id.path == "other.rs")
+            .unwrap();
+
+        let outcome = app.click_files_row(other_idx);
+        let crate::ui::navigation::FilesConfirmOutcome::Opened(_) = outcome else {
+            panic!("a file row must open, not toggle or no-op");
+        };
+        assert_eq!(
+            app.focus,
+            MainPaneFocus::Files,
+            "a click must not hand focus to Diff the way Enter does"
+        );
+        assert_eq!(app.files_selection, other_idx);
+        let other_file_idx = app
+            .files
+            .iter()
+            .position(|f| f.display_path() == "other.rs")
+            .unwrap();
+        assert!(
+            matches!(app.rows[app.cursor], RenderRow::FileHeader { file_idx } if file_idx == other_file_idx),
+            "the diff cursor must land on other.rs's own file header"
+        );
+    }
+
+    /// req 4: clicking a directory that collapses the currently selected
+    /// *descendant* must land the selection on the directory itself —
+    /// exercised here through the real click entry point (not
+    /// `toggle_directory` called directly, as
+    /// [`collapsing_a_directory_containing_the_selection_reselects_that_directory`]
+    /// does for the keyboard's `Space` path). Falls out for free: `click_files_row`
+    /// writes `files_selection = idx` (the directory just clicked) *before*
+    /// `toggle_directory` ever captures "previous" from it, so the
+    /// ancestor-walk tier of `resolve_selection` doesn't even need to run —
+    /// see `confirm_row`'s own docs.
+    #[test]
+    fn clicking_a_directory_containing_the_selection_reselects_that_directory() {
+        let mut app = nested_app();
+        app.focus = MainPaneFocus::Files;
+        app.files_selection = app
+            .visible_rows
+            .iter()
+            .position(|r| r.id.path == "src/nested/b.rs")
+            .unwrap();
+        let nested_dir_idx = app
+            .visible_rows
+            .iter()
+            .position(|r| r.id.path == "src/nested" && r.id.is_directory)
+            .unwrap();
+
+        let outcome = app.click_files_row(nested_dir_idx);
+        assert_eq!(outcome, crate::ui::navigation::FilesConfirmOutcome::Toggled);
+        assert_eq!(
+            selected_path(&app),
+            Some("src/nested"),
+            "the selection must land on the collapsed directory, not vanish"
+        );
+    }
+
+    /// req 5/out-of-range: a click index past `visible_rows`' end (blank
+    /// space below the last row) reports `NoSelection` and mutates nothing
+    /// — `files_selection` in particular must stay wherever it already was,
+    /// not snap to the invalid index.
+    #[test]
+    fn click_files_row_out_of_range_reports_no_selection_and_mutates_nothing() {
+        let mut app = nested_app();
+        app.focus = MainPaneFocus::Diff;
+        let other_idx = app
+            .visible_rows
+            .iter()
+            .position(|r| r.id.path == "other.rs")
+            .unwrap();
+        app.files_selection = other_idx;
+        let cursor_before = app.cursor;
+        let past_the_end = app.visible_rows.len() + 5;
+
+        assert_eq!(
+            app.click_files_row(past_the_end),
+            crate::ui::navigation::FilesConfirmOutcome::NoSelection
+        );
+        assert_eq!(
+            app.files_selection, other_idx,
+            "an out-of-range click must not move the selection"
+        );
+        assert_eq!(app.cursor, cursor_before);
+        assert_eq!(
+            app.focus,
+            MainPaneFocus::Diff,
+            "an out-of-range click is a true no-op — focus included"
+        );
+    }
+
+    /// req 7: a click resolves to the right file header regardless of what
+    /// kind of change that file represents — new, deleted, renamed, or
+    /// binary (which, having no hunks at all, stands in for "hunk-less"
+    /// too; see `RenderRow::BinaryNotice`). `FIXTURE` (`multi_file.diff`)
+    /// already covers modified/new/deleted/renamed; a synthetic binary file
+    /// is appended for the one kind it has no real diff text for.
+    #[test]
+    fn click_files_row_jumps_to_the_right_header_for_every_kind_of_change() {
+        let mut files = parse_unified_diff(FIXTURE);
+        files.push(DiffFile {
+            new_path: Some("assets/logo.png".to_owned()),
+            old_path: Some("assets/logo.png".to_owned()),
+            is_binary: true,
+            ..Default::default()
+        });
+        let mut app = App::new("test-repo".to_owned(), PathBuf::from("/repo"), files);
+        app.focus = MainPaneFocus::Diff;
+
+        for display_path in [
+            "src/lib.rs",        // modified
+            "src/new_module.rs", // new
+            "src/old_module.rs", // deleted
+            "src/renamed_to.rs", // renamed
+            "assets/logo.png",   // binary/hunk-less
+        ] {
+            let row_idx = app
+                .visible_rows
+                .iter()
+                .position(|r| r.id.path == display_path)
+                .unwrap_or_else(|| panic!("{display_path} has no tree row"));
+            let file_idx = app
+                .files
+                .iter()
+                .position(|f| f.display_path() == display_path)
+                .unwrap();
+
+            let outcome = app.click_files_row(row_idx);
+            assert!(
+                matches!(
+                    outcome,
+                    crate::ui::navigation::FilesConfirmOutcome::Opened(_)
+                ),
+                "{display_path} must open on click"
+            );
+            assert!(
+                matches!(
+                    app.rows[app.cursor],
+                    RenderRow::FileHeader { file_idx: idx } | RenderRow::BinaryNotice { file_idx: idx }
+                        if idx == file_idx
+                ),
+                "{display_path} must land on its own header/binary-notice row"
+            );
+            assert_eq!(app.focus, MainPaneFocus::Files);
+        }
+    }
+
     #[test]
     fn refresh_prunes_a_collapsed_directory_path_that_no_longer_exists() {
         let mut app = nested_app();

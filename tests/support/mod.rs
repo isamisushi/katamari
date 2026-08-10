@@ -12,4 +12,4 @@ pub mod screen;
 
 pub use harness::{Harness, KittyMode, SpawnOptions};
 pub use key::Key;
-pub use mouse::MouseKey;
+pub use mouse::{MouseButton, MouseKey};

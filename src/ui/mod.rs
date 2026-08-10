@@ -81,7 +81,7 @@ use crate::watch::{self, WatchSignal};
 use anyhow::Result;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
-    KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags,
     PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
@@ -1242,16 +1242,18 @@ fn event_loop(
                     }
                 }
             }
-            // Issue #20: only wheel events route anywhere. `ScrollUp`/
-            // `ScrollDown` are the only two kinds this task covers (req 9
-            // — "ignore unsupported buttons/motions") — `Down`/`Up`/`Drag`/
-            // `Moved`/`ScrollLeft`/`ScrollRight` all fall to the wildcard
-            // arm below, the seam #21 (file-tree clicks)/#22 (code-pane
-            // targeting) extend with real handling. `mouse::scroll_at`
-            // never touches keyboard focus by construction (see that
-            // function's docs), which is what makes req 5's "wheel
-            // scrolling does not steal keyboard focus" true here without a
-            // separate check.
+            // Issue #20 wired wheel routing; issue #21 adds the files-tree
+            // click. `Up`/`Drag`/`Moved`/`ScrollLeft`/`ScrollRight`, and a
+            // `Down` of any button but `Left`, still fall to the wildcard
+            // arm below — right-click is issue #23's seam (req 8: reserved,
+            // untouched here), and there's no drag/double-click in scope
+            // for either wheel or click. `mouse::scroll_at`/
+            // `mouse::handle_left_click` never touch keyboard focus except
+            // through the same `App::click_files_row`/`confirm_row` path
+            // Enter already uses, which is what makes req 5's "wheel
+            // scrolling does not steal keyboard focus" (and the click
+            // path's deliberate *opposite* — see `click_files_row`'s docs)
+            // both true by construction.
             //
             // Gated on `mouse_enabled` (`[ui] mouse`, see
             // `Config::mouse`'s docs) even though `run` already skips
@@ -1261,7 +1263,7 @@ fn event_loop(
             // belt-and-suspenders against a terminal/multiplexer that
             // reports mouse events regardless of what katamari asked for —
             // "keyboard behavior is identical with mouse disabled" means
-            // *nothing* here should react to a wheel byte that arrives
+            // *nothing* here should react to a mouse byte that arrives
             // anyway, not just "we didn't ask for it."
             Ok(AppEvent::Terminal(Event::Mouse(mouse_event))) if mouse_enabled => {
                 match mouse_event.kind {
@@ -1284,6 +1286,30 @@ fn event_loop(
                             keymap,
                             &mut help_row_count_cache,
                             area,
+                        );
+                    }
+                    // The keyboard path's fully-modal gates apply to clicks
+                    // too: compose/scope-menu/units-setup intercept every
+                    // keystroke before it can reach the App, but their
+                    // recorded modal rects only cover the diff pane — a
+                    // *sidebar* click would otherwise mutate selection/
+                    // focus/the diff cursor beneath an open modal, a state
+                    // no keyboard sequence can produce. A click while one
+                    // is open falls to the `_` arm below instead. (An open
+                    // help popup needs no gate here: it records itself over
+                    // the whole frame, so the DiffFiles-only guard inside
+                    // `handle_left_click` already makes such clicks
+                    // no-ops.)
+                    MouseEventKind::Down(MouseButton::Left)
+                        if compose.is_none() && scope_menu.is_none() && units_setup.is_none() =>
+                    {
+                        mouse::handle_left_click(
+                            &geometry,
+                            stack,
+                            &mut jump_stack,
+                            &mut hover_state,
+                            mouse_event.column,
+                            mouse_event.row,
                         );
                     }
                     _ => {}

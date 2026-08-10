@@ -11,7 +11,7 @@
 use crate::diff::ColumnMap;
 use crate::lsp::LspManager;
 use crate::lsp::client::uri_to_path;
-use crate::ui::app::App;
+use crate::ui::app::{App, MainPaneFocus};
 use crate::ui::file_view::FileView;
 use crate::ui::hover_popup::HoverQuery;
 use crate::ui::refresh;
@@ -307,8 +307,11 @@ pub(crate) fn record_jump(
 /// open hover popup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilesConfirmOutcome {
-    /// Nothing was selected to confirm — only reachable on an empty diff
-    /// (`visible_rows` itself empty).
+    /// Nothing was selected to confirm — reachable on an empty diff
+    /// (`visible_rows` itself empty), and, since issue #21's
+    /// [`App::click_files_row`] shares this same outcome type, also an
+    /// out-of-range or blank-space click (row index past `visible_rows`'
+    /// end) landing nowhere real.
     NoSelection,
     /// The selection was a directory row: its collapsed state was flipped
     /// (see [`App::toggle_directory`]). This never leaves the files pane's
@@ -316,8 +319,12 @@ pub enum FilesConfirmOutcome {
     /// no jump history and invalidate no hover popup for this outcome —
     /// unlike `Opened`, nothing under the diff cursor changed.
     Toggled,
-    /// The selection was a file row: the diff cursor jumped to its header
-    /// and focus returned to `Diff`, exactly as every #14 confirm did.
+    /// The selection was a file row: the diff cursor jumped to its header.
+    /// Which pane holds focus afterwards depends on the producer — Enter
+    /// ([`App::confirm_files_selection`]) hands focus to `Diff` exactly as
+    /// every #14 confirm did, while a mouse click
+    /// ([`App::click_files_row`]) keeps `Files` so repeated clicks and
+    /// `j`/`k` continue browsing the tree (issue #21 req 2).
     Opened(JumpEntry),
 }
 
@@ -348,21 +355,32 @@ impl App {
         Some((self.repo_root.join(relative), line, col))
     }
 
-    /// `Enter` while the files pane has focus (issue #14, extended by #15's
-    /// tree): a directory row toggles its collapsed state (mirroring
-    /// `Space`/`Action::ToggleDirectory` — see [`Self::toggle_directory`]'s
-    /// docs), producing no jump; a file row jumps the diff cursor to its
-    /// header row and hands focus back to `Diff` (via
-    /// [`Self::jump_cursor_to`], which sets that unconditionally — see its
-    /// own docs), the sidebar's one and only way to actually move the diff,
-    /// since every other action while `Files` is focused only moves
-    /// `files_selection` (see [`Self::update`]'s `MainPaneFocus::Files`
-    /// arms). See [`FilesConfirmOutcome`] for what `ui::mod`'s
-    /// `Action::Confirm` arm does with each case.
-    pub fn confirm_files_selection(&mut self) -> FilesConfirmOutcome {
-        let Some(row) = self.visible_rows.get(self.files_selection) else {
+    /// The shared body behind [`Self::confirm_files_selection`] (`Enter`,
+    /// issue #14/#15) and [`Self::click_files_row`] (a mouse click, issue
+    /// #21): resolves `idx` in `visible_rows` and applies the row's own
+    /// keyboard-equivalent transition — a directory row toggles its
+    /// collapsed state (mirroring `Space`/`Action::ToggleDirectory` — see
+    /// [`Self::toggle_directory`]'s docs), producing no jump; a file row
+    /// jumps the diff cursor to its header row via [`Self::jump_cursor_to`],
+    /// which sets `focus = Diff` unconditionally (see its own docs) — the
+    /// sidebar's one and only way to actually move the diff, since every
+    /// other action while `Files` is focused only moves `files_selection`
+    /// (see [`Self::update`]'s `MainPaneFocus::Files` arms). `keep_files_focus`
+    /// re-asserts `Files` afterward for the click path (req 2: repeated
+    /// clicks, and `j`/`k` right after one, should keep browsing the tree
+    /// without a focus round trip) — the keyboard path leaves `Diff`
+    /// focused exactly as it always has, unaffected by this parameter.
+    /// Always writes `files_selection = idx` first (even before the
+    /// out-of-range check would matter — mirroring req 5/out-of-range's
+    /// "no mutation" only through the early return, not by skipping the
+    /// write on a hit) so a click can select a row the keyboard cursor
+    /// hadn't reached yet. See [`FilesConfirmOutcome`] for what callers do
+    /// with each case.
+    fn confirm_row(&mut self, idx: usize, keep_files_focus: bool) -> FilesConfirmOutcome {
+        let Some(row) = self.visible_rows.get(idx) else {
             return FilesConfirmOutcome::NoSelection;
         };
+        self.files_selection = idx;
         match row.kind {
             crate::ui::file_tree::VisibleKind::Directory { .. } => {
                 let path = row.id.path.clone();
@@ -382,6 +400,9 @@ impl App {
                     return FilesConfirmOutcome::NoSelection;
                 };
                 self.jump_cursor_to(target_row, 0);
+                if keep_files_focus {
+                    self.focus = MainPaneFocus::Files;
+                }
                 FilesConfirmOutcome::Opened(JumpEntry {
                     file: self.repo_root.join(&display_path),
                     git_root: self.repo_root.clone(),
@@ -390,6 +411,45 @@ impl App {
                 })
             }
         }
+    }
+
+    /// `Enter` while the files pane has focus — unchanged since issue #14/
+    /// #15 (see [`Self::confirm_row`], the body this now delegates to):
+    /// confirms whatever `files_selection` already points at, always
+    /// handing focus to `Diff` on a file row.
+    pub fn confirm_files_selection(&mut self) -> FilesConfirmOutcome {
+        self.confirm_row(self.files_selection, false)
+    }
+
+    /// A primary click on visible tree row `idx` (issue #21, req 1/2):
+    /// focuses `Files` first — so a click while `Diff` owns focus still
+    /// resolves against the sidebar's own transitions, not the diff pane's
+    /// — then confirms that row exactly like `Enter` would, except a file
+    /// row hands focus straight back to `Files` (see [`Self::confirm_row`]'s
+    /// `keep_files_focus`) so repeated clicks, and `j`/`k` right after one,
+    /// keep browsing the tree without an intervening Tab. Only ever called
+    /// with the sidebar on screen to click at all — the `debug_assert`
+    /// documents that invariant rather than enforcing it at runtime (an
+    /// event that outraces a `sidebar_visible` toggle can't reach here in
+    /// the first place, since [`mouse::handle_left_click`](crate::ui::mouse::handle_left_click)
+    /// only calls this after [`mouse::files_row_at`](crate::ui::mouse::files_row_at)
+    /// finds a row, which the hidden sidebar never records a hit-testable
+    /// rect for).
+    pub fn click_files_row(&mut self, idx: usize) -> FilesConfirmOutcome {
+        debug_assert!(
+            self.sidebar_visible,
+            "a files-tree click can't reach here with the sidebar hidden"
+        );
+        // Bounds first, focus second: an out-of-range index must be a true
+        // no-op (req 5's blank-space rule) — the wired mouse path already
+        // bounds-checks in `files_row_at`, but this is a `pub fn`, and a
+        // future caller shouldn't be able to flip focus with an index that
+        // resolves to nothing.
+        if idx >= self.visible_rows.len() {
+            return FilesConfirmOutcome::NoSelection;
+        }
+        self.focus = MainPaneFocus::Files;
+        self.confirm_row(idx, true)
     }
 }
 
@@ -1050,5 +1110,86 @@ mod tests {
             "toggling a directory must not hand focus to Diff"
         );
         assert_eq!(app.cursor, 0, "the diff cursor must not move either");
+    }
+
+    // ---- click_files_row (issue #21) --------------------------------------
+
+    /// The req-2 crux, and the one place a click's outcome actually differs
+    /// from `Enter`'s: `jump_cursor_to` (called from inside `confirm_row`)
+    /// sets `focus = Diff` unconditionally as its own first line, exactly
+    /// as [`confirm_files_selection_lands_on_the_selected_files_header_and_focuses_diff`]
+    /// pins down for the keyboard path — `click_files_row` must flip it
+    /// straight back to `Files` afterward rather than leaving that Diff
+    /// focus in place, so repeated clicks (and `j`/`k` right after one)
+    /// keep browsing the tree without an intervening Tab.
+    #[test]
+    fn click_files_row_on_a_file_opens_it_but_leaves_focus_on_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = two_file_app(dir.path());
+        app.cursor = 2; // file 0's content row
+        app.focus = crate::ui::app::MainPaneFocus::Diff;
+        app.files_selection = 0;
+
+        let FilesConfirmOutcome::Opened(to) = app.click_files_row(1) else {
+            panic!("a two-file diff's file row must open, not toggle or no-op");
+        };
+        assert_eq!(to.file, dir.path().join("b.rs"));
+        assert_eq!(app.cursor, 3, "row 3 is b.rs's own file header");
+        assert_eq!(app.files_selection, 1, "the click selects the clicked row");
+        assert_eq!(
+            app.focus,
+            crate::ui::app::MainPaneFocus::Files,
+            "a click must keep Files focused, unlike Enter's confirm"
+        );
+    }
+
+    #[test]
+    fn click_files_row_round_trips_through_the_jump_stack() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = two_file_app(dir.path());
+        app.cursor = 2; // a real source location in file 0
+        app.focus = crate::ui::app::MainPaneFocus::Diff;
+
+        let from = jump_entry_for(&app, dir.path());
+        let FilesConfirmOutcome::Opened(to) = app.click_files_row(1) else {
+            panic!("a two-file diff's file row must open, not toggle or no-op");
+        };
+        let mut jump_stack = JumpStack::new();
+        record_jump(&mut jump_stack, from.clone(), Some(to));
+        assert_eq!(
+            jump_stack.back(None),
+            from,
+            "Ctrl-o must be able to retrace a click's jump exactly like Enter's"
+        );
+    }
+
+    /// req 5: a click past the end of `visible_rows` (blank space below the
+    /// last row, or a stale index from a frame that's already moved on)
+    /// reports `NoSelection` and leaves everything — selection, focus,
+    /// cursor — untouched, the same "early return before any mutation"
+    /// shape `confirm_row` already gives an empty diff.
+    #[test]
+    fn click_files_row_out_of_range_reports_no_selection_and_mutates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = two_file_app(dir.path());
+        app.focus = crate::ui::app::MainPaneFocus::Diff;
+        app.files_selection = 0;
+        let cursor_before = app.cursor;
+
+        assert_eq!(
+            app.click_files_row(99),
+            FilesConfirmOutcome::NoSelection,
+            "only two files exist — index 99 is well past the tree"
+        );
+        assert_eq!(
+            app.files_selection, 0,
+            "an out-of-range click must not move the selection"
+        );
+        assert_eq!(app.cursor, cursor_before);
+        assert_eq!(
+            app.focus,
+            crate::ui::app::MainPaneFocus::Diff,
+            "an out-of-range click is a true no-op — focus included"
+        );
     }
 }
