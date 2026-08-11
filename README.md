@@ -3,25 +3,37 @@
 A terminal diff-review tool. `ktmr diff` shows a `git diff` with syntax
 highlighting, hover/go-to-definition/find-references/diagnostics from real
 language servers, and inline review comments an AI coding agent can read
-back and address — all without leaving the terminal.
+back and address — and `u` regroups a big tangled diff into ordered,
+stacked-PR-like review units, without creating a single branch. All of it
+without leaving the terminal.
 
 ![demo](docs/demo.gif)
 
+- **Semantic review units** — `u` groups the diff's hunks into ordered,
+  stacked-PR-like units (the refactor first, then the feature built on it,
+  tests with the code they cover), each reviewable as its own scoped
+  diff — derived and read-only, through the `claude`/`codex` CLI you
+  already have, no branches created, nothing written outside `.katamari/`
+  (see [Review units](#review-units))
 - **LSP inside the diff** — hover, go-to-definition, find-references, and
   live diagnostics on changed lines (Rust / TypeScript / Python / Go /
   Kotlin / Java; servers auto-install on first use; `[lsp.servers.<id>]`
   wires up a custom server for any other filetype)
 - **Live refresh** — working-tree diffs refresh as an agent's edits land on
   disk by default; pass `--no-watch` for a static session
-- **Any unit of change** — working tree, staged, one commit, a range, a jj
+- **Any scope of change** — working tree, staged, one commit, a range, a jj
   change or revset; browse and pick from `ktmr log`, or switch mid-session
   with a popup (`o`)
 - **jj snapshot timeline** — step through every save of an agent's session,
   not just the final state
-- **Comment round-trip** — leave comments in the TUI, an agent reads and
-  resolves them via `ktmr comments`
+- **Comment round-trip** — leave comments in the TUI, on one line or a `V`
+  visual range, and an agent reads and resolves them via `ktmr comments`
+- **Mouse, when you want it** — wheel scrolls the pane under the pointer,
+  clicks drive the file tree and run go-to-definition, right-click opens a
+  context menu, resting the pointer hovers — all optional, keyboard-first
+  as ever
 - **Find your way around** — `/` searches the diff vim-style (`n`/`N`),
-  `z o` unfolds the unchanged context git omitted around hunks, and `?`
+  `zo` unfolds the unchanged context git omitted around hunks, and `?`
   opens a filterable help window showing every live binding
 - **`ktmr doctor`** — a checkhealth-style report answering "is the LSP
   actually working in my environment," down to a live spawn-and-hover
@@ -46,6 +58,17 @@ reads and updates through `ktmr comments`, and the working-tree diff refreshes
 live as the agent's edits land on disk — no restart, no re-running a command
 by hand. Pass `ktmr diff --no-watch` when you want a static working-tree
 snapshot instead.
+
+That workflow has a second problem besides missing semantics: an agent
+tends to land its whole task as one tangled diff, with no commit structure
+worth reading — the refactor, the feature it enabled, the tests, and a
+lockfile bump interleaved across files in alphabetical order. The
+established fix, stacked PRs, buys back readability by materializing real
+branches and PRs before anyone has read the change. katamari's
+[review units](#review-units) recover the same "read it in dependency
+order, one concern at a time" property as a derived, read-only view over
+the diff you already have — grouped through your own `claude`/`codex` CLI,
+with nothing created and nothing rewritten.
 
 For repositories using [jj](https://github.com/jj-vcs/jj) colocated with
 git, katamari also keeps a timeline of jj's automatic working-copy
@@ -251,6 +274,7 @@ can adjust it and try again. An AI coding agent addresses either shape with:
 
 ```
 ktmr comments list --json           # or: ktmr comments export --format=md
+ktmr comments list --json --status all   # resolved ones too — list/export both take --status open|resolved|all (default: open)
 ktmr comments resolve <id>          # after addressing one (reopen <id> undoes it)
 ktmr comments add <file> <line> <body>                    # leave a comment from a script/agent
 ktmr comments add <file> <start> <body> --end-line <end>  # ...or on a line range
@@ -260,7 +284,7 @@ ktmr comments add <file> <start> <body> --end-line <end>  # ...or on a line rang
 resolutions show up live in an open `ktmr diff` session. `ktmr skill install`
 writes that exact loop into the current repository as a small, tool-agnostic
 harness, so an agent picks it up automatically rather than needing the
-workflow spelled out in every prompt. Four pieces, none of them ever
+workflow spelled out in every prompt. Three pieces, none of them ever
 overwriting content that isn't theirs:
 
 - **The skill itself**, at `.agents/skills/katamari-review/` — deliberately
@@ -283,9 +307,9 @@ Re-running the command is always safe — every piece re-checks rather than
 blindly rewriting: `SKILL.md` refreshes if a newer katamari version shipped
 changes, a pre-existing real `.claude/skills/katamari-review` directory from
 before this layout existed is migrated (backing up whatever was there rather
-than discarding it), and any of the three links (`.claude/skills/*`,
-`CLAUDE.md`) that already points somewhere else is left alone with a
-warning.
+than discarding it), and either of the two links
+(`.claude/skills/katamari-review`, `CLAUDE.md`) that already points
+somewhere else is left alone with a warning.
 
 The first time you save a comment (`C-s`) in a repository that doesn't have
 the full harness installed yet, `ktmr diff` offers to install it right
@@ -294,7 +318,7 @@ Code review skill (ktmr skill install)`. `y` installs it and reports each
 piece's outcome in the status bar; any other key dismisses the offer — and,
 since it wasn't `y`, is then handled normally (a `j` right after dismissing
 still moves the cursor, for instance). Offered at most once per session
-either way — but a repo that only has *some* of the four pieces (e.g. one
+either way — but a repo that only has *some* of the three pieces (e.g. one
 that ran an older katamari's `ktmr skill install`, from before `AGENTS.md`/
 `CLAUDE.md` were part of the harness) is still offered the rest once, since
 installing is always idempotent. Set `[skill] offer_install = false` in
@@ -330,6 +354,91 @@ Swapping to anything other than the working tree pauses live refresh's
 refresh loop (the watcher itself keeps running) until you swap back;
 `.katamari/comments.jsonl`'s own watcher is unaffected either way.
 
+Finally, `u` groups the current diff into ordered review units — katamari's
+stacked-PR-like reading order — and `Enter` on one scopes the whole session
+to it. That's the next section.
+
+## Review units
+
+A one-shot agent session tends to land as one big tangled diff: a
+refactor, the feature it enabled, its tests, and a lockfile bump,
+interleaved across files in alphabetical order. Stacked-PR tooling solves
+that readability problem by materializing real branches and PRs —
+reshaping the repository before you've read the change. katamari recovers
+the same reading order without touching the repo: press `u` in `ktmr
+diff`, and the diff's hunks are grouped into ordered semantic units —
+foundations and refactors first, then the code built on them, tests and
+docs with the change they cover — each one reviewable as its own scoped
+diff. The grouping is derived and read-only: no branches, no rebase,
+nothing written outside `.katamari/`.
+
+The grouping runs through an agent CLI you already have — `claude` or
+`codex`, spawned headlessly (`claude -p --output-format json` /
+`codex exec`) under the account it's already authenticated with. katamari
+deliberately has no LLM client and no API key of its own. With neither CLI
+installed, `u` says so in the status bar and everything else keeps
+working; `ktmr doctor`'s **agents** section shows which CLIs it can see
+and which one `u` would spawn.
+
+What the model sees, and what it's allowed to decide, is deliberately
+narrow:
+
+- katamari does the deterministic part first: every hunk gets a stable
+  content-hash ID, and lockfile/generated noise (`*.lock`,
+  `package-lock.json`, `go.sum`, `*.pb.go`, `generated/` path segments,
+  ...) is split off before the model ever sees the diff, into a trailing
+  "Lockfiles & generated" unit — the part of the diff a reviewer most
+  wants to skip past.
+- The prompt carries each remaining hunk's file path, add/remove counts,
+  hunk header, and its changed lines only — never unchanged context, never
+  whole files, and nothing at all from the noise bucket. A huge diff
+  degrades deterministically (fewer excerpt lines per hunk) to stay inside
+  a fixed prompt budget.
+- The model returns only a mapping — unit labels, one-line descriptions,
+  an ordering, and which hunk IDs belong to each — never restated diff
+  content. katamari then enforces the invariants the UI relies on: a
+  hallucinated ID is dropped, an ID claimed twice keeps its first
+  placement, and every hunk the model didn't place lands in a trailing
+  "Ungrouped" unit — so the units always cover the whole diff, exactly
+  once.
+
+The units panel (`u`) lists the units in reading order, each with its
+label, hunk count, and the files it touches; `j`/`k` select, and the
+panel's bottom row shows the selected unit's one-line description. `Enter`
+scopes the diff to that unit: the changed-file list and search narrow to
+just its hunks, and a two-row banner plus the status bar pin
+`unit 2/5: <label>` above the diff, so the scope is never ambiguous on
+screen. `Esc` widens back to the full diff (that takes precedence over its
+search-highlight-clear role), `u` reopens the panel with the current unit
+preselected — stepping unit-by-unit is two keys — and `U` discards the
+cached grouping and asks the agent afresh. Live refresh keeps working
+while scoped: units re-anchor to the refreshed diff by content, not line
+numbers, and a unit whose hunks were all rewritten away widens back to the
+full diff rather than stranding you on an empty view. Switching scope
+(working tree ↔ staged ↔ a revision) drops the unit filter — a grouping
+describes one diff, not the new one.
+
+Generation runs in the background: the status bar shows `units: asking the
+agent CLI …` and the whole TUI stays interactive — expect seconds to
+minutes depending on the model, with a hard 3-minute cap, and a result
+that arrives after the diff has already changed is discarded with a status
+note rather than applied to the wrong diff. Results are cached in
+`.katamari/groups.jsonl` (covered by `.katamari/`'s own generated
+`.gitignore`), keyed by the hunks' content: reopening the same diff is
+instant and never prompts, while any edit to any changed line produces a
+new key, so a stale grouping is never shown against a diff it doesn't
+describe.
+
+The first `u` that would actually spawn a CLI — no `[units]` config
+anywhere, no cached grouping — opens a one-time three-step picker instead:
+which CLI, which model, which reasoning effort. The choice is appended as
+a `[units]` block to `~/.config/katamari/config.toml` (append-only —
+anything hand-written in the file is preserved) and never asked again;
+`Esc` abandons it without saving or spawning anything. See `[units]` under
+[Config](#config) for the keys and their exact CLI-flag mapping, and
+`ktmr reset --units-config` ([Reset](#reset)) to remove the block and get
+the picker back.
+
 ## Keybindings
 
 Vim bindings are the default; set `keymap = "emacs"` in config (see
@@ -339,13 +448,19 @@ underneath. `Esc` is the generic "get me out of this": it dismisses the
 nearest open overlay (a popup, the hover card, the references panel), and
 with nothing local left open it pops exactly the one view a `gd`/`L`/`t`/`I`
 press pushed, revealing what was underneath — at the root diff, where
-there's nothing left to pop, it clears a confirmed search instead.
+there's nothing left to pop, it cancels an active visual selection first,
+then widens an active unit scope back to the full diff, then clears a
+confirmed search.
 `Ctrl-o`/`Ctrl-i` are a separate axis entirely: they retrace *chronological*
 cursor history — every significant jump (go to definition/references, a
 confirmed search, a diagnostic step, and later a file-tree or mouse jump),
 regardless of which feature caused it — not view stacking, so they keep
 working exactly the same whether or not `Esc` has popped anything in
 between.
+
+The hint bar along the bottom starts collapsed to a handful of essentials
+ending in `. more`; `.` expands it to the full list (and back), so the
+table below never has to live in your head.
 
 | Action | Vim | Emacs |
 | --- | --- | --- |
@@ -369,8 +484,12 @@ between.
 | Toggle unified/side-by-side | `s` | `s` |
 | Toggle timeline | `t` | `t` |
 | Toggle log view | `L` | `L` |
+| Toggle LSP inspector | `I` | `I` |
 | Open scope menu | `o` | `o` |
+| Toggle units panel | `u` | `u` |
+| Regenerate units | `U` | `U` |
 | Open help | `?` | `?` |
+| Toggle hint bar | `.` | `.` |
 | Toggle range-select (timeline/log) | `v` | `C-Space` |
 | Visual-line select (diff) | `V` | `V` |
 | Yank visual selection (diff) | `y` | `y` |
@@ -607,6 +726,27 @@ check = true
 # offer entirely. `ktmr skill install` always keeps working as an explicit
 # command either way.
 offer_install = true
+
+[units]
+# Review units (see "Review units" above): which agent CLI `u` spawns to
+# group the diff, and what model/effort it runs with. All optional — with
+# no [units] table in either config file, the first `u` that would spawn a
+# CLI opens a one-time picker that writes this section for you.
+# "claude" or "codex". Unset: whichever is installed, claude first — and a
+# preference that isn't installed falls back to that same detection order
+# rather than failing.
+agent = "claude"
+# Passed verbatim to `claude --model` / `--effort`. claude_model defaults
+# to "sonnet" even when the key is absent; an explicit "" drops the
+# --model flag entirely, deferring to the CLI's own default. An unset
+# effort adds no flag.
+claude_model = "sonnet"
+claude_effort = "high"
+# The codex equivalents map to `codex exec --model` and
+# `-c model_reasoning_effort=`; unset means no flag, leaving the CLI's own
+# configuration in charge.
+# codex_model = "gpt-5-codex"
+# codex_effort = "medium"
 ```
 
 ## Language servers
@@ -749,7 +889,7 @@ ktmr doctor --language rust    # limit the live probe to one language or a [lsp.
 ktmr doctor --json             # machine-readable: {"sections": [{"title", "checks": [{"status", "label", "detail"}]}]}
 ```
 
-Four sections, always in this order:
+Five sections, always in this order:
 
 - **vcs** — is `git` on `PATH` (with its version), is the current directory
   actually inside a repository, and (only when one is detected) is it a
@@ -763,6 +903,12 @@ Four sections, always in this order:
   doctor` prints (above), folded in as checks: where each of the six
   built-in languages' server resolves from today, plus every
   `[lsp.servers.<id>]` custom entry.
+- **agents** — which agent CLIs (`claude`, `codex`) are on `PATH` for
+  [review units](#review-units)' grouping and, when more than one is,
+  which one `u` would actually spawn — resolved through the same `[units]`
+  preference the TUI uses, so the report can't drift from what `u` does.
+  None found is a warning, not an error: grouping is optional, and
+  everything else works without it.
 - **lsp (live probe)** — the reason this command exists: for every built-in
   or custom language with at least one matching file in the repository
   (tracked or untracked-and-not-ignored) *and* a static resolution, actually
@@ -785,6 +931,32 @@ building a release binary and running it against a throwaway multi-language
 monorepo in an isolated sandbox, so a release is only cut once LSP
 auto-install has actually been proven end to end, not just unit-tested. See
 `AGENTS.md`'s "Release check" section for usage.
+
+## Reset
+
+`ktmr reset` returns katamari to a fresh-install state, selectively — and
+with no flags it removes nothing at all: it prints an inventory of every
+target, whether it currently exists, where it lives, and which flag would
+remove it.
+
+```
+ktmr reset                  # report only: what exists where; removes nothing
+ktmr reset --cache          # the repo's grouping cache (.katamari/groups.jsonl) + katamari's state dir — update-check cache, index caches, and the per-session LSP journals
+ktmr reset --units-config   # strip the [units] table from both config files
+ktmr reset --servers        # katamari-managed language-server installs (large downloads, hence not part of --cache)
+ktmr reset --comments       # .katamari/comments.jsonl — review data, never implied by --all
+ktmr reset --all            # cache + units-config + servers; comments always take the explicit flag
+```
+
+`--units-config` edits surgically: only the `[units]` table is removed
+from each config file, everything else — comments and formatting
+included — is preserved byte-for-byte, and a file left holding nothing but
+whitespace afterward is deleted outright. Review comments are review data,
+not cache, which is why `--all` deliberately never touches them. After any
+run, a `.katamari/` directory left holding only its own generated
+`.gitignore` is tidied away entirely — and outside a git repository, the
+repo-scoped targets are skipped while the user-level ones (servers, state
+dir, home config) still work.
 
 ## jj colocated setup
 
