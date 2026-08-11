@@ -73,6 +73,30 @@ resolved — this skill is that workflow.
   `ktmr comments add src/lib.rs 10 "extract this" --end-line 18`.
 - `ktmr comments reopen <id>` — undo an accidental resolve.
 
+## Seeing the diff the way the reviewer does
+
+The reviewer may be reading the diff as ordered *review units* — a
+stacked-PR-like grouping of its hunks (foundations and refactors first,
+then the code built on them, tests and docs with the change they cover)
+that katamari generates through an agent CLI (`claude` or `codex`). You
+can print that same grouping headlessly:
+
+```
+ktmr diff --dump-units             # the cached grouping if one exists, else generate it
+ktmr diff --dump-units --regroup   # always generate afresh
+```
+
+The output is a plain-text list: one numbered unit per line with its
+label, hunk count, and the files it touches — a trailing `[noise]` unit
+collects lockfile/generated churn, and `[ungrouped]` collects anything the
+grouping didn't place. Two good uses: structuring a summary back to the
+reviewer in the same order they'll read the change in, and checking that
+your diff actually decomposes into the story you meant to tell. Reading
+the cache (`.katamari/groups.jsonl`) is instant; generating spawns the
+agent CLI and can take seconds to minutes (hard cap: three minutes), and
+with no `claude`/`codex` on `PATH` it fails with a message saying so
+rather than printing a partial answer.
+
 ## Notes
 
 - Comment anchors are always `file:line` (or `file:start-end` for a range)

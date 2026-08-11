@@ -100,7 +100,12 @@ address review feedback:
    session picks this up immediately, no restart needed.
 
 You can leave your own comments the same way, e.g. to flag something you
-noticed but aren't fixing now: `ktmr comments add <file> <line> <body>`.
+noticed but aren't fixing now: `ktmr comments add <file> <line> <body>`
+(add `--end-line <line>` to comment on a range).
+
+The reviewer may be reading the diff as ordered, stacked-PR-like *review
+units*; `ktmr diff --dump-units` prints that same grouping headlessly,
+e.g. to structure a summary in the reviewer's reading order.
 
 Full workflow, JSON shape, and other commands:
 `.agents/skills/katamari-review/SKILL.md`.
