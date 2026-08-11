@@ -104,10 +104,14 @@ export XDG_DATA_HOME="$HOMEDIR/data"
 
 wait_for_pane_text "README.md"
 
-# (a) tmux has no kitty keyboard protocol — the hint bar must show the
-# always-available fallback binding, not the kitty-only C-i alias.
-if ! pane | grep -qF "C-o/M-Right"; then
-    fail "expected hint bar to show the C-o/M-Right fallback (tmux has no kitty protocol)"
+# (a) tmux has no kitty keyboard protocol — the hint bar's jump item must
+# show the always-available fallback binding, not the kitty-only C-i
+# alias. The collapsed bar folds the jump item behind ". more" (the
+# review-UX hint redesign), so expand it first: "." is ToggleHints.
+"$TMUX_BIN" -L "$SOCKET" send-keys -t "$SESSION" .
+wait_for_pane_text "C-o/M-Right"
+if pane | grep -qF "C-o/C-i"; then
+    fail "the kitty-only C-i alias must never show in a terminal without the protocol"
 fi
 
 # (b) a known diff line renders.
