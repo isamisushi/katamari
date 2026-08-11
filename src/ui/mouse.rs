@@ -32,7 +32,9 @@
 //! the same rows here — see [`HitRow`]'s own docs.
 
 use crate::keymap::Keymap;
+use crate::ui::context_menu::MenuTarget;
 use crate::ui::diff_view;
+use crate::ui::file_tree::VisibleKind;
 use crate::ui::file_view;
 use crate::ui::help::{self, HelpState};
 use crate::ui::hover_popup::HoverState;
@@ -296,6 +298,19 @@ pub struct FrameGeometry {
     diff_content: Option<(Rect, Vec<HitRow>)>,
     /// As [`Self::diff_content`], for `View::File`'s single content pane.
     file_content: Option<(Rect, Vec<HitRow>)>,
+    /// Issue #23: the context menu's own popup rect, recorded outside
+    /// `entries` entirely (unlike every `ScrollTarget` above) — a right-
+    /// click that misses this rect must still resolve against whatever's
+    /// really underneath (`DiffFiles`/`DiffPane`/`FilePane`, the open
+    /// flow's retarget rule, req 7), which a coarse "block the whole pane"
+    /// recording the way the three `*Modal` variants use would defeat:
+    /// [`Self::hit_rect`]'s last-match-wins scan would then find the block
+    /// itself first, and there'd be no way to see past it to what a
+    /// retarget needs to resolve. `mouse::handle_right_click` checks this
+    /// field directly, ahead of any `hit_rect` lookup at all; wheel routing
+    /// is blocked the same way — an explicit `context_menu.is_none()` guard
+    /// in `ui::mod`'s event loop, not a recorded rect here.
+    context_menu_rect: Option<Rect>,
 }
 
 impl FrameGeometry {
@@ -316,6 +331,19 @@ impl FrameGeometry {
     /// As [`Self::record_diff_content`], for `View::File`.
     pub fn record_file_content(&mut self, rect: Rect, hits: Vec<HitRow>) {
         self.file_content = Some((rect, hits));
+    }
+
+    /// Records the context menu's own precise popup rect for this frame —
+    /// see [`Self::context_menu_rect`]'s field docs.
+    pub fn record_context_menu(&mut self, rect: Rect) {
+        self.context_menu_rect = Some(rect);
+    }
+
+    /// The context menu's popup rect this frame, or `None` when no menu was
+    /// drawn — what [`crate::ui::context_menu::entry_at`] resolves a click
+    /// against.
+    pub fn context_menu_rect(&self) -> Option<Rect> {
+        self.context_menu_rect
     }
 
     /// `(local_x, local_y, hit)` for a click at `(col, row)` landing inside
@@ -630,6 +658,203 @@ fn handle_file_pane_click(
     identifier_hit
 }
 
+/// What a right-click resolved to (issue #23) — `ui::mod`'s open/retarget/
+/// close flow turns this into an actual
+/// [`crate::ui::context_menu::ContextMenuState`]. Deriving the menu's real
+/// *entries* needs `LspManager`/`App::comment_target`/... none of which
+/// this module depends on (see this module's own doc comment on why
+/// `Action::GotoDefinition` dispatch is likewise one level up from
+/// [`handle_left_click`]) — this only resolves *what* was clicked and
+/// positions the cursor/selection accordingly, exactly as
+/// [`handle_left_click`] already does for the left button.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RightClickOutcome {
+    /// The click landed on the open menu's own popup rect, a fully-modal
+    /// overlay (compose/help/the scope-menu/units-setup wizard), or
+    /// nothing recorded at all (a view — Timeline/Log/the LSP inspector —
+    /// this menu was never wired up for). A true no-op: nothing changes,
+    /// including whether a menu is open — a fully-modal overlay's content
+    /// must never be disturbed by a stray click regardless of which mouse
+    /// button, and a second right-click on the menu itself has nothing to
+    /// do (left-click is what invokes an entry).
+    Noop,
+    /// The click closed a dismissable overlay that would otherwise
+    /// visually overlap a menu opening underneath/beside it (req 9) — the
+    /// hover popup specifically, already closed by this call (this
+    /// function holds `&mut HoverState` already, for the ordinary
+    /// cursor-move invalidation below). No menu opens from this same
+    /// click.
+    ClosedHover,
+    /// As [`Self::ClosedHover`], for the references/units panel — reported
+    /// rather than closed here, since neither is owned by this module (see
+    /// `ui::mod`'s `RefsPanelState`); the caller clears both the same
+    /// unconditional way its own left-click dismiss guard already does.
+    ClosedPanel,
+    /// A real, menu-eligible target — the caller derives entries and
+    /// opens/retargets the menu at the click point.
+    Target(MenuTarget),
+    /// Blank space, a pane border, or a click past the end of the files
+    /// tree — the caller closes an already-open menu (retarget-when-valid/
+    /// close-when-invalid, req 7) and does nothing otherwise.
+    Miss,
+}
+
+/// A right-click at `(col, row)` (issue #23). Positions the cursor/
+/// selection for whatever real target it resolves to exactly like
+/// [`handle_left_click`] would — `App::position_cursor_from_click`/
+/// `App::select_files_row`/`FileView::position_cursor_from_click` — but
+/// deliberately *never* the identifier-click-chases-`gd` follow-up
+/// [`handle_left_click`] triggers, nor `App::cancel_visual`: resolving a
+/// menu target must never navigate anywhere or discard an active visual
+/// selection out from under the very "Add comment (N lines)"/"Yank
+/// selection" entries that selection is about to make available.
+///
+/// Checks [`FrameGeometry::context_menu_rect`] *before* any `hit_rect`
+/// lookup, deliberately outside the `match` below: an already-open menu's
+/// popup has no `ScrollTarget` of its own to match against (see that
+/// field's docs on why), and checking it first is what lets a right-click
+/// elsewhere in the very pane the menu is drawn over still resolve against
+/// whatever's really there — `DiffFiles`/`DiffPane`/`FilePane`, recorded
+/// every frame regardless of whether a menu happens to be open — instead of
+/// being swallowed by some coarse "the menu owns this whole pane" rect the
+/// way a wheel tick is (see `ui::mod`'s own `context_menu.is_none()` guard
+/// on its wheel arm). That is what makes retargeting (req 7) possible at
+/// all: a second right-click on a *different* row must reach this
+/// function's ordinary target resolution below, not stop at "a menu is
+/// open, therefore no-op."
+pub fn handle_right_click(
+    geometry: &FrameGeometry,
+    stack: &mut ViewStack,
+    hover_state: &mut HoverState,
+    col: u16,
+    row: u16,
+) -> RightClickOutcome {
+    if geometry
+        .context_menu_rect()
+        .is_some_and(|rect| rect.contains(Position { x: col, y: row }))
+    {
+        return RightClickOutcome::Noop;
+    }
+    match geometry.hit_rect(col, row) {
+        Some((
+            _,
+            ScrollTarget::ComposeModal
+            | ScrollTarget::ScopeMenuModal
+            | ScrollTarget::UnitsSetupModal
+            | ScrollTarget::HelpPopup,
+        )) => RightClickOutcome::Noop,
+        Some((_, ScrollTarget::HoverPopup)) => {
+            hover_state.close();
+            RightClickOutcome::ClosedHover
+        }
+        Some((_, ScrollTarget::RefsPanel | ScrollTarget::UnitsPanel)) => {
+            RightClickOutcome::ClosedPanel
+        }
+        Some((rect, ScrollTarget::DiffFiles)) => match stack.top_mut() {
+            View::Diff(app) => {
+                let Some(idx) = files_row_at(
+                    rect,
+                    app.files_scroll_offset,
+                    app.visible_rows.len(),
+                    col,
+                    row,
+                ) else {
+                    return RightClickOutcome::Miss;
+                };
+                if !app.select_files_row(idx) {
+                    return RightClickOutcome::Miss;
+                }
+                match app.visible_rows[idx].kind {
+                    VisibleKind::Directory { .. } => {
+                        RightClickOutcome::Target(MenuTarget::TreeDir {
+                            path: app.visible_rows[idx].id.path.clone(),
+                        })
+                    }
+                    VisibleKind::File { .. } => RightClickOutcome::Target(MenuTarget::TreeFile),
+                }
+            }
+            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+                RightClickOutcome::Miss
+            }
+        },
+        Some((_, ScrollTarget::DiffPane)) => {
+            diff_pane_menu_target(geometry, stack, hover_state, col, row)
+        }
+        Some((_, ScrollTarget::FilePane)) => {
+            file_pane_menu_target(geometry, stack, hover_state, col, row)
+        }
+        // Every remaining target (the timeline/log lists, the inspector's
+        // three panes) is a view this menu was never wired up for at all —
+        // req 8's own scope, not a gap to fill here.
+        _ => RightClickOutcome::Miss,
+    }
+}
+
+/// [`handle_right_click`]'s `DiffPane` branch: resolves `(col, row)` the
+/// same way [`handle_diff_pane_click`] does, positions the cursor via
+/// `App::position_cursor_from_click`, invalidates a now-stale hover popup
+/// on a cursor-key change (mirroring [`handle_diff_pane_click`]'s own
+/// `before_hover` check) — but stops there, reporting
+/// [`RightClickOutcome::Target`] rather than chasing go-to-definition or
+/// cancelling an active visual selection (see [`handle_right_click`]'s own
+/// docs).
+fn diff_pane_menu_target(
+    geometry: &FrameGeometry,
+    stack: &mut ViewStack,
+    hover_state: &mut HoverState,
+    col: u16,
+    row: u16,
+) -> RightClickOutcome {
+    let Some((local_x, _local_y, hit)) = geometry.diff_row_hit(col, row) else {
+        return RightClickOutcome::Miss;
+    };
+    let Some(resolved) = resolve_hit(*hit, diff_view::gutter_width(), local_x) else {
+        return RightClickOutcome::Miss;
+    };
+    let before_hover = stack.top().hover_cursor_key();
+    match stack.top_mut() {
+        View::Diff(app) => {
+            app.position_cursor_from_click(resolved.row_idx, resolved.display_col);
+        }
+        View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+            return RightClickOutcome::Miss;
+        }
+    }
+    if stack.top().hover_cursor_key() != before_hover {
+        hover_state.invalidate();
+    }
+    RightClickOutcome::Target(MenuTarget::DiffRow)
+}
+
+/// As [`diff_pane_menu_target`], for `View::File`.
+fn file_pane_menu_target(
+    geometry: &FrameGeometry,
+    stack: &mut ViewStack,
+    hover_state: &mut HoverState,
+    col: u16,
+    row: u16,
+) -> RightClickOutcome {
+    let Some((local_x, _local_y, hit)) = geometry.file_row_hit(col, row) else {
+        return RightClickOutcome::Miss;
+    };
+    let Some(resolved) = resolve_hit(*hit, file_view::gutter_width(), local_x) else {
+        return RightClickOutcome::Miss;
+    };
+    let before_hover = stack.top().hover_cursor_key();
+    match stack.top_mut() {
+        View::File(file) => {
+            file.position_cursor_from_click(resolved.row_idx, resolved.display_col);
+        }
+        View::Diff(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+            return RightClickOutcome::Miss;
+        }
+    }
+    if stack.top().hover_cursor_key() != before_hover {
+        hover_state.invalidate();
+    }
+    RightClickOutcome::Target(MenuTarget::FileViewRow)
+}
+
 #[allow(clippy::too_many_arguments)]
 // one small dispatcher threading
 // through every overlay a wheel event might land on — mirrors
@@ -772,7 +997,12 @@ pub fn scroll_at(
         }
         // Deliberately consumed and discarded: these overlays have nothing
         // scrollable, and the wheel must not reach content the modal is
-        // blocking (see `ScrollTarget`'s docs on these variants).
+        // blocking (see `ScrollTarget`'s docs on these variants). The
+        // context menu (issue #23) has no `ScrollTarget` of its own to
+        // match here at all — see `FrameGeometry::context_menu_rect`'s
+        // docs on why — `ui::mod`'s event loop instead gates the whole
+        // wheel arm on `context_menu.is_none()` before ever calling this
+        // function.
         ScrollTarget::ScopeMenuModal
         | ScrollTarget::UnitsSetupModal
         | ScrollTarget::ComposeModal => {}
@@ -1418,5 +1648,306 @@ mod tests {
             app.hover_query().is_none(),
             "a historical/non-interactive diff must never resolve an LSP target"
         );
+    }
+
+    // ---- handle_right_click (issue #23) ------------------------------------
+
+    #[test]
+    fn handle_right_click_on_a_diff_row_positions_the_cursor_without_chasing_gd() {
+        let app = fixture_app();
+        let hits = unified_hits(&app);
+        let geometry = geometry_over(hits);
+        let mut stack = ViewStack::new(View::Diff(app));
+        let mut hover_state = HoverState::default();
+
+        let outcome = handle_right_click(
+            &geometry,
+            &mut stack,
+            &mut hover_state,
+            diff_view::gutter_width() as u16,
+            4,
+        );
+        assert_eq!(outcome, RightClickOutcome::Target(MenuTarget::DiffRow));
+        let View::Diff(app) = stack.top() else {
+            unreachable!()
+        };
+        assert_eq!(app.cursor, 4, "the click still positions the cursor");
+    }
+
+    #[test]
+    fn handle_right_click_never_cancels_an_active_visual_selection() {
+        let mut app = fixture_app();
+        app.cursor = 2; // the Context row — a real selectable start
+        assert_eq!(
+            app.toggle_visual(),
+            crate::ui::app::VisualToggleOutcome::Started
+        );
+        let hits = unified_hits(&app);
+        let geometry = geometry_over(hits);
+        let mut stack = ViewStack::new(View::Diff(app));
+        let mut hover_state = HoverState::default();
+
+        // Right-click a different, identifier-eligible row — exactly the
+        // shape of click that would cancel visual mode via
+        // `handle_left_click` (see `handle_diff_pane_click`'s docs).
+        handle_right_click(
+            &geometry,
+            &mut stack,
+            &mut hover_state,
+            diff_view::gutter_width() as u16,
+            4,
+        );
+        let View::Diff(app) = stack.top() else {
+            unreachable!()
+        };
+        assert!(
+            app.visual_active(),
+            "resolving a menu target must never discard the selection the \
+             menu's own \"Add comment\"/\"Yank selection\" entries need"
+        );
+    }
+
+    #[test]
+    fn handle_right_click_on_the_open_menus_own_rect_is_a_noop() {
+        let app = fixture_app();
+        let mut geometry = FrameGeometry::new();
+        geometry.record_context_menu(rect(0, 0, 20, 5));
+        let mut stack = ViewStack::new(View::Diff(app));
+        let mut hover_state = HoverState::default();
+
+        assert_eq!(
+            handle_right_click(&geometry, &mut stack, &mut hover_state, 5, 2),
+            RightClickOutcome::Noop
+        );
+    }
+
+    /// The bug this pins down: a right-click that misses the menu's own
+    /// precise rect, but still lands inside the pane the menu happens to be
+    /// drawn over, must resolve against whatever's really there (req 7's
+    /// retarget rule) — not be swallowed the way it would be if the popup
+    /// rect were instead recorded as a coarse, whole-pane `ScrollTarget`
+    /// entry the way the fully-modal overlays are.
+    #[test]
+    fn handle_right_click_elsewhere_in_the_pane_resolves_past_the_open_menu() {
+        let app = fixture_app();
+        let hits = unified_hits(&app);
+        let mut geometry = geometry_over(hits);
+        // The menu's own small popup sits at (0, 0)-(10, 2) — well clear of
+        // row 4, where the real `DiffPane`/`diff_content` target is.
+        geometry.record_context_menu(rect(0, 0, 10, 2));
+        let mut stack = ViewStack::new(View::Diff(app));
+        let mut hover_state = HoverState::default();
+
+        let outcome = handle_right_click(
+            &geometry,
+            &mut stack,
+            &mut hover_state,
+            diff_view::gutter_width() as u16,
+            4,
+        );
+        assert_eq!(outcome, RightClickOutcome::Target(MenuTarget::DiffRow));
+    }
+
+    #[test]
+    fn handle_right_click_on_a_fully_modal_overlay_is_a_noop() {
+        for target in [
+            ScrollTarget::ComposeModal,
+            ScrollTarget::ScopeMenuModal,
+            ScrollTarget::UnitsSetupModal,
+            ScrollTarget::HelpPopup,
+        ] {
+            let app = fixture_app();
+            let mut geometry = FrameGeometry::new();
+            geometry.record(rect(0, 0, 20, 5), target);
+            let mut stack = ViewStack::new(View::Diff(app));
+            let mut hover_state = HoverState::default();
+
+            assert_eq!(
+                handle_right_click(&geometry, &mut stack, &mut hover_state, 5, 2),
+                RightClickOutcome::Noop,
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_right_click_on_the_hover_popup_closes_it_and_opens_nothing() {
+        let app = fixture_app();
+        let mut geometry = FrameGeometry::new();
+        geometry.record(rect(0, 0, 20, 5), ScrollTarget::HoverPopup);
+        let mut stack = ViewStack::new(View::Diff(app));
+        let mut hover_state = HoverState::default();
+        hover_state.set_pending();
+        assert!(hover_state.status_hint().is_some());
+
+        let outcome = handle_right_click(&geometry, &mut stack, &mut hover_state, 5, 2);
+        assert_eq!(outcome, RightClickOutcome::ClosedHover);
+        assert!(
+            hover_state.status_hint().is_none(),
+            "the pending/message state must be cleared, same as `HoverState::close`"
+        );
+    }
+
+    #[test]
+    fn handle_right_click_on_refs_or_units_panel_reports_closed_panel() {
+        for target in [ScrollTarget::RefsPanel, ScrollTarget::UnitsPanel] {
+            let app = fixture_app();
+            let mut geometry = FrameGeometry::new();
+            geometry.record(rect(0, 0, 20, 5), target);
+            let mut stack = ViewStack::new(View::Diff(app));
+            let mut hover_state = HoverState::default();
+
+            assert_eq!(
+                handle_right_click(&geometry, &mut stack, &mut hover_state, 5, 2),
+                RightClickOutcome::ClosedPanel,
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_right_click_on_blank_space_is_a_miss() {
+        let app = fixture_app();
+        let geometry = FrameGeometry::new(); // nothing recorded at all
+        let mut stack = ViewStack::new(View::Diff(app));
+        let mut hover_state = HoverState::default();
+
+        assert_eq!(
+            handle_right_click(&geometry, &mut stack, &mut hover_state, 5, 2),
+            RightClickOutcome::Miss
+        );
+    }
+
+    /// Two right-clicks in a row against different geometry, exercising
+    /// both halves of "retarget when valid, close when invalid" (req 7) at
+    /// the resolution layer this function owns — `ui::mod`'s open flow is
+    /// what actually replaces `context_menu` on each outcome, but both
+    /// outcomes it would react to originate here.
+    #[test]
+    fn handle_right_click_called_twice_resolves_independently_each_time() {
+        let app = fixture_app();
+        let hits = unified_hits(&app);
+        let geometry = geometry_over(hits);
+        let mut stack = ViewStack::new(View::Diff(app));
+        let mut hover_state = HoverState::default();
+
+        let first = handle_right_click(
+            &geometry,
+            &mut stack,
+            &mut hover_state,
+            diff_view::gutter_width() as u16,
+            4,
+        );
+        assert_eq!(first, RightClickOutcome::Target(MenuTarget::DiffRow));
+
+        // A second click on blank space (past the last recorded row) must
+        // resolve to `Miss` on its own — not carry over the first click's
+        // `Target` outcome.
+        let second = handle_right_click(&geometry, &mut stack, &mut hover_state, 5, 99);
+        assert_eq!(second, RightClickOutcome::Miss);
+    }
+
+    /// A files-tree fixture with one real directory row — `fixture_app`
+    /// puts every file at the repo root, too flat to exercise
+    /// `MenuTarget::TreeDir` at all.
+    fn dir_tree_app() -> crate::ui::app::App {
+        let make = |name: &str| crate::diff::DiffFile {
+            old_path: Some(name.to_owned()),
+            new_path: Some(name.to_owned()),
+            hunks: vec![crate::diff::DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                known_eof: true,
+                rows: vec![row(
+                    crate::diff::DiffLineKind::Context,
+                    "content",
+                    Some(1),
+                    Some(1),
+                )],
+            }],
+            ..Default::default()
+        };
+        crate::ui::app::App::new(
+            "repo".to_owned(),
+            std::path::PathBuf::from("/repo"),
+            vec![make("dir/a.rs"), make("dir/b.rs")],
+        )
+    }
+
+    fn geometry_over_files() -> FrameGeometry {
+        let mut geometry = FrameGeometry::new();
+        geometry.record(OUTER, ScrollTarget::DiffFiles);
+        geometry
+    }
+
+    #[test]
+    fn handle_right_click_on_a_directory_row_selects_without_toggling() {
+        let app = dir_tree_app(); // visible_rows[0] == "dir" (a directory)
+        assert!(matches!(
+            app.visible_rows[0].kind,
+            crate::ui::file_tree::VisibleKind::Directory { expanded: true, .. }
+        ));
+        let geometry = geometry_over_files();
+        let mut stack = ViewStack::new(View::Diff(app));
+        let mut hover_state = HoverState::default();
+
+        // Inner row 1 (col/row translated through `OUTER`'s border) is
+        // `visible_rows[0]`.
+        let outcome = handle_right_click(&geometry, &mut stack, &mut hover_state, 5, 1);
+        assert_eq!(
+            outcome,
+            RightClickOutcome::Target(MenuTarget::TreeDir {
+                path: "dir".to_owned()
+            })
+        );
+        let View::Diff(app) = stack.top() else {
+            unreachable!()
+        };
+        assert_eq!(app.focus, crate::ui::app::MainPaneFocus::Files);
+        assert_eq!(app.files_selection, 0);
+        assert!(
+            matches!(
+                app.visible_rows[0].kind,
+                crate::ui::file_tree::VisibleKind::Directory { expanded: true, .. }
+            ),
+            "a right-click must never toggle the directory it targets"
+        );
+    }
+
+    #[test]
+    fn handle_right_click_on_a_file_row_reports_the_tree_file_target() {
+        let app = dir_tree_app(); // visible_rows[1] == "a.rs" (a file)
+        let geometry = geometry_over_files();
+        let mut stack = ViewStack::new(View::Diff(app));
+        let mut hover_state = HoverState::default();
+
+        // Inner row 2 is `visible_rows[1]`.
+        let outcome = handle_right_click(&geometry, &mut stack, &mut hover_state, 5, 2);
+        assert_eq!(outcome, RightClickOutcome::Target(MenuTarget::TreeFile));
+        let View::Diff(app) = stack.top() else {
+            unreachable!()
+        };
+        assert_eq!(app.focus, crate::ui::app::MainPaneFocus::Files);
+        assert_eq!(app.files_selection, 1);
+        assert_eq!(
+            app.cursor, 0,
+            "selecting a tree row must never jump the diff cursor"
+        );
+    }
+
+    #[test]
+    fn handle_right_click_past_the_end_of_the_files_tree_is_a_miss() {
+        let app = dir_tree_app();
+        let geometry = geometry_over_files();
+        let mut stack = ViewStack::new(View::Diff(app));
+        let mut hover_state = HoverState::default();
+
+        // Inner row 7 is well past the 3-row tree (dir, a.rs, b.rs) —
+        // blank space below the last row.
+        let outcome = handle_right_click(&geometry, &mut stack, &mut hover_state, 5, 7);
+        assert_eq!(outcome, RightClickOutcome::Miss);
     }
 }

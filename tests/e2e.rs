@@ -17,6 +17,8 @@ mod support;
 // files tucked under `tests/e2e/` (invisible to that auto-discovery, which
 // only scans `tests/*.rs` directly) while still splitting them out of this
 // one file.
+#[path = "e2e/context_menu.rs"]
+mod context_menu;
 #[path = "e2e/doctor.rs"]
 mod doctor;
 #[path = "e2e/file_tree.rs"]

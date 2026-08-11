@@ -451,6 +451,29 @@ impl App {
         self.focus = MainPaneFocus::Files;
         self.confirm_row(idx, true)
     }
+
+    /// A right-click on visible tree row `idx` (issue #23): focuses `Files`
+    /// and selects `idx` — *only* that, deliberately never [`Self::confirm_row`]'s
+    /// toggle-or-jump — so the context menu that opens next targets exactly
+    /// the row under the pointer without also mutating the diff (a click
+    /// that's about to open a menu of *choices*, one of which may well be
+    /// "toggle this directory," must not have already toggled it before the
+    /// reviewer picked anything). `ui::mod`'s menu-confirm dispatch reuses
+    /// [`Action::Confirm`](crate::keymap::Action::Confirm) afterward for the
+    /// "Open file"/"toggle directory" entries specifically *because* this
+    /// leaves `files_selection`/`focus` in exactly the state that action
+    /// already expects (see `crate::ui::context_menu::MenuCommand`'s docs).
+    /// Bounds-checked the same way [`Self::click_files_row`] is, returning
+    /// whether `idx` resolved to a real row at all — blank space below the
+    /// tree selects nothing and leaves every field untouched.
+    pub fn select_files_row(&mut self, idx: usize) -> bool {
+        if idx >= self.visible_rows.len() {
+            return false;
+        }
+        self.focus = MainPaneFocus::Files;
+        self.files_selection = idx;
+        true
+    }
 }
 
 impl FileView {
@@ -1191,5 +1214,103 @@ mod tests {
             crate::ui::app::MainPaneFocus::Diff,
             "an out-of-range click is a true no-op — focus included"
         );
+    }
+
+    // ---- select_files_row (issue #23) --------------------------------------
+
+    /// Both changed files nested under one directory — unlike `two_file_app`
+    /// (two root-level files, no directory row at all), this gives
+    /// `select_files_row`'s directory test a real `VisibleKind::Directory`
+    /// row to select at index 0.
+    fn dir_app(repo_root: &Path) -> crate::ui::app::App {
+        let make = |name: &str| DiffFile {
+            old_path: Some(name.to_owned()),
+            new_path: Some(name.to_owned()),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                known_eof: true,
+                rows: vec![DiffRow {
+                    kind: DiffLineKind::Context,
+                    text: "content".to_owned(),
+                    old_line: Some(1),
+                    new_line: Some(1),
+                }],
+            }],
+            ..Default::default()
+        };
+        crate::ui::app::App::new(
+            "repo".to_owned(),
+            repo_root.to_path_buf(),
+            vec![make("dir/a.rs"), make("dir/b.rs")],
+        )
+    }
+
+    /// The crux distinguishing this from `click_files_row`: selecting a
+    /// *directory* row must never toggle it — a right-click is about to
+    /// open a menu whose entries include the toggle as one choice among
+    /// several, not pre-empt that choice itself.
+    #[test]
+    fn select_files_row_on_a_directory_selects_without_toggling() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let mut app = dir_app(repo_dir.path()); // one "dir" directory row at index 0
+        app.focus = crate::ui::app::MainPaneFocus::Diff;
+        assert!(
+            matches!(
+                app.visible_rows[0].kind,
+                crate::ui::file_tree::VisibleKind::Directory { expanded: true, .. }
+            ),
+            "dir starts expanded"
+        );
+
+        assert!(app.select_files_row(0));
+        assert_eq!(app.focus, crate::ui::app::MainPaneFocus::Files);
+        assert_eq!(app.files_selection, 0);
+        assert!(
+            matches!(
+                app.visible_rows[0].kind,
+                crate::ui::file_tree::VisibleKind::Directory { expanded: true, .. }
+            ),
+            "selecting must never flip the directory's collapsed state"
+        );
+    }
+
+    /// The same distinction on a *file* row: selection moves, but the diff
+    /// cursor must not jump — unlike `click_files_row`, which opens it.
+    #[test]
+    fn select_files_row_on_a_file_selects_without_opening() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = two_file_app(dir.path());
+        app.focus = crate::ui::app::MainPaneFocus::Diff;
+        let cursor_before = app.cursor;
+        // Row 1 is "a.rs" (row 0 is the "src" directory) in this fixture.
+        let file_idx = app
+            .visible_rows
+            .iter()
+            .position(|r| matches!(r.kind, crate::ui::file_tree::VisibleKind::File { .. }))
+            .expect("two_file_app has at least one file row");
+
+        assert!(app.select_files_row(file_idx));
+        assert_eq!(app.focus, crate::ui::app::MainPaneFocus::Files);
+        assert_eq!(app.files_selection, file_idx);
+        assert_eq!(
+            app.cursor, cursor_before,
+            "selecting a file row must never move the diff cursor"
+        );
+    }
+
+    #[test]
+    fn select_files_row_out_of_range_reports_false_and_mutates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = two_file_app(dir.path());
+        app.focus = crate::ui::app::MainPaneFocus::Diff;
+        app.files_selection = 0;
+
+        assert!(!app.select_files_row(99));
+        assert_eq!(app.files_selection, 0);
+        assert_eq!(app.focus, crate::ui::app::MainPaneFocus::Diff);
     }
 }

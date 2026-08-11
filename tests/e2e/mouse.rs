@@ -513,22 +513,24 @@ fn border_hint_status_and_blank_space_clicks_are_no_ops() {
 }
 
 #[test]
-fn right_click_on_a_real_tree_row_does_nothing() {
+fn right_click_on_a_real_tree_row_opens_a_context_menu() {
+    // Issue #20-#22 reserved right-click as issue #23's seam (a no-op
+    // here, until #23 landed); #23 wires it up to a real context menu — see
+    // `tests/e2e/context_menu.rs` for the full open/invoke/close behavior.
+    // This stays here as the lightweight regression guard for the seam
+    // itself: a right-click on a real tree row is no longer a no-op.
     let (_repo, mut h) = spawn_tree_repo();
     let before = h.screen_contents();
 
-    // Row 2 ("nested") is a perfectly valid left-click target elsewhere in
-    // this file — proving right-click is a no-op *there specifically*, not
-    // just over blank space, is what makes this req 8's real regression
-    // guard.
-    click(&h, MouseButton::Right, TREE_CLICK_COL, 2);
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(
-        h.screen_contents(),
-        before,
-        "a right click must not toggle/select/jump anything (issue #23's seam)"
+    click(&h, MouseButton::Right, TREE_CLICK_COL, 2); // row 2: "nested"
+    h.wait_until(Duration::from_secs(3), |screen| screen.contents() != before);
+    assert!(
+        h.screen_contents().contains("directory"),
+        "right-clicking a directory row must open its context menu; screen:\n{}",
+        h.screen_contents()
     );
 
+    h.send(Key::Esc);
     h.send(Key::Char('q'));
     let status = h.wait_exit(Duration::from_secs(5));
     assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");

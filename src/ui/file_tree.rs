@@ -273,6 +273,46 @@ fn collect_directory_paths(nodes: &[Node], out: &mut HashSet<String>) {
     }
 }
 
+/// Every directory path nested anywhere under `dir_path` — never `dir_path`
+/// itself — reusing the same [`collect_directory_paths`] walk
+/// [`prune_collapsed`] already does, just rooted at one directory's
+/// children instead of the whole forest. Issue #23's context menu derives
+/// its "Expand/Collapse all descendants" entries' bounded-ness from this
+/// set's length (a leaf directory — zero nested directories — omits both
+/// entries entirely, see `ui::context_menu::tree_dir_entries`) and
+/// [`crate::ui::app::App::set_descendants_collapsed`] bulk-applies against
+/// it — bounded strictly by the in-memory tree already built for the
+/// sidebar, never a filesystem walk, which is what keeps "expand/collapse
+/// all descendants" safe to offer at all (issue #23 req 4). An empty set —
+/// not `None` — for a `dir_path` that doesn't name a directory in `tree` at
+/// all; defensive only, since every real caller reads `dir_path` straight
+/// off a [`VisibleRow`] this same `tree` just produced.
+pub fn descendant_dir_paths(tree: &FileTree, dir_path: &str) -> HashSet<String> {
+    let mut out = HashSet::new();
+    if let Some(NodeKind::Directory { children }) = find_directory(&tree.roots, dir_path) {
+        collect_directory_paths(children, &mut out);
+    }
+    out
+}
+
+/// The directory [`Node`] at `path`, depth-first — [`descendant_dir_paths`]'s
+/// one lookup, kept as its own function rather than inlined so it stays a
+/// plain tree search with no `collected` accumulator to thread through the
+/// recursion (unlike [`collect_directory_paths`], which needs one).
+fn find_directory<'a>(nodes: &'a [Node], path: &str) -> Option<&'a NodeKind> {
+    for node in nodes {
+        if let NodeKind::Directory { children } = &node.kind {
+            if node.path == path {
+                return Some(&node.kind);
+            }
+            if let Some(found) = find_directory(children, path) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 /// Re-anchors a files-pane selection against a freshly flattened `rows` —
 /// req 8. Tries `previous` first (typically the selection from just before
 /// a rebuild), then `fallback` (typically the diff cursor's own file, so a
@@ -541,6 +581,52 @@ mod tests {
         // "nested" still sorts ahead of "a.rs" even collapsed — only its
         // own descendants ("b.rs") are hidden.
         assert_eq!(labels, vec!["src", "nested", "a.rs"]);
+    }
+
+    // ---- descendant_dir_paths (issue #23) ----------------------------------
+
+    #[test]
+    fn descendant_dir_paths_of_a_leaf_directory_is_empty() {
+        let files = [file("src/a.rs")];
+        let tree = build(&files);
+        assert!(descendant_dir_paths(&tree, "src").is_empty());
+    }
+
+    #[test]
+    fn descendant_dir_paths_collects_every_nested_directory_but_never_itself() {
+        let files = [
+            file("src/nested/deep/a.rs"),
+            file("src/nested/b.rs"),
+            file("src/other/c.rs"),
+        ];
+        let tree = build(&files);
+        let paths = descendant_dir_paths(&tree, "src");
+        assert_eq!(
+            paths,
+            HashSet::from([
+                "src/nested".to_owned(),
+                "src/nested/deep".to_owned(),
+                "src/other".to_owned(),
+            ])
+        );
+        assert!(!paths.contains("src"), "must never include dir_path itself");
+    }
+
+    #[test]
+    fn descendant_dir_paths_of_an_unknown_path_is_empty() {
+        let files = [file("src/a.rs")];
+        let tree = build(&files);
+        assert!(descendant_dir_paths(&tree, "does/not/exist").is_empty());
+    }
+
+    #[test]
+    fn descendant_dir_paths_of_a_file_path_is_empty() {
+        // "src/a.rs" names a *file*, not a directory — `find_directory`
+        // must never match it even though the path string exists in the
+        // tree.
+        let files = [file("src/a.rs")];
+        let tree = build(&files);
+        assert!(descendant_dir_paths(&tree, "src/a.rs").is_empty());
     }
 
     // ---- prune_collapsed ------------------------------------------------

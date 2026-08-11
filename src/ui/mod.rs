@@ -16,6 +16,7 @@
 pub mod app;
 pub mod clipboard;
 pub mod compose;
+pub mod context_menu;
 pub mod diff_view;
 pub mod file_tree;
 pub mod file_view;
@@ -62,6 +63,7 @@ use crate::lsp::{
 use crate::lsp::{ObservationStore, ServerIdentity};
 use crate::skill;
 use crate::ui::compose::{ComposeOutcome, ComposeState};
+use crate::ui::context_menu::{ContextMenuState, MenuCommand, MenuTarget};
 use crate::ui::help::{HelpOutcome, HelpState};
 use crate::ui::log_view::LogView;
 use crate::ui::navigation::{FilesConfirmOutcome, JumpEntry, JumpStack, navigate_to, record_jump};
@@ -93,7 +95,7 @@ use lsp_types::{FileChangeType, PositionEncodingKind};
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout as RatatuiLayout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout as RatatuiLayout, Position, Rect};
 use std::collections::HashSet;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -621,6 +623,13 @@ fn event_loop(
     let mut warned_servers: HashSet<(LangKey, PathBuf)> = HashSet::new();
     let mut compose: Option<ComposeState> = None;
     let mut scope_menu: Option<ScopeMenuState> = None;
+    // Issue #23's right-click context menu. `Some` only while it's actually
+    // open — like `scope_menu`/`refs_panel`, a transient layer on top of
+    // whichever view is on screen, not something the view stack itself
+    // owns. Re-derived every iteration (see `refresh_context_menu`, called
+    // just below the loop preamble) so a readiness reason can flip live
+    // while the menu sits open, per req 5.
+    let mut context_menu: Option<ContextMenuState> = None;
     let mut help: Option<HelpState> = None;
     // Issue #5's `/` search prompt — `Some` only while it's actually open;
     // the confirmed search it produces on Enter lives on `App::search`
@@ -896,6 +905,14 @@ fn event_loop(
             .or_else(|| units_status.clone())
             .or_else(|| lsp_status.clone())
             .or_else(|| watch_status.as_ref().map(|s| s.text.clone()));
+        // Issue #23 req 5: a disabled entry's reason (e.g. "LSP: rust-
+        // analyzer is starting") must flip live while the menu just sits
+        // open, not freeze on whatever it said the frame it opened —
+        // re-derived fresh every iteration, same "nothing here is ever
+        // carried over stale" reasoning as `geometry` just below. Closes
+        // the menu outright (rather than rendering an empty popup) if its
+        // target stops resolving any entries at all.
+        refresh_context_menu(&mut context_menu, stack.top(), lsp_manager);
         // Issue #20: rebuilt fresh every iteration — every rect a pane/
         // overlay might have moved (resize, a toggled sidebar, a popup
         // opening) since the last frame, so nothing here is ever carried
@@ -918,6 +935,7 @@ fn event_loop(
                 &comment_index,
                 compose.as_ref(),
                 scope_menu.as_ref(),
+                context_menu.as_ref(),
                 help.as_ref(),
                 search_prompt.as_ref(),
                 jj_repo.is_some(),
@@ -1126,6 +1144,7 @@ fn event_loop(
                                     highlighter,
                                     &mut hover_state,
                                     &mut refs_panel,
+                                    &mut context_menu,
                                     &mut watch_paused,
                                     &mut watch_status,
                                 ) {
@@ -1224,6 +1243,7 @@ fn event_loop(
                                     jj_repo.as_ref(),
                                     &mut compose,
                                     &mut scope_menu,
+                                    &mut context_menu,
                                     &mut help,
                                     &mut search_prompt,
                                     highlighter,
@@ -1243,12 +1263,12 @@ fn event_loop(
                 }
             }
             // Issue #20 wired wheel routing; issue #21 adds the files-tree
-            // click. `Up`/`Drag`/`Moved`/`ScrollLeft`/`ScrollRight`, and a
-            // `Down` of any button but `Left`, still fall to the wildcard
-            // arm below — right-click is issue #23's seam (req 8: reserved,
-            // untouched here), and there's no drag/double-click in scope
-            // for either wheel or click. `mouse::scroll_at`/
-            // `mouse::handle_left_click` never touch keyboard focus except
+            // click; issue #23 adds the right-click context menu below.
+            // `Up`/`Drag`/`Moved`/`ScrollLeft`/`ScrollRight` still fall to
+            // the wildcard arm below — there's no drag/double-click in
+            // scope for wheel, click, or the context menu.
+            // `mouse::scroll_at`/`mouse::handle_left_click` never touch
+            // keyboard focus except
             // through the same `App::click_files_row`/`confirm_row` path
             // Enter already uses, which is what makes req 5's "wheel
             // scrolling does not steal keyboard focus" (and the click
@@ -1267,7 +1287,18 @@ fn event_loop(
             // anyway, not just "we didn't ask for it."
             Ok(AppEvent::Terminal(Event::Mouse(mouse_event))) if mouse_enabled => {
                 match mouse_event.kind {
-                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    // Issue #23: while the context menu is open, every wheel
+                    // tick is inert — it has no scrollable content of its
+                    // own (≤6 entries), and content beneath it must never
+                    // scroll out from under it (req 9). `context_menu` has
+                    // no `ScrollTarget`/recorded rect for `scroll_at` to
+                    // match on at all (see `FrameGeometry::context_menu_rect`'s
+                    // docs on why) — this explicit guard is the whole of
+                    // that block, in place of the coarse-rect-plus-no-op-arm
+                    // shape the three fully-modal overlays below use.
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                        if context_menu.is_none() =>
+                    {
                         let delta = if mouse_event.kind == MouseEventKind::ScrollUp {
                             -mouse::WHEEL_SCROLL_ROWS
                         } else {
@@ -1289,17 +1320,89 @@ fn event_loop(
                         );
                     }
                     // The keyboard path's fully-modal gates apply to clicks
-                    // too: compose/scope-menu/units-setup intercept every
-                    // keystroke before it can reach the App, but their
-                    // recorded modal rects only cover the diff pane — a
-                    // *sidebar* click would otherwise mutate selection/
-                    // focus/the diff cursor beneath an open modal, a state
-                    // no keyboard sequence can produce. A click while one
-                    // is open falls to the `_` arm below instead. (An open
-                    // help popup needs no gate here: it records itself over
-                    // the whole frame, so the DiffFiles-only guard inside
-                    // `handle_left_click` already makes such clicks
-                    // no-ops.)
+                    // too: compose/scope-menu/units-setup/help intercept
+                    // every keystroke before it can reach the App, but
+                    // their recorded rects cover less than the full frame —
+                    // the modal trio only spans the diff pane, and help's
+                    // centered popup leaves margins on every side — so a
+                    // click in the uncovered strip would otherwise mutate
+                    // selection/focus/the diff cursor beneath an open
+                    // modal, a state no keyboard sequence can produce. A
+                    // click while one is open falls to the `_` arm below
+                    // instead.
+                    // Issue #23: the context menu's own left-click handling
+                    // — checked *first*, ahead of the refs/units dismiss
+                    // arm and the general click-dispatch arm just below, so
+                    // a click while the menu is open is always resolved
+                    // against the menu, never misread as a click meant for
+                    // whatever overlay/pane happens to be recorded beneath
+                    // it (in practice `context_menu` and `refs_panel`/
+                    // `units_panel`/`compose`/`scope_menu`/`units_setup`
+                    // can never be `Some` at once — the open flow closes
+                    // any of those before a menu can open at all, see
+                    // `mouse::handle_right_click`'s docs — but ordering
+                    // this arm first makes that guarantee explicit rather
+                    // than relying on every other guard below getting an
+                    // extra `&& context_menu.is_none()` added and kept in
+                    // sync forever). Three outcomes, matching
+                    // `context_menu::entry_at`'s own three-way split: a hit
+                    // on an entry runs the *exact* same confirm dispatch
+                    // `Action::Confirm` (keyboard Enter) already does — set
+                    // the click's entry as selected, then let
+                    // `handle_action`'s own interception block do the rest,
+                    // so mouse and keyboard invocation are provably one
+                    // code path, not two; the border/title row is a
+                    // captured no-op; anywhere else closes the menu (req
+                    // 7's close-when-invalid half, and req 9: this click
+                    // must never also reach content underneath).
+                    MouseEventKind::Down(MouseButton::Left) if context_menu.is_some() => {
+                        let click = Position {
+                            x: mouse_event.column,
+                            y: mouse_event.row,
+                        };
+                        match geometry.context_menu_rect() {
+                            Some(rect) if rect.contains(click) => {
+                                if let Some(idx) = context_menu::entry_at(
+                                    rect,
+                                    context_menu.as_ref().unwrap().entries().len(),
+                                    mouse_event.column,
+                                    mouse_event.row,
+                                ) {
+                                    context_menu.as_mut().unwrap().set_selected(idx);
+                                    handle_action(
+                                        Action::Confirm,
+                                        stack,
+                                        &mut hover_state,
+                                        &mut pending_hover,
+                                        &mut pending_goto,
+                                        &mut refs_panel,
+                                        &mut units_panel,
+                                        &mut units_setup,
+                                        &mut pending_units,
+                                        &mut units_status,
+                                        &mut jump_stack,
+                                        &diagnostics,
+                                        &mut goto_status,
+                                        lsp_manager,
+                                        jj_repo.as_ref(),
+                                        &mut compose,
+                                        &mut scope_menu,
+                                        &mut context_menu,
+                                        &mut help,
+                                        &mut search_prompt,
+                                        highlighter,
+                                        &mut watch_paused,
+                                        watch_active,
+                                        &mut watch_status,
+                                        &mut hints_expanded,
+                                        &observer,
+                                    );
+                                }
+                                // else: the border/title row — captured, no-op.
+                            }
+                            _ => context_menu = None, // missed the popup entirely
+                        }
+                    }
                     // The references/units panels follow the keyboard's
                     // own convention for them ("any other key closes the
                     // panel"): the first click anywhere dismisses the
@@ -1315,7 +1418,10 @@ fn event_loop(
                         units_panel = None;
                     }
                     MouseEventKind::Down(MouseButton::Left)
-                        if compose.is_none() && scope_menu.is_none() && units_setup.is_none() =>
+                        if compose.is_none()
+                            && scope_menu.is_none()
+                            && units_setup.is_none()
+                            && help.is_none() =>
                     {
                         let identifier_hit = mouse::handle_left_click(
                             &geometry,
@@ -1354,6 +1460,7 @@ fn event_loop(
                                 jj_repo.as_ref(),
                                 &mut compose,
                                 &mut scope_menu,
+                                &mut context_menu,
                                 &mut help,
                                 &mut search_prompt,
                                 highlighter,
@@ -1365,7 +1472,101 @@ fn event_loop(
                             );
                         }
                     }
+                    // Issue #23: secondary click — resolves a fresh target,
+                    // retargets an already-open menu onto a new one, or
+                    // closes it, all through the single
+                    // `mouse::handle_right_click` open/retarget/close flow
+                    // (its own docs cover why compose/help/the fully-modal
+                    // overlays are a no-op here rather than a close: a
+                    // stray click, either mouse button, must never discard
+                    // one of those). The final assignment below always
+                    // replaces `context_menu` wholesale — retarget-when-
+                    // valid and close-when-invalid (req 7) both fall out of
+                    // that same one `match`, never a second "is this a
+                    // retarget or a fresh open" branch.
+                    // Same fully-modal gate as the left-click arm above,
+                    // plus help: every one of these records less than the
+                    // full frame (help's centered popup leaves margins,
+                    // the modal trio only covers the diff pane), so
+                    // without the gate a right-click in the uncovered
+                    // strip could open a menu over — and then act beneath
+                    // — an overlay that swallows every key.
+                    MouseEventKind::Down(MouseButton::Right)
+                        if compose.is_none()
+                            && scope_menu.is_none()
+                            && units_setup.is_none()
+                            && help.is_none() =>
+                    {
+                        match mouse::handle_right_click(
+                            &geometry,
+                            stack,
+                            &mut hover_state,
+                            mouse_event.column,
+                            mouse_event.row,
+                        ) {
+                            mouse::RightClickOutcome::Noop
+                            | mouse::RightClickOutcome::ClosedHover => {}
+                            mouse::RightClickOutcome::ClosedPanel => {
+                                refs_panel = None;
+                                units_panel = None;
+                            }
+                            mouse::RightClickOutcome::Miss => context_menu = None,
+                            mouse::RightClickOutcome::Target(target) => {
+                                // Req 9: opening the menu closes anything
+                                // that would overlap it — a hover popup or
+                                // refs/units panel open *elsewhere* on
+                                // screen (a click directly on one is
+                                // already handled by the outcomes above).
+                                hover_state.close();
+                                refs_panel = None;
+                                units_panel = None;
+                                let entries =
+                                    context_menu_entries_for(&target, stack.top(), lsp_manager);
+                                context_menu = if entries.is_empty() {
+                                    goto_status = Some("menu: nothing to do here".to_owned());
+                                    None
+                                } else {
+                                    Some(ContextMenuState::new(
+                                        target,
+                                        entries,
+                                        (mouse_event.column, mouse_event.row),
+                                    ))
+                                };
+                            }
+                        }
+                    }
+                    // Req 7's hover highlight: moving over an open menu's
+                    // entries moves its selection. Only meaningful while a
+                    // menu is up — there is deliberately no app-wide
+                    // motion tracking here (issue #24 owns passive hover).
+                    MouseEventKind::Moved if context_menu.is_some() => {
+                        if let Some(rect) = geometry.context_menu_rect()
+                            && let Some(idx) = context_menu::entry_at(
+                                rect,
+                                context_menu.as_ref().unwrap().entries().len(),
+                                mouse_event.column,
+                                mouse_event.row,
+                            )
+                        {
+                            context_menu.as_mut().unwrap().set_selected(idx);
+                        }
+                    }
                     _ => {}
+                }
+            }
+            Ok(AppEvent::Terminal(Event::Resize(_, _))) => {
+                // Issue #23 req 10: a resize can shift or shrink the pane
+                // the menu's target row/index was resolved against —
+                // rather than trying to prove a resize never invalidates
+                // it, always close and say so, the same "always-close over
+                // clever survival analysis" call `handle_watch_refresh`
+                // makes for a watch refresh that doesn't preserve the
+                // overlay (see that function's docs). The next frame
+                // re-measures every pane's geometry from scratch regardless
+                // (see `run`'s loop preamble), so there's nothing else a
+                // resize needs here.
+                if context_menu.take().is_some() {
+                    goto_status = Some("menu: closed on resize".to_owned());
                 }
             }
             Ok(AppEvent::Terminal(_)) => {
@@ -1428,6 +1629,7 @@ fn event_loop(
                     highlighter,
                     &mut hover_state,
                     &mut refs_panel,
+                    &mut context_menu,
                     &mut watch_status,
                     watch_paused,
                     live_search,
@@ -1656,6 +1858,27 @@ fn check_action_readiness(
     readiness_status_message(readiness, &lang, action_name)
 }
 
+/// As [`check_action_readiness`], minus the [`LspManager::ensure_started`]
+/// call — issue #23's context menu needs to *preview* what a Hover/
+/// GotoDefinition/FindReferences entry would say right now, every frame it
+/// sits open (req 5: the reason must flip live), without that preview
+/// itself being the thing that kicks a not-started server off or leaves a
+/// journal record behind. Starting the server and recording telemetry both
+/// stay exclusively [`check_action_readiness`]'s job, reached only once the
+/// reviewer actually confirms an entry (`ui::mod`'s context-menu
+/// interception dispatches the real [`Action`] via the ordinary
+/// `handle_action` arms — see that block's docs) — this is read-only,
+/// side-effect-free preview, never the real dispatch path.
+fn peek_action_readiness(
+    lsp_manager: &LspManager,
+    query: &hover_popup::HoverQuery,
+    action_name: &str,
+) -> Option<String> {
+    let (lang, _root) = lsp_manager.server_identity(&query.file, &query.git_root)?;
+    let readiness = classify_action_readiness(lsp_manager.state(&query.file, &query.git_root));
+    readiness_status_message(readiness, &lang, action_name)
+}
+
 /// The status line for each [`ActionReadiness`] — split out of
 /// [`check_action_readiness`] as a pure function so every message shape
 /// (notably `Installing`'s live progress pass-through and `Unavailable`'s
@@ -1679,6 +1902,106 @@ fn readiness_status_message(
             "LSP: {message}; {action_name} unavailable until ready"
         )),
         ActionReadiness::Unavailable { reason } => Some(reason),
+    }
+}
+
+/// The three [`peek_action_readiness`] calls a diff-row/file-view-row
+/// context menu needs, grouped to match [`context_menu::SymbolReadiness`]'s
+/// own shape — one call site for what would otherwise be three
+/// near-identical lines at both of [`context_menu_entries_for`]'s callers
+/// (the open flow and the every-frame refresh).
+fn symbol_readiness(
+    lsp_manager: &LspManager,
+    query: &hover_popup::HoverQuery,
+) -> context_menu::SymbolReadiness {
+    context_menu::SymbolReadiness {
+        hover: peek_action_readiness(lsp_manager, query, "hover"),
+        goto_definition: peek_action_readiness(lsp_manager, query, "go to definition"),
+        find_references: peek_action_readiness(lsp_manager, query, "find references"),
+    }
+}
+
+/// Whether the diff cursor's current row is a [`RenderRow::Line`] — the
+/// same eligibility check [`app::App::toggle_visual`] itself makes before
+/// starting a fresh selection (see its docs), re-derived here rather than
+/// exposed as its own `App` method: it's a one-line fact about already-`pub`
+/// state (`app.rows`/`app.cursor`), not new `App` behavior, and the context
+/// menu is its only caller outside `App` itself.
+fn can_start_visual(app: &App) -> bool {
+    matches!(app.rows.get(app.cursor), Some(RenderRow::Line { .. }))
+}
+
+/// Gathers the facts a [`context_menu::MenuTarget`] needs and derives its
+/// entries — the one place `LspManager`/`App::comment_target`/`App::visual_active`
+/// meet `context_menu`'s pure derivation functions (see that module's own
+/// docs on why gathering facts stays out of it). Shared by
+/// `mouse::handle_right_click`'s open flow and [`refresh_context_menu`]'s
+/// every-frame re-derivation, so there is exactly one place that knows how
+/// to turn a target into entries. Returns an empty `Vec` when `target`
+/// doesn't match `view` at all (defensive: nothing pops or swaps the view
+/// stack while the menu holds every key) or a `FileViewRow`/`DiffRow`
+/// target's symbol has nothing left to target — both callers treat an empty
+/// result as "close the menu," never "render nothing."
+fn context_menu_entries_for(
+    target: &MenuTarget,
+    view: &View,
+    lsp_manager: &LspManager,
+) -> Vec<context_menu::MenuEntry> {
+    match (target, view) {
+        (MenuTarget::TreeDir { path }, View::Diff(app)) => {
+            let expanded = app.visible_rows.iter().any(|row| {
+                row.id.is_directory
+                    && &row.id.path == path
+                    && matches!(
+                        row.kind,
+                        file_tree::VisibleKind::Directory { expanded: true, .. }
+                    )
+            });
+            context_menu::tree_dir_entries(expanded, app.descendant_dir_count(path))
+        }
+        (MenuTarget::TreeFile, View::Diff(_)) => context_menu::tree_file_entries(),
+        (MenuTarget::DiffRow, View::Diff(app)) => {
+            let symbol = view
+                .hover_query()
+                .map(|query| symbol_readiness(lsp_manager, &query));
+            context_menu::diff_row_entries(
+                symbol,
+                app.comment_target(),
+                app.visual_active(),
+                can_start_visual(app),
+            )
+        }
+        (MenuTarget::FileViewRow, View::File(_)) => match view.hover_query() {
+            Some(query) => {
+                context_menu::file_view_symbol_entries(symbol_readiness(lsp_manager, &query))
+            }
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Re-derives the open context menu's entries against the current frame's
+/// facts (req 5) — called once per event-loop iteration, before `draw`, so
+/// both the frame about to render and whatever key/click this same
+/// iteration processes afterward see the same, freshly-peeked readiness.
+/// Closes the menu outright once re-derivation comes back empty (the
+/// target stopped making sense — see [`context_menu_entries_for`]'s docs)
+/// rather than rendering an empty popup [`ContextMenuState::set_entries`]
+/// would panic on.
+fn refresh_context_menu(
+    context_menu: &mut Option<ContextMenuState>,
+    view: &View,
+    lsp_manager: &LspManager,
+) {
+    let Some(target) = context_menu.as_ref().map(|menu| menu.target.clone()) else {
+        return;
+    };
+    let entries = context_menu_entries_for(&target, view, lsp_manager);
+    if entries.is_empty() {
+        *context_menu = None;
+    } else if let Some(menu) = context_menu.as_mut() {
+        menu.set_entries(entries);
     }
 }
 
@@ -1770,6 +2093,7 @@ fn handle_action(
     jj_repo: Option<&JjRepo>,
     compose: &mut Option<ComposeState>,
     scope_menu: &mut Option<ScopeMenuState>,
+    context_menu: &mut Option<ContextMenuState>,
     help: &mut Option<HelpState>,
     search_prompt: &mut Option<search::SearchPromptState>,
     highlighter: &mut LineHighlighter,
@@ -1824,6 +2148,112 @@ fn handle_action(
         return;
     }
 
+    // Issue #23's context menu, intercepted ahead of every other overlay
+    // below (the menu only ever opens once `mouse::handle_right_click`'s
+    // open flow has already closed anything it would otherwise overlap —
+    // see that function's docs — so this and, say, `scope_menu`'s own
+    // interception just below are never both reachable for the same
+    // action; this one still goes first, structurally, so a future overlay
+    // added between the two could never change that by accident).
+    // Deliberately built entirely out of `Action` arms, never a raw-key
+    // bypass the way `compose`/the revision input are (see `run`'s event
+    // loop): the resolver's own global-quit intercept
+    // (`StepResult::Matched(Action::Quit) => return Ok(())`, in `run`,
+    // *before* `handle_action` is ever called) sits structurally above
+    // this function entirely, so `q` still quits the whole session while
+    // this menu is open, exactly like every other overlay here — a raw-key
+    // bypass would have hidden `q` from the resolver and broken that.
+    if let Some(menu) = context_menu {
+        match action {
+            Action::CursorDown => return menu.move_down(),
+            Action::CursorUp => return menu.move_up(),
+            Action::Top => return menu.move_top(),
+            Action::Bottom => return menu.move_bottom(),
+            Action::Cancel => {
+                *context_menu = None;
+                return;
+            }
+            Action::Confirm => {
+                let entry = menu.selected_entry().clone();
+                match entry.enabled {
+                    // Disabled entries teach, never invoke (issue #23 req
+                    // 5) — the menu stays open so the reviewer can read the
+                    // reason and pick something else, the same "stay open
+                    // on a rejected choice" shape `scope_menu`'s own
+                    // `Revision` input uses for a bad revset.
+                    Err(reason) => {
+                        *goto_status = Some(reason);
+                        return;
+                    }
+                    Ok(()) => {
+                        let target = menu.target.clone();
+                        // Closed *before* dispatching, not after: every
+                        // command below either recurses into this very
+                        // function (whose own top-of-function check just
+                        // above would otherwise see the menu as still
+                        // open) or mutates the tree directly — neither
+                        // should have to know or care that a menu was ever
+                        // involved.
+                        *context_menu = None;
+                        match entry.command {
+                            // Req 8 by construction: every entry but the
+                            // two descendant-bulk ones below dispatches
+                            // through this exact recursive call into the
+                            // ordinary, unmodified `Action` arms further
+                            // down this same function — readiness checks,
+                            // `ensure_started`, observer telemetry, and all
+                            // — never a second implementation of what the
+                            // keyboard binding already does.
+                            MenuCommand::Action(inner) => handle_action(
+                                inner,
+                                stack,
+                                hover_state,
+                                pending_hover,
+                                pending_goto,
+                                refs_panel,
+                                units_panel,
+                                units_setup,
+                                pending_units,
+                                units_status,
+                                jump_stack,
+                                diagnostics,
+                                goto_status,
+                                lsp_manager,
+                                jj_repo,
+                                compose,
+                                scope_menu,
+                                context_menu,
+                                help,
+                                search_prompt,
+                                highlighter,
+                                watch_paused,
+                                watch_active,
+                                watch_status,
+                                hints_expanded,
+                                observer,
+                            ),
+                            MenuCommand::ExpandAllDescendants
+                            | MenuCommand::CollapseAllDescendants => {
+                                if let (MenuTarget::TreeDir { path }, View::Diff(app)) =
+                                    (&target, stack.top_mut())
+                                {
+                                    app.set_descendants_collapsed(
+                                        path,
+                                        entry.command == MenuCommand::CollapseAllDescendants,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            // Any other key closes the menu, then falls through — same
+            // precedent as `scope_menu`'s own wildcard arm just below.
+            _ => *context_menu = None,
+        }
+    }
+
     // The scope-menu popup's *list* half intercepts its own navigation
     // keys the same way `refs_panel`/`hover_state` do below — `Revision`
     // input never reaches here at all (see `run`'s event loop: it bypasses
@@ -1869,6 +2299,7 @@ fn handle_action(
                                 highlighter,
                                 hover_state,
                                 refs_panel,
+                                context_menu,
                                 watch_paused,
                                 watch_status,
                             ) {
@@ -2868,6 +3299,7 @@ fn apply_scope_swap(
     highlighter: &mut LineHighlighter,
     hover_state: &mut hover_popup::HoverState,
     refs_panel: &mut Option<RefsPanelState>,
+    context_menu: &mut Option<ContextMenuState>,
     watch_paused: &mut bool,
     watch_status: &mut Option<WatchStatus>,
 ) -> Result<(), String> {
@@ -2913,6 +3345,12 @@ fn apply_scope_swap(
 
     hover_state.invalidate();
     *refs_panel = None;
+    // A scope swap replaces the diff/tree wholesale — the row/directory the
+    // menu targeted (a `MenuTarget::DiffRow`'s cursor position, a
+    // `TreeDir`'s path) has no guaranteed correspondence in the new one, so
+    // this closes it the same way `refs_panel` does just above rather than
+    // re-deriving against content the menu was never opened on.
+    *context_menu = None;
     highlighter.clear_cache();
     if interactive {
         warm_up_diff(app, lsp_manager);
@@ -2980,6 +3418,7 @@ fn handle_watch_refresh(
     highlighter: &mut LineHighlighter,
     hover_state: &mut hover_popup::HoverState,
     refs_panel: &mut Option<RefsPanelState>,
+    context_menu: &mut Option<ContextMenuState>,
     watch_status: &mut Option<WatchStatus>,
     watch_paused: bool,
     live_search: Option<(&str, &refresh::Anchor)>,
@@ -3025,6 +3464,19 @@ fn handle_watch_refresh(
             *refs_panel = None;
             overlay_closed = true;
         }
+    }
+    // Issue #23 req 10: the menu closes on *every* refresh, not only when
+    // `overlay_survives` flipped — that flag tracks the diff cursor's own
+    // row, which says nothing about a `TreeDir`/`TreeFile` target: a
+    // refresh re-flattens `visible_rows` and re-anchors `files_selection`
+    // wholesale, so a tree menu opened before it can silently point at a
+    // different row while its entries look unchanged (`tree_file_entries`
+    // structurally can't go empty to signal staleness). Always-close over
+    // clever survival analysis, the same call the `Event::Resize` arm
+    // makes — reopening costs one right-click.
+    if context_menu.is_some() {
+        *context_menu = None;
+        overlay_closed = true;
     }
 
     sync_lsp_after_refresh(app, lsp_manager, &batch.changes);
@@ -3301,6 +3753,7 @@ fn draw(
     comments: &CommentIndex,
     compose: Option<&ComposeState>,
     scope_menu: Option<&ScopeMenuState>,
+    context_menu: Option<&ContextMenuState>,
     help: Option<&HelpState>,
     search_prompt: Option<&search::SearchPromptState>,
     jj_available: bool,
@@ -3398,6 +3851,9 @@ fn draw(
                 scope_menu::render(frame, diff_area, state, jj_available);
                 geometry.record(diff_area, mouse::ScrollTarget::ScopeMenuModal);
             }
+            if let Some(state) = context_menu {
+                context_menu::render(frame, diff_area, state, geometry);
+            }
             key_display::render(frame, diff_area, key_display);
         }
         View::File(file) => {
@@ -3415,6 +3871,9 @@ fn draw(
             }
             if let Some(panel) = refs_panel {
                 refs_panel::render(frame, areas.content, panel, geometry);
+            }
+            if let Some(state) = context_menu {
+                context_menu::render(frame, areas.content, state, geometry);
             }
             key_display::render(frame, areas.content, key_display);
         }
@@ -4018,6 +4477,59 @@ mod tests {
         );
     }
 
+    // ---- peek_action_readiness (issue #23) -----------------------------------
+
+    /// The whole point of this function existing separately from
+    /// [`check_action_readiness`]: a context menu can peek a `NotStarted`
+    /// server's readiness every frame it sits open without that ever being
+    /// the thing that kicks the server off — only actually confirming the
+    /// entry (through the real `handle_action` arm) does that.
+    #[test]
+    fn peek_action_readiness_reports_not_started_without_starting_the_server() {
+        let (events_tx, _events_rx) = mpsc::channel();
+        let lsp_manager =
+            LspManager::new(events_tx, Arc::new(std::collections::HashMap::new()), false);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        let file = dir.path().join("main.rs");
+        let query = hover_popup::HoverQuery {
+            file: file.clone(),
+            git_root: dir.path().to_path_buf(),
+            line: 0,
+            line_text: "fn main() {}".to_owned(),
+            display_col: 3,
+        };
+        assert_eq!(
+            lsp_manager.state(&file, dir.path()),
+            ServerState::NotStarted
+        );
+
+        let message = peek_action_readiness(&lsp_manager, &query, "go to definition")
+            .expect("a NotStarted server must never report Ready");
+        assert!(message.contains("is starting"), "{message}");
+
+        assert_eq!(
+            lsp_manager.state(&file, dir.path()),
+            ServerState::NotStarted,
+            "peeking must never kick the server off — see `check_action_readiness` for that"
+        );
+    }
+
+    #[test]
+    fn peek_action_readiness_leaves_an_unconfigured_file_type_alone() {
+        let (events_tx, _events_rx) = mpsc::channel();
+        let lsp_manager =
+            LspManager::new(events_tx, Arc::new(std::collections::HashMap::new()), false);
+        let query = hover_popup::HoverQuery {
+            file: PathBuf::from("/repo/README.md"),
+            git_root: PathBuf::from("/repo"),
+            line: 0,
+            line_text: "hello".to_owned(),
+            display_col: 0,
+        };
+        assert_eq!(peek_action_readiness(&lsp_manager, &query, "hover"), None);
+    }
+
     // ---- readiness_status_message ------------------------------------------
 
     #[test]
@@ -4213,5 +4725,377 @@ mod tests {
              sequence while still in the alternate screen would otherwise \
              leave capture stuck on; got:\n{written:?}"
         );
+    }
+
+    // ---- context menu: handle_action's interception block (issue #23) -----
+
+    /// Calls the real [`handle_action`] with every param this suite's
+    /// context-menu tests don't need to individually observe filled in with
+    /// an inert default — `context_menu`/`compose`/`goto_status` stay as
+    /// out-params since those are exactly what each test asserts on.
+    #[allow(clippy::too_many_arguments)]
+    fn call_handle_action(
+        action: Action,
+        stack: &mut ViewStack,
+        context_menu: &mut Option<ContextMenuState>,
+        compose: &mut Option<ComposeState>,
+        goto_status: &mut Option<String>,
+        lsp_manager: &LspManager,
+        observer: &crate::lsp::ObservationHandle,
+    ) {
+        let mut hover_state = hover_popup::HoverState::default();
+        let mut pending_hover: Option<PendingHover> = None;
+        let mut pending_goto: Option<(JumpEntry, PendingGoto)> = None;
+        let mut refs_panel: Option<RefsPanelState> = None;
+        let mut units_panel: Option<UnitsPanel> = None;
+        let mut units_setup: Option<UnitsSetupState> = None;
+        let mut pending_units: Option<Receiver<Result<crate::groups::Grouping, String>>> = None;
+        let mut units_status: Option<String> = None;
+        let mut jump_stack = JumpStack::new();
+        let diagnostics = DiagnosticsStore::new();
+        let mut scope_menu: Option<ScopeMenuState> = None;
+        let mut help: Option<HelpState> = None;
+        let mut search_prompt: Option<search::SearchPromptState> = None;
+        let mut highlighter = LineHighlighter::new();
+        let mut watch_paused = false;
+        let mut watch_status: Option<WatchStatus> = None;
+        let mut hints_expanded = false;
+
+        handle_action(
+            action,
+            stack,
+            &mut hover_state,
+            &mut pending_hover,
+            &mut pending_goto,
+            &mut refs_panel,
+            &mut units_panel,
+            &mut units_setup,
+            &mut pending_units,
+            &mut units_status,
+            &mut jump_stack,
+            &diagnostics,
+            goto_status,
+            lsp_manager,
+            None,
+            compose,
+            &mut scope_menu,
+            context_menu,
+            &mut help,
+            &mut search_prompt,
+            &mut highlighter,
+            &mut watch_paused,
+            false,
+            &mut watch_status,
+            &mut hints_expanded,
+            observer,
+        );
+    }
+
+    fn inert_lsp_manager() -> LspManager {
+        let (events_tx, _events_rx) = mpsc::channel();
+        LspManager::new(events_tx, Arc::new(std::collections::HashMap::new()), false)
+    }
+
+    #[test]
+    fn context_menu_confirm_on_an_enabled_entry_closes_and_dispatches_add_comment() {
+        let app = selectable_diff_app();
+        let mut stack = ViewStack::new(View::Diff(app));
+        let entry = context_menu::MenuEntry {
+            label: "Add comment".to_owned(),
+            enabled: Ok(()),
+            command: MenuCommand::Action(Action::AddComment),
+        };
+        let mut context_menu = Some(ContextMenuState::new(
+            MenuTarget::DiffRow,
+            vec![entry],
+            (0, 0),
+        ));
+        let mut compose: Option<ComposeState> = None;
+        let mut goto_status: Option<String> = None;
+        let lsp_manager = inert_lsp_manager();
+
+        call_handle_action(
+            Action::Confirm,
+            &mut stack,
+            &mut context_menu,
+            &mut compose,
+            &mut goto_status,
+            &lsp_manager,
+            &crate::lsp::ObservationStore::in_memory(),
+        );
+
+        assert!(
+            context_menu.is_none(),
+            "confirming an enabled entry always closes the menu first"
+        );
+        assert!(
+            compose.is_some(),
+            "AddComment must dispatch through the real Action::AddComment arm \
+             (req 8) — this is req 8 proven by observation, not by reading code"
+        );
+    }
+
+    #[test]
+    fn context_menu_confirm_dispatches_toggle_visual_line_and_starts_a_selection() {
+        let app = selectable_diff_app();
+        let mut stack = ViewStack::new(View::Diff(app));
+        let entry = context_menu::MenuEntry {
+            label: "Start visual selection".to_owned(),
+            enabled: Ok(()),
+            command: MenuCommand::Action(Action::ToggleVisualLine),
+        };
+        let mut context_menu = Some(ContextMenuState::new(
+            MenuTarget::DiffRow,
+            vec![entry],
+            (0, 0),
+        ));
+        let mut compose: Option<ComposeState> = None;
+        let mut goto_status: Option<String> = None;
+        let lsp_manager = inert_lsp_manager();
+
+        call_handle_action(
+            Action::Confirm,
+            &mut stack,
+            &mut context_menu,
+            &mut compose,
+            &mut goto_status,
+            &lsp_manager,
+            &crate::lsp::ObservationStore::in_memory(),
+        );
+
+        let View::Diff(app) = stack.top() else {
+            unreachable!()
+        };
+        assert!(
+            app.visual_active(),
+            "ToggleVisualLine must dispatch through the real Action arm and \
+             flip the visual anchor on"
+        );
+        assert!(context_menu.is_none());
+    }
+
+    #[test]
+    fn context_menu_confirm_on_a_disabled_entry_stays_open_and_reports_the_reason() {
+        let app = selectable_diff_app();
+        let mut stack = ViewStack::new(View::Diff(app));
+        let reason = "LSP: rust is starting; go to definition is not ready yet".to_owned();
+        let entry = context_menu::MenuEntry {
+            label: "Go to definition".to_owned(),
+            enabled: Err(reason.clone()),
+            command: MenuCommand::Action(Action::GotoDefinition),
+        };
+        let mut context_menu = Some(ContextMenuState::new(
+            MenuTarget::DiffRow,
+            vec![entry],
+            (0, 0),
+        ));
+        let mut compose: Option<ComposeState> = None;
+        let mut goto_status: Option<String> = None;
+        let lsp_manager = inert_lsp_manager();
+
+        call_handle_action(
+            Action::Confirm,
+            &mut stack,
+            &mut context_menu,
+            &mut compose,
+            &mut goto_status,
+            &lsp_manager,
+            &crate::lsp::ObservationStore::in_memory(),
+        );
+
+        assert!(
+            context_menu.is_some(),
+            "a disabled entry must never close the menu or invoke anything"
+        );
+        assert_eq!(goto_status, Some(reason));
+    }
+
+    /// A two-directory-deep fixture (`src` > `src/nested`) for
+    /// `ExpandAllDescendants`'s dispatch test — `selectable_diff_app` puts
+    /// its one file at the repo root, too flat to have any directory at all.
+    fn nested_files_app() -> App {
+        let make = |name: &str| crate::diff::DiffFile {
+            old_path: Some(name.to_owned()),
+            new_path: Some(name.to_owned()),
+            hunks: vec![crate::diff::DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                known_eof: true,
+                rows: vec![crate::diff::DiffRow {
+                    kind: crate::diff::DiffLineKind::Context,
+                    text: "x".to_owned(),
+                    old_line: Some(1),
+                    new_line: Some(1),
+                }],
+            }],
+            ..Default::default()
+        };
+        App::new(
+            "repo".to_owned(),
+            PathBuf::from("/repo"),
+            vec![make("src/nested/a.rs"), make("src/nested/b.rs")],
+        )
+    }
+
+    #[test]
+    fn context_menu_confirm_dispatches_expand_all_descendants_via_app_method() {
+        let mut app = nested_files_app();
+        app.set_descendants_collapsed("src", true); // setup: start collapsed
+        assert!(
+            !app.visible_rows
+                .iter()
+                .any(|r| r.id.path == "src/nested/a.rs"),
+            "setup sanity: collapsing must hide the nested file rows"
+        );
+        let mut stack = ViewStack::new(View::Diff(app));
+        let entry = context_menu::MenuEntry {
+            label: "Expand all descendants".to_owned(),
+            enabled: Ok(()),
+            command: MenuCommand::ExpandAllDescendants,
+        };
+        let mut context_menu = Some(ContextMenuState::new(
+            MenuTarget::TreeDir {
+                path: "src".to_owned(),
+            },
+            vec![entry],
+            (0, 0),
+        ));
+        let mut compose: Option<ComposeState> = None;
+        let mut goto_status: Option<String> = None;
+        let lsp_manager = inert_lsp_manager();
+
+        call_handle_action(
+            Action::Confirm,
+            &mut stack,
+            &mut context_menu,
+            &mut compose,
+            &mut goto_status,
+            &lsp_manager,
+            &crate::lsp::ObservationStore::in_memory(),
+        );
+
+        let View::Diff(app) = stack.top() else {
+            unreachable!()
+        };
+        assert!(
+            app.visible_rows
+                .iter()
+                .any(|r| r.id.path == "src/nested/a.rs"),
+            "ExpandAllDescendants must reach App::set_descendants_collapsed"
+        );
+        assert!(context_menu.is_none());
+    }
+
+    #[test]
+    fn context_menu_cursor_and_top_bottom_actions_navigate_without_invoking_anything() {
+        let app = selectable_diff_app();
+        let mut stack = ViewStack::new(View::Diff(app));
+        let entries = vec![
+            context_menu::MenuEntry {
+                label: "a".to_owned(),
+                enabled: Ok(()),
+                command: MenuCommand::Action(Action::Hover),
+            },
+            context_menu::MenuEntry {
+                label: "b".to_owned(),
+                enabled: Ok(()),
+                command: MenuCommand::Action(Action::Hover),
+            },
+            context_menu::MenuEntry {
+                label: "c".to_owned(),
+                enabled: Ok(()),
+                command: MenuCommand::Action(Action::Hover),
+            },
+        ];
+        let mut context_menu = Some(ContextMenuState::new(MenuTarget::DiffRow, entries, (0, 0)));
+        let mut compose: Option<ComposeState> = None;
+        let mut goto_status: Option<String> = None;
+        let lsp_manager = inert_lsp_manager();
+
+        call_handle_action(
+            Action::Bottom,
+            &mut stack,
+            &mut context_menu,
+            &mut compose,
+            &mut goto_status,
+            &lsp_manager,
+            &crate::lsp::ObservationStore::in_memory(),
+        );
+        assert_eq!(context_menu.as_ref().unwrap().selected(), 2);
+
+        call_handle_action(
+            Action::CursorUp,
+            &mut stack,
+            &mut context_menu,
+            &mut compose,
+            &mut goto_status,
+            &lsp_manager,
+            &crate::lsp::ObservationStore::in_memory(),
+        );
+        assert_eq!(context_menu.as_ref().unwrap().selected(), 1);
+
+        call_handle_action(
+            Action::Top,
+            &mut stack,
+            &mut context_menu,
+            &mut compose,
+            &mut goto_status,
+            &lsp_manager,
+            &crate::lsp::ObservationStore::in_memory(),
+        );
+        assert_eq!(context_menu.as_ref().unwrap().selected(), 0);
+        assert!(
+            context_menu.is_some(),
+            "pure navigation must never close or invoke anything"
+        );
+    }
+
+    #[test]
+    fn context_menu_cancel_closes_the_menu() {
+        let app = selectable_diff_app();
+        let mut stack = ViewStack::new(View::Diff(app));
+        let entry = context_menu::MenuEntry {
+            label: "a".to_owned(),
+            enabled: Ok(()),
+            command: MenuCommand::Action(Action::Hover),
+        };
+        let mut context_menu = Some(ContextMenuState::new(
+            MenuTarget::DiffRow,
+            vec![entry],
+            (0, 0),
+        ));
+        let mut compose: Option<ComposeState> = None;
+        let mut goto_status: Option<String> = None;
+        let lsp_manager = inert_lsp_manager();
+
+        call_handle_action(
+            Action::Cancel,
+            &mut stack,
+            &mut context_menu,
+            &mut compose,
+            &mut goto_status,
+            &lsp_manager,
+            &crate::lsp::ObservationStore::in_memory(),
+        );
+        assert!(context_menu.is_none());
+    }
+
+    /// The structural guarantee the context-menu interception block's own
+    /// docs describe: `q` is intercepted by the resolver in `run` — via
+    /// `StepResult::Matched(Action::Quit) => return Ok(())` — *before*
+    /// `handle_action` (and therefore this menu's own interception) is ever
+    /// reached, on whatever key sequence a real keypress produces. Proven
+    /// here at the resolver level, which has no notion of `context_menu` (or
+    /// any other overlay) at all — that's what makes this true regardless of
+    /// what's open, not a fact this test has to construct a menu to check.
+    #[test]
+    fn q_resolves_to_quit_through_the_real_keymap_resolver() {
+        let keymap = Keymap::from_bindings(&vim_preset(true));
+        let mut resolver = keymap.resolver();
+        let chord = KeyChord::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        assert_eq!(resolver.feed(chord), StepResult::Matched(Action::Quit));
     }
 }

@@ -1791,6 +1791,47 @@ impl App {
         self.clamp_files_scroll();
     }
 
+    /// How many directories are nested under `path` — issue #23's context
+    /// menu reads this to decide whether "Expand/Collapse all descendants"
+    /// makes sense to offer at all (a leaf directory has nothing to bulk-act
+    /// on; see [`file_tree::descendant_dir_paths`]'s docs on the bound this
+    /// gives). `pub` (unlike `tree` itself, which stays private) so the
+    /// context menu's open flow — `ui::mouse`, outside this module — can
+    /// ask the question without reaching into `App`'s own tree field.
+    pub fn descendant_dir_count(&self, path: &str) -> usize {
+        file_tree::descendant_dir_paths(&self.tree, path).len()
+    }
+
+    /// Issue #23's "Expand/Collapse all descendants" context-menu entries:
+    /// bulk-flips every directory nested under `path` (never `path` itself
+    /// — see [`Self::toggle_directory`] for that single-row toggle) to
+    /// `collapsed`, re-flattens `visible_rows`, and re-anchors
+    /// `files_selection` exactly the way [`Self::toggle_directory`] does —
+    /// a bulk collapse can just as easily bury the current selection under
+    /// a now-hidden subtree as a single toggle can. The one genuinely new
+    /// tree mutation this milestone adds (see `ui::context_menu::MenuCommand`'s
+    /// docs on why every other entry reuses an existing [`crate::keymap::Action`]
+    /// instead) — still routed through the same `collapsed_dirs`/
+    /// `flatten_visible`/`resolve_and_set_selection` primitives
+    /// `toggle_directory` uses, not a second bookkeeping path.
+    pub fn set_descendants_collapsed(&mut self, path: &str, collapsed: bool) {
+        let previous = self
+            .visible_rows
+            .get(self.files_selection)
+            .map(|row| row.id.clone());
+        let descendants = file_tree::descendant_dir_paths(&self.tree, path);
+        if collapsed {
+            self.collapsed_dirs.extend(descendants);
+        } else {
+            for descendant in &descendants {
+                self.collapsed_dirs.remove(descendant);
+            }
+        }
+        self.visible_rows = file_tree::flatten_visible(&self.tree, &self.collapsed_dirs);
+        self.resolve_and_set_selection(previous);
+        self.clamp_files_scroll();
+    }
+
     /// The row index a `(target_file, target_line)` jump should land on
     /// within this diff, if it has one — how a go-to-definition/references
     /// jump (or `Ctrl-o`/`Ctrl-i`) decides to move the cursor within the
@@ -4391,6 +4432,83 @@ index 1111111..2222222 100644\n\
             app.visible_rows.len(),
             before_len,
             "expanding must restore every descendant row"
+        );
+    }
+
+    // ---- descendant_dir_count / set_descendants_collapsed (issue #23) -----
+
+    #[test]
+    fn descendant_dir_count_reports_nested_directories_only() {
+        let app = nested_app();
+        // "src" has one nested directory ("src/nested"); "src/nested"
+        // itself has none.
+        assert_eq!(app.descendant_dir_count("src"), 1);
+        assert_eq!(app.descendant_dir_count("src/nested"), 0);
+    }
+
+    #[test]
+    fn set_descendants_collapsed_never_collapses_path_itself() {
+        let mut app = nested_app();
+        app.set_descendants_collapsed("src", true);
+        let src_row = app
+            .visible_rows
+            .iter()
+            .find(|r| r.id.path == "src" && r.id.is_directory)
+            .expect("src's own row always stays visible");
+        assert!(
+            matches!(
+                src_row.kind,
+                file_tree::VisibleKind::Directory { expanded: true, .. }
+            ),
+            "src itself must stay expanded — only its descendants collapse"
+        );
+        // "src/nested" is a descendant, so it collapsed, hiding "b.rs".
+        assert!(
+            !app.visible_rows
+                .iter()
+                .any(|r| r.id.path == "src/nested/b.rs"),
+            "src/nested's own collapse must hide its child row"
+        );
+    }
+
+    #[test]
+    fn set_descendants_collapsed_false_re_expands_every_nested_directory() {
+        let mut app = nested_app();
+        app.set_descendants_collapsed("src", true);
+        app.set_descendants_collapsed("src", false);
+        assert!(
+            app.visible_rows
+                .iter()
+                .any(|r| r.id.path == "src/nested/b.rs"),
+            "expanding all descendants must restore the hidden row"
+        );
+    }
+
+    /// Mirrors `collapsing_a_directory_containing_the_selection_reselects_that_directory`
+    /// below, for the bulk operation: burying the selection under a
+    /// collapsed descendant must re-anchor it, not leave a dangling index.
+    #[test]
+    fn set_descendants_collapsed_reanchors_a_buried_selection() {
+        let mut app = nested_app();
+        app.focus = MainPaneFocus::Files;
+        let nested_file_idx = app
+            .visible_rows
+            .iter()
+            .position(|r| r.id.path == "src/nested/b.rs")
+            .unwrap();
+        app.files_selection = nested_file_idx;
+
+        app.set_descendants_collapsed("src", true);
+
+        assert!(app.files_selection < app.visible_rows.len());
+        let selected = &app.visible_rows[app.files_selection];
+        assert_eq!(
+            selected.id,
+            file_tree::NodeId {
+                path: "src/nested".to_owned(),
+                is_directory: true,
+            },
+            "selection must move to the nearest visible ancestor"
         );
     }
 
