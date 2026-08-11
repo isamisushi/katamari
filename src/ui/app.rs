@@ -716,9 +716,22 @@ impl App {
 
     /// The raw text of the row at `cursor`, for [`symbols::scan`] — `None`
     /// for a file/hunk header or binary notice, which have no line content
-    /// to scan.
+    /// to scan. A thin wrapper over [`Self::row_text`] at the cursor's own
+    /// row, kept as its own name since every existing call site reads more
+    /// naturally as "the cursor's row text" than "row text at the cursor".
     fn cursor_row_text(&self) -> Option<&str> {
-        match self.rows.get(self.cursor)? {
+        self.row_text(self.cursor)
+    }
+
+    /// As [`Self::cursor_row_text`], for an arbitrary row rather than only
+    /// the cursor's own — issue #24's passive pointer hover needs to scan
+    /// symbols on whatever row the pointer is resting on, which is never the
+    /// keyboard cursor's row (req 3: passive hover must not move `cursor`).
+    /// Extracted from `cursor_row_text`'s old body rather than added
+    /// alongside it, so the two can never drift apart on what "a row's
+    /// text" means.
+    fn row_text(&self, row_idx: usize) -> Option<&str> {
+        match self.rows.get(row_idx)? {
             RenderRow::Line {
                 file_idx,
                 hunk_idx,
@@ -751,8 +764,22 @@ impl App {
     /// symbol's display column into the server's encoding), and that
     /// column itself. `None` when the cursor isn't on an eligible row (a
     /// header, a `Del` line, a deleted/binary file) or the row has no
-    /// identifier-like token to target.
+    /// identifier-like token to target. A thin wrapper over
+    /// [`Self::hover_query_for`] at the cursor's own row and active symbol —
+    /// see that method's docs for why the two are split.
     pub fn hover_query(&self) -> Option<HoverQuery> {
+        self.hover_query_for(self.cursor, self.active_symbol)
+    }
+
+    /// As [`Self::hover_query`], for an arbitrary row/symbol-index pair
+    /// rather than only the cursor's own — extracted so issue #24's passive
+    /// pointer hover (via [`Self::hover_query_at`]) can build the identical
+    /// query a keyboard hover would, for whatever row the pointer is
+    /// resting on, without moving `cursor`/`active_symbol` to get there
+    /// (req 3). `symbol_idx` indexes the same [`symbols::scan`] output
+    /// [`Self::hover_query`] itself reads off `active_symbol` — this
+    /// function makes no assumption about where that index came from.
+    fn hover_query_for(&self, row_idx: usize, symbol_idx: usize) -> Option<HoverQuery> {
         if !self.interactive {
             return None;
         }
@@ -760,14 +787,14 @@ impl App {
             file_idx,
             hunk_idx,
             row_idx,
-        } = self.rows.get(self.cursor)?
+        } = self.rows.get(row_idx)?
         else {
             return None;
         };
         let file = &self.files[*file_idx];
         let row = &file.hunks[*hunk_idx].rows[*row_idx];
         let (relative_path, line) = lsp_target(row, file)?;
-        let symbol = symbols::scan(&row.text).get(self.active_symbol).copied()?;
+        let symbol = symbols::scan(&row.text).get(symbol_idx).copied()?;
         Some(HoverQuery {
             file: self.repo_root.join(relative_path),
             git_root: self.repo_root.clone(),
@@ -775,6 +802,24 @@ impl App {
             line_text: row.text.clone(),
             display_col: symbol.display_start,
         })
+    }
+
+    /// As [`Self::hover_query_for`], resolving the symbol from a raw
+    /// display column instead of an already-known index — issue #24's
+    /// [`crate::ui::pointer_hover::resolve_target`] has a `(row, column)`
+    /// pointer hit, not a symbol index, and unlike [`Self::resolve_active_symbol`]'s
+    /// click-positioning fallback (symbol `0` when nothing matches, so a
+    /// click always lands *somewhere*), a pointer resting on whitespace
+    /// must resolve to no target at all rather than silently offering
+    /// whatever symbol `0` happens to be — a popup for the wrong identifier
+    /// would be worse than no popup. See [`Self::symbol_at`]'s `matched`
+    /// flag, which is what makes that distinction possible here.
+    pub fn hover_query_at(&self, row_idx: usize, display_col: usize) -> Option<HoverQuery> {
+        let (symbol_idx, matched) = self.symbol_at(row_idx, display_col);
+        if !matched {
+            return None;
+        }
+        self.hover_query_for(row_idx, symbol_idx)
     }
 
     /// What `Action::AddComment` ("c") would create a review comment about
@@ -1886,8 +1931,17 @@ impl App {
     /// landed on a symbol apart from `active_symbol` merely sitting on `0`
     /// by default (see `position_cursor_from_click`'s docs).
     fn resolve_active_symbol(&self, display_col: usize) -> (usize, bool) {
+        self.symbol_at(self.cursor, display_col)
+    }
+
+    /// As [`Self::resolve_active_symbol`], for an arbitrary row rather than
+    /// only the cursor's own — extracted the same way [`Self::row_text`]
+    /// was, for the same caller: issue #24's [`Self::hover_query_at`] needs
+    /// to resolve a symbol on the pointer's row without moving `cursor`
+    /// there first the way a click's `position_cursor_from_click` does.
+    fn symbol_at(&self, row_idx: usize, display_col: usize) -> (usize, bool) {
         let symbols = self
-            .cursor_row_text()
+            .row_text(row_idx)
             .map(symbols::scan)
             .unwrap_or_default();
         match symbols
@@ -2800,6 +2854,51 @@ mod tests {
         // thing `hover_query` alone can't tell apart from a real match on
         // symbol 0 itself.
         assert_eq!(app.resolve_active_symbol(2), (0, false));
+    }
+
+    // ---- hover_query_at (issue #24) ---------------------------------------
+
+    #[test]
+    fn hover_query_at_matches_hover_query_built_from_the_same_row_and_column() {
+        let mut app = test_app();
+        app.update(Action::Top);
+        app.update(Action::CursorDown); // hunk header
+        app.update(Action::CursorDown); // row 2: "fn helper() {}"
+        let expected = app.hover_query().expect("row 2 has an eligible symbol");
+        // Moved off the row afterward — `hover_query_at` must reproduce the
+        // identical query without the cursor sitting on the target row at
+        // all (req 3: passive hover never moves `cursor`/`active_symbol`).
+        app.update(Action::CursorDown);
+        app.update(Action::CursorDown);
+        assert_ne!(app.cursor, 2);
+        assert_eq!(app.hover_query_at(2, 1), Some(expected));
+    }
+
+    #[test]
+    fn hover_query_at_on_a_del_row_is_none() {
+        let app = test_app();
+        // Row 3 is the `Del` row "fn old_name() {}" — no current line for a
+        // language server to be asked about (mirrors `hover_query`'s own
+        // refusal via `lsp_target`).
+        assert_eq!(app.hover_query_at(3, 1), None);
+    }
+
+    #[test]
+    fn hover_query_at_is_none_when_the_diff_is_not_interactive() {
+        let mut app = test_app();
+        app.interactive = false;
+        assert_eq!(app.hover_query_at(2, 1), None);
+    }
+
+    #[test]
+    fn hover_query_at_on_whitespace_is_none_unlike_the_click_paths_symbol_zero_fallback() {
+        // Column 2 on row 2 ("fn helper() {}") is the space between "fn"
+        // and "helper" — `resolve_active_symbol`/`position_cursor_from_click`
+        // fall back to symbol 0 there (see the test above), but a passive
+        // pointer resting on whitespace must resolve to no target at all,
+        // not a stale/wrong identifier (see `hover_query_at`'s own docs).
+        let app = test_app();
+        assert_eq!(app.hover_query_at(2, 2), None);
     }
 
     #[test]

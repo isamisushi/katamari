@@ -108,6 +108,22 @@ impl View {
         }
     }
 
+    /// As [`Self::hover_query`], for issue #24's passive pointer hover: the
+    /// query a keyboard hover would build for `(row_idx, display_col)`
+    /// instead of the cursor's own position, without moving the cursor to
+    /// get there — see [`App::hover_query_at`]/[`FileView::hover_query_at`].
+    /// `None` for [`View::Timeline`]/[`View::Log`]/[`View::LspInspector`],
+    /// the same views [`Self::hover_query`] already refuses (see those
+    /// types' own `hover_query` docs) — none of the three has a rendered
+    /// code pane a pointer could rest on in the first place.
+    pub fn hover_query_at(&self, row_idx: usize, display_col: usize) -> Option<HoverQuery> {
+        match self {
+            View::Diff(app) => app.hover_query_at(row_idx, display_col),
+            View::File(file) => file.hover_query_at(row_idx, display_col),
+            View::Timeline(_) | View::Log(_) | View::LspInspector(_) => None,
+        }
+    }
+
     /// `(cursor, active_symbol)` — a cheap, comparable snapshot of "what's
     /// under the cursor for hover purposes." `ui::mod`'s event loop
     /// compares this before and after every action to decide whether an

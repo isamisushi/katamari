@@ -405,15 +405,33 @@ starting shows the same "not ready" status rather than queuing a surprise
 later jump), while a gutter, whitespace, a deletion, a side-by-side old
 cell, or a non-interactive historical diff only positions the cursor.
 Shift-click extends an active visual selection (`V`) instead, without
-triggering go-to-definition. Drag selection, double-click word selection,
-right-click menus, and passive hover are not implemented yet. While capture
-is on, a terminal's plain click-and-drag text selection
-goes to katamari instead of the terminal — most terminals still offer
-native selection by holding Shift while dragging. Set `[ui] mouse = false`
-to leave capture off entirely and get plain, unshifted drag selection
-back; katamari makes no attempt to emulate selection itself. Inside tmux,
-`set -g mouse on` is additionally required for wheel events to reach
-katamari at all, regardless of `[ui] mouse`.
+triggering go-to-definition. Right-click opens a context-aware action menu
+(hover/go to definition/find references on an identifier, expand/collapse
+on a tree row, add-comment on a diff row, and more depending on what's
+under the pointer); its entries follow the same LSP-readiness rules as the
+keyboard. Drag selection and double-click word selection are not
+implemented yet. While capture is on, a terminal's plain click-and-drag
+text selection goes to katamari instead of the terminal — most terminals
+still offer native selection by holding Shift while dragging. Set
+`[ui] mouse = false` to leave capture off entirely and get plain, unshifted
+drag selection back; katamari makes no attempt to emulate selection itself.
+Inside tmux, `set -g mouse on` is additionally required for wheel events to
+reach katamari at all, regardless of `[ui] mouse`.
+
+Resting the pointer (no click, no button held) on an eligible code symbol
+or a changed-file tree row for about 400ms shows details without moving the
+keyboard cursor: a code symbol gets the same hover popup `K` would show
+(subject to the same LSP-readiness gating — a not-yet-ready server
+just stays quiet rather than queuing a surprise popup later), and a tree
+row gets a compact status-bar line with its full path, status, `+/-`
+stats, or old → new path for a rename, plus a changed-descendant count for
+a directory. Moving to another target, leaving the pane, pressing a key,
+clicking, scrolling, resizing, or opening any overlay cancels it instantly.
+Controlled independently of click/wheel/right-click support via
+`[ui] mouse_hover = true` (the default) — `false` stops katamari from
+*acting* on pointer motion, not from the terminal *reporting* it:
+`EnableMouseCapture` already requests any-motion reporting whenever
+`[ui] mouse` is on, regardless of `mouse_hover`.
 
 With a visual selection active (`V`, above), `y` copies it to the terminal
 clipboard via OSC 52: each selected line's repo-relative path, old/new line
@@ -557,6 +575,11 @@ show_keys = false
 # above). Default true; set false to leave the terminal's own
 # click-and-drag text selection working instead.
 mouse = true
+# Resting the pointer on an eligible code symbol or changed-file tree row
+# shows details after ~400ms, independently of click/wheel/right-click
+# support above — see "Mouse" under "Keybindings". Default true; only ever
+# has anything to act on while `mouse` (above) is also true.
+mouse_hover = true
 
 [watch]
 # Debounce window for live refresh: how long a burst of filesystem changes

@@ -159,6 +159,18 @@ pub struct Config {
     /// pattern — nothing renders differently based on this, only whether
     /// capture is ever enabled at all.
     pub mouse: bool,
+    /// `[ui] mouse_hover` — whether resting the pointer on an eligible code
+    /// symbol or changed-file tree row shows details after a short debounce
+    /// (issue #24), independently of `mouse` above. Defaults to `true`, but
+    /// only ever has anything to act on when `mouse` itself is also `true`
+    /// (see `ui::mod`'s event loop, whose `Moved` arm is nested inside the
+    /// same capture guard `mouse` already gates) — `EnableMouseCapture`
+    /// requests any-motion reporting (`?1003h`) unconditionally whenever
+    /// capture is on at all, so this field only ever stops katamari from
+    /// *acting* on a `Moved` event, never from the terminal sending one.
+    /// `false` is for a reviewer who wants clicks/wheel/right-click but
+    /// finds a popup appearing under a resting pointer distracting.
+    pub mouse_hover: bool,
     pub debounce_ms: u64,
     /// `[update] check` — whether a TUI session ever looks for a newer
     /// katamari release: both the once-a-day background GitHub check
@@ -255,6 +267,7 @@ impl Default for Config {
             wrap: true,
             show_keys: false,
             mouse: true,
+            mouse_hover: true,
             debounce_ms: DEFAULT_DEBOUNCE_MS,
             update_check: true,
             offer_install: true,
@@ -319,6 +332,7 @@ struct RawUi {
     wrap: Option<bool>,
     show_keys: Option<bool>,
     mouse: Option<bool>,
+    mouse_hover: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -374,6 +388,7 @@ const UI_KEYS: &[&str] = &[
     "wrap",
     "show_keys",
     "mouse",
+    "mouse_hover",
 ];
 const WATCH_KEYS: &[&str] = &["debounce_ms"];
 const UPDATE_KEYS: &[&str] = &["check"];
@@ -442,6 +457,9 @@ fn merge_raw(base: &mut RawFile, overlay: RawFile) {
         }
         if overlay_ui.mouse.is_some() {
             base_ui.mouse = overlay_ui.mouse;
+        }
+        if overlay_ui.mouse_hover.is_some() {
+            base_ui.mouse_hover = overlay_ui.mouse_hover;
         }
     }
     if let Some(overlay_watch) = overlay.watch {
@@ -694,6 +712,7 @@ fn finalize(raw: RawFile) -> Config {
         wrap: ui.wrap.unwrap_or(true),
         show_keys: ui.show_keys.unwrap_or(false),
         mouse: ui.mouse.unwrap_or(true),
+        mouse_hover: ui.mouse_hover.unwrap_or(true),
         debounce_ms: watch.debounce_ms.unwrap_or(DEFAULT_DEBOUNCE_MS),
         update_check: update.check.unwrap_or(true),
         offer_install: skill.offer_install.unwrap_or(true),
@@ -999,6 +1018,20 @@ mod tests {
     }
 
     #[test]
+    fn mouse_hover_defaults_to_true_independently_of_mouse_and_can_be_disabled() {
+        let repo = fixture_repo();
+        assert!(load_merged(&repo).mouse_hover, "on by default");
+
+        write_repo_config(&repo, "[ui]\nmouse_hover = false\n");
+        let config = load_merged(&repo);
+        assert!(!config.mouse_hover);
+        // Turning passive hover off on its own doesn't also turn off click/
+        // wheel/right-click capture — the two fields are independent (see
+        // `Config::mouse_hover`'s docs).
+        assert!(config.mouse);
+    }
+
+    #[test]
     fn repo_config_takes_precedence_over_home_config_field_by_field() {
         // Simulate the merge directly rather than mutating the real $HOME,
         // which every test in this binary shares: `merge_raw` is exactly
@@ -1012,6 +1045,7 @@ mod tests {
                 wrap: None,
                 show_keys: None,
                 mouse: None,
+                mouse_hover: None,
             }),
             watch: Some(RawWatch {
                 debounce_ms: Some(500),
@@ -1025,6 +1059,7 @@ mod tests {
                 wrap: None,
                 show_keys: None,
                 mouse: None,
+                mouse_hover: None,
             }),
             ..RawFile::default()
         };

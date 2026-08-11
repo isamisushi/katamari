@@ -29,6 +29,7 @@ pub mod lsp_inspector;
 pub mod mouse;
 pub mod navigation;
 mod pane;
+mod pointer_hover;
 pub mod refresh;
 pub mod refs_panel;
 pub mod scope_menu;
@@ -340,6 +341,7 @@ pub fn run(
         config.offer_install,
         observer.clone(),
         config.mouse,
+        config.mouse_hover,
     );
 
     restore_terminal(&mut terminal)?;
@@ -588,10 +590,18 @@ fn event_loop(
     offer_skill_install: bool,
     observer: crate::lsp::ObservationHandle,
     mouse_enabled: bool,
+    mouse_hover_enabled: bool,
 ) -> Result<()> {
     let mut key_display = key_display::KeyDisplayState::new(show_keys);
     let mut hover_state = hover_popup::HoverState::default();
     let mut pending_hover: Option<PendingHover> = None;
+    // Issue #24: the passive pointer-hover analogue of `hover_state`/
+    // `pending_hover` just above — a wholly separate state machine and
+    // generation counter (see `pointer_hover`'s module docs on why the two
+    // must never share one), but the identical "state type owns pure
+    // transitions, the event loop owns the in-flight `Receiver`" split.
+    let mut pointer_hover = pointer_hover::PointerHoverState::default();
+    let mut pending_pointer_hover: Option<PendingHover> = None;
     let mut pending_goto: Option<(JumpEntry, PendingGoto)> = None;
     let mut refs_panel: Option<RefsPanelState> = None;
     // The semantic-units overlay and its in-flight computation. Unlike
@@ -779,6 +789,43 @@ fn event_loop(
             pending_hover = None;
         }
 
+        // As the `pending_hover` poll just above, for issue #24's passive
+        // pointer hover — same shape, a wholly separate generation/receiver
+        // pair (see `pointer_hover`'s field docs on why the two counters
+        // never share). `pointer_hover.apply` folds in the extra "silent
+        // Idle on `Ok(None)`/`Err`" divergence documented there; this call
+        // site still records every outcome (including those) to the
+        // journal, "passive"-prefixed so the inspector can tell the two
+        // hover paths apart.
+        if !matches!(stack.top(), View::LspInspector(_))
+            && let Some((generation, operation_id, rx)) = &pending_pointer_hover
+            && let Ok(result) = rx.try_recv()
+        {
+            let stale = *generation != pointer_hover.generation();
+            let outcome = if stale {
+                crate::lsp::EventOutcome::Superseded
+            } else {
+                match &result {
+                    Ok(Some(_)) => crate::lsp::EventOutcome::Result,
+                    Ok(None) => crate::lsp::EventOutcome::NoResult,
+                    Err(error) => request_error_outcome(error),
+                }
+            };
+            pointer_hover.apply(*generation, result, highlighter);
+            observer.record_ui(
+                Some(*operation_id),
+                outcome,
+                match outcome {
+                    crate::lsp::EventOutcome::Result => "passive hover displayed",
+                    crate::lsp::EventOutcome::NoResult => "passive hover returned no result",
+                    crate::lsp::EventOutcome::Unsupported => "passive hover unsupported",
+                    crate::lsp::EventOutcome::Superseded => "passive hover result superseded",
+                    _ => "passive hover failed",
+                },
+            );
+            pending_pointer_hover = None;
+        }
+
         if let Some(rx) = &pending_units
             && let Ok(result) = rx.try_recv()
         {
@@ -898,9 +945,46 @@ fn event_loop(
         {
             watch_status = None;
         }
-        key_display.tick(Instant::now());
+        let now = Instant::now();
+        key_display.tick(now);
+        // Issue #24: the debounce deadline is checked once per loop
+        // iteration here, in the wall-clock preamble, rather than driven by
+        // any dedicated timer/thread — see `pointer_hover::POINTER_HOVER_DEBOUNCE`'s
+        // docs for the resulting worst-case latency. `passive_hover_suppressed`
+        // is re-checked right before firing (defense-in-depth: every real
+        // trigger for it already runs through one of the four cancellation
+        // hooks below, so this should never actually catch anything by the
+        // time a debounce fires — but it costs nothing to be sure).
+        if let Some((target, anchor_row)) = pointer_hover.due(now) {
+            if passive_hover_suppressed(
+                &compose,
+                &search_prompt,
+                &help,
+                &scope_menu,
+                &units_setup,
+                &refs_panel,
+                &units_panel,
+                &context_menu,
+                &hover_state,
+                stack.top(),
+            ) {
+                pointer_hover.cancel();
+            } else {
+                fire_pointer_hover(
+                    &target,
+                    anchor_row,
+                    &mut pointer_hover,
+                    &mut pending_pointer_hover,
+                    lsp_manager,
+                    &observer,
+                    &diagnostics,
+                    stack.top(),
+                );
+            }
+        }
         let status_note = hover_state
             .status_hint()
+            .or_else(|| pointer_hover.tree_status_hint())
             .or_else(|| goto_status.clone())
             .or_else(|| units_status.clone())
             .or_else(|| lsp_status.clone())
@@ -927,6 +1011,7 @@ fn event_loop(
                 keymap,
                 highlighter,
                 &hover_state,
+                &pointer_hover,
                 &diagnostics,
                 refs_panel.as_ref().map(|s| &s.panel),
                 units_panel.as_ref(),
@@ -949,315 +1034,331 @@ fn event_loop(
             Ok(AppEvent::Terminal(Event::Key(key))) => {
                 if key.kind != KeyEventKind::Press {
                     // no-op; falls through to the loop's bottom
-                } else if let Some(state) = compose.as_mut() {
-                    // The compose overlay wants raw characters, not
-                    // `Action`s — see `ui::compose::handle_key`'s docs on
-                    // why this bypasses the keymap resolver entirely rather
-                    // than only intercepting a few already-resolved
-                    // actions the way the hover popup/references panel do
-                    // below. The key-display overlay masks this the same
-                    // way — see `key_display`'s module docs on why it never
-                    // echoes typed characters.
-                    key_display.record_typing(Instant::now());
-                    match compose::handle_key(state.buffer_mut(), key) {
-                        ComposeOutcome::Continue => {}
-                        ComposeOutcome::Cancel => compose = None,
-                        ComposeOutcome::Save => {
-                            let (status, saved) = finish_compose(
-                                state,
-                                comments_repo_root.as_deref(),
-                                &mut comment_list,
-                                &mut comment_index,
-                            );
-                            compose = None;
-                            // Issue #19's range-compose counterpart to #17's
-                            // `y`: a successful save clears the selection
-                            // that produced it, so the reviewer sees the new
-                            // range's markers land in place of the (now
-                            // stale) highlighted rows instead of both
-                            // showing at once. A no-op for a plain `c` —
-                            // `cancel_visual`'s own `bool` result already
-                            // handles "there was nothing to cancel," so this
-                            // doesn't need to distinguish the two cases.
-                            if saved && let View::Diff(app) = stack.top_mut() {
-                                app.cancel_visual();
-                            }
-
-                            // The prompt only ever fires once per session
-                            // (`skill_prompt_offered`), only after a comment
-                            // actually persisted (not a discarded-empty or
-                            // failed save), only when the reviewer hasn't
-                            // opted out (`offer_skill_install`), and only
-                            // when this repo doesn't already have the full
-                            // harness — skill, AGENTS.md, and CLAUDE.md, see
-                            // `skill::harness_installed`'s docs on why *any*
-                            // missing piece re-offers (M17 extended this
-                            // from a skill-only check so a repo that only
-                            // ran an older `ktmr skill install` still gets
-                            // offered the rest) — any one of those false
-                            // means a plain status message, same as before
-                            // M16.
-                            let offer = saved
-                                && offer_skill_install
-                                && !skill_prompt_offered
-                                && comments_repo_root
-                                    .as_deref()
-                                    .is_some_and(|root| !skill::harness_installed(root));
-                            goto_status = Some(if offer {
-                                skill_prompt_offered = true;
-                                awaiting_skill_prompt_key = true;
-                                format!(
-                                    "{status} \u{b7} press y to install the Claude Code review skill (ktmr skill install)"
-                                )
-                            } else {
-                                status
-                            });
-                        }
-                    }
-                } else if let Some(state) = help.as_mut() {
-                    // The help popup is modal (see `ui::help`'s module
-                    // docs): every key while it's open is consumed here,
-                    // never falling through to the resolver below, so
-                    // there's nothing more this arm needs to do once
-                    // `handle_key` returns other than decide whether to
-                    // close. Sits right after `compose` and before the
-                    // search prompt and the scope-menu revision input in
-                    // this `else if` chain — mutual exclusion between all
-                    // four holds structurally, not by any extra check here:
-                    // `?` only ever reaches the resolver (and so only ever
-                    // produces `Action::OpenHelp`, see `handle_action`
-                    // below) when none of `compose`, `search_prompt`, or
-                    // `ScopeMenuState::Revision` is already claiming every
-                    // keystroke as literal text, so `help` can never become
-                    // `Some` while any of those is open, and all three sit
-                    // ahead of this one regardless (`search_prompt`'s own
-                    // arm below sits *after* this one, for the same reason
-                    // in reverse: `/` while help is open filters its own
-                    // row list rather than opening a second, unrelated
-                    // prompt underneath it).
-                    //
-                    // Deliberately does *not* call `key_display.record_typing`
-                    // the way `compose`/the revision input do above: that
-                    // masking exists to keep private review content (a
-                    // comment body, a revision string) off the
-                    // `--show-keys` overlay — see `key_display`'s module
-                    // docs — but `Filter` mode only ever narrows a list of
-                    // public command names/descriptions/bindings, so
-                    // there's nothing here worth hiding.
-                    let filter = state.filter_text();
-                    let total_rows = match &help_row_count_cache {
-                        Some((cached_filter, count)) if cached_filter == filter => *count,
-                        _ => {
-                            let count = help::build_rows(keymap, filter).len();
-                            help_row_count_cache = Some((filter.to_owned(), count));
-                            count
-                        }
-                    };
-                    let viewport = help::viewport_rows(area);
-                    match help::handle_key(state, key, total_rows, viewport) {
-                        HelpOutcome::Continue => {}
-                        HelpOutcome::Close => help = None,
-                    }
-                } else if let Some(prompt) = search_prompt.as_mut() {
-                    // Bypasses the keymap resolver for the same reason
-                    // `compose`/the revision input do below: a query like
-                    // `fn main` or `TODO(` can contain characters (space,
-                    // `(`) that would otherwise resolve to unrelated
-                    // `Action`s. Sits between `help` and the scope-menu
-                    // revision input in this `else if` chain — see `help`'s
-                    // own comment above for why the four-way mutual
-                    // exclusion holds structurally.
-                    //
-                    // Deliberately does *not* call `key_display.record_typing`
-                    // the way `compose`/the revision input do — same
-                    // reasoning as `help`'s own filter text above: a search
-                    // query only ever narrows down to content already
-                    // visible on screen (the diff itself), never private
-                    // review prose, so there's nothing here worth masking
-                    // from `--show-keys`.
-                    match search::handle_prompt_key(&mut prompt.input, key) {
-                        search::SearchPromptOutcome::Continue => {
-                            if let View::Diff(app) = stack.top_mut() {
-                                app.recompute_search_live(prompt.input.text(), &prompt.origin);
-                            }
-                        }
-                        search::SearchPromptOutcome::Cancel => {
-                            let origin = prompt.origin.clone();
-                            if let View::Diff(app) = stack.top_mut() {
-                                app.cancel_search(&origin);
-                            }
-                            search_prompt = None;
-                        }
-                        search::SearchPromptOutcome::Confirm => {
-                            let origin = prompt.origin.clone();
-                            // The prompt's own current text, not
-                            // `app.search`'s prior state — see
-                            // `App::confirm_search`'s docs on why a
-                            // reopened prompt confirmed with nothing typed
-                            // must cancel rather than silently reconfirm
-                            // whatever search was already active before
-                            // this `/` press.
-                            let query = prompt.input.text().to_owned();
-                            let jump_from = prompt.jump_from.clone();
-                            if let View::Diff(app) = stack.top_mut() {
-                                goto_status = app.confirm_search(&query, &origin);
-                            }
-                            // `confirm_search` itself never moves the
-                            // cursor — the live incremental preview
-                            // already did, on every keystroke while the
-                            // prompt was open — so this records the whole
-                            // `/` session (from wherever it was pressed to
-                            // wherever Enter leaves the cursor now) as one
-                            // significant jump, not each keystroke's own
-                            // preview move. A query that resolved to zero
-                            // matches, or was cancelled via
-                            // `App::cancel_search` above, leaves the cursor
-                            // back where it started — `record_jump`'s
-                            // equality check quietly declines to record
-                            // that case, same as everywhere else.
-                            record_jump(&mut jump_stack, jump_from, stack.top().jump_entry());
-                            search_prompt = None;
-                        }
-                    }
-                } else if let Some(ScopeMenuState::Revision(input)) = scope_menu.as_mut() {
-                    // Bypasses the keymap resolver for the same reason
-                    // `compose` does above: a revision string can contain
-                    // characters (`.`, `@`, `-`) that would otherwise
-                    // resolve to unrelated `Action`s. Masked the same way
-                    // too — a revision string is still user-typed text.
-                    key_display.record_typing(Instant::now());
-                    match handle_revision_key(input, key) {
-                        RevisionInputOutcome::Continue => {}
-                        RevisionInputOutcome::Back => {
-                            scope_menu = Some(ScopeMenuState::new_list(jj_repo.is_some()));
-                        }
-                        RevisionInputOutcome::Submit(text) => {
-                            let at_root = stack.is_at_root();
-                            if let View::Diff(app) = stack.top_mut() {
-                                match apply_scope_swap(
-                                    app,
-                                    &ScopeChoice::Revision(text),
-                                    at_root,
-                                    watch_active,
-                                    jj_repo.as_ref(),
-                                    lsp_manager,
-                                    highlighter,
-                                    &mut hover_state,
-                                    &mut refs_panel,
-                                    &mut context_menu,
-                                    &mut watch_paused,
-                                    &mut watch_status,
-                                ) {
-                                    Ok(()) => scope_menu = None,
-                                    Err(e) => {
-                                        goto_status = Some(format!("scope: {e}"));
-                                        // Leave `scope_menu` open (still
-                                        // `Revision`) so the reviewer can
-                                        // fix the input and retry — an
-                                        // invalid revision must never blank
-                                        // the diff already on screen.
-                                    }
-                                }
-                            } else {
-                                // The popup only ever opens from a
-                                // `View::Diff` (see `Action::OpenScopeMenu`'s
-                                // handling below) and nothing else pops the
-                                // stack while it's open, so this shouldn't
-                                // happen in practice — closing defensively
-                                // rather than leaving an orphaned overlay.
-                                scope_menu = None;
-                            }
-                        }
-                    }
                 } else {
-                    // M16's first-comment skill-install prompt consumes
-                    // exactly the one keypress that follows it, resolved
-                    // *before* the keymap even sees this key — same
-                    // bypass-the-resolver idea `compose`/the revision input
-                    // use above, but only for this single key rather than a
-                    // whole overlay's lifetime. `y` means "install now" and
-                    // is swallowed entirely here, before the resolver ever
-                    // gets a chance to match it against
-                    // `Action::YankSelection` (issue #17): a reviewer who
-                    // just saved their first comment sees the skill-install
-                    // offer, not a yank status, even though `y` is a bound
-                    // key everywhere else. Any other key means "dismiss" —
-                    // deliberately *not* swallowed: falling through to the
-                    // ordinary resolver below means a reviewer who, say,
-                    // presses `j` to keep scrolling right after saving a
-                    // comment gets both the dismiss and the scroll from that
-                    // one keypress, rather than needing a second, wasted
-                    // press just to clear the prompt first.
-                    let mut consumed_by_skill_prompt = false;
-                    if awaiting_skill_prompt_key {
-                        awaiting_skill_prompt_key = false;
-                        if key.code == KeyCode::Char('y') && key.modifiers.is_empty() {
-                            consumed_by_skill_prompt = true;
-                            goto_status =
-                                Some(run_skill_install_prompt(comments_repo_root.as_deref()));
-                        }
-                    }
-
-                    if !consumed_by_skill_prompt {
-                        let chord = KeyChord::from(key);
-                        let step = resolver.feed(chord);
-                        key_display.record_step(chord, step, Instant::now());
-                        match step {
-                            // Global quit, intercepted here rather than
-                            // taught to every pushed view: reached only via
-                            // this `else` branch's resolver (see the long
-                            // comment chain above — compose/help/search
-                            // prompt/the scope-menu's revision input all
-                            // bypass the resolver entirely while they own
-                            // input, so a plain `q` typed into any of them
-                            // never resolves to `Action::Quit` in the first
-                            // place), and unconditionally on whatever view
-                            // is on top — a pushed `File`/`Timeline`/`Log`/
-                            // `LspInspector`, the units-setup wizard, an
-                            // open hover/references/scope-menu overlay, all
-                            // included. `handle_action` never even sees
-                            // this action: terminal restore, LSP shutdown,
-                            // observer shutdown, and the update-exit notice
-                            // all live in `run` after `event_loop` returns,
-                            // so returning `Ok(())` here runs every one of
-                            // them exactly as a normal exit would.
-                            StepResult::Matched(Action::Quit) => return Ok(()),
-                            StepResult::Matched(action) => {
-                                stack.top_mut().clear_pending_keys();
-                                goto_status = None;
-                                handle_action(
-                                    action,
-                                    stack,
-                                    &mut hover_state,
-                                    &mut pending_hover,
-                                    &mut pending_goto,
-                                    &mut refs_panel,
-                                    &mut units_panel,
-                                    &mut units_setup,
-                                    &mut pending_units,
-                                    &mut units_status,
-                                    &mut jump_stack,
-                                    &diagnostics,
-                                    &mut goto_status,
-                                    lsp_manager,
-                                    jj_repo.as_ref(),
-                                    &mut compose,
-                                    &mut scope_menu,
-                                    &mut context_menu,
-                                    &mut help,
-                                    &mut search_prompt,
-                                    highlighter,
-                                    &mut watch_paused,
-                                    watch_active,
-                                    &mut watch_status,
-                                    &mut hints_expanded,
-                                    &observer,
+                    // Issue #24 req 5's first cancellation hook: any real key
+                    // press cancels passive pointer hover unconditionally,
+                    // before the compose/help/search-prompt/scope-menu/ordinary
+                    // dispatch chain below even runs — a keystroke is the
+                    // clearest possible signal the reviewer's attention just
+                    // left wherever the pointer was resting, whether or not it
+                    // resolves to an `Action` at all (`StepResult::Pending`/
+                    // `Cancelled` count too, which is why this sits ahead of
+                    // the resolver rather than inside its `Matched` arm).
+                    cancel_pending_pointer_hover(
+                        &mut pointer_hover,
+                        &mut pending_pointer_hover,
+                        &observer,
+                    );
+                    if let Some(state) = compose.as_mut() {
+                        // The compose overlay wants raw characters, not
+                        // `Action`s — see `ui::compose::handle_key`'s docs on
+                        // why this bypasses the keymap resolver entirely rather
+                        // than only intercepting a few already-resolved
+                        // actions the way the hover popup/references panel do
+                        // below. The key-display overlay masks this the same
+                        // way — see `key_display`'s module docs on why it never
+                        // echoes typed characters.
+                        key_display.record_typing(Instant::now());
+                        match compose::handle_key(state.buffer_mut(), key) {
+                            ComposeOutcome::Continue => {}
+                            ComposeOutcome::Cancel => compose = None,
+                            ComposeOutcome::Save => {
+                                let (status, saved) = finish_compose(
+                                    state,
+                                    comments_repo_root.as_deref(),
+                                    &mut comment_list,
+                                    &mut comment_index,
                                 );
+                                compose = None;
+                                // Issue #19's range-compose counterpart to #17's
+                                // `y`: a successful save clears the selection
+                                // that produced it, so the reviewer sees the new
+                                // range's markers land in place of the (now
+                                // stale) highlighted rows instead of both
+                                // showing at once. A no-op for a plain `c` —
+                                // `cancel_visual`'s own `bool` result already
+                                // handles "there was nothing to cancel," so this
+                                // doesn't need to distinguish the two cases.
+                                if saved && let View::Diff(app) = stack.top_mut() {
+                                    app.cancel_visual();
+                                }
+
+                                // The prompt only ever fires once per session
+                                // (`skill_prompt_offered`), only after a comment
+                                // actually persisted (not a discarded-empty or
+                                // failed save), only when the reviewer hasn't
+                                // opted out (`offer_skill_install`), and only
+                                // when this repo doesn't already have the full
+                                // harness — skill, AGENTS.md, and CLAUDE.md, see
+                                // `skill::harness_installed`'s docs on why *any*
+                                // missing piece re-offers (M17 extended this
+                                // from a skill-only check so a repo that only
+                                // ran an older `ktmr skill install` still gets
+                                // offered the rest) — any one of those false
+                                // means a plain status message, same as before
+                                // M16.
+                                let offer = saved
+                                    && offer_skill_install
+                                    && !skill_prompt_offered
+                                    && comments_repo_root
+                                        .as_deref()
+                                        .is_some_and(|root| !skill::harness_installed(root));
+                                goto_status = Some(if offer {
+                                    skill_prompt_offered = true;
+                                    awaiting_skill_prompt_key = true;
+                                    format!(
+                                        "{status} \u{b7} press y to install the Claude Code review skill (ktmr skill install)"
+                                    )
+                                } else {
+                                    status
+                                });
                             }
-                            StepResult::Pending => {
-                                stack.top_mut().set_pending_keys(resolver.pending_display());
+                        }
+                    } else if let Some(state) = help.as_mut() {
+                        // The help popup is modal (see `ui::help`'s module
+                        // docs): every key while it's open is consumed here,
+                        // never falling through to the resolver below, so
+                        // there's nothing more this arm needs to do once
+                        // `handle_key` returns other than decide whether to
+                        // close. Sits right after `compose` and before the
+                        // search prompt and the scope-menu revision input in
+                        // this `else if` chain — mutual exclusion between all
+                        // four holds structurally, not by any extra check here:
+                        // `?` only ever reaches the resolver (and so only ever
+                        // produces `Action::OpenHelp`, see `handle_action`
+                        // below) when none of `compose`, `search_prompt`, or
+                        // `ScopeMenuState::Revision` is already claiming every
+                        // keystroke as literal text, so `help` can never become
+                        // `Some` while any of those is open, and all three sit
+                        // ahead of this one regardless (`search_prompt`'s own
+                        // arm below sits *after* this one, for the same reason
+                        // in reverse: `/` while help is open filters its own
+                        // row list rather than opening a second, unrelated
+                        // prompt underneath it).
+                        //
+                        // Deliberately does *not* call `key_display.record_typing`
+                        // the way `compose`/the revision input do above: that
+                        // masking exists to keep private review content (a
+                        // comment body, a revision string) off the
+                        // `--show-keys` overlay — see `key_display`'s module
+                        // docs — but `Filter` mode only ever narrows a list of
+                        // public command names/descriptions/bindings, so
+                        // there's nothing here worth hiding.
+                        let filter = state.filter_text();
+                        let total_rows = match &help_row_count_cache {
+                            Some((cached_filter, count)) if cached_filter == filter => *count,
+                            _ => {
+                                let count = help::build_rows(keymap, filter).len();
+                                help_row_count_cache = Some((filter.to_owned(), count));
+                                count
                             }
-                            StepResult::Cancelled => stack.top_mut().clear_pending_keys(),
+                        };
+                        let viewport = help::viewport_rows(area);
+                        match help::handle_key(state, key, total_rows, viewport) {
+                            HelpOutcome::Continue => {}
+                            HelpOutcome::Close => help = None,
+                        }
+                    } else if let Some(prompt) = search_prompt.as_mut() {
+                        // Bypasses the keymap resolver for the same reason
+                        // `compose`/the revision input do below: a query like
+                        // `fn main` or `TODO(` can contain characters (space,
+                        // `(`) that would otherwise resolve to unrelated
+                        // `Action`s. Sits between `help` and the scope-menu
+                        // revision input in this `else if` chain — see `help`'s
+                        // own comment above for why the four-way mutual
+                        // exclusion holds structurally.
+                        //
+                        // Deliberately does *not* call `key_display.record_typing`
+                        // the way `compose`/the revision input do — same
+                        // reasoning as `help`'s own filter text above: a search
+                        // query only ever narrows down to content already
+                        // visible on screen (the diff itself), never private
+                        // review prose, so there's nothing here worth masking
+                        // from `--show-keys`.
+                        match search::handle_prompt_key(&mut prompt.input, key) {
+                            search::SearchPromptOutcome::Continue => {
+                                if let View::Diff(app) = stack.top_mut() {
+                                    app.recompute_search_live(prompt.input.text(), &prompt.origin);
+                                }
+                            }
+                            search::SearchPromptOutcome::Cancel => {
+                                let origin = prompt.origin.clone();
+                                if let View::Diff(app) = stack.top_mut() {
+                                    app.cancel_search(&origin);
+                                }
+                                search_prompt = None;
+                            }
+                            search::SearchPromptOutcome::Confirm => {
+                                let origin = prompt.origin.clone();
+                                // The prompt's own current text, not
+                                // `app.search`'s prior state — see
+                                // `App::confirm_search`'s docs on why a
+                                // reopened prompt confirmed with nothing typed
+                                // must cancel rather than silently reconfirm
+                                // whatever search was already active before
+                                // this `/` press.
+                                let query = prompt.input.text().to_owned();
+                                let jump_from = prompt.jump_from.clone();
+                                if let View::Diff(app) = stack.top_mut() {
+                                    goto_status = app.confirm_search(&query, &origin);
+                                }
+                                // `confirm_search` itself never moves the
+                                // cursor — the live incremental preview
+                                // already did, on every keystroke while the
+                                // prompt was open — so this records the whole
+                                // `/` session (from wherever it was pressed to
+                                // wherever Enter leaves the cursor now) as one
+                                // significant jump, not each keystroke's own
+                                // preview move. A query that resolved to zero
+                                // matches, or was cancelled via
+                                // `App::cancel_search` above, leaves the cursor
+                                // back where it started — `record_jump`'s
+                                // equality check quietly declines to record
+                                // that case, same as everywhere else.
+                                record_jump(&mut jump_stack, jump_from, stack.top().jump_entry());
+                                search_prompt = None;
+                            }
+                        }
+                    } else if let Some(ScopeMenuState::Revision(input)) = scope_menu.as_mut() {
+                        // Bypasses the keymap resolver for the same reason
+                        // `compose` does above: a revision string can contain
+                        // characters (`.`, `@`, `-`) that would otherwise
+                        // resolve to unrelated `Action`s. Masked the same way
+                        // too — a revision string is still user-typed text.
+                        key_display.record_typing(Instant::now());
+                        match handle_revision_key(input, key) {
+                            RevisionInputOutcome::Continue => {}
+                            RevisionInputOutcome::Back => {
+                                scope_menu = Some(ScopeMenuState::new_list(jj_repo.is_some()));
+                            }
+                            RevisionInputOutcome::Submit(text) => {
+                                let at_root = stack.is_at_root();
+                                if let View::Diff(app) = stack.top_mut() {
+                                    match apply_scope_swap(
+                                        app,
+                                        &ScopeChoice::Revision(text),
+                                        at_root,
+                                        watch_active,
+                                        jj_repo.as_ref(),
+                                        lsp_manager,
+                                        highlighter,
+                                        &mut hover_state,
+                                        &mut refs_panel,
+                                        &mut context_menu,
+                                        &mut watch_paused,
+                                        &mut watch_status,
+                                    ) {
+                                        Ok(()) => scope_menu = None,
+                                        Err(e) => {
+                                            goto_status = Some(format!("scope: {e}"));
+                                            // Leave `scope_menu` open (still
+                                            // `Revision`) so the reviewer can
+                                            // fix the input and retry — an
+                                            // invalid revision must never blank
+                                            // the diff already on screen.
+                                        }
+                                    }
+                                } else {
+                                    // The popup only ever opens from a
+                                    // `View::Diff` (see `Action::OpenScopeMenu`'s
+                                    // handling below) and nothing else pops the
+                                    // stack while it's open, so this shouldn't
+                                    // happen in practice — closing defensively
+                                    // rather than leaving an orphaned overlay.
+                                    scope_menu = None;
+                                }
+                            }
+                        }
+                    } else {
+                        // M16's first-comment skill-install prompt consumes
+                        // exactly the one keypress that follows it, resolved
+                        // *before* the keymap even sees this key — same
+                        // bypass-the-resolver idea `compose`/the revision input
+                        // use above, but only for this single key rather than a
+                        // whole overlay's lifetime. `y` means "install now" and
+                        // is swallowed entirely here, before the resolver ever
+                        // gets a chance to match it against
+                        // `Action::YankSelection` (issue #17): a reviewer who
+                        // just saved their first comment sees the skill-install
+                        // offer, not a yank status, even though `y` is a bound
+                        // key everywhere else. Any other key means "dismiss" —
+                        // deliberately *not* swallowed: falling through to the
+                        // ordinary resolver below means a reviewer who, say,
+                        // presses `j` to keep scrolling right after saving a
+                        // comment gets both the dismiss and the scroll from that
+                        // one keypress, rather than needing a second, wasted
+                        // press just to clear the prompt first.
+                        let mut consumed_by_skill_prompt = false;
+                        if awaiting_skill_prompt_key {
+                            awaiting_skill_prompt_key = false;
+                            if key.code == KeyCode::Char('y') && key.modifiers.is_empty() {
+                                consumed_by_skill_prompt = true;
+                                goto_status =
+                                    Some(run_skill_install_prompt(comments_repo_root.as_deref()));
+                            }
+                        }
+
+                        if !consumed_by_skill_prompt {
+                            let chord = KeyChord::from(key);
+                            let step = resolver.feed(chord);
+                            key_display.record_step(chord, step, Instant::now());
+                            match step {
+                                // Global quit, intercepted here rather than
+                                // taught to every pushed view: reached only via
+                                // this `else` branch's resolver (see the long
+                                // comment chain above — compose/help/search
+                                // prompt/the scope-menu's revision input all
+                                // bypass the resolver entirely while they own
+                                // input, so a plain `q` typed into any of them
+                                // never resolves to `Action::Quit` in the first
+                                // place), and unconditionally on whatever view
+                                // is on top — a pushed `File`/`Timeline`/`Log`/
+                                // `LspInspector`, the units-setup wizard, an
+                                // open hover/references/scope-menu overlay, all
+                                // included. `handle_action` never even sees
+                                // this action: terminal restore, LSP shutdown,
+                                // observer shutdown, and the update-exit notice
+                                // all live in `run` after `event_loop` returns,
+                                // so returning `Ok(())` here runs every one of
+                                // them exactly as a normal exit would.
+                                StepResult::Matched(Action::Quit) => return Ok(()),
+                                StepResult::Matched(action) => {
+                                    stack.top_mut().clear_pending_keys();
+                                    goto_status = None;
+                                    handle_action(
+                                        action,
+                                        stack,
+                                        &mut hover_state,
+                                        &mut pending_hover,
+                                        &mut pending_goto,
+                                        &mut refs_panel,
+                                        &mut units_panel,
+                                        &mut units_setup,
+                                        &mut pending_units,
+                                        &mut units_status,
+                                        &mut jump_stack,
+                                        &diagnostics,
+                                        &mut goto_status,
+                                        lsp_manager,
+                                        jj_repo.as_ref(),
+                                        &mut compose,
+                                        &mut scope_menu,
+                                        &mut context_menu,
+                                        &mut help,
+                                        &mut search_prompt,
+                                        highlighter,
+                                        &mut watch_paused,
+                                        watch_active,
+                                        &mut watch_status,
+                                        &mut hints_expanded,
+                                        &observer,
+                                    );
+                                }
+                                StepResult::Pending => {
+                                    stack.top_mut().set_pending_keys(resolver.pending_display());
+                                }
+                                StepResult::Cancelled => stack.top_mut().clear_pending_keys(),
+                            }
                         }
                     }
                 }
@@ -1286,6 +1387,24 @@ fn event_loop(
             // *nothing* here should react to a mouse byte that arrives
             // anyway, not just "we didn't ask for it."
             Ok(AppEvent::Terminal(Event::Mouse(mouse_event))) if mouse_enabled => {
+                // Issue #24 req 5's second cancellation hook: any mouse
+                // event that isn't bare motion cancels passive pointer
+                // hover — a click, a drag, a wheel tick, all mean the
+                // reviewer's attention (or their hand on the button) is
+                // doing something other than resting. `Drag` never reaches
+                // this check with pointer hover still armed for the same
+                // reason it's structurally free elsewhere in this module:
+                // crossterm only reports `Moved` when *no* button is held
+                // (see `parse_cb`), so a held button always arrives as
+                // `Drag`, already caught by this `!= Moved` guard before the
+                // `match` below even runs.
+                if mouse_event.kind != MouseEventKind::Moved {
+                    cancel_pending_pointer_hover(
+                        &mut pointer_hover,
+                        &mut pending_pointer_hover,
+                        &observer,
+                    );
+                }
                 match mouse_event.kind {
                     // Issue #23: while the context menu is open, every wheel
                     // tick is inert — it has no scrollable content of its
@@ -1536,9 +1655,15 @@ fn event_loop(
                         }
                     }
                     // Req 7's hover highlight: moving over an open menu's
-                    // entries moves its selection. Only meaningful while a
-                    // menu is up — there is deliberately no app-wide
-                    // motion tracking here (issue #24 owns passive hover).
+                    // entries moves its selection. Checked first, ahead of
+                    // issue #24's own `Moved` arm just below, since the two
+                    // are mutually exclusive by construction (the menu
+                    // closes hover/refs/units before it can ever open — see
+                    // `mouse::handle_right_click`'s docs) but a guard order
+                    // that made that explicit rather than assumed is one
+                    // fewer thing to keep in sync if that ever changes: menu
+                    // open → menu highlight wins; menu closed → passive
+                    // hover tracking (below) gets the event instead.
                     MouseEventKind::Moved if context_menu.is_some() => {
                         if let Some(rect) = geometry.context_menu_rect()
                             && let Some(idx) = context_menu::entry_at(
@@ -1549,6 +1674,59 @@ fn event_loop(
                             )
                         {
                             context_menu.as_mut().unwrap().set_selected(idx);
+                        }
+                    }
+                    // Issue #24: app-wide passive hover tracking — armed
+                    // only when `[ui] mouse_hover` is on (independent of
+                    // `mouse`/capture itself; see `Config::mouse_hover`'s
+                    // docs) and only once every fully-modal/suppressing
+                    // overlay above has already had first refusal via the
+                    // context-menu arm's guard. `passive_hover_suppressed`
+                    // covers everything *this* arm still needs to check
+                    // (compose/search/help/scope-menu/units-setup/refs/
+                    // units-panel/an explicit hover already active/visual
+                    // selection) — load-bearing here, not just the
+                    // deadline-fire's defense-in-depth copy (see that call
+                    // site's docs): this is what stops a debounce from ever
+                    // arming while one of those is open in the first place.
+                    // `resolve_target` returning `None` (the pointer left
+                    // every eligible pane, or landed on an ineligible row)
+                    // cancels exactly like an explicit trigger would — "left
+                    // the pane" is req 5's own wording.
+                    MouseEventKind::Moved if mouse_hover_enabled => {
+                        if passive_hover_suppressed(
+                            &compose,
+                            &search_prompt,
+                            &help,
+                            &scope_menu,
+                            &units_setup,
+                            &refs_panel,
+                            &units_panel,
+                            &context_menu,
+                            &hover_state,
+                            stack.top(),
+                        ) {
+                            cancel_pending_pointer_hover(
+                                &mut pointer_hover,
+                                &mut pending_pointer_hover,
+                                &observer,
+                            );
+                        } else {
+                            match pointer_hover::resolve_target(
+                                &geometry,
+                                stack,
+                                mouse_event.column,
+                                mouse_event.row,
+                            ) {
+                                Some((target, anchor_row)) => {
+                                    pointer_hover.arm(target, anchor_row, Instant::now());
+                                }
+                                None => cancel_pending_pointer_hover(
+                                    &mut pointer_hover,
+                                    &mut pending_pointer_hover,
+                                    &observer,
+                                ),
+                            }
                         }
                     }
                     _ => {}
@@ -1568,6 +1746,16 @@ fn event_loop(
                 if context_menu.take().is_some() {
                     goto_status = Some("menu: closed on resize".to_owned());
                 }
+                // Issue #24 req 5's third cancellation hook: the pointer's
+                // resolved target/anchor row was computed against this
+                // frame's now-stale geometry, exactly the same "don't try
+                // to prove it still applies" reasoning the context-menu
+                // close just above already follows for the same event.
+                cancel_pending_pointer_hover(
+                    &mut pointer_hover,
+                    &mut pending_pointer_hover,
+                    &observer,
+                );
             }
             Ok(AppEvent::Terminal(_)) => {
                 // Resize, focus, paste: nothing to dispatch, but the next
@@ -1633,6 +1821,9 @@ fn event_loop(
                     &mut watch_status,
                     watch_paused,
                     live_search,
+                    &mut pointer_hover,
+                    &mut pending_pointer_hover,
+                    &observer,
                 );
                 // The working tree just changed, which can shift where
                 // every comment relocates to even though the comment log
@@ -1644,6 +1835,19 @@ fn event_loop(
                 }
             }
             Ok(AppEvent::CommentsChanged) => {
+                // Issue #24 req 5's fifth cancellation hook, easy to miss
+                // because it isn't an input event: a comment reload can
+                // insert or resize an inline comment block, reflowing
+                // every diff row below it under a stationary pointer —
+                // the same "changing layout" case the resize hook covers,
+                // arriving through this always-live watcher (`ktmr
+                // comments add/resolve` from another terminal) instead of
+                // any key or mouse byte.
+                cancel_pending_pointer_hover(
+                    &mut pointer_hover,
+                    &mut pending_pointer_hover,
+                    &observer,
+                );
                 if let Some(root) = &comments_repo_root {
                     match CommentStore::new(root).load() {
                         Ok(loaded) => {
@@ -1918,6 +2122,153 @@ fn symbol_readiness(
         hover: peek_action_readiness(lsp_manager, query, "hover"),
         goto_definition: peek_action_readiness(lsp_manager, query, "go to definition"),
         find_references: peek_action_readiness(lsp_manager, query, "find references"),
+    }
+}
+
+/// Issue #24: whether passive pointer hover must stay suppressed this
+/// frame — every overlay/prompt that already claims exclusive keyboard
+/// input (compose, search, help, the scope menu, the units wizard, an open
+/// refs/units panel, the context menu), an *explicit* hover already
+/// `Pending`/`Shown` (see [`hover_popup::HoverState::blocks_passive`]'s
+/// docs on why `Message` doesn't count), or an active visual selection
+/// (`View::Diff` only — no other view has one). Checked at `Moved`-arm time
+/// (load-bearing: this is what keeps a mouse resting over an open overlay
+/// from ever arming a debounce in the first place) and again right before a
+/// debounce fires (see that call site's own docs on why the second check is
+/// pure defense-in-depth). `scope_menu`/`units_setup` are included even
+/// though req 7 doesn't name them individually — both already block every
+/// keystroke exactly like compose/search/help do, so a resting pointer
+/// showing a popup *through* one would be the same bug wearing a different
+/// hat.
+#[allow(clippy::too_many_arguments)] // one bool per already-`Option`
+// overlay this frame's suppression depends on, the same "no struct saves
+// anything here" reasoning `event_loop`'s own signature docs give.
+fn passive_hover_suppressed(
+    compose: &Option<ComposeState>,
+    search_prompt: &Option<search::SearchPromptState>,
+    help: &Option<HelpState>,
+    scope_menu: &Option<ScopeMenuState>,
+    units_setup: &Option<UnitsSetupState>,
+    refs_panel: &Option<RefsPanelState>,
+    units_panel: &Option<UnitsPanel>,
+    context_menu: &Option<ContextMenuState>,
+    hover_state: &hover_popup::HoverState,
+    view: &View,
+) -> bool {
+    compose.is_some()
+        || search_prompt.is_some()
+        || help.is_some()
+        || scope_menu.is_some()
+        || units_setup.is_some()
+        || refs_panel.is_some()
+        || units_panel.is_some()
+        || context_menu.is_some()
+        || hover_state.blocks_passive()
+        || matches!(view, View::Diff(app) if app.visual_active())
+}
+
+/// Fires whatever a [`pointer_hover::PointerHoverState`] debounce's deadline
+/// just made due — issue #24's analogue of `Action::Hover`'s own dispatch
+/// (see that arm's docs), reached only after [`passive_hover_suppressed`]
+/// has already said no. `Tree` is a synchronous local lookup (no LSP
+/// involved at all — req 8) and goes straight to `Shown`, cancelling
+/// silently if the row vanished from the tree between arming and firing
+/// (a rebuild, a scroll past the end). `Code` is peek-only against
+/// readiness (req 4): [`classify_action_readiness`] without ever calling
+/// [`LspManager::ensure_started`] — a drifting mouse must not be what
+/// launches a language server — so anything but `Ready` cancels silently,
+/// with no journal entry at all (mirroring `check_action_readiness`'s
+/// design, minus the start-the-server side effect `peek_action_readiness`
+/// already omits for the same "preview, not dispatch" reason). A `Ready`
+/// target dispatches exactly like `Action::Hover`: `Queued` recorded,
+/// `set_pending`, the request submitted, and any previous passive request
+/// still in flight recorded `Superseded` (structurally at most one, since
+/// arming a new target already cancelled whatever came before — see
+/// `PointerHoverState::arm`'s docs — this only catches the one case a
+/// `Tree`→`Code` retarget or the reverse could leave stale: a `Pending`
+/// request whose `Armed` predecessor already got superseded when it was
+/// *armed*, not when it *fires*, so this is a second, cheap belt-and-
+/// suspenders check, not the primary mechanism).
+#[allow(clippy::too_many_arguments)]
+fn fire_pointer_hover(
+    target: &pointer_hover::PointerTarget,
+    anchor_row: u16,
+    pointer_hover: &mut pointer_hover::PointerHoverState,
+    pending_pointer_hover: &mut Option<PendingHover>,
+    lsp_manager: &LspManager,
+    observer: &crate::lsp::ObservationHandle,
+    diagnostics: &DiagnosticsStore,
+    view: &View,
+) {
+    match target {
+        pointer_hover::PointerTarget::Tree(id) => {
+            let View::Diff(app) = view else {
+                pointer_hover.cancel();
+                return;
+            };
+            match pointer_hover::tree_note_for(app, id) {
+                Some(text) => pointer_hover.show_tree_note(id.clone(), anchor_row, text),
+                None => pointer_hover.cancel(),
+            }
+        }
+        pointer_hover::PointerTarget::Code(query) => {
+            let readiness =
+                classify_action_readiness(lsp_manager.state(&query.file, &query.git_root));
+            if readiness != ActionReadiness::Ready {
+                pointer_hover.cancel();
+                return;
+            }
+            let operation_id = observer.next_operation_id();
+            observer.record_ui(
+                Some(operation_id),
+                crate::lsp::EventOutcome::Queued,
+                "passive hover: resolving target",
+            );
+            let overlapping = diagnostics.diagnostics_on_line(&query.file, query.line);
+            let diagnostics_prefix = hover_popup::diagnostics_section(&overlapping);
+            pointer_hover.set_pending(target.clone(), anchor_row, diagnostics_prefix);
+            let generation = pointer_hover.generation();
+            let rx = lsp_manager.hover_with_operation(
+                &query.file,
+                &query.git_root,
+                &query.line_text,
+                query.line,
+                query.display_col,
+                operation_id,
+            );
+            if let Some((_, superseded_id, _)) = pending_pointer_hover.take() {
+                observer.record_ui(
+                    Some(superseded_id),
+                    crate::lsp::EventOutcome::Superseded,
+                    "passive hover request superseded by a newer passive hover",
+                );
+            }
+            *pending_pointer_hover = Some((generation, operation_id, rx));
+        }
+    }
+}
+
+/// Cancels issue #24's passive pointer hover unconditionally — the shared
+/// body of all four of req 5's cancellation hooks (any key press, any
+/// non-`Moved` mouse event, a resize, a watch refresh), mirroring
+/// [`cancel_pending_lsp_requests`]'s shape for the explicit hover/goto path:
+/// drop to `Idle` (bumping generation, so a still-in-flight response is
+/// discarded as stale on arrival) and, only if a `Code` request was actually
+/// in flight, record one `Superseded` journal entry. An `Armed` debounce
+/// that hadn't fired yet gets no journal entry at all — nothing was ever
+/// queued for one to supersede.
+fn cancel_pending_pointer_hover(
+    pointer_hover: &mut pointer_hover::PointerHoverState,
+    pending_pointer_hover: &mut Option<PendingHover>,
+    observer: &crate::lsp::ObservationHandle,
+) {
+    pointer_hover.cancel();
+    if let Some((_, operation_id, _)) = pending_pointer_hover.take() {
+        observer.record_ui(
+            Some(operation_id),
+            crate::lsp::EventOutcome::Superseded,
+            "passive hover request superseded",
+        );
     }
 }
 
@@ -3422,6 +3773,9 @@ fn handle_watch_refresh(
     watch_status: &mut Option<WatchStatus>,
     watch_paused: bool,
     live_search: Option<(&str, &refresh::Anchor)>,
+    pointer_hover: &mut pointer_hover::PointerHoverState,
+    pending_pointer_hover: &mut Option<PendingHover>,
+    observer: &crate::lsp::ObservationHandle,
 ) {
     if watch_paused {
         return;
@@ -3430,6 +3784,16 @@ fn handle_watch_refresh(
     let View::Diff(app) = stack.root_mut() else {
         return; // watch mode only ever runs against the root diff view
     };
+
+    // Issue #24 req 5's fourth cancellation hook: unconditional, unlike
+    // `hover_state`/`refs_panel` just below, which only close when
+    // `overlay_survives` says the cursor's own row didn't make it through
+    // the refresh — a passive target's row could easily survive while its
+    // *content* (and therefore what a stale response would render) did not,
+    // and correctness here matters more than occasionally re-requesting a
+    // hover that would have come back identical (see the issue's own
+    // implementation notes).
+    cancel_pending_pointer_hover(pointer_hover, pending_pointer_hover, observer);
 
     if let Some(hook) = pre_refresh_hook {
         hook.before_refresh(&app.repo_root);
@@ -3745,6 +4109,7 @@ fn draw(
     keymap: &Keymap,
     highlighter: &mut LineHighlighter,
     hover_state: &hover_popup::HoverState,
+    pointer_hover_state: &pointer_hover::PointerHoverState,
     diagnostics: &DiagnosticsStore,
     refs_panel: Option<&RefsPanel>,
     units_panel: Option<&UnitsPanel>,
@@ -3823,8 +4188,18 @@ fn draw(
                 search_prompt.map(|p| (p.input.text(), p.input.cursor())),
                 &hint_items,
             );
-            if let Some(row) = view.cursor_screen_row() {
-                hover_popup::render(frame, diff_area, row, hover_state, geometry);
+            // Issue #24 render precedence: an explicit (keyboard-cursor)
+            // hover, once open, always wins over a passive pointer popup —
+            // `passive_hover_suppressed` already keeps the two from *arming*
+            // at once, but an already-`Shown` pointer popup must still yield
+            // the instant an explicit hover opens on top of it, rather than
+            // both trying to occupy the same anchored rect.
+            if hover_state.is_open() {
+                if let Some(row) = view.cursor_screen_row() {
+                    hover_popup::render(frame, diff_area, row, hover_state, geometry);
+                }
+            } else {
+                pointer_hover::render(frame, diff_area, pointer_hover_state);
             }
             if let Some(panel) = refs_panel {
                 refs_panel::render(frame, diff_area, panel, geometry);
@@ -3866,8 +4241,14 @@ fn draw(
             // `render` itself carved out of `areas.content`.
             geometry.record_file_content(file_view::content_rect(areas.content), file_hits);
             file_view::render_status(frame, areas.status, file, status_note, &hint_items);
-            if let Some(row) = view.cursor_screen_row() {
-                hover_popup::render(frame, areas.content, row, hover_state, geometry);
+            // Same explicit-wins-over-passive precedence as `View::Diff`
+            // above.
+            if hover_state.is_open() {
+                if let Some(row) = view.cursor_screen_row() {
+                    hover_popup::render(frame, areas.content, row, hover_state, geometry);
+                }
+            } else {
+                pointer_hover::render(frame, areas.content, pointer_hover_state);
             }
             if let Some(panel) = refs_panel {
                 refs_panel::render(frame, areas.content, panel, geometry);
@@ -4528,6 +4909,345 @@ mod tests {
             display_col: 0,
         };
         assert_eq!(peek_action_readiness(&lsp_manager, &query, "hover"), None);
+    }
+
+    // ---- fire_pointer_hover / cancel_pending_pointer_hover (issue #24) -----
+
+    #[test]
+    fn fire_pointer_hover_on_a_not_ready_server_never_populates_pending_or_starts_it() {
+        let (events_tx, _events_rx) = mpsc::channel();
+        let lsp_manager =
+            LspManager::new(events_tx, Arc::new(std::collections::HashMap::new()), false);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+        let file = dir.path().join("main.rs");
+        let query = hover_popup::HoverQuery {
+            file: file.clone(),
+            git_root: dir.path().to_path_buf(),
+            line: 0,
+            line_text: "fn main() {}".to_owned(),
+            display_col: 3,
+        };
+        assert_eq!(
+            lsp_manager.state(&file, dir.path()),
+            ServerState::NotStarted
+        );
+
+        let target = pointer_hover::PointerTarget::Code(query);
+        let mut pointer_hover_state = pointer_hover::PointerHoverState::default();
+        let mut pending: Option<PendingHover> = None;
+        let observer = crate::lsp::ObservationStore::in_memory();
+        let view = View::Diff(App::new(
+            "test-repo".to_owned(),
+            dir.path().to_path_buf(),
+            Vec::new(),
+        ));
+        let diagnostics = DiagnosticsStore::new();
+
+        fire_pointer_hover(
+            &target,
+            0,
+            &mut pointer_hover_state,
+            &mut pending,
+            &lsp_manager,
+            &observer,
+            &diagnostics,
+            &view,
+        );
+
+        assert!(
+            pending.is_none(),
+            "a not-ready server must never populate a pending passive request"
+        );
+        assert_eq!(
+            lsp_manager.state(&file, dir.path()),
+            ServerState::NotStarted,
+            "passive hover must never call ensure_started — a drifting mouse must not launch a server"
+        );
+        assert!(
+            observer.events().is_empty(),
+            "req 4: passive hover stays silent for a not-ready state, no journal entry either"
+        );
+    }
+
+    #[test]
+    fn fire_pointer_hover_on_a_tree_target_shows_the_tooltip_synchronously_with_no_lsp_involved() {
+        let file = crate::diff::DiffFile {
+            old_path: Some("src/a.rs".to_owned()),
+            new_path: Some("src/a.rs".to_owned()),
+            ..Default::default()
+        };
+        let app = App::new("test-repo".to_owned(), PathBuf::from("/repo"), vec![file]);
+        let id = app.visible_rows[0].id.clone();
+        let view = View::Diff(app);
+
+        let (events_tx, _events_rx) = mpsc::channel();
+        let lsp_manager =
+            LspManager::new(events_tx, Arc::new(std::collections::HashMap::new()), false);
+        let observer = crate::lsp::ObservationStore::in_memory();
+        let diagnostics = DiagnosticsStore::new();
+        let mut pointer_hover_state = pointer_hover::PointerHoverState::default();
+        let mut pending: Option<PendingHover> = None;
+
+        let target = pointer_hover::PointerTarget::Tree(id);
+        fire_pointer_hover(
+            &target,
+            3,
+            &mut pointer_hover_state,
+            &mut pending,
+            &lsp_manager,
+            &observer,
+            &diagnostics,
+            &view,
+        );
+
+        assert!(
+            pending.is_none(),
+            "a tree lookup is synchronous — it never goes through the async pending-request path"
+        );
+        assert!(
+            pointer_hover_state.tree_status_hint().is_some(),
+            "a resolvable tree target shows its tooltip immediately"
+        );
+        assert!(
+            observer.events().is_empty(),
+            "a tree lookup has nothing to do with LSP — no journal entry"
+        );
+    }
+
+    #[test]
+    fn cancel_pending_pointer_hover_with_nothing_in_flight_records_no_journal_entry() {
+        let mut pointer_hover_state = pointer_hover::PointerHoverState::default();
+        pointer_hover_state.arm(
+            pointer_hover::PointerTarget::Tree(file_tree::NodeId {
+                path: "src".to_owned(),
+                is_directory: true,
+            }),
+            0,
+            std::time::Instant::now(),
+        );
+        let mut pending: Option<PendingHover> = None;
+        let observer = crate::lsp::ObservationStore::in_memory();
+
+        cancel_pending_pointer_hover(&mut pointer_hover_state, &mut pending, &observer);
+
+        assert!(pending.is_none());
+        // The `Armed` debounce is gone — even a deadline far in the future
+        // is no longer due for it.
+        assert_eq!(
+            pointer_hover_state.due(std::time::Instant::now() + Duration::from_secs(3600)),
+            None
+        );
+        assert!(
+            observer.events().is_empty(),
+            "nothing was ever queued for a cancel to supersede"
+        );
+    }
+
+    #[test]
+    fn cancel_pending_pointer_hover_drops_the_receiver_and_records_superseded() {
+        let mut pointer_hover_state = pointer_hover::PointerHoverState::default();
+        let (_tx, rx) = mpsc::channel();
+        let mut pending: Option<PendingHover> = Some((0, 42, rx));
+        let observer = crate::lsp::ObservationStore::in_memory();
+
+        cancel_pending_pointer_hover(&mut pointer_hover_state, &mut pending, &observer);
+
+        assert!(pending.is_none(), "the in-flight receiver must be dropped");
+        let events = observer.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].operation_id, Some(42));
+        assert_eq!(events[0].outcome, crate::lsp::EventOutcome::Superseded);
+    }
+
+    // ---- passive_hover_suppressed (issue #24) -------------------------------
+
+    /// Every argument defaulted to "not suppressing" — each test below flips
+    /// exactly one to prove that condition alone is enough, without having
+    /// to restate every other parameter each time.
+    #[allow(clippy::too_many_arguments)]
+    fn suppressed(
+        compose: bool,
+        search_prompt: bool,
+        help: bool,
+        scope_menu: bool,
+        units_setup: bool,
+        refs_panel: bool,
+        units_panel: bool,
+        context_menu: bool,
+        hover_blocks: bool,
+        visual_active: bool,
+    ) -> bool {
+        let compose = compose.then(|| {
+            ComposeState::new(app::CommentTarget::Single {
+                file: "a.rs".to_owned(),
+                line: 1,
+            })
+        });
+        let search_prompt = search_prompt.then(|| search::SearchPromptState {
+            input: search::SearchInput::new(),
+            origin: refresh::capture_anchor(&[], &[], 0, 0),
+            jump_from: None,
+        });
+        let help = help.then(HelpState::default);
+        let scope_menu = scope_menu.then(|| ScopeMenuState::new_list(false));
+        let units_setup = units_setup.then(|| {
+            UnitsSetupState::new(vec![crate::groups::agent::AgentCli {
+                kind: crate::groups::agent::AgentKind::Claude,
+                path: PathBuf::from("/bin/claude"),
+            }])
+        });
+        let refs_panel = refs_panel.then(|| RefsPanelState {
+            git_root: PathBuf::from("/repo"),
+            panel: RefsPanel::new("test".to_owned(), Vec::new(), 0),
+            operation_id: 0,
+        });
+        let units_panel = units_panel.then(|| {
+            UnitsPanel::build(
+                &crate::groups::Grouping {
+                    diff_key: String::new(),
+                    agent: "claude".to_owned(),
+                    created_at: 0,
+                    units: Vec::new(),
+                },
+                &[],
+            )
+        });
+        let context_menu = context_menu.then(|| {
+            ContextMenuState::new(
+                MenuTarget::DiffRow,
+                vec![context_menu::MenuEntry {
+                    label: "hover".to_owned(),
+                    enabled: Ok(()),
+                    command: MenuCommand::Action(Action::Hover),
+                }],
+                (0, 0),
+            )
+        });
+        let mut hover_state = hover_popup::HoverState::default();
+        if hover_blocks {
+            hover_state.invalidate();
+            hover_state.set_pending();
+        }
+        let mut app = App::new(
+            "test-repo".to_owned(),
+            PathBuf::from("/repo"),
+            vec![crate::diff::DiffFile {
+                old_path: Some("a.rs".to_owned()),
+                new_path: Some("a.rs".to_owned()),
+                hunks: vec![crate::diff::DiffHunk {
+                    old_start: 1,
+                    old_lines: 1,
+                    new_start: 1,
+                    new_lines: 1,
+                    header: String::new(),
+                    known_eof: true,
+                    rows: vec![crate::diff::DiffRow {
+                        kind: crate::diff::DiffLineKind::Context,
+                        text: "alpha".to_owned(),
+                        old_line: Some(1),
+                        new_line: Some(1),
+                    }],
+                }],
+                ..Default::default()
+            }],
+        );
+        if visual_active {
+            app.cursor = 2; // the one `RenderRow::Line` in this fixture
+            let outcome = app.toggle_visual();
+            debug_assert!(matches!(outcome, app::VisualToggleOutcome::Started));
+        }
+        let view = View::Diff(app);
+
+        passive_hover_suppressed(
+            &compose,
+            &search_prompt,
+            &help,
+            &scope_menu,
+            &units_setup,
+            &refs_panel,
+            &units_panel,
+            &context_menu,
+            &hover_state,
+            &view,
+        )
+    }
+
+    #[test]
+    fn nothing_open_never_suppresses() {
+        assert!(!suppressed(
+            false, false, false, false, false, false, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn compose_suppresses() {
+        assert!(suppressed(
+            true, false, false, false, false, false, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn search_prompt_suppresses() {
+        assert!(suppressed(
+            false, true, false, false, false, false, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn help_suppresses() {
+        assert!(suppressed(
+            false, false, true, false, false, false, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn scope_menu_suppresses() {
+        assert!(suppressed(
+            false, false, false, true, false, false, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn units_setup_suppresses() {
+        assert!(suppressed(
+            false, false, false, false, true, false, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn refs_panel_suppresses() {
+        assert!(suppressed(
+            false, false, false, false, false, true, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn units_panel_suppresses() {
+        assert!(suppressed(
+            false, false, false, false, false, false, true, false, false, false
+        ));
+    }
+
+    #[test]
+    fn context_menu_suppresses() {
+        assert!(suppressed(
+            false, false, false, false, false, false, false, true, false, false
+        ));
+    }
+
+    #[test]
+    fn an_explicit_hover_pending_or_shown_suppresses() {
+        assert!(suppressed(
+            false, false, false, false, false, false, false, false, true, false
+        ));
+    }
+
+    #[test]
+    fn an_active_visual_selection_suppresses() {
+        assert!(suppressed(
+            false, false, false, false, false, false, false, false, false, true
+        ));
     }
 
     // ---- readiness_status_message ------------------------------------------

@@ -889,3 +889,139 @@ fn shift_click_extends_the_visual_selection_and_never_chases_definition() {
     let status = h.wait_exit(Duration::from_secs(5));
     assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
 }
+
+// ---- issue #24: debounced pointer details ---------------------------------
+
+/// The one deliberately-real-timing test in this suite's #24 coverage:
+/// resting the pointer (no click, no button) on a real identifier for
+/// comfortably longer than `pointer_hover::POINTER_HOVER_DEBOUNCE` (400ms)
+/// produces a hover popup, sourced from a real (if fake) language server
+/// response — `fake_lsp_server.py`'s fixed `HOVER_INFO_UNIQUE` body — without
+/// ever touching the keyboard cursor position shown in the status bar.
+/// Everything else about the debounce/cancellation state machine is proven
+/// deterministically in `ui::pointer_hover`'s own unit tests (`Instant`
+/// injected, zero sleeps); this is only here to prove the real event loop —
+/// real `Moved` bytes, a real wall clock, a real child-process LSP — wires
+/// the same thing together end to end.
+#[test]
+fn resting_the_pointer_on_a_ready_symbol_shows_a_hover_popup_after_the_debounce() {
+    if !fixture::python3_available() {
+        eprintln!("skipping: python3 not on PATH (fake LSP server fixture needs it)");
+        return;
+    }
+    let repo = fixture::lsp_readiness_repo(0.0, 0.0);
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            cols: 160,
+            ..Default::default()
+        },
+    );
+
+    h.wait_for_text("GOTO_TARGET_TOKEN");
+    h.wait_for_text("\u{b7} 1/");
+
+    // Land on the GOTO_TARGET_TOKEN add row to read where its one
+    // identifier actually renders (FileHeader/HunkHeader/Context/Context/
+    // Add — same layout `clicking_an_identifier_on_an_add_row_activates_go_to_definition`
+    // above already relies on), then move the keyboard cursor back off it —
+    // the debounce below must reach that row purely through the pointer.
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.wait_for_text("\u{b7} 5/");
+    let (row, col) = active_symbol_cell(&h);
+
+    h.send(Key::Char('g'));
+    h.send(Key::Char('g'));
+    h.wait_for_text("\u{b7} 1/");
+
+    // Even at `init_delay_secs: 0.0`, the fake server's `initialize`
+    // handshake still takes real wall-clock time, and passive hover
+    // deliberately never calls `ensure_started` itself (req 4) — `warm_up_root`
+    // already kicked the server off at session startup regardless, so this
+    // is purely "wait for it," the same retry-a-real-race reasoning
+    // `clicking_an_identifier_on_an_add_row_activates_go_to_definition`
+    // above uses for the identical handshake.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        h.send_mouse(MouseKey::Moved { column: col, row });
+        // Comfortably past the 400ms debounce plus the event loop's own
+        // up-to-100ms poll latency.
+        std::thread::sleep(Duration::from_millis(700));
+        if h.screen_contents().contains("HOVER_INFO_UNIQUE") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pointer rest never produced a hover popup within 5s (server \
+             readiness race); screen:\n{}",
+            h.screen_contents()
+        );
+    }
+
+    // The keyboard cursor never left row 1 — passive hover has its own
+    // anchor/target entirely separate from `App::cursor` (req 3).
+    assert!(h.screen_contents().contains("\u{b7} 1/"));
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+/// Req 5: any keypress cancels an in-progress debounce outright, before it
+/// can ever fire — resting on a real identifier, then pressing a key well
+/// inside the 400ms window, must never let the original rest's popup appear
+/// even after enough wall-clock time has passed that it otherwise would
+/// have.
+#[test]
+fn a_keypress_before_the_debounce_elapses_cancels_it_and_no_popup_ever_appears() {
+    if !fixture::python3_available() {
+        eprintln!("skipping: python3 not on PATH (fake LSP server fixture needs it)");
+        return;
+    }
+    let repo = fixture::lsp_readiness_repo(0.0, 0.0);
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            cols: 160,
+            ..Default::default()
+        },
+    );
+
+    h.wait_for_text("GOTO_TARGET_TOKEN");
+    h.wait_for_text("\u{b7} 1/");
+
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.wait_for_text("\u{b7} 5/");
+    let (row, col) = active_symbol_cell(&h);
+
+    h.send(Key::Char('g'));
+    h.send(Key::Char('g'));
+    h.wait_for_text("\u{b7} 1/");
+
+    h.send_mouse(MouseKey::Moved { column: col, row });
+    // Well inside the 400ms debounce — nowhere near due yet.
+    std::thread::sleep(Duration::from_millis(150));
+    h.send(Key::Char('j'));
+    h.wait_for_text("\u{b7} 2/");
+    h.send(Key::Char('k'));
+    h.wait_for_text("\u{b7} 1/");
+
+    // Comfortably past where the original rest's debounce would have fired,
+    // had the keypress not cancelled it.
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(
+        !h.screen_contents().contains("HOVER_INFO_UNIQUE"),
+        "a keypress before the debounce elapses must cancel it outright; screen:\n{}",
+        h.screen_contents()
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}

@@ -57,6 +57,20 @@ pub enum MouseKey {
         row: u16,
         shift: bool,
     },
+    /// Issue #24: bare pointer motion with *no* button held — the byte a
+    /// real terminal's any-motion reporting (`?1003h`, requested
+    /// unconditionally whenever mouse capture is on — see
+    /// `Config::mouse_hover`'s docs) sends every time the pointer crosses
+    /// into a new terminal cell while nothing is pressed. A held button
+    /// never reaches this variant: crossterm's own `parse_cb` only decodes
+    /// `MouseEventKind::Moved` when the button bits are `3` (none); any
+    /// button held during motion decodes to `Drag` instead, a wholly
+    /// different `Cb` this module has no constructor for (nothing in this
+    /// suite exercises drag).
+    Moved {
+        column: u16,
+        row: u16,
+    },
 }
 
 impl MouseKey {
@@ -109,6 +123,14 @@ impl MouseKey {
                 row,
                 'm',
             ),
+            // `35` = the motion bit (`0x20`) OR'd with `3` (no button held)
+            // — crossterm's `parse_cb` decodes `(cb & 3) | ((cb & 0xC0) >>
+            // 4)` to button `None`, and the motion bit alone (no press bit)
+            // to `Moved` rather than `Drag`. Always `M`: motion has no
+            // release counterpart for SGR to report with a lowercase
+            // trailing byte, the same reasoning `ScrollUp`/`ScrollDown`
+            // above already give.
+            MouseKey::Moved { column, row } => (35, column, row, 'M'),
         };
         format!("\x1b[<{cb};{};{}{trailing}", column + 1, row + 1).into_bytes()
     }
@@ -182,6 +204,14 @@ mod tests {
             }
             .encode(),
             b"\x1b[<2;1;1M".to_vec()
+        );
+    }
+
+    #[test]
+    fn moved_encodes_button_35_with_no_release_variant() {
+        assert_eq!(
+            MouseKey::Moved { column: 5, row: 10 }.encode(),
+            b"\x1b[<35;6;11M".to_vec()
         );
     }
 

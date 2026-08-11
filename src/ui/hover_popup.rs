@@ -27,7 +27,7 @@ use std::path::PathBuf;
 /// — the one place that knows how to build this from either `App` or
 /// `FileView`'s state, so `ui::mod`'s event loop never matches on the view
 /// type just to ask "what's under the cursor".
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HoverQuery {
     /// Absolute path to the file to open.
     pub file: PathBuf,
@@ -55,9 +55,19 @@ enum Status {
     Shown(RenderedHover),
 }
 
-struct RenderedHover {
-    lines: Vec<Line<'static>>,
-    scroll: usize,
+/// `pub(super)` (not just this module's own use) — issue #24's passive
+/// pointer hover popup renders the identical box a resolved cursor-hover
+/// response would, just anchored at the pointer's row instead of the
+/// keyboard cursor's, so `ui::pointer_hover` builds and holds one of these
+/// too rather than a second, parallel "rendered hover" shape. `lines`/
+/// `scroll` stay `pub(super)` rather than getting accessor methods: both
+/// call sites (this module's own [`render_popup`] and
+/// `pointer_hover::render`) are inside `ui`, and a passive popup never
+/// scrolls (no way to keep keyboard focus on the diff *and* interact with
+/// it — see that module's docs), so `scroll` is always `0` there.
+pub(super) struct RenderedHover {
+    pub(super) lines: Vec<Line<'static>>,
+    pub(super) scroll: usize,
 }
 
 /// Tracks one in-flight-or-resolved hover request. `ui::mod` owns exactly
@@ -87,6 +97,19 @@ impl HoverState {
 
     pub fn is_open(&self) -> bool {
         matches!(self.status, Status::Shown(_))
+    }
+
+    /// Whether an *explicit* (keyboard-cursor) hover is active enough that
+    /// issue #24's passive pointer hover must stay suppressed — `Pending`
+    /// (a request the reviewer's own `Action::Hover` press is waiting on) or
+    /// `Shown` (its popup already on screen), but deliberately not `Message`:
+    /// a resolved-to-nothing/errored explicit hover has already returned
+    /// control to the reviewer with nothing left on screen to protect, so a
+    /// passive request arming right after one is exactly the same as if the
+    /// explicit hover had never happened. See `ui::mod::passive_hover_suppressed`,
+    /// the one caller.
+    pub fn blocks_passive(&self) -> bool {
+        matches!(self.status, Status::Pending | Status::Shown(_))
     }
 
     pub fn close(&mut self) {
@@ -235,6 +258,17 @@ fn render_popup(
     // precedence, the same "only record what's really on screen" rule
     // every other overlay in this module family follows).
     geometry.record(rect, ScrollTarget::HoverPopup);
+    render_popup_frame(frame, rect, rendered);
+}
+
+/// The popup's actual drawing (`Clear` + bordered box + scrolled content),
+/// split out of [`render_popup`] so `ui::pointer_hover::render` can reuse it
+/// at its own, independently-computed `rect` without also inheriting
+/// [`render_popup`]'s `geometry.record` call — issue #24's passive popup is
+/// deliberately non-interactive (no `ScrollTarget` of its own; see that
+/// module's docs on why), so recording it would make it a wheel/click
+/// target it was never meant to be.
+pub(super) fn render_popup_frame(frame: &mut Frame, rect: Rect, rendered: &RenderedHover) {
     frame.render_widget(Clear, rect);
 
     let block = Block::default().borders(Borders::ALL).title(" hover ");
@@ -253,8 +287,11 @@ fn render_popup(
 
 /// At most ~60% of `area`'s width and ~40% of its height, positioned just
 /// below the cursor's row — or above it, when there isn't enough room
-/// below.
-fn popup_rect(area: Rect, cursor_screen_row: u16) -> Rect {
+/// below. `pub(super)`: issue #24's passive pointer popup shares this exact
+/// placement math, anchored at the pointer's row instead of the cursor's —
+/// nothing about this function assumes the anchor came from a keyboard
+/// cursor at all, it's already anchor-agnostic.
+pub(super) fn popup_rect(area: Rect, cursor_screen_row: u16) -> Rect {
     let width = ((area.width as u32 * 3) / 5).clamp(20, area.width.max(20) as u32) as u16;
     let height = ((area.height as u32 * 2) / 5).clamp(3, area.height.max(3) as u32) as u16;
     let x = area.x + area.width.saturating_sub(width) / 2;
@@ -296,8 +333,11 @@ pub fn plain_text(contents: &HoverContents) -> String {
 /// Renders a "Diagnostics" section: a bold header followed by one line per
 /// diagnostic (`[severity] message (source)`), in the order given. Empty
 /// input renders as no lines at all, not an empty header — a caller with
-/// nothing to show shouldn't have to check that itself.
-fn diagnostics_section(diagnostics: &[&Diagnostic]) -> Vec<Line<'static>> {
+/// nothing to show shouldn't have to check that itself. `pub(super)`:
+/// issue #24's passive hover dispatch prepends the identical section ahead
+/// of a resolved pointer-hover response, the same way [`HoverState::apply`]
+/// does for an explicit one.
+pub(super) fn diagnostics_section(diagnostics: &[&Diagnostic]) -> Vec<Line<'static>> {
     if diagnostics.is_empty() {
         return Vec::new();
     }
@@ -337,7 +377,11 @@ fn marked_string_plain_text(marked: &MarkedString) -> String {
     }
 }
 
-fn render_hover_contents(
+/// `pub(super)`: issue #24's passive pointer hover renders a resolved
+/// response through the identical markdown/diagnostics pipeline an explicit
+/// hover does — see [`HoverState::apply`]'s own call for the pattern this
+/// mirrors.
+pub(super) fn render_hover_contents(
     contents: &HoverContents,
     highlighter: &mut LineHighlighter,
 ) -> Vec<Line<'static>> {
@@ -639,5 +683,91 @@ mod tests {
             state.status_hint(),
             Some("hover: no hover information".to_owned())
         );
+    }
+
+    // ---- blocks_passive (issue #24) --------------------------------------
+
+    #[test]
+    fn blocks_passive_is_false_while_idle() {
+        let state = HoverState::default();
+        assert!(!state.blocks_passive());
+    }
+
+    #[test]
+    fn blocks_passive_is_true_while_pending() {
+        let mut state = HoverState::default();
+        state.invalidate();
+        state.set_pending();
+        assert!(state.blocks_passive());
+    }
+
+    #[test]
+    fn blocks_passive_is_true_while_shown() {
+        let mut hl = LineHighlighter::new();
+        let mut state = HoverState::default();
+        state.invalidate();
+        let generation = state.generation();
+        let hover = lsp_types::Hover {
+            contents: HoverContents::Scalar(MarkedString::String("hi".to_owned())),
+            range: None,
+        };
+        state.apply(generation, Ok(Some(hover)), &mut hl);
+        assert!(state.blocks_passive());
+    }
+
+    #[test]
+    fn blocks_passive_is_false_once_resolved_to_a_message() {
+        // A resolved-to-nothing/errored explicit hover has already returned
+        // control to the reviewer — see `blocks_passive`'s own docs on why
+        // `Message` deliberately doesn't suppress passive hover the way
+        // `Pending`/`Shown` do.
+        let mut hl = LineHighlighter::new();
+        let mut state = HoverState::default();
+        state.invalidate();
+        let generation = state.generation();
+        state.apply(generation, Ok(None), &mut hl);
+        assert!(!state.blocks_passive());
+    }
+
+    // ---- popup_rect (issue #24: shared by the pointer-anchored popup) ----
+
+    #[test]
+    fn popup_rect_positions_below_the_anchor_row_when_there_is_room() {
+        let area = Rect::new(0, 0, 80, 40);
+        let rect = popup_rect(area, 5);
+        assert_eq!(rect.y, area.y + 5 + 1, "opens just below the anchor row");
+    }
+
+    #[test]
+    fn popup_rect_flips_above_the_anchor_row_near_the_bottom_edge() {
+        let area = Rect::new(0, 0, 80, 10);
+        // Near the pane's last row, with no room below for the popup's own
+        // height — must flip to open above instead of running off-screen.
+        let anchor_row = 9;
+        let rect = popup_rect(area, anchor_row);
+        assert!(
+            rect.y < area.y + anchor_row,
+            "must open above the anchor row when there's no room below"
+        );
+        assert!(
+            rect.y + rect.height <= area.y + area.height,
+            "must stay fully within the pane's bottom edge"
+        );
+    }
+
+    #[test]
+    fn popup_rect_stays_within_the_panes_top_edge_when_the_anchor_is_near_it() {
+        let area = Rect::new(0, 0, 80, 6);
+        // Not enough room above *or* below a tiny pane — must clamp to the
+        // top rather than producing a negative/overflowing `y`.
+        let rect = popup_rect(area, 0);
+        assert!(rect.y >= area.y);
+    }
+
+    #[test]
+    fn popup_rect_never_exceeds_the_panes_own_width() {
+        let area = Rect::new(0, 0, 80, 40);
+        let rect = popup_rect(area, 5);
+        assert!(rect.x + rect.width <= area.x + area.width);
     }
 }

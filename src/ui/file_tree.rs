@@ -16,7 +16,7 @@
 //! silently dropping the other (issue #15's acceptance criterion), and
 //! `is_directory` is what a lookup needs to tell them apart.
 
-use crate::diff::DiffFile;
+use crate::diff::{DiffFile, FileStatus};
 use std::collections::{HashMap, HashSet};
 
 /// A node's stable, rebuild-independent identity. `path` alone is not
@@ -242,6 +242,38 @@ fn flatten_node(node: &Node, collapsed: &HashSet<String>, rows: &mut Vec<Visible
                 for child in children {
                     flatten_node(child, collapsed, rows);
                 }
+            }
+        }
+    }
+}
+
+/// Issue #24 req 8: the local (LSP-free) metadata a passive pointer hover
+/// shows for a changed-file tree row — a repo-relative path, status, and
+/// `+/-` stats for a plain file, an old→new path for a rename, or a changed-
+/// descendant count for a directory. Every field this reads already lives on
+/// [`VisibleRow`]/[`DiffFile`] (see [`DiffFile::status`]'s own docs, which
+/// literally anticipated "a future consumer, e.g. a mouse tooltip"), so this
+/// is pure formatting, not a new lookup — `ui::mod`'s passive-hover dispatch
+/// calls it directly once a `Tree` target's debounce fires, with no LSP
+/// round trip involved at all (req 8's whole point).
+pub fn tooltip_line(row: &VisibleRow, files: &[DiffFile]) -> String {
+    match &row.kind {
+        VisibleKind::Directory {
+            descendant_files, ..
+        } => format!("{} ({descendant_files} changed)", row.id.path),
+        VisibleKind::File { file_idx } => {
+            let file = &files[*file_idx];
+            let (added, deleted) = file.stat();
+            if file.status() == FileStatus::Renamed {
+                let old = file.old_path.as_deref().unwrap_or("?");
+                let new = file.new_path.as_deref().unwrap_or("?");
+                format!("{old} \u{2192} {new} \u{b7} +{added} -{deleted}")
+            } else {
+                format!(
+                    "{} \u{b7} {:?} \u{b7} +{added} -{deleted}",
+                    row.id.path,
+                    file.status()
+                )
             }
         }
     }
@@ -740,5 +772,104 @@ mod tests {
         let rows = flatten_visible(&tree, &HashSet::new());
         let previous = node_id("gone.rs", false);
         assert_eq!(resolve_selection(&rows, Some(&previous), None), None);
+    }
+
+    // ---- tooltip_line (issue #24) ------------------------------------
+
+    /// A single-hunk file with `added` `Add` rows and `deleted` `Del` rows,
+    /// so [`DiffFile::stat`] reports exactly the counts a test asks for —
+    /// the plain [`file`] fixture above always stats to `(0, 0)`, which
+    /// can't tell a `+2 -1` tooltip apart from a `+0 -0` one.
+    fn file_with_stat(old: Option<&str>, new: Option<&str>, added: u32, deleted: u32) -> DiffFile {
+        use crate::diff::{DiffHunk, DiffLineKind, DiffRow};
+        let mut rows = Vec::new();
+        for _ in 0..added {
+            rows.push(DiffRow {
+                kind: DiffLineKind::Add,
+                text: "+".to_owned(),
+                old_line: None,
+                new_line: Some(1),
+            });
+        }
+        for _ in 0..deleted {
+            rows.push(DiffRow {
+                kind: DiffLineKind::Del,
+                text: "-".to_owned(),
+                old_line: Some(1),
+                new_line: None,
+            });
+        }
+        DiffFile {
+            old_path: old.map(str::to_owned),
+            new_path: new.map(str::to_owned),
+            is_renamed: old.is_some() && new.is_some() && old != new,
+            hunks: vec![DiffHunk {
+                rows,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tooltip_line_of_a_directory_reports_its_path_and_descendant_count() {
+        let files = [file("src/a.rs"), file("src/nested/b.rs")];
+        let tree = build(&files);
+        let rows = flatten_visible(&tree, &HashSet::new());
+        let src = rows.iter().find(|r| r.label == "src").unwrap();
+        assert_eq!(tooltip_line(src, &files), "src (2 changed)");
+    }
+
+    #[test]
+    fn tooltip_line_of_a_modified_file_reports_path_status_and_stats() {
+        let files = [file_with_stat(Some("a.rs"), Some("a.rs"), 2, 1)];
+        let tree = build(&files);
+        let rows = flatten_visible(&tree, &HashSet::new());
+        assert_eq!(
+            tooltip_line(&rows[0], &files),
+            "a.rs \u{b7} Modified \u{b7} +2 -1"
+        );
+    }
+
+    #[test]
+    fn tooltip_line_of_an_added_file_reports_the_added_status() {
+        let mut f = file_with_stat(None, Some("new.rs"), 3, 0);
+        f.is_new = true;
+        let files = [f];
+        let tree = build(&files);
+        let rows = flatten_visible(&tree, &HashSet::new());
+        assert_eq!(
+            tooltip_line(&rows[0], &files),
+            "new.rs \u{b7} Added \u{b7} +3 -0"
+        );
+    }
+
+    #[test]
+    fn tooltip_line_of_a_deleted_file_reports_the_deleted_status() {
+        let mut f = file_with_stat(Some("gone.rs"), None, 0, 4);
+        f.is_deleted = true;
+        let files = [f];
+        let tree = build(&files);
+        let rows = flatten_visible(&tree, &HashSet::new());
+        assert_eq!(
+            tooltip_line(&rows[0], &files),
+            "gone.rs \u{b7} Deleted \u{b7} +0 -4"
+        );
+    }
+
+    #[test]
+    fn tooltip_line_of_a_rename_shows_old_arrow_new_instead_of_the_status_word() {
+        let files = [file_with_stat(
+            Some("old_name.rs"),
+            Some("new_name.rs"),
+            1,
+            1,
+        )];
+        let tree = build(&files);
+        let rows = flatten_visible(&tree, &HashSet::new());
+        assert_eq!(
+            tooltip_line(&rows[0], &files),
+            "old_name.rs \u{2192} new_name.rs \u{b7} +1 -1"
+        );
     }
 }

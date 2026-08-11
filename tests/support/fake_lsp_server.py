@@ -5,17 +5,23 @@ Speaks just enough of LSP-over-stdio (`Content-Length` framing, JSON-RPC
 2.0) for `tests/e2e/lsp_readiness.rs`'s readiness coverage (issue #11):
 answer `initialize` — after sleeping `sys.argv[1]` seconds first, so a test
 has a real, controllable window to press actions against a server that
-hasn't come up yet — declare `definitionProvider`, then answer
-`textDocument/definition` with no result after sleeping `sys.argv[2]`
-seconds, so the same fixture can also prove movement stays responsive
-while a *Ready* server is deliberately slow to answer a real request.
-`sys.argv[3] == "1"` (issue #12) switches that last answer to a real
-`Location` in a sibling file instead, for a PTY test that needs an actual
-`FileView` push to prove `Esc` pops it — see
+hasn't come up yet — declare `definitionProvider`/`hoverProvider`, then
+answer `textDocument/definition` with no result after sleeping
+`sys.argv[2]` seconds, so the same fixture can also prove movement stays
+responsive while a *Ready* server is deliberately slow to answer a real
+request. `sys.argv[3] == "1"` (issue #12) switches that last answer to a
+real `Location` in a sibling file instead, for a PTY test that needs an
+actual `FileView` push to prove `Esc` pops it — see
 `support::fixture::lsp_readiness_repo_with_definition_target`'s docs.
-Everything else (`initialized`, `textDocument/didOpen`, `shutdown`/`exit`)
-is handled just well enough that katamari's client doesn't see anything it
-would treat as a protocol violation; an unrecognized request gets an empty
+`textDocument/hover` (issue #24) always answers immediately, regardless of
+`init_delay`/`definition_delay`, with a fixed, unique plain-text body
+(`HOVER_INFO_UNIQUE`) — the one PTY test that needs a real hover result
+(`tests/e2e/mouse.rs`'s debounced-pointer-details coverage) only needs a
+witness string to appear in a popup after the client-side 400ms debounce,
+never a server-side delay of its own to synchronize against. Everything
+else (`initialized`, `textDocument/didOpen`, `shutdown`/`exit`) is handled
+just well enough that katamari's client doesn't see anything it would
+treat as a protocol violation; an unrecognized request gets an empty
 result rather than being left to hang, so a future test extending this
 fixture doesn't deadlock by surprise.
 
@@ -90,7 +96,10 @@ def main():
                     "jsonrpc": "2.0",
                     "id": message_id,
                     "result": {
-                        "capabilities": {"definitionProvider": True},
+                        "capabilities": {
+                            "definitionProvider": True,
+                            "hoverProvider": True,
+                        },
                         "serverInfo": {"name": "fake-lsp-server", "version": "0.0.0"},
                     },
                 }
@@ -124,6 +133,22 @@ def main():
                 # readiness contract never depends on a real navigation
                 # target.
                 write_message({"jsonrpc": "2.0", "id": message_id, "result": None})
+        elif method == "textDocument/hover":
+            # Issue #24: no delay of its own — see this script's module
+            # docs on why the client-side debounce is the only timing a
+            # hover PTY test needs.
+            write_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": message_id,
+                    "result": {
+                        "contents": {
+                            "kind": "plaintext",
+                            "value": "HOVER_INFO_UNIQUE",
+                        }
+                    },
+                }
+            )
         elif method == "shutdown":
             write_message({"jsonrpc": "2.0", "id": message_id, "result": None})
         elif method == "exit":

@@ -123,10 +123,20 @@ impl FileView {
     /// The plain text of the line the cursor currently sits on — used for
     /// symbol scanning within this module and, via
     /// [`crate::ui::navigation`], to resolve the display column of the
-    /// active symbol when recording this position on the jump stack.
+    /// active symbol when recording this position on the jump stack. A thin
+    /// wrapper over [`Self::line_text_at`] at the cursor's own line — see
+    /// that method's docs for why the two are split.
     pub fn cursor_line_text(&self) -> String {
+        self.line_text_at(self.cursor)
+    }
+
+    /// As [`Self::cursor_line_text`], for an arbitrary line rather than only
+    /// the cursor's own — issue #24's passive pointer hover needs to scan
+    /// symbols on whatever line the pointer is resting on, without moving
+    /// `cursor` there first (mirrors [`crate::ui::app::App::row_text`]).
+    fn line_text_at(&self, idx: usize) -> String {
         self.highlighter
-            .line(self.cursor)
+            .line(idx)
             .iter()
             .map(|s| s.text.as_str())
             .collect()
@@ -145,18 +155,41 @@ impl FileView {
 
     /// As [`crate::ui::app::App::hover_query`]: what `Action::Hover` should
     /// ask about, or `None` when this view has no hover target (see
-    /// `file_path`) or the current line has no identifier-like token.
+    /// `file_path`) or the current line has no identifier-like token. A thin
+    /// wrapper over [`Self::hover_query_for`] at the cursor's own line and
+    /// active symbol — see that method's docs for why the two are split.
     pub fn hover_query(&self) -> Option<HoverQuery> {
+        self.hover_query_for(self.cursor, self.active_symbol)
+    }
+
+    /// As [`crate::ui::app::App::hover_query_for`], for an arbitrary line/
+    /// symbol-index pair — extracted so issue #24's passive pointer hover
+    /// (via [`Self::hover_query_at`]) can build the identical query a
+    /// keyboard hover would for whatever line the pointer rests on, without
+    /// moving `cursor`/`active_symbol` (req 3).
+    fn hover_query_for(&self, row_idx: usize, symbol_idx: usize) -> Option<HoverQuery> {
         let file = self.file_path.clone()?;
-        let line_text = self.cursor_line_text();
-        let symbol = symbols::scan(&line_text).get(self.active_symbol).copied()?;
+        let line_text = self.line_text_at(row_idx);
+        let symbol = symbols::scan(&line_text).get(symbol_idx).copied()?;
         Some(HoverQuery {
             file,
             git_root: self.git_root.clone(),
-            line: self.cursor as u32,
+            line: row_idx as u32,
             line_text,
             display_col: symbol.display_start,
         })
+    }
+
+    /// As [`crate::ui::app::App::hover_query_at`] — resolves the symbol from
+    /// a raw display column, requiring a real match (no [`Self::resolve_active_symbol`]-style
+    /// symbol-`0` fallback: see that method's docs for why a pointer resting
+    /// on whitespace must resolve to no target at all).
+    pub fn hover_query_at(&self, row_idx: usize, display_col: usize) -> Option<HoverQuery> {
+        let (symbol_idx, matched) = self.symbol_at(row_idx, display_col);
+        if !matched {
+            return None;
+        }
+        self.hover_query_for(row_idx, symbol_idx)
     }
 
     /// The number of lines in the opened file — the file view's analogue of
@@ -350,7 +383,13 @@ impl FileView {
     /// As [`crate::ui::app::App::resolve_active_symbol`] — see that
     /// method's docs.
     fn resolve_active_symbol(&self, display_col: usize) -> (usize, bool) {
-        let symbols = symbols::scan(&self.cursor_line_text());
+        self.symbol_at(self.cursor, display_col)
+    }
+
+    /// As [`crate::ui::app::App::symbol_at`], for an arbitrary line —
+    /// extracted for the same reason [`Self::line_text_at`] was.
+    fn symbol_at(&self, row_idx: usize, display_col: usize) -> (usize, bool) {
+        let symbols = symbols::scan(&self.line_text_at(row_idx));
         match symbols
             .iter()
             .position(|s| s.display_start <= display_col && display_col < s.display_end)
@@ -924,6 +963,52 @@ mod tests {
         // Column 2 of "fn main() {" is still inside the leading "fn" — use
         // column 11, the trailing brace, which no symbol covers.
         assert_eq!(view.resolve_active_symbol(11), (0, false));
+    }
+
+    // ---- hover_query_at (issue #24) ---------------------------------------
+
+    /// As [`test_view`], but with a real hover target — [`Self::hover_query`]/
+    /// [`Self::hover_query_at`] both refuse unconditionally when `file_path`
+    /// is `None`, which `test_view` deliberately is (see that fixture's
+    /// docs), so the hover-query tests below need their own fixture.
+    fn test_view_with_target() -> FileView {
+        let source = "fn main() {\n    let x = 1;\n    let y = 2;\n}\n";
+        let mut view = FileView::with_hover_target(
+            "src/main.rs".to_owned(),
+            source,
+            Some((PathBuf::from("/repo/src/main.rs"), PathBuf::from("/repo"))),
+        );
+        view.set_viewport_height(2);
+        view
+    }
+
+    #[test]
+    fn hover_query_at_matches_hover_query_built_from_the_same_row_and_column() {
+        let mut view = test_view_with_target();
+        view.update(Action::CursorDown); // "    let x = 1;"
+        let expected = view.hover_query().expect("row 1 has an eligible symbol");
+        // Moved off the row afterward — `hover_query_at` must reproduce the
+        // identical query without the cursor sitting on the target row at
+        // all (req 3: passive hover never moves `cursor`/`active_symbol`).
+        view.update(Action::CursorDown);
+        view.update(Action::CursorDown);
+        assert_ne!(view.cursor, 1);
+        assert_eq!(view.hover_query_at(1, 5), Some(expected));
+    }
+
+    #[test]
+    fn hover_query_at_is_none_without_a_hover_target() {
+        let view = test_view(); // built with `target: None`
+        assert_eq!(view.hover_query_at(0, 3), None);
+    }
+
+    #[test]
+    fn hover_query_at_on_whitespace_is_none_unlike_the_click_paths_symbol_zero_fallback() {
+        // Column 11 of "fn main() {" is the trailing brace — no symbol
+        // covers it (see `resolve_active_symbol_falls_back_to_symbol_zero_on_whitespace`
+        // above for the click path's opposite, symbol-0 fallback).
+        let view = test_view_with_target();
+        assert_eq!(view.hover_query_at(0, 11), None);
     }
 
     #[test]
