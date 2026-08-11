@@ -564,6 +564,108 @@ fn a_sidebar_click_cannot_reach_the_tree_through_an_open_modal() {
     assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
 }
 
+/// The wheel-shaped sibling of the click test above, and the regression
+/// test for the bug that motivated the event loop's modal guard on the
+/// wheel arm: the three fully-modal overlays record `ScrollTarget` rects
+/// spanning only the diff pane, so the sidebar's own `DiffFiles` rect
+/// stayed hittable beneath an open scope menu and a wheel tick there
+/// scrolled the file list out from under it — a state no keyboard
+/// sequence can produce. Part (1) proves these exact wheel bytes at these
+/// exact coordinates do scroll the sidebar in this session (and measures
+/// how fast), so part (2)'s bounded "nothing moved" wait is sized by
+/// evidence rather than hope; part (3) proves the block is scoped to the
+/// modal being open, not a sticky disable.
+#[test]
+fn a_sidebar_wheel_cannot_scroll_the_file_list_through_an_open_modal() {
+    let repo = fixture::many_files_repo(30);
+    let mut h = Harness::spawn(repo.path(), SpawnOptions::default());
+    h.wait_for_text("file000.txt");
+    wait_for_settled_diff_render(&h);
+
+    // ---- (1) no modal: the same wheel input provably scrolls ----------
+    let started = std::time::Instant::now();
+    for _ in 0..6 {
+        h.send_mouse(MouseKey::ScrollDown { column: 10, row: 8 });
+    }
+    h.wait_until(Duration::from_secs(3), |screen| {
+        !region_text(screen, SIDEBAR_COLS.0, SIDEBAR_COLS.1).contains("file000.txt")
+    });
+    let measured_scroll_latency = started.elapsed();
+
+    // Back to the top so part (2) watches the same well-known first row.
+    for _ in 0..6 {
+        h.send_mouse(MouseKey::ScrollUp { column: 10, row: 8 });
+    }
+    h.wait_until(Duration::from_secs(3), |screen| {
+        region_text(screen, SIDEBAR_COLS.0, SIDEBAR_COLS.1).contains("file000.txt")
+    });
+
+    // ---- (2) scope menu open: the identical wheel input is inert ------
+    h.send(Key::Char('o'));
+    h.wait_for_text("Working tree");
+    let sidebar_before =
+        h.with_screen(|screen| region_text(screen, SIDEBAR_COLS.0, SIDEBAR_COLS.1));
+    for _ in 0..6 {
+        h.send_mouse(MouseKey::ScrollDown { column: 10, row: 8 });
+    }
+    std::thread::sleep((measured_scroll_latency * 3).max(Duration::from_millis(300)));
+    let sidebar_after = h.with_screen(|screen| region_text(screen, SIDEBAR_COLS.0, SIDEBAR_COLS.1));
+    assert_eq!(
+        sidebar_after, sidebar_before,
+        "a sidebar wheel while the scope menu is open must not scroll the file list"
+    );
+    // "Revision" is the menu-only marker here (the "Revision…" entry):
+    // "Working tree" also names the scope the view is showing, so it can
+    // legitimately appear outside the menu.
+    assert!(
+        h.screen_contents().contains("Revision"),
+        "the scope menu itself must still be open"
+    );
+
+    // ---- (3) help open: the same sidebar tick is inert too ------------
+    // Help isn't in the wheel arm's coarse guard (its popup is itself
+    // wheel-scrollable) — the block for its *uncovered margins* is a
+    // separate point-check, so it gets its own half here: column 10 sits
+    // left of the centered popup (x = 15 on a 100-column terminal),
+    // squarely in the margin the finer check must capture.
+    h.send(Key::Esc);
+    h.wait_until(Duration::from_secs(3), |screen| {
+        !screen.contents().contains("Revision")
+    });
+    // Only columns left of the popup (x = 15) stay visible sidebar once
+    // help opens, so the before/after comparison is restricted to that
+    // margin strip — each row's status letter and the file name's leading
+    // digits land inside it, which is enough to betray any scroll.
+    let margin_before = h.with_screen(|screen| region_text(screen, 0, 15));
+    h.send(Key::Char('?'));
+    h.wait_for_text("Navigation");
+    for _ in 0..6 {
+        h.send_mouse(MouseKey::ScrollDown { column: 10, row: 8 });
+    }
+    std::thread::sleep((measured_scroll_latency * 3).max(Duration::from_millis(300)));
+    let margin_under_help = h.with_screen(|screen| region_text(screen, 0, 15));
+    assert_eq!(
+        margin_under_help, margin_before,
+        "a sidebar-margin wheel while help is open must not scroll the file list"
+    );
+
+    // ---- (4) overlays closed: the wheel path works again --------------
+    h.send(Key::Esc);
+    h.wait_until(Duration::from_secs(3), |screen| {
+        !screen.contents().contains("Navigation")
+    });
+    for _ in 0..6 {
+        h.send_mouse(MouseKey::ScrollDown { column: 10, row: 8 });
+    }
+    h.wait_until(Duration::from_secs(3), |screen| {
+        !region_text(screen, SIDEBAR_COLS.0, SIDEBAR_COLS.1).contains("file000.txt")
+    });
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
 #[test]
 fn a_truncated_label_still_resolves_to_the_right_row() {
     // The sidebar's own width (`SIDEBAR_WIDTH`) is a fixed 30 columns
@@ -654,6 +756,104 @@ fn a_plain_click_past_any_identifier_only_positions_the_cursor() {
     // The click's own jump reverses cleanly, same as a keyboard move would.
     h.send(Key::CtrlO);
     h.wait_for_text("\u{b7} 4/");
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+/// Issue #22's close-and-consume rule for the references/units panels,
+/// proven through the real event loop: the first click while the
+/// "Definitions" panel is open dismisses it and must never *also* act on
+/// the pane behind it — the diff pane's rect stays hittable above the
+/// panel's bottom strip, so a fallen-through click would silently move
+/// the cursor beneath the panel, a state no keyboard sequence can
+/// produce. Part (1) calibrates: the same click at the same coordinates,
+/// with no panel open, provably repositions the cursor in this session
+/// (and measures how fast), so part (2)'s "nothing moved" wait is sized
+/// by evidence. The two-`Location` fixture mode exists precisely because
+/// no single-location or null definition answer can ever open the panel.
+#[test]
+fn a_click_while_the_definitions_panel_is_open_closes_it_and_reaches_nothing_beneath() {
+    if !fixture::python3_available() {
+        eprintln!("skipping: python3 not on PATH (fake LSP server fixture needs it)");
+        return;
+    }
+    let repo = fixture::lsp_readiness_repo_with_two_definition_targets(0.0, 0.0);
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            cols: 160,
+            ..Default::default()
+        },
+    );
+    h.wait_for_text("GOTO_TARGET_TOKEN");
+    h.wait_for_text("\u{b7} 1/");
+
+    // Land on the GOTO_TARGET_TOKEN add row (FileHeader/HunkHeader/
+    // Context/Context/Add), same as the go-to-definition click test below.
+    for _ in 0..4 {
+        h.send(Key::Char('j'));
+    }
+    h.wait_for_text("\u{b7} 5/");
+
+    // ---- (1) no panel: this exact click provably moves the cursor -----
+    // Located from the rendered screen rather than hardcoded: "alpha" is
+    // the hunk's first context row's own text, well right of the
+    // line-number gutter (where a click is a no-op) — anywhere that isn't
+    // the current row works, since all this part pins down is "these
+    // coordinates reposition the cursor at all."
+    let (target_col, target_row) = h.with_screen(|screen| {
+        let (rows, cols) = screen.size();
+        for row in 0..rows {
+            let mut text = String::new();
+            for col in 0..cols {
+                // Blank cells report empty contents — pad them so string
+                // index equals screen column (all-ASCII rows here).
+                match screen.cell(row, col).map(|c| c.contents()) {
+                    Some(c) if !c.is_empty() => text.push_str(c),
+                    _ => text.push(' '),
+                }
+            }
+            if let Some(idx) = text.find("alpha") {
+                return (idx as u16 + 2, row);
+            }
+        }
+        panic!("the alpha context row must be on screen");
+    });
+    let started = std::time::Instant::now();
+    click(&h, MouseButton::Left, target_col, target_row);
+    h.wait_until(Duration::from_secs(3), |screen| {
+        !screen.contents().contains("\u{b7} 5/")
+    });
+    let measured_click_latency = started.elapsed();
+
+    // Back to the add row for part (2) — via Top, since the click above
+    // left the cursor at a row this test deliberately never hardcodes.
+    h.send(Key::Char('g'));
+    h.send(Key::Char('g'));
+    h.wait_for_text("\u{b7} 1/");
+    for _ in 0..4 {
+        h.send(Key::Char('j'));
+    }
+    h.wait_for_text("\u{b7} 5/");
+
+    // ---- (2) panel open: the identical click closes it and nothing else
+    h.send(Key::Char('g'));
+    h.send(Key::Char('d'));
+    h.wait_for_text("Definitions");
+
+    click(&h, MouseButton::Left, target_col, target_row);
+    h.wait_until(Duration::from_secs(3), |screen| {
+        !screen.contents().contains("Definitions")
+    });
+    std::thread::sleep((measured_click_latency * 3).max(Duration::from_millis(300)));
+    let screen = h.screen_contents();
+    assert!(
+        screen.contains("\u{b7} 5/"),
+        "the click that dismissed the panel must be consumed, never also \
+         reposition the cursor beneath it; screen:\n{screen}"
+    );
 
     h.send(Key::Char('q'));
     let status = h.wait_exit(Duration::from_secs(5));
@@ -890,6 +1090,84 @@ fn shift_click_extends_the_visual_selection_and_never_chases_definition() {
     assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
 }
 
+// ---- issue #23: the `?` help popup gates mouse clicks too -----------------
+
+/// Compose/scope-menu/units-setup are fully modal *and* their recorded
+/// rects cover the whole diff pane, so a stray click has nowhere uncovered
+/// to land — help is the one overlay where that second half doesn't hold:
+/// its centered popup leaves margins on every side (`help::popup_rect`'s
+/// 70%/80% sizing at this harness's default 100x30 puts the popup's own
+/// right edge at column ~85), so `column: 90` at any row is guaranteed to
+/// sit in the uncovered strip while still lining up with a real, otherwise-
+/// clickable diff row (the same file000 Add row, at column 90, row 4,
+/// `right_click_a_diff_row_and_confirming_add_comment_opens_compose` in
+/// `tests/e2e/context_menu.rs` already proves opens "Add comment" and
+/// `a_plain_click_past_any_identifier_only_positions_the_cursor` above
+/// proves repositions the cursor — both need help's own extra `&& help.is_none()`
+/// guard on top of the fully-modal trio's, or this margin would leak
+/// clicks straight through to the pane help is supposed to be blocking
+/// every keystroke for.
+#[test]
+fn a_click_in_helps_uncovered_margin_reaches_neither_the_menu_nor_the_diff_pane() {
+    let repo = fixture::many_files_repo(3);
+    let mut h = Harness::spawn(repo.path(), SpawnOptions::default());
+    h.wait_for_text("FIRST_MARKER");
+    h.wait_for_text("LAST_MARKER");
+    h.wait_for_text("\u{b7} 1/");
+
+    h.send(Key::Char('?'));
+    h.wait_for_text("Move down one row");
+    h.wait_for_text("Navigation");
+
+    // Right-click: would ordinarily open a context menu (per
+    // `right_click_a_diff_row_and_confirming_add_comment_opens_compose`,
+    // the identical column/row). No "wait for a change" predicate makes
+    // sense for a claim that nothing happens — same fixed-wait idiom
+    // `a_sidebar_click_cannot_reach_the_tree_through_an_open_modal` and
+    // `border_hint_status_and_blank_space_clicks_are_no_ops` already use
+    // for this shape of assertion.
+    click(&h, MouseButton::Right, 90, 4);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !h.screen_contents().contains("Add comment"),
+        "a right-click in help's own uncovered margin must never open a \
+         context menu underneath it; screen:\n{}",
+        h.screen_contents()
+    );
+    assert!(
+        h.screen_contents().contains("Navigation"),
+        "help must still be the thing on screen; screen:\n{}",
+        h.screen_contents()
+    );
+
+    // Left-click: would ordinarily reposition the cursor onto row 4 (per
+    // `a_plain_click_past_any_identifier_only_positions_the_cursor`).
+    click(&h, MouseButton::Left, 90, 4);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        h.screen_contents().contains("\u{b7} 1/"),
+        "a left-click in help's own uncovered margin must never move the \
+         diff cursor beneath it; screen:\n{}",
+        h.screen_contents()
+    );
+
+    // Close help and repeat the identical left-click — proving the click
+    // mechanism itself really works, and was genuinely gated above rather
+    // than coincidentally inert (the same "second click for real" pattern
+    // `mouse.rs`'s own directory-toggle test uses for its inverse: proving
+    // symmetry rather than trusting a single observation).
+    h.send(Key::Esc);
+    h.wait_until(Duration::from_secs(3), |screen| {
+        !screen.contents().contains("j/k scroll")
+    });
+    click(&h, MouseButton::Left, 90, 4);
+    h.wait_for_text("\u{b7} 4/");
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
 // ---- issue #24: debounced pointer details ---------------------------------
 
 /// The one deliberately-real-timing test in this suite's #24 coverage:
@@ -1020,6 +1298,205 @@ fn a_keypress_before_the_debounce_elapses_cancels_it_and_no_popup_ever_appears()
         "a keypress before the debounce elapses must cancel it outright; screen:\n{}",
         h.screen_contents()
     );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+/// Req 5's *second* cancellation hook, alongside the keypress one just
+/// above: "any mouse event that isn't bare motion" — a wheel tick included,
+/// not only a click — cancels an armed debounce outright. `ui::mod`'s own
+/// dispatch checks `mouse_event.kind != MouseEventKind::Moved` once, before
+/// it even looks at *which* kind of non-motion event arrived, so a wheel
+/// tick and a click share one guard; this test only needs to prove the
+/// wheel half, since a click's own cancellation is already implied by every
+/// click test elsewhere in this file never once producing a stray popup.
+#[test]
+fn a_wheel_tick_before_the_debounce_elapses_cancels_it_and_no_popup_ever_appears() {
+    if !fixture::python3_available() {
+        eprintln!("skipping: python3 not on PATH (fake LSP server fixture needs it)");
+        return;
+    }
+    let repo = fixture::lsp_readiness_repo(0.0, 0.0);
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            cols: 160,
+            ..Default::default()
+        },
+    );
+
+    h.wait_for_text("GOTO_TARGET_TOKEN");
+    h.wait_for_text("\u{b7} 1/");
+
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.wait_for_text("\u{b7} 5/");
+    let (row, col) = active_symbol_cell(&h);
+
+    h.send(Key::Char('g'));
+    h.send(Key::Char('g'));
+    h.wait_for_text("\u{b7} 1/");
+
+    h.send_mouse(MouseKey::Moved { column: col, row });
+    // Well inside the 400ms debounce — nowhere near due yet.
+    std::thread::sleep(Duration::from_millis(150));
+    // A harmless diff-pane wheel tick at the same spot — already proven
+    // side-effect-free for cursor position by
+    // `wheel_over_the_diff_pane_scrolls_it_not_the_sidebar` — is enough to
+    // trip the `!= Moved` guard regardless of what `scroll_at` itself then
+    // does with it.
+    h.send_mouse(MouseKey::ScrollDown { column: col, row });
+
+    // Comfortably past where the original rest's debounce would have
+    // fired, had the wheel tick not cancelled it.
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(
+        !h.screen_contents().contains("HOVER_INFO_UNIQUE"),
+        "a wheel tick before the debounce elapses must cancel it outright; screen:\n{}",
+        h.screen_contents()
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+/// Issue #24 reqs 8-9's second target kind: resting the pointer on a
+/// file-tree row shows *local* metadata (no LSP round trip — `tree_note_for`
+/// reads straight off `App::visible_rows`/`App::files`, already in memory),
+/// and it clears the moment the pointer leaves. Two rows prove two of
+/// `file_tree::tooltip_line`'s branches (a directory's changed-descendant
+/// count, a rename's old→new path) — the plain-file branch has no PTY test
+/// of its own either, but shares the exact same dispatch (`fire_pointer_hover`'s
+/// `Tree` arm, `tree_note_for`'s one shared call) these two already prove
+/// reaches the real event loop, so it would be redundant coverage, not
+/// additional risk.
+#[test]
+fn resting_the_pointer_on_a_tree_row_shows_its_local_metadata_and_clears_on_leave() {
+    let (_repo, mut h) = spawn_tree_repo();
+
+    // Row 2 ("src/nested") is a directory; its only descendant with a
+    // change is `NESTED_MARKER_UNIQUE.txt`, nested one level deeper still
+    // inside "deep" — `descendant_file_count` rolls that up regardless of
+    // depth, so the tooltip reports exactly one changed file.
+    h.send_mouse(MouseKey::Moved {
+        column: TREE_CLICK_COL,
+        row: 2,
+    });
+    // A `wait_until` rather than a fixed sleep-then-assert: the 400ms
+    // debounce's expiry is checked by the app's own tick, and under a
+    // fully parallel suite run that tick (plus the render behind it) can
+    // land arbitrarily later than any margin a sleep would hardcode —
+    // waiting on the tooltip itself is the only load-proof shape.
+    h.wait_until(Duration::from_secs(3), |screen| {
+        screen.contents().contains("src/nested (1 changed)")
+    });
+
+    // Row 7 ("src/new_name.txt") is a rename — a different pointer target,
+    // so this re-arms a fresh debounce rather than reusing the one above.
+    h.send_mouse(MouseKey::Moved {
+        column: TREE_CLICK_COL,
+        row: 7,
+    });
+    h.wait_until(Duration::from_secs(3), |screen| {
+        screen
+            .contents()
+            .contains("src/old_name.txt \u{2192} src/new_name.txt")
+    });
+
+    // Row 8, blank space below the last tree row — the same no-op position
+    // `border_hint_status_and_blank_space_clicks_are_no_ops` uses — resolves
+    // to no target at all, so `resolve_target`'s `None` case cancels
+    // outright: req 9's "clears when the pointer leaves."
+    h.send_mouse(MouseKey::Moved {
+        column: TREE_CLICK_COL,
+        row: 8,
+    });
+    h.wait_until(Duration::from_secs(2), |screen| {
+        !screen.contents().contains("src/old_name.txt")
+    });
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+/// `[ui] mouse_hover` (issue #24) is a second, independent gate from `[ui]
+/// mouse` (issue #20's own config test, `mouse_disabled_via_config_ignores_wheel_bytes`
+/// above): disabling it must suppress the passive popup even on a server
+/// that's fully `Ready` and would otherwise answer immediately, while
+/// leaving ordinary mouse capture — a plain click still positions the
+/// cursor — completely untouched, proving the two flags really do gate two
+/// separate `MouseEventKind` arms rather than one shared "is the mouse on
+/// at all" switch.
+#[test]
+fn mouse_hover_disabled_via_config_suppresses_the_passive_popup_but_not_clicks() {
+    if !fixture::python3_available() {
+        eprintln!("skipping: python3 not on PATH (fake LSP server fixture needs it)");
+        return;
+    }
+    let repo = fixture::lsp_readiness_repo(0.0, 0.0);
+    // `lsp_readiness_repo` already writes `.katamari/config.toml` for the
+    // fake server's own `[lsp.servers.stubls]` section (see that
+    // function's docs) — append `[ui] mouse_hover = false` to it rather
+    // than overwriting, the same one-file-two-concerns shape a real
+    // reviewer's own config would have.
+    let config_path = repo.path().join(".katamari").join("config.toml");
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    config.push_str("\n[ui]\nmouse_hover = false\n");
+    std::fs::write(&config_path, config).unwrap();
+
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            cols: 160,
+            ..Default::default()
+        },
+    );
+
+    h.wait_for_text("GOTO_TARGET_TOKEN");
+    h.wait_for_text("\u{b7} 1/");
+
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.wait_for_text("\u{b7} 5/");
+    let (row, col) = active_symbol_cell(&h);
+
+    h.send(Key::Char('g'));
+    h.send(Key::Char('g'));
+    h.wait_for_text("\u{b7} 1/");
+
+    // Rest on the ready symbol across the same total real-time budget
+    // `resting_the_pointer_on_a_ready_symbol_shows_a_hover_popup_after_the_debounce`
+    // gives the identical server-handshake race — a single short wait
+    // would risk a vacuous pass (the server just wasn't `Ready` yet, not
+    // that the flag suppressed anything); re-sending `Moved` across the
+    // full 5s budget rules that out without ever giving `mouse_hover_enabled`
+    // a chance to matter.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        h.send_mouse(MouseKey::Moved { column: col, row });
+        std::thread::sleep(Duration::from_millis(700));
+    }
+    assert!(
+        !h.screen_contents().contains("HOVER_INFO_UNIQUE"),
+        "[ui] mouse_hover = false must suppress the passive popup even on a \
+         ready symbol; screen:\n{}",
+        h.screen_contents()
+    );
+
+    // Mouse capture itself is untouched by this flag — a plain click still
+    // positions the cursor (`mouse_hover_enabled` only gates the `Moved`
+    // passive-hover arm, a separate guard from `mouse_enabled`/capture
+    // itself).
+    click(&h, MouseButton::Left, col, row);
+    h.wait_for_text("\u{b7} 5/");
 
     h.send(Key::Char('q'));
     let status = h.wait_exit(Duration::from_secs(5));

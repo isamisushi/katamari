@@ -73,6 +73,22 @@ pub enum Key {
     /// crossterm's own escape-timeout heuristic there is what turns "ESC,
     /// then nothing else arrives" into `KeyCode::Esc`.
     Esc,
+    /// A generic Alt/Meta + character keypress — the emacs preset's own
+    /// `M-<char>` prefix convention (`M-f`/`M-b`/`M-.`/`M->`, ...; see
+    /// `keymap::emacs_preset`), general where [`Key::AltLeft`]/
+    /// [`Key::AltRight`] above are fixed to one named arrow each. Under
+    /// [`KittyMode::Unsupported`], encodes the legacy "meta sends escape"
+    /// convention [`Key::Esc`]'s own docs describe: a bare `ESC`
+    /// immediately followed by the character's raw UTF-8 bytes, which
+    /// crossterm's legacy parser recognizes by recursing on the tail and
+    /// OR-ing in `KeyModifiers::ALT` (see
+    /// `crossterm::event::sys::unix::parse::parse_event`'s `ESC` arm —
+    /// anything after `ESC` but `O`/`[`/a second `ESC` takes this path).
+    /// Under [`KittyMode::Supported`], encodes the kitty CSI-u form with
+    /// the alt modifier bit set (`3` = `1 + 2`, the same `1 + modifier-bits`
+    /// convention [`Key::CtrlI`]'s `\x1b[105;5u` and [`Key::BackTab`]'s
+    /// `\x1b[9;2u` already use).
+    AltChar(char),
 }
 
 impl Key {
@@ -108,6 +124,15 @@ impl Key {
             Key::Esc => match mode {
                 KittyMode::Supported => b"\x1b[27u".to_vec(),
                 KittyMode::Unsupported => vec![0x1b],
+            },
+            Key::AltChar(c) => match mode {
+                KittyMode::Supported => format!("\x1b[{};3u", c as u32).into_bytes(),
+                KittyMode::Unsupported => {
+                    let mut buf = vec![0x1b];
+                    let mut char_buf = [0u8; 4];
+                    buf.extend_from_slice(c.encode_utf8(&mut char_buf).as_bytes());
+                    buf
+                }
             },
         }
     }

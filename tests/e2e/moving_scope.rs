@@ -188,3 +188,81 @@ fn a_cli_opened_head_scope_follows_an_amend_too() {
     let status = h.wait_exit(DEFAULT_WAIT);
     assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
 }
+
+/// Issue #8's own "define how this interacts with... jj moving revsets" —
+/// still an open question when the milestone shipped (see
+/// `src/vcs/jj.rs`'s `resolve_commit_id`/`revision_diff` real-jj unit
+/// tests for the pieces this test can't itself reach) — because
+/// `start_revision_watch` (`src/ui/mod.rs`) unconditionally spawns only a
+/// *git* ref-watcher (`watch::REVISION_WATCH_TARGETS`: `.git/HEAD`,
+/// `refs`, ...) regardless of `RevisionScope::via_jj`. That's only correct
+/// for a jj moving scope if a colocated repo's auto-export actually
+/// writes to that same git ref surface on every `jj` command — an
+/// assumption confirmed by hand while building this fixture (`.git/HEAD`
+/// changes hash on a plain `jj commit`, with no `git` command involved at
+/// all) but never before proven through a live katamari session. This is
+/// the jj-side analogue of [`a_cli_opened_head_scope_follows_an_amend_too`]
+/// above: same shape, same bounded wait, a real `jj commit` in place of a
+/// real `git commit --amend`.
+///
+/// `@-` (not `@`) is the scope under test: a freshly advanced `@` is
+/// always empty — nothing of its own yet to diff against a parent — so
+/// "the most recently finalized change" is jj's moving target here, the
+/// direct analogue of git's `HEAD` always naming the tip of whatever has
+/// been committed so far. [`fixture::jj_moving_scope_repo`] leaves `@-`
+/// pointing at "first"; this test's own `jj commit` finalizes a second
+/// change on top of it, advancing `@-` to point there instead.
+#[test]
+fn a_jj_revision_scope_follows_a_real_jj_commit_too() {
+    if !fixture::jj_available() {
+        eprintln!("skipping: jj not on PATH");
+        return;
+    }
+    let repo = fixture::jj_moving_scope_repo();
+
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            args: vec!["diff", "-r", "@-"],
+            ..Default::default()
+        },
+    );
+    // Unlike the positional `range` scope above, a `-r`/`--revision` jj
+    // scope *does* get the `r: <revset>` label (see `main.rs`'s `run_diff`)
+    // — both are checked, the same "swap landed, and the label is
+    // symbolic" pair the scope-menu test at the top of this file checks
+    // for `HEAD`.
+    h.wait_for_text("r: @-");
+    h.wait_for_text("alpha");
+
+    const MARKER: &str = "MOVING_SCOPE_MARKER_JJ_COMMIT";
+    std::fs::write(
+        repo.path().join("notes.txt"),
+        format!("alpha\nbeta\ngamma\n{MARKER}\n"),
+    )
+    .expect("failed to edit the fixture's tracked file");
+    // A real `jj commit`: snapshots the edit above into a new change with
+    // this description, then advances `@` onto a fresh empty child —
+    // which is what moves `@-` from "first" onto this new change. No
+    // separate `git add`/`git commit` involved anywhere in this step; if
+    // this test passes at all, it's colocation's own auto-export that put
+    // the new content where the git-only ref-watcher could see it.
+    fixture::jj(repo.path(), &["commit", "-m", "second"]);
+
+    // No key sent — only the ref-watcher -> resolve -> re-diff pipeline
+    // can surface the marker.
+    h.wait_until(Duration::from_secs(10), |screen| {
+        screen.contents().contains(MARKER)
+    });
+    // The scope label stays exactly "r: @-" — symbolic by construction,
+    // same invariant the git-side test above checks after its own amend.
+    assert!(
+        h.screen_contents().contains("r: @-"),
+        "the scope label must stay symbolic across the refresh; screen:\n{}",
+        h.screen_contents()
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(DEFAULT_WAIT);
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}

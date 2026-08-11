@@ -13,6 +13,10 @@ request. `sys.argv[3] == "1"` (issue #12) switches that last answer to a
 real `Location` in a sibling file instead, for a PTY test that needs an
 actual `FileView` push to prove `Esc` pops it — see
 `support::fixture::lsp_readiness_repo_with_definition_target`'s docs.
+`sys.argv[3] == "2"` (issue #22's references-panel mouse coverage) answers
+with a two-`Location` array instead — the only shape that makes the real
+client open its "Definitions" `RefsPanel` rather than navigate, which no
+single-location or null answer can ever reach.
 `textDocument/hover` (issue #24) always answers immediately, regardless of
 `init_delay`/`definition_delay`, with a fixed, unique plain-text body
 (`HOVER_INFO_UNIQUE`) — the one PTY test that needs a real hover result
@@ -73,14 +77,11 @@ def write_message(obj):
 def main():
     init_delay = float(sys.argv[1]) if len(sys.argv) > 1 else 0.0
     definition_delay = float(sys.argv[2]) if len(sys.argv) > 2 else 0.0
-    # Issue #12: when set, `textDocument/definition` answers with a real
-    # `Location` in a sibling file (`other.stub`, next to whichever file
-    # was asked about) instead of `None` — see
-    # `support::fixture::lsp_readiness_repo_with_definition_target`'s docs
-    # for why a *second* file, not just a non-null response, is what a
-    # genuine `FileView`-push test needs. Off by default so issue #11's
-    # existing not-ready/no-result assertions never have to think about it.
-    definition_target = len(sys.argv) > 3 and sys.argv[3] == "1"
+    # Issue #12 ("1") / issue #22 ("2"): what `textDocument/definition`
+    # answers with — see the module docstring. "0"/absent answers `None`,
+    # so issue #11's existing not-ready/no-result assertions never have to
+    # think about either mode.
+    definition_mode = sys.argv[3] if len(sys.argv) > 3 else "0"
 
     while True:
         message = read_message()
@@ -106,7 +107,7 @@ def main():
             )
         elif method == "textDocument/definition":
             time.sleep(definition_delay)
-            if definition_target:
+            if definition_mode in ("1", "2"):
                 # Derive `other.stub`'s URI from the request's own
                 # `textDocument.uri` rather than hardcoding a path this
                 # script was never told (no repo root is passed on argv) —
@@ -114,19 +115,25 @@ def main():
                 # last path segment is exact, not a guess.
                 uri = message["params"]["textDocument"]["uri"]
                 base = uri.rsplit("/", 1)[0]
-                write_message(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": message_id,
-                        "result": {
-                            "uri": f"{base}/other.stub",
-                            "range": {
-                                "start": {"line": 0, "character": 0},
-                                "end": {"line": 0, "character": 0},
-                            },
+
+                def other_stub_location(line):
+                    return {
+                        "uri": f"{base}/other.stub",
+                        "range": {
+                            "start": {"line": line, "character": 0},
+                            "end": {"line": line, "character": 0},
                         },
                     }
-                )
+
+                if definition_mode == "2":
+                    # Both of `other.stub`'s two real lines — distinct
+                    # entries so the RefsPanel has a genuine list, both in
+                    # a file that actually exists so `build_entries` reads
+                    # real content.
+                    result = [other_stub_location(0), other_stub_location(1)]
+                else:
+                    result = other_stub_location(0)
+                write_message({"jsonrpc": "2.0", "id": message_id, "result": result})
             else:
                 # `None` — no definition found — is enough to prove a
                 # request actually dispatched and answered; issue #11's

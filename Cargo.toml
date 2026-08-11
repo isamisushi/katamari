@@ -42,6 +42,14 @@ tar = "0.4.46"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+# Already in the tree transitively (via zip/ureq — see Cargo.lock), so this
+# adds no new download: used only by tests/support/harness.rs to decode the
+# OSC 52 clipboard payloads it captures. Production's own `write_osc52`
+# still hand-rolls its encoder rather than pull this in (see
+# `src/ui/clipboard.rs`'s docs on why) — that reasoning is about not adding
+# a new dependency to the shipped binary, which a dev-only, test-only
+# decoder never touches.
+base64 = "0.22"
 tempfile = "3.27.0"
 pty-process = "0.5"
 vt100 = "0.16"

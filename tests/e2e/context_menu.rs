@@ -389,3 +389,136 @@ fn right_click_retargets_a_valid_new_row_and_closes_on_a_miss() {
     let status = h.wait_exit(Duration::from_secs(5));
     assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
 }
+
+/// Issue #23 req 10: a watch-mode refresh closes an open context menu
+/// unconditionally, not only when the diff cursor's own row happened to
+/// survive the refresh — see `ui::mod::handle_watch_refresh`'s own comment
+/// on why a `TreeDir`/`TreeFile` target can't rely on that survival check.
+/// Mirrors `tests/e2e/watch.rs::bare_session_refreshes_after_a_working_tree_edit`'s
+/// "bare session, no `--no-watch`" shape (the only way to get a real
+/// watcher thread) plus this file's own right-click-opens-a-menu setup.
+/// Edits `file001.txt` — a file the menu was never anchored to — rather
+/// than `file000.txt`: the close is supposed to fire on *any* refresh, so
+/// proving it against an unrelated file's edit is the stronger claim, and
+/// sidesteps any race between the write landing and the menu's own target
+/// row changing.
+#[test]
+fn a_watch_refresh_closes_an_open_context_menu_and_reports_why() {
+    let repo = fixture::many_files_repo(3);
+    let mut h = Harness::spawn(repo.path(), SpawnOptions::default());
+    h.wait_for_text("FIRST_MARKER");
+    h.wait_for_text("LAST_MARKER");
+
+    // file000's own Add row, exactly as this file's other menu tests.
+    click(&h, MouseButton::Right, 90, 4);
+    h.wait_for_text("Add comment");
+
+    std::fs::write(
+        repo.path().join("file001.txt"),
+        "alpha CHANGED\nbeta\ngamma\nWATCH_MARKER\n",
+    )
+    .expect("failed to edit watched fixture file");
+
+    // Same generous, evidence-bounded wait `watch.rs` already tolerates for
+    // the watcher's real debounce/reread latency — never a fixed sleep.
+    h.wait_until(Duration::from_secs(10), |screen| {
+        !screen.contents().contains("Add comment")
+    });
+    assert!(
+        h.screen_contents().contains("closed: file changed"),
+        "a watch refresh that closed the menu must say why on the status \
+         line; screen:\n{}",
+        h.screen_contents()
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+/// Issue #23's menu is derived from `App::comment_target()`/`App::visual_active()`
+/// (`ui::context_menu::diff_row_entries`), and `diff_pane_menu_target`'s own
+/// docs are explicit that a right-click repositions the cursor via
+/// `App::position_cursor_from_click` but never cancels an active visual
+/// selection the way the keyboard's own `Esc`/a failed range-comment save
+/// can. This chains that fact through a real right-click: open a `V`
+/// selection first (the same two-row selection
+/// `tests/e2e/range_comment.rs::selecting_two_context_lines_and_saving_creates_one_range_comment`
+/// uses, so its compose-header/marker witnesses apply unchanged here), then
+/// right-click a row the selection already covers, and confirm the menu
+/// offers the range-labeled comment entry (not a stray single-line one) and
+/// still calls the selection "active" rather than "startable."
+#[test]
+fn right_click_on_an_active_visual_selection_keeps_it_and_opens_the_range_labeled_menu() {
+    let repo = fixture::basic_repo();
+    let mut h = Harness::spawn(repo.path(), SpawnOptions::default());
+
+    h.wait_for_text("README.md");
+    // Six `j` presses land on row 6, "This is line three." (new_line 4) —
+    // see `range_comment.rs`'s own docs for this fixture's row layout.
+    for _ in 0..6 {
+        h.send(Key::Char('j'));
+    }
+    h.wait_for_text("\u{b7} 7/");
+
+    h.send(Key::Char('V'));
+    h.wait_for_text("VISUAL");
+    // Extends onto row 7, "This is line four." (new_line 5) — both context
+    // rows, contiguous, one file: a valid two-line range.
+    h.send(Key::Char('j'));
+    h.wait_for_text("\u{b7} 8/");
+
+    // Right-click row 7's own screen row (one border row above its flat
+    // index) — the row the selection already extends onto, not a fresh
+    // cursor position.
+    click(&h, MouseButton::Right, 90, 8);
+    h.wait_for_text("Add comment (2 lines)");
+    assert!(
+        h.screen_contents().contains("Cancel visual selection"),
+        "a right-click landing on the selection's own row must not cancel \
+         it; screen:\n{}",
+        h.screen_contents()
+    );
+    assert!(
+        !h.screen_contents().contains("Start visual selection"),
+        "the selection survived, so the startable label must not appear; \
+         screen:\n{}",
+        h.screen_contents()
+    );
+
+    let (col, row) = find_text(&h, "Add comment (2 lines)");
+    click(&h, MouseButton::Left, col + 1, row);
+
+    // Same compose target the keyboard `c` path reaches for this identical
+    // selection — proving the click's row resolution landed on the same
+    // range, not a collapsed single line.
+    h.wait_for_text("README.md:4-5");
+
+    for c in "right-click range".chars() {
+        h.send(Key::Char(c));
+    }
+    h.send(Key::CtrlS);
+    h.wait_for_text("comment: saved");
+
+    let contents = h.screen_contents();
+    let three_row = contents
+        .lines()
+        .find(|l| l.contains("This is line three."))
+        .expect("range start row");
+    let four_row = contents
+        .lines()
+        .find(|l| l.contains("This is line four."))
+        .expect("range end row");
+    assert!(
+        three_row.contains('\u{25C6}'),
+        "the range's start row must carry the open marker: {three_row:?}"
+    );
+    assert!(
+        four_row.contains('\u{25C6}'),
+        "the range's end row must carry the open marker too: {four_row:?}"
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}

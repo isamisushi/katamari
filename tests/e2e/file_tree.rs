@@ -79,3 +79,68 @@ fn tab_navigate_collapse_expand_and_open_a_nested_file() {
     let status = h.wait_exit(Duration::from_secs(5));
     assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
 }
+
+/// Issue #15 req 7: Enter is just as first-class as Space for toggling a
+/// directory row — a second, structurally distinct dispatch path
+/// (`Action::Confirm`'s `focus == Files` guard in `ui::mod::handle_action`,
+/// landing on `FilesConfirmOutcome::Toggled`) from the one the test above
+/// proves through `Action::ToggleDirectory`'s own arm. `navigation.rs`'s
+/// own unit test proves `App::confirm_files_selection` returns `Toggled`
+/// and leaves `focus`/jump history untouched, but calls that method
+/// directly — this proves a real Enter keypress actually decodes to
+/// `Action::Confirm` and reaches this exact guard, and that the surrounding
+/// wiring in `ui::mod` really does skip `record_jump`/`hover_state.invalidate()`
+/// for it (both only run on the `Opened` arm).
+#[test]
+fn enter_toggles_a_directory_row_without_moving_focus_to_diff() {
+    let repo = fixture::tree_repo();
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            args: vec!["diff", "--staged"],
+            ..Default::default()
+        },
+    );
+    h.wait_for_text("new_name.txt");
+    h.wait_for_text("NESTED_MARKER_UNIQUE");
+
+    // Tab -> Files, `gg` -> "src" (the tree's root row), `j` -> "nested",
+    // the one directory directly under "src" — the same navigation the
+    // Space-driven test above relies on.
+    h.send(Key::Tab);
+    h.send(Key::Char('g'));
+    h.send(Key::Char('g'));
+    h.send(Key::Char('j'));
+
+    // Enter (not Space) collapses "nested" — same witness as the Space
+    // test: its descendants ("deep" and the marker file within it)
+    // disappear from the sidebar.
+    h.send(Key::Enter);
+    h.wait_until(Duration::from_secs(3), |screen| {
+        !screen.contents().contains("NESTED_MARKER_UNIQUE")
+    });
+
+    // Had Enter wrongly taken the `Opened` arm instead of `Toggled`, focus
+    // would have snapped to `Diff` — `gd`'s files-focus-blocked note
+    // (`tests/e2e/focus.rs`'s own witness: it only ever renders while
+    // `Files` owns focus) proves it stayed on `Files` instead.
+    h.send(Key::Char('g'));
+    h.send(Key::Char('d'));
+    h.wait_for_text("definition: focus the diff pane first");
+
+    // Enter again on the still-selected "nested" row re-expands it —
+    // symmetry, and proof the toggle didn't corrupt `files_selection`.
+    h.send(Key::Enter);
+    h.wait_for_text("NESTED_MARKER_UNIQUE");
+
+    // Navigate onto the marker file itself and confirm a plain Enter-to-
+    // open still works after the round trip above.
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.send(Key::Enter);
+    h.wait_for_text("MARKER_CONTENT_LINE_UNIQUE");
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}

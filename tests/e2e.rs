@@ -55,6 +55,8 @@ mod search;
 mod show_keys;
 #[path = "e2e/skill_install.rs"]
 mod skill_install;
+#[path = "e2e/timeline.rs"]
+mod timeline;
 #[path = "e2e/update_check.rs"]
 mod update_check;
 #[path = "e2e/visual.rs"]

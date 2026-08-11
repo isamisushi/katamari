@@ -230,3 +230,119 @@ fn kitty_unsupported() {
     let status = h.wait_exit(Duration::from_secs(5));
     assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
 }
+
+// ---- issue #13's emacs preset: M-f/M-b over real wire bytes ---------------
+
+/// Issue #13's emacs preset binds `M-f`/`M-b` to `NextSymbol`/`PrevSymbol`
+/// (real emacs `forward-word`/`backward-word`, repurposed here for the
+/// active symbol — see `keymap::emacs_preset`'s own doc comment for why).
+/// `keymap::tests::emacs_meta_f_and_meta_b_resolve_to_next_and_prev_symbol`
+/// already proves the binding table entry is correct against a hand-built
+/// `KeyEvent`; this proves the same claim through real bytes crossterm has
+/// to decode — a bare `ESC` immediately followed by `f`/`b` under the
+/// legacy fallback, or the kitty CSI-u modified form once the protocol has
+/// negotiated (see `Key::AltChar`'s docs) — two genuinely different parsing
+/// paths through crossterm, so this runs once per `KittyMode` rather than
+/// trusting one to stand in for the other, the same reasoning
+/// `kitty_supported`/`kitty_unsupported` above already follow for
+/// `M-Left`/`M-Right`.
+fn emacs_meta_f_and_meta_b_move_the_active_symbol(kitty_mode: KittyMode) {
+    let repo = fixture::basic_repo();
+    // Opt into the emacs preset the same way `tests/e2e/doctor.rs`/
+    // `mouse.rs`/`update_check.rs` already write ad hoc `.katamari/config.toml`
+    // fixtures: directly, rather than adding a new `fixture::` constructor
+    // just one test in this file needs. Committed immediately (unlike those
+    // other tests, which never need a deterministic bottom row) so it
+    // doesn't itself show up as a fourth working-tree diff entry ahead of
+    // `basic_repo`'s own three — `Action::Bottom` below needs the diff's
+    // real last row to land on `todo.txt`'s pre-existing content exactly as
+    // `basic_repo` wrote it, not shift onto this config write instead.
+    std::fs::create_dir_all(repo.path().join(".katamari")).unwrap();
+    std::fs::write(
+        repo.path().join(".katamari").join("config.toml"),
+        "keymap = \"emacs\"\n",
+    )
+    .unwrap();
+    fixture::git(repo.path(), &["add", ".katamari/config.toml"]);
+    fixture::git(repo.path(), &["commit", "-q", "-m", "enable emacs keymap"]);
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            kitty_mode,
+            ..Default::default()
+        },
+    );
+    h.wait_for_text("README.md");
+
+    // The status bar's own "· {cursor+1}/{total}" position indicator
+    // (`ui::status_bar`) is the only reliable witness that `Action::Bottom`
+    // actually fired below: `basic_repo`'s whole diff is short enough to
+    // render in full on this harness's 30-row terminal regardless of
+    // cursor position, so waiting for any particular line's *text* to
+    // appear would prove nothing about whether the cursor moved at all.
+    const POSITION_MARKER: &str = "\u{b7} 1/";
+    // `wait_for_text("README.md")` above only proves the diff pane's own
+    // content painted, not that the (separately positioned) status bar's
+    // own frame landed alongside it — wait for the exact substring this
+    // parses below, rather than assuming it rode in on the same frame.
+    h.wait_for_text(POSITION_MARKER);
+    let initial = h.screen_contents();
+    let digits_start = initial
+        .find(POSITION_MARKER)
+        .map(|i| i + POSITION_MARKER.len())
+        .expect("initial cursor position must render as \"· 1/N\"");
+    let total: usize = initial[digits_start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .expect("row count after \"· 1/\" must be a plain integer");
+
+    // `M->` is this preset's own `Action::Bottom` (real emacs
+    // `end-of-buffer`) — lands the cursor on the diff's last row,
+    // `todo.txt`'s own single `Add` line ("- write more fixtures"), a real
+    // content row with several word-like symbols to cycle through, and
+    // (per `App::update`'s "cursor moved" tail) resets `active_symbol` to 0
+    // there. Reached this way rather than vim's `j`/`G`, which this preset
+    // doesn't bind at all.
+    h.send(Key::AltChar('>'));
+    h.wait_for_text(&format!("\u{b7} {total}/{total}"));
+    let before = h.with_screen(underlined_cells);
+    assert!(
+        !before.is_empty(),
+        "the bottom row must have a real active symbol to cycle from; screen:\n{}",
+        h.screen_contents()
+    );
+
+    // The actual payoff: real Alt-f bytes on the wire must reach
+    // `Action::NextSymbol`, moving the underline off `active_symbol == 0`.
+    h.send(Key::AltChar('f'));
+    h.wait_until(Duration::from_secs(2), |s| {
+        underlined_cells(s) != before && !underlined_cells(s).is_empty()
+    });
+    let after_forward = h.with_screen(underlined_cells);
+    assert_ne!(
+        after_forward, before,
+        "M-f must have actually moved the active symbol"
+    );
+
+    // And real Alt-b bytes must reach `Action::PrevSymbol`, moving it back
+    // to exactly where it started — proof this is real cycling, not some
+    // other action that happened to change the screen.
+    h.send(Key::AltChar('b'));
+    h.wait_until(Duration::from_secs(2), |s| underlined_cells(s) == before);
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
+fn emacs_meta_f_and_meta_b_move_the_active_symbol_over_kitty_csi_u_bytes() {
+    emacs_meta_f_and_meta_b_move_the_active_symbol(KittyMode::Supported);
+}
+
+#[test]
+fn emacs_meta_f_and_meta_b_move_the_active_symbol_over_legacy_escape_bytes() {
+    emacs_meta_f_and_meta_b_move_the_active_symbol(KittyMode::Unsupported);
+}

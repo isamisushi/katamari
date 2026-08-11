@@ -149,6 +149,155 @@ pub fn moving_scope_repo() -> FixtureRepo {
     FixtureRepo { dir }
 }
 
+/// Whether `jj` is on `PATH` — [`python3_available`]'s jj-side counterpart,
+/// the same self-skip pattern for the same reason: `jj` is mise-managed
+/// (`mise.toml`'s `[tools]` pins a version), so it resolves in this
+/// project's own dev/CI environment, but a contributor's machine might not
+/// have it at all, and this suite must stay green either way. Every
+/// jj-backed E2E test (`tests/e2e/moving_scope.rs`'s jj case,
+/// `tests/e2e/timeline.rs`) checks this first and skips — with an
+/// `eprintln!`, so the skip is visible under `--nocapture` — rather than
+/// fails, mirroring `src/vcs/jj.rs`'s and `src/ui/timeline_view.rs`'s own
+/// real-jj unit tests.
+pub fn jj_available() -> bool {
+    std::process::Command::new("jj")
+        .arg("--version")
+        .output()
+        .is_ok()
+}
+
+/// Runs `jj <args>` in `dir` and panics with the captured output on
+/// failure — [`git`]'s jj-side counterpart, for the same "a fixture that
+/// failed to build is a test-infrastructure bug, not something a test body
+/// should have to check for" reason. Unlike [`git`], no `-c user.*`
+/// override: jj's identity comes from repo-scoped config
+/// ([`init_jj_repo`] sets it once via `jj config set --repo`), not a
+/// per-invocation flag, so every call here can stay a plain `jj <args>`.
+/// `pub` (like [`git`]) so `tests/e2e/moving_scope.rs`/`tests/e2e/timeline.rs`
+/// can drive real `jj commit`/`jj util snapshot` calls *after* a harness is
+/// already spawned against a fixture built here.
+pub fn jj(dir: &Path, args: &[&str]) {
+    let output = Command::new("jj")
+        .args(["--color", "never", "--no-pager"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("failed to spawn jj — is it on PATH?");
+    assert!(
+        output.status.success(),
+        "jj {args:?} failed in {}:\nstdout: {}\nstderr: {}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// `jj git init --colocate` can't go through [`jj`]'s `current_dir`-only
+/// wrapper the way every *later* jj call in a fixture can — there's no repo
+/// yet at this point for jj to detect from `dir` as a cwd, and this is the
+/// one call that creates it (mirrors the identical split
+/// `src/vcs/jj.rs`'s and `src/ui/timeline_view.rs`'s own real-jj test
+/// fixtures both make, for the same reason — see either's
+/// `jj_git_init_colocate`). Requires `dir` to already be a git repo (see
+/// [`init_repo`]): `--colocate` adopts an *existing* `.git`, it doesn't
+/// create one.
+fn jj_git_init_colocate(dir: &Path) {
+    let output = Command::new("jj")
+        .args([
+            "--color",
+            "never",
+            "--no-pager",
+            "git",
+            "init",
+            "--colocate",
+        ])
+        .current_dir(dir)
+        .output()
+        .expect("failed to spawn jj — is it on PATH?");
+    assert!(
+        output.status.success(),
+        "jj git init --colocate failed in {}:\nstdout: {}\nstderr: {}",
+        dir.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// A colocated jj+git repo — `.jj` initialized alongside the same `.git`
+/// [`init_repo`] always builds first, with repo-scoped `user.name`/
+/// `user.email` set (`jj config set --repo`, never a real `~/.jjconfig`,
+/// which the test process's per-test `$HOME` deliberately has none of —
+/// see `support::harness::Harness::spawn`'s docs) — every jj-backed E2E
+/// fixture in this file starts here, the same base every real-jj *unit*
+/// test fixture (`src/vcs/jj.rs`'s `jj_fixture`, `src/ui/timeline_view.rs`'s
+/// `jj_timeline_fixture`) already builds for itself.
+fn init_jj_repo() -> tempfile::TempDir {
+    let dir = init_repo();
+    let root = dir.path();
+    jj_git_init_colocate(root);
+    jj(
+        root,
+        &["config", "set", "--repo", "user.name", "katamari e2e"],
+    );
+    jj(
+        root,
+        &["config", "set", "--repo", "user.email", "e2e@katamari.test"],
+    );
+    dir
+}
+
+/// A colocated jj+git repo, one real commit ("first") deep — the
+/// moving-*jj*-revset counterpart to [`moving_scope_repo`]'s git-only
+/// fixture, for issue #8's own "define how this interacts with... jj
+/// moving revsets" acceptance criterion. `jj commit -m "first"` both
+/// records "first"'s content *and* advances `@` onto a fresh, empty change
+/// on top of it — so `@-` (not `@`, which starts out empty with nothing of
+/// its own to diff against a not-yet-existing parent) is this fixture's
+/// moving scope, the direct jj analogue of git's `HEAD` always naming the
+/// tip of whatever has been committed so far. `tests/e2e/moving_scope.rs`'s
+/// jj test opens `ktmr diff -r @-`, then runs a second real `jj commit`
+/// itself — the same "amend after the harness is already spawned" shape
+/// [`moving_scope_repo`]'s own docs describe — to advance `@-` onto a new
+/// finalized change, proving the live scope follows it.
+pub fn jj_moving_scope_repo() -> FixtureRepo {
+    let dir = init_jj_repo();
+    let root = dir.path();
+
+    std::fs::write(root.join("notes.txt"), "alpha\nbeta\ngamma\n").unwrap();
+    jj(root, &["commit", "-m", "first"]);
+
+    FixtureRepo { dir }
+}
+
+/// A colocated jj+git repo with two live working-copy snapshots recorded
+/// via `jj util snapshot` — the shape `crate::vcs::jj::JjRepo::snapshot_ops`
+/// actually surfaces (see that method's docs: only operations described
+/// exactly `"snapshot working copy"` count, which a `jj commit`'s
+/// `describe`+`new` never produces), rebuilt here by shelling to `jj util
+/// snapshot` directly since this crate has no library target an E2E binary
+/// could call `JjRepo::snapshot` through — the same two-snapshot shape
+/// `src/ui/timeline_view.rs`'s own `jj_timeline_fixture` unit-test helper
+/// builds via that method. Never a `jj commit`: colocation auto-exports
+/// `@`'s current tree into the git index on every jj command regardless
+/// (confirmed empirically — `git status` shows it staged even with zero
+/// real commits), and `GitSource::baseline`'s already-tested unborn-HEAD
+/// fallback (the empty tree) means `ktmr diff`'s own *outer* working-tree
+/// diff still shows real content with no `jj commit` needed at all. The
+/// second snapshot's `SYMONE SYMTWO` line gives `tests/e2e/timeline.rs` a
+/// row with two identifier-like tokens to cycle between, mirroring that
+/// same unit test's own reason for the exact text.
+pub fn jj_timeline_repo() -> FixtureRepo {
+    let dir = init_jj_repo();
+    let root = dir.path();
+
+    std::fs::write(root.join("a.txt"), "one\n").unwrap();
+    jj(root, &["util", "snapshot"]);
+    std::fs::write(root.join("a.txt"), "one\nSYMONE SYMTWO\n").unwrap();
+    jj(root, &["util", "snapshot"]);
+
+    FixtureRepo { dir }
+}
+
 /// A repo whose working-tree edit touches Japanese (CJK, double-width)
 /// content — the first end-to-end guard for the whole rendering pipeline
 /// (parse -> highlight -> terminal cells) on wide characters, not just the
@@ -412,7 +561,7 @@ pub fn many_files_repo(count: usize) -> FixtureRepo {
 }
 
 pub fn lsp_readiness_repo(init_delay_secs: f64, definition_delay_secs: f64) -> FixtureRepo {
-    lsp_readiness_repo_inner(init_delay_secs, definition_delay_secs, false)
+    lsp_readiness_repo_inner(init_delay_secs, definition_delay_secs, "0")
 }
 
 /// As [`lsp_readiness_repo`], but `textDocument/definition` answers with a
@@ -430,13 +579,26 @@ pub fn lsp_readiness_repo_with_definition_target(
     init_delay_secs: f64,
     definition_delay_secs: f64,
 ) -> FixtureRepo {
-    lsp_readiness_repo_inner(init_delay_secs, definition_delay_secs, true)
+    lsp_readiness_repo_inner(init_delay_secs, definition_delay_secs, "1")
+}
+
+/// As [`lsp_readiness_repo_with_definition_target`], but the definition
+/// answer is a *two*-`Location` array — the only response shape that makes
+/// the client open its "Definitions" `RefsPanel` instead of navigating
+/// (see `ui::apply_definition_result`), which the panel's own
+/// close-and-consume mouse coverage needs and no other fixture mode can
+/// reach.
+pub fn lsp_readiness_repo_with_two_definition_targets(
+    init_delay_secs: f64,
+    definition_delay_secs: f64,
+) -> FixtureRepo {
+    lsp_readiness_repo_inner(init_delay_secs, definition_delay_secs, "2")
 }
 
 fn lsp_readiness_repo_inner(
     init_delay_secs: f64,
     definition_delay_secs: f64,
-    definition_target: bool,
+    definition_mode: &str,
 ) -> FixtureRepo {
     let dir = init_repo();
     let root = dir.path();
@@ -467,9 +629,8 @@ fn lsp_readiness_repo_inner(
         format!(
             "[lsp.servers.stubls]\n\
              command = \"python3\"\n\
-             args = [\"{server_script}\", \"{init_delay_secs}\", \"{definition_delay_secs}\", \"{}\"]\n\
+             args = [\"{server_script}\", \"{init_delay_secs}\", \"{definition_delay_secs}\", \"{definition_mode}\"]\n\
              extensions = [\"stub\"]\n",
-            if definition_target { "1" } else { "0" },
         ),
     )
     .unwrap();

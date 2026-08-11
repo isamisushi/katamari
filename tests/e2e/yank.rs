@@ -104,6 +104,63 @@ fn a_second_y_after_a_successful_yank_proves_the_selection_was_cleared() {
 }
 
 #[test]
+fn y_writes_a_real_osc_52_sequence_whose_decoded_payload_matches_the_format() {
+    // Every other test in this file only checks the status-bar note — the
+    // observable witness `ui::mod::handle_action` leaves behind (see this
+    // file's module docs on why). `write_osc52` (src/ui/clipboard.rs)
+    // writes straight to `io::stdout()`, bypassing ratatui's own `Terminal`
+    // — exactly the kind of interleaving/corruption risk only a real
+    // compiled binary through a real PTY can surface. `Harness` normally
+    // never looks past the parsed screen because `vt100::Parser::new`'s
+    // default callbacks silently discard OSC 52 (per its own crate docs);
+    // `Harness::last_osc52_clipboard` (tests/support/harness.rs) opts into
+    // vt100's `Callbacks::copy_to_clipboard` hook instead, so this test can
+    // assert on the actual escape sequence's decoded payload rather than
+    // just ktmr's own claim about it.
+    let repo = fixture::basic_repo();
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            cols: 160,
+            ..Default::default()
+        },
+    );
+
+    h.wait_for_text("README.md");
+    // Same positioning as `v_j_y_yanks_the_selection_and_reports_counts`:
+    // two `j` presses land on row 2 ("# Sample project", the hunk's first
+    // context line, old:new 1:1); `V` then one `j` extends onto row 3 (the
+    // blank context line right after it, old:new 2:2) — a 2-line selection
+    // entirely within README.md's single hunk.
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.wait_for_text("\u{b7} 3/");
+
+    h.send(Key::Char('V'));
+    h.wait_for_text("VISUAL");
+    h.send(Key::Char('j'));
+    h.wait_for_text("\u{b7} 4/");
+
+    h.send(Key::Char('y'));
+    h.wait_for_text("via OSC 52; terminal support required");
+
+    // The documented format (src/ui/clipboard.rs's `format_diff_selection`
+    // docs / issue #17 req 4): path header, `old:new | line` column header,
+    // then one `old:new | <marker><text>` row per selected line — a space
+    // marker for context, blank text for the blank second line.
+    let expected = "README.md\nold:new | line\n1:1 |  # Sample project\n2:2 |  ";
+    assert_eq!(
+        h.last_osc52_clipboard().as_deref(),
+        Some(expected),
+        "the real OSC 52 payload must decode to the documented format"
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
 fn inspector_yank_reaches_copy_selection_through_the_named_action_resolver() {
     if !fixture::python3_available() {
         eprintln!("skipping: python3 not on PATH (fake LSP server fixture needs it)");

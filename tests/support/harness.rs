@@ -8,6 +8,7 @@
 
 use super::key::Key;
 use super::mouse::MouseKey;
+use base64::Engine;
 use pty_process::Size;
 use pty_process::blocking::{Command, Pty, open};
 use std::io::{Read, Write};
@@ -18,6 +19,30 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use vt100::Parser;
+
+/// Captures OSC 52 clipboard payloads off the real byte stream. `vt100`
+/// parses and dispatches `\x1b]52;...\x1b\\` per its own `perform.rs`, but
+/// `Parser::new`'s default `CB = ()` (`impl Callbacks for ()` — every
+/// method a no-op) just discards it; this is the minimal opt-in swap to
+/// `Parser::new_with_callbacks` needed to keep the raw base64 instead. Only
+/// `copy_to_clipboard` is overridden — every other trait method stays the
+/// default no-op, since nothing else in this suite needs bell/title/
+/// resize/paste-request events.
+///
+/// Holds an `Arc<Mutex<..>>` rather than being the storage itself: one
+/// clone lives inside the `vt100::Parser` (moved in by
+/// `new_with_callbacks`, called only from the reader thread's `process`),
+/// the other stays on [`Harness`] for [`Harness::last_osc52_clipboard`] to
+/// read from a test thread — same split as `screen`/`bytes_read` already
+/// use for the same reason.
+#[derive(Clone, Default)]
+struct ClipboardCapture(Arc<Mutex<Option<Vec<u8>>>>);
+
+impl vt100::Callbacks for ClipboardCapture {
+    fn copy_to_clipboard(&mut self, _screen: &mut vt100::Screen, _ty: &[u8], data: &[u8]) {
+        *self.0.lock().expect("clipboard mutex poisoned") = Some(data.to_vec());
+    }
+}
 
 /// Whether the fake terminal answers crossterm's kitty-keyboard-protocol
 /// probe (`\x1b[?u\x1b[c`) as though it supports the protocol. See
@@ -103,8 +128,9 @@ pub const DEFAULT_WAIT: Duration = Duration::from_secs(3);
 pub struct Harness {
     pty: Arc<Pty>,
     write_lock: Arc<Mutex<()>>,
-    screen: Arc<Mutex<Parser>>,
+    screen: Arc<Mutex<Parser<ClipboardCapture>>>,
     bytes_read: Arc<AtomicUsize>,
+    clipboard: Arc<Mutex<Option<Vec<u8>>>>,
     kitty_mode: KittyMode,
     child: Child,
     reader: Option<JoinHandle<()>>,
@@ -184,7 +210,13 @@ impl Harness {
 
         let pty = Arc::new(pty);
         let write_lock = Arc::new(Mutex::new(()));
-        let screen = Arc::new(Mutex::new(Parser::new(opts.rows, opts.cols, 0)));
+        let clipboard: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+        let screen = Arc::new(Mutex::new(Parser::new_with_callbacks(
+            opts.rows,
+            opts.cols,
+            0,
+            ClipboardCapture(Arc::clone(&clipboard)),
+        )));
         let bytes_read = Arc::new(AtomicUsize::new(0));
 
         let reader = spawn_reader_thread(
@@ -200,6 +232,7 @@ impl Harness {
             write_lock,
             screen,
             bytes_read,
+            clipboard,
             kitty_mode: opts.kitty_mode,
             child,
             reader: Some(reader),
@@ -268,6 +301,27 @@ impl Harness {
             .contents()
     }
 
+    /// The most recent OSC 52 clipboard payload the child has written,
+    /// base64-decoded back to UTF-8 — `None` until a real
+    /// `\x1b]52;c;<base64>\x1b\\` sequence has actually been parsed off the
+    /// wire (see [`ClipboardCapture`]). Everywhere else in the suite the
+    /// rendered status-bar note is witness enough that `ktmr` believes it
+    /// copied something (see `yank.rs`'s module docs on why this harness
+    /// otherwise never inspects raw bytes); this exists only for the one
+    /// test that needs to prove the actual escape sequence and its base64
+    /// payload survive a real write to a real terminal fd.
+    pub fn last_osc52_clipboard(&self) -> Option<String> {
+        let raw = self
+            .clipboard
+            .lock()
+            .expect("clipboard mutex poisoned")
+            .clone()?;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(raw)
+            .expect("ktmr's OSC 52 payload must be valid base64");
+        Some(String::from_utf8(decoded).expect("ktmr's OSC 52 payload must be valid UTF-8"))
+    }
+
     /// Runs `f` against the current parsed screen — for assertions that
     /// need [`vt100::Screen`]'s cell-level API (`cell`, `is_wide`,
     /// `underline`, ...), which a plain string snapshot can't answer. See
@@ -321,7 +375,7 @@ fn write_locked(pty: &Pty, lock: &Mutex<()>, bytes: &[u8]) {
 fn spawn_reader_thread(
     pty: Arc<Pty>,
     write_lock: Arc<Mutex<()>>,
-    screen: Arc<Mutex<Parser>>,
+    screen: Arc<Mutex<Parser<ClipboardCapture>>>,
     bytes_read: Arc<AtomicUsize>,
     kitty_mode: KittyMode,
 ) -> JoinHandle<()> {

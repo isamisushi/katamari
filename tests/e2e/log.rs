@@ -6,8 +6,40 @@
 //! pushed diff, never "back" to the list underneath it (issue #12; this
 //! file used to assert the opposite, pre-#12, behavior — see git history).
 
-use crate::support::{Harness, Key, SpawnOptions, fixture};
+use crate::support::{Harness, Key, MouseKey, SpawnOptions, fixture};
 use std::time::Duration;
+
+/// `count` commits and nothing else — issue #20 req 6's cheapest,
+/// lowest-flake-risk still-unproven wheel target (`LogView`'s own list, no
+/// jj/LSP dependency the Timeline/Inspector panes in the same gap would
+/// carry). Built inline here rather than added to `support::fixture` (out
+/// of scope for this change): `fixture::git` is `pub` for exactly this
+/// kind of direct use — see its own docs, written for
+/// `tests/e2e/moving_scope.rs`'s comparable need. `--allow-empty`: `LogView`
+/// only ever reads a commit's id/time/author/subject (`RevisionEntry`),
+/// never its diff, so real file content would prove nothing an empty
+/// commit doesn't, and skipping it keeps `count` commits cheap enough to
+/// build inline in a test body.
+fn many_commits_repo(count: usize) -> tempfile::TempDir {
+    let dir = tempfile::Builder::new()
+        .prefix("katamari-e2e-log-repo-")
+        .tempdir()
+        .expect("failed to create fixture tempdir");
+    fixture::git(dir.path(), &["init", "-q"]);
+    for i in 0..count {
+        let marker = match i {
+            0 => " OLDEST_MARKER_UNIQUE",
+            n if n == count - 1 => " NEWEST_MARKER_UNIQUE",
+            _ => "",
+        };
+        let message = format!("commit {i:03}{marker}");
+        fixture::git(
+            dir.path(),
+            &["commit", "--allow-empty", "-q", "-m", &message],
+        );
+    }
+    dir
+}
 
 #[test]
 fn esc_pops_a_pushed_diff_back_to_the_log_list() {
@@ -140,4 +172,50 @@ fn q_quits_the_session_directly_from_the_log_views_own_root() {
         status.success(),
         "ktmr should exit 0 on q from the log view's own root, got {status:?}"
     );
+}
+
+/// Issue #20 req 6: the log list is one of the panes wheel routing must
+/// cover (`ScrollTarget::LogList` -> `LogView::scroll_by`). 40 commits
+/// comfortably overflows any plausible list viewport at the harness's
+/// default 100x30 terminal — `LogView::render_list` windows around
+/// `selected` the same way the sidebar/diff panes do, so the newest commit
+/// (`git log`'s default order, this view's own row 0) starts visible at
+/// the top and must scroll out of view once the wheel pushes `selected`
+/// far enough past it. Same "first item scrolls away" witness
+/// `tests/e2e/mouse.rs::wheel_over_the_sidebar_scrolls_files_not_the_diff_pane`
+/// already uses for `ScrollTarget::DiffFiles` — the point of this test is
+/// only whether a real SGR wheel byte reaches `LogView::scroll_by` at all,
+/// which `log_view.rs`'s own colocated tests already prove correct in
+/// isolation.
+#[test]
+fn wheel_over_the_log_list_scrolls_the_selection_through_real_dispatch() {
+    let repo = many_commits_repo(40);
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            args: vec!["log"],
+            ..Default::default()
+        },
+    );
+
+    h.wait_for_text("NEWEST_MARKER_UNIQUE");
+
+    // 20 ticks (3 rows each — `mouse::WHEEL_SCROLL_ROWS` — 60 rows of
+    // requested scroll total) clears any plausible list-viewport height by
+    // a wide margin; `LogView::scroll_by` clamps at `entries.len() - 1`
+    // (39), so this can never overshoot into a no-op the way a much larger
+    // request could.
+    for _ in 0..20 {
+        h.send_mouse(MouseKey::ScrollDown {
+            column: 50,
+            row: 10,
+        });
+    }
+    h.wait_until(Duration::from_secs(3), |screen| {
+        !screen.contents().contains("NEWEST_MARKER_UNIQUE")
+    });
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
 }

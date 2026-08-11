@@ -77,6 +77,46 @@ fn v_pressed_again_cancels_the_selection_the_same_way_esc_does() {
 }
 
 #[test]
+fn tab_off_the_diff_pane_cancels_a_live_selection_leaving_no_stale_anchor() {
+    let repo = fixture::basic_repo();
+    let mut h = Harness::spawn(repo.path(), SpawnOptions::default());
+
+    h.wait_for_text("README.md");
+    h.send(Key::Char('j'));
+    h.send(Key::Char('j'));
+    h.wait_for_text("\u{b7} 3/");
+
+    h.send(Key::Char('V'));
+    h.wait_for_text("VISUAL");
+
+    // Issue #16 req 10's 7th invalidation trigger: `Action::FocusNextPane`
+    // carries its own `self.visual_anchor = None` (app.rs), separate from
+    // the shared `rederive()` funnel the other six triggers go through —
+    // leaving `Diff` focus must cancel the selection outright, not just
+    // stop rendering its indicator while focus is elsewhere. `basic_repo`
+    // has two files, so the sidebar is visible and `Tab` genuinely moves
+    // focus to `Files` rather than being the no-op it is on a one-file diff
+    // (see `focus.rs`'s own note on that case).
+    h.send(Key::Tab);
+    h.wait_until(Duration::from_secs(3), |screen| {
+        !screen.contents().contains("VISUAL")
+    });
+
+    // Prove the anchor is truly gone, not just the indicator hidden while
+    // `Files` owns focus: `BackTab` returns focus to `Diff`, and a bare `y`
+    // there demands a fresh `V` — the exact message `yank.rs`'s
+    // `y_without_a_selection_names_the_required_step` uses to mean "no
+    // selection exists."
+    h.send(Key::BackTab);
+    h.send(Key::Char('y'));
+    h.wait_for_text("yank: press V to select lines first");
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
 fn v_on_the_file_header_row_reports_nothing_selectable() {
     let repo = fixture::basic_repo();
     let mut h = Harness::spawn(repo.path(), SpawnOptions::default());
