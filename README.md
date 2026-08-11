@@ -148,8 +148,12 @@ ktmr diff <rev>        # one commit's own changes
 ktmr diff <a>..<b>     # a revision range
 ```
 
-`--no-watch` is a working-tree-only opt-out; staged and historical diffs are
-already static.
+`--no-watch` is a working-tree-only opt-out; staged and pinned historical
+diffs are already static. A diff opened through a *moving* revision —
+`HEAD`, a branch name, or a jj revset like `@` — is the one exception: it
+re-resolves live, so amending the commit it points at (`git commit
+--amend`, `jj describe`/`squash`) updates the open diff in place, cursor
+and scroll preserved. A diff opened by commit hash never changes.
 
 In a colocated jj repository (see [jj colocated setup](#jj-colocated-setup)),
 `ktmr diff` also takes jj revsets, matching `jj diff`'s own flags so jj

@@ -12,6 +12,7 @@ pub mod debounce;
 
 pub use debounce::{ChangeKind, ChangedPath};
 
+use crate::vcs::git::GitSource;
 use debounce::Debounce;
 use ignore::Match;
 use ignore::gitignore::Gitignore;
@@ -288,6 +289,197 @@ impl CommentsWatchSession {
     }
 }
 
+/// Issue #8: a git-dir path this module watches for a *moving revision*
+/// scope (`ktmr diff -r HEAD`, the scope menu's "Revision…") possibly
+/// pointing at a different commit — resolved once at watch-start via
+/// [`GitSource::git_path`], never hand-joined onto the repository root (see
+/// that method's docs and [`spawn_revision_watcher`]'s: a git *worktree*'s
+/// `.git` is a file, not a directory, and per-worktree state lives under a
+/// private gitdir elsewhere entirely).
+enum RevisionWatchTarget {
+    /// A single file — relevant only when a notify event names this exact
+    /// path. `HEAD`/`logs/HEAD`/`packed-refs` all share a git-dir with
+    /// `index`/`COMMIT_EDITMSG`/`ORIG_HEAD`/`FETCH_HEAD` and everything
+    /// else a plain `git add` or `git commit` also touches there — an
+    /// unfiltered whole-directory watch would fire a resolve-and-maybe-
+    /// re-diff check on every single one of those, not just the ones that
+    /// can actually mean a moving scope's target changed.
+    Exact(PathBuf),
+    /// A whole directory tree — every change under it is relevant. `refs/`
+    /// and `logs/refs/` contain nothing *but* ref files and reflogs to
+    /// begin with, so there's nothing to filter out from either.
+    Prefix(PathBuf),
+}
+
+/// The git-dir-relative paths whose changes can mean a moving revision like
+/// `HEAD` now names a different commit — see this module's docs and issue
+/// #8's grounding: an amend on a branch rewrites that branch's ref under
+/// `refs/`, `logs/refs/…`, and `logs/HEAD` but *not* `.git/HEAD` itself
+/// (which stays a symbolic ref); a detached-HEAD amend rewrites `HEAD`
+/// directly instead. `packed-refs` covers the (rarer, but real) case a ref
+/// lives there rather than as a loose file under `refs/`. A colocated jj
+/// repo needs nothing extra watched here — jj keeps its own git `HEAD`/refs
+/// in sync on every operation (confirmed empirically while building this
+/// feature: `jj describe`/`jj squash` rewrite the colocated `.git/HEAD`
+/// exactly like a `git commit --amend` would) — see this module's docs on
+/// why `.jj/` internals are deliberately never watched at all.
+const REVISION_WATCH_TARGETS: &[(&str, bool)] = &[
+    ("HEAD", false),
+    ("logs/HEAD", false),
+    ("refs", true),
+    ("logs/refs", true),
+    ("packed-refs", false),
+];
+
+/// Whether a raw (absolute) notify event path is one this module actually
+/// cares about, given the resolved `targets` [`RevisionWatchSession::start`]
+/// built at watch-start — the same "classify against concrete, already-
+/// resolved paths, no I/O" shape [`is_excluded`] already has, and pure for
+/// the same reason: fully unit-testable with hand-built [`PathBuf`]s, no
+/// real git repository required.
+fn is_revision_relevant(targets: &[RevisionWatchTarget], path: &Path) -> bool {
+    targets.iter().any(|target| match target {
+        RevisionWatchTarget::Exact(p) => p == path,
+        RevisionWatchTarget::Prefix(p) => path.starts_with(p),
+    })
+}
+
+/// Starts the issue #8 ref-watcher against `git`'s repository and sends `()`
+/// on `tx` (debounced — see [`REVISION_DEBOUNCE`]) each time a watched
+/// git-dir path changes. Sibling of [`spawn_comments_watcher`] in every way
+/// that matters: synchronous setup so a caller learns immediately if it
+/// failed, its own thread for the pipeline, and a bare `()` signal — `ui::mod`
+/// decides what a tick actually means (re-resolve the current moving scope,
+/// cheaply, and only re-diff if it actually changed — see
+/// `handle_moving_scope_refresh`), the same way it decides what a comments
+/// signal means.
+///
+/// Each [`REVISION_WATCH_TARGETS`] entry that [`GitSource::git_path`]
+/// resolves to a path that doesn't exist on disk yet (a fresh repo's
+/// `logs/HEAD` before its first commit, or `packed-refs` in a repo that has
+/// never been packed) is skipped rather than failing the whole watcher —
+/// `notify` can't watch a path that isn't there, and "one target doesn't
+/// exist yet" is routine, not a setup failure the caller should hear about.
+pub fn spawn_revision_watcher(git: &GitSource, tx: Sender<()>) -> notify::Result<()> {
+    let session = RevisionWatchSession::start(git)?;
+    std::thread::spawn(move || session.run(tx));
+    Ok(())
+}
+
+/// As [`COMMENTS_DEBOUNCE`]: a ref update is a tiny, infrequent write, not
+/// the "formatter rewrites a whole crate" burst [`DEBOUNCE_QUIET`] exists
+/// for — just enough to collapse the handful of raw filesystem events one
+/// `git commit --amend` can generate (it touches more than one of
+/// [`REVISION_WATCH_TARGETS`] in a single operation) into one signal.
+const REVISION_DEBOUNCE: Duration = Duration::from_millis(100);
+
+struct RevisionWatchSession {
+    targets: Vec<RevisionWatchTarget>,
+    notify_rx: mpsc::Receiver<notify::Result<Event>>,
+    _watcher: RecommendedWatcher,
+}
+
+impl RevisionWatchSession {
+    fn start(git: &GitSource) -> notify::Result<Self> {
+        let (notify_tx, notify_rx) = mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |res| {
+            let _ = notify_tx.send(res);
+        })?;
+
+        let mut targets = Vec::new();
+        // Dedupes which directories actually get a `watch()` call: `HEAD`
+        // and `packed-refs` both resolve to the same top-level git-dir, and
+        // registering that twice would be redundant (harmless on most
+        // backends, but needless all the same).
+        let mut watched_dirs = std::collections::HashSet::new();
+
+        for &(relative, is_dir) in REVISION_WATCH_TARGETS {
+            let resolved = git.git_path(relative).map_err(|e| {
+                notify::Error::generic(&format!("failed to resolve git-path for {relative}: {e}"))
+            })?;
+            if !resolved.exists() {
+                continue; // skip, not fail — see this function's own docs
+            }
+            let (watch_dir, mode) = if is_dir {
+                (resolved.clone(), RecursiveMode::Recursive)
+            } else {
+                let parent = resolved
+                    .parent()
+                    .expect("a git-path file target always has a parent dir")
+                    .to_path_buf();
+                (parent, RecursiveMode::NonRecursive)
+            };
+            if watched_dirs.insert((watch_dir.clone(), mode)) {
+                watcher.watch(&watch_dir, mode)?;
+            }
+            let target = if is_dir {
+                RevisionWatchTarget::Prefix(resolved)
+            } else {
+                RevisionWatchTarget::Exact(resolved)
+            };
+            targets.push(target);
+        }
+
+        Ok(Self {
+            targets,
+            notify_rx,
+            _watcher: watcher,
+        })
+    }
+
+    fn run(self, tx: Sender<()>) {
+        let mut last_sent: Option<Instant> = None;
+        loop {
+            match self.notify_rx.recv_timeout(POLL_TICK) {
+                Ok(Ok(event)) => {
+                    // `classify` narrows to Create/Modify/Remove the same
+                    // way it already does for the working-tree watcher — a
+                    // mere *read* of `HEAD` (`EventKind::Access`, which every
+                    // `git`/`jj` invocation triggers, including katamari's
+                    // own) is not a ref changing, and without this filter it
+                    // starves out the real write event: any git command run
+                    // shortly after this session starts (warm-up, the scope
+                    // swap's own resolve) counts as "relevant" purely by
+                    // path, keeps re-arming `REVISION_DEBOUNCE`, and can
+                    // easily suppress an amend's genuine Modify/Rename that
+                    // lands within that same window.
+                    let relevant = classify(&event)
+                        .iter()
+                        .any(|(path, _)| is_revision_relevant(&self.targets, path));
+                    if !relevant {
+                        continue;
+                    }
+                    let now = Instant::now();
+                    // Leading-edge throttle, same shape as the comments
+                    // watcher's: an event inside the window is dropped, not
+                    // deferred — so a *second* amend whose final ref write
+                    // lands within [`REVISION_DEBOUNCE`] of the first's
+                    // forwarded tick would go unnoticed until the next ref
+                    // change. Accepted: a real amend is a git process whose
+                    // several ref/reflog writes each get their own event
+                    // (the trailing ones re-trigger past the window), and
+                    // two complete amends inside 100ms is not a
+                    // human-drivable sequence; a trailing-edge debounce
+                    // would buy that corner at the cost of a timer in a
+                    // loop that deliberately has none.
+                    if last_sent.is_none_or(|t| now.duration_since(t) >= REVISION_DEBOUNCE) {
+                        last_sent = Some(now);
+                        if tx.send(()).is_err() {
+                            return;
+                        }
+                    }
+                }
+                Ok(Err(_)) => {
+                    // As in `WatchSession::run`: one bad event from the
+                    // platform backend doesn't invalidate the session.
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+    }
+}
+
 /// Builds the gitignore filter from `repo_root`'s top-level `.gitignore`
 /// only — not the full per-directory hierarchy a real `git status` walk
 /// would consult (see [`ignore::WalkBuilder`] for that, which this module
@@ -301,6 +493,48 @@ fn build_ignore(repo_root: &Path) -> Gitignore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- spawn_revision_watcher (issue #8) ---------------------------------
+
+    /// A real `git commit --amend` against a real repo, watched by a real
+    /// `spawn_revision_watcher` session — the one thing the pure
+    /// `is_revision_relevant_table` test above can't prove: that
+    /// `git_path` resolution, `notify` registration, and the `classify`-based
+    /// event-kind filter (see [`RevisionWatchSession::run`]'s docs) all
+    /// actually wire together against a live filesystem, not just hand-built
+    /// `PathBuf`s.
+    #[test]
+    fn spawn_revision_watcher_fires_on_a_real_amend() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(path.join("a.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "first"]);
+
+        let source = GitSource::at(path.to_path_buf());
+        let (tx, rx) = mpsc::channel::<()>();
+        spawn_revision_watcher(&source, tx).expect("failed to start revision watcher");
+
+        std::fs::write(path.join("a.txt"), "one\ntwo\n").unwrap();
+        git(&["commit", "-q", "-a", "--amend", "--no-edit"]);
+
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "expected a signal within 5s of a real amend"
+        );
+    }
 
     fn write(dir: &Path, relative: &str, contents: &str) {
         let path = dir.join(relative);
@@ -391,5 +625,47 @@ mod tests {
             vec![(PathBuf::from("c"), ChangeKind::Deleted)]
         );
         assert!(classify(&event(EventKind::Any, "d")).is_empty());
+    }
+
+    // ---- is_revision_relevant (issue #8) -----------------------------------
+
+    /// A table test against hand-built targets (no real `GitSource`/`git`
+    /// process involved — see [`is_revision_relevant`]'s own docs on why
+    /// this can be pure), covering every [`RevisionWatchTarget`] variant and
+    /// the noisy-sibling-file case [`RevisionWatchTarget::Exact`] exists to
+    /// filter out.
+    #[test]
+    fn is_revision_relevant_table() {
+        let git_dir = PathBuf::from("/repo/.git");
+        let targets = vec![
+            RevisionWatchTarget::Exact(git_dir.join("HEAD")),
+            RevisionWatchTarget::Exact(git_dir.join("packed-refs")),
+            RevisionWatchTarget::Prefix(git_dir.join("refs")),
+        ];
+
+        // Exact matches.
+        assert!(is_revision_relevant(&targets, &git_dir.join("HEAD")));
+        assert!(is_revision_relevant(&targets, &git_dir.join("packed-refs")));
+        // Prefix matches, including a nested path under the watched dir.
+        assert!(is_revision_relevant(
+            &targets,
+            &git_dir.join("refs").join("heads").join("main")
+        ));
+        assert!(is_revision_relevant(&targets, &git_dir.join("refs")));
+
+        // A noisy sibling in the same (non-recursively watched) git-dir
+        // that isn't itself a watch target must NOT be treated as relevant
+        // — this is the whole reason `Exact` exists rather than just
+        // watching the git-dir wholesale and filtering nothing.
+        assert!(!is_revision_relevant(&targets, &git_dir.join("index")));
+        assert!(!is_revision_relevant(
+            &targets,
+            &git_dir.join("COMMIT_EDITMSG")
+        ));
+        // A directory this session never resolved a target under at all.
+        assert!(!is_revision_relevant(
+            &targets,
+            &git_dir.join("logs").join("HEAD")
+        ));
     }
 }

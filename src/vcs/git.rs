@@ -146,6 +146,77 @@ impl GitSource {
         Ok(output.status.success())
     }
 
+    /// Issue #8: the full object id `rev` currently resolves to, or
+    /// `Ok(None)` if it doesn't resolve to anything — [`Self::rev_exists`]'s
+    /// sibling, except this one hands back the id itself rather than
+    /// discarding it, since detecting *which* commit a moving revision like
+    /// `HEAD` points at right now (not just whether it points at something)
+    /// is the whole point of `ui::mod`'s moving-scope refresh. `Ok(None)`
+    /// rather than an `Err` for "doesn't resolve" mirrors `rev_exists`'s own
+    /// choice: a revision that no longer resolves (a branch got deleted, a
+    /// detached `HEAD` rewound past what it named) is exactly as unsurprising
+    /// here as "doesn't exist yet" is there, not a failure worth a status-bar
+    /// error of its own.
+    pub fn resolve(&self, rev: &str) -> Result<Option<String>> {
+        let output = self
+            .git_command()
+            .args(["rev-parse", "--verify", "-q"])
+            .arg(rev)
+            .output()
+            .context("failed to run `git rev-parse`")?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let id = String::from_utf8(output.stdout)
+            .context("git rev-parse produced non-UTF-8 output")?
+            .trim()
+            .to_owned();
+        Ok(Some(id))
+    }
+
+    /// Issue #8: resolves `relative` (`HEAD`, `refs`, `packed-refs`, ...)
+    /// against this repository's *actual* git directory via `git rev-parse
+    /// --git-path <relative>`, never by hand-composing `<something>/.git/
+    /// <relative>` ourselves (see [`crate::watch::spawn_revision_watcher`],
+    /// the one caller): a git *worktree*'s `.git` is a file, not a
+    /// directory, and per-worktree state (`HEAD`, `logs/HEAD`) lives under a
+    /// private gitdir elsewhere entirely (typically `<main-repo>/.git/
+    /// worktrees/<name>/HEAD`) while shared state (`refs/`, `packed-refs`)
+    /// still lives in the common dir — only git itself reliably knows which
+    /// is which. Confirmed empirically against this project's own worktree
+    /// setup while building this feature.
+    ///
+    /// `git rev-parse --git-path` itself prints a path relative to the `-C`
+    /// working directory it was invoked with (this repository's root) for a
+    /// plain, non-worktree repo, but an *absolute* one the moment the real
+    /// git-dir lives somewhere else entirely (the worktree case above) — so
+    /// the result is joined onto [`Self::repo_root`] here purely to
+    /// guarantee an absolute, directly `Path::exists`/`notify`-usable
+    /// return value in the common case; [`PathBuf::join`] treats an already-
+    /// absolute second path as a full replacement rather than concatenating
+    /// it (see its own docs), so this join is a no-op precisely when git
+    /// already did the worktree-aware resolution itself, never a second,
+    /// competing guess at where the real path lives.
+    pub fn git_path(&self, relative: &str) -> Result<PathBuf> {
+        let output = self
+            .git_command()
+            .args(["rev-parse", "--git-path"])
+            .arg(relative)
+            .output()
+            .context("failed to run `git rev-parse --git-path`")?;
+        if !output.status.success() {
+            bail!(
+                "git rev-parse --git-path {relative} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let path = String::from_utf8(output.stdout)
+            .context("git rev-parse --git-path produced non-UTF-8 output")?
+            .trim()
+            .to_owned();
+        Ok(self.repo_root.join(path))
+    }
+
     /// `HEAD` for a repository with at least one commit, or the empty tree
     /// for one that doesn't — the tree-ish every other method here diffs
     /// against.
@@ -805,5 +876,78 @@ mod tests {
         let entries = source.log(10).unwrap();
 
         assert_eq!(entries, vec![LogEntry::LocalChanges { changed_files: 1 }]);
+    }
+
+    // ---- GitSource::resolve / git_path (issue #8) --------------------------
+
+    #[test]
+    fn resolve_matches_rev_parse() {
+        let dir = init_repo();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        git(dir.path(), &["add", "a.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "first"]);
+
+        let source = GitSource::discover(dir.path()).unwrap();
+        let resolved = source.resolve("HEAD").unwrap();
+
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let expected = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+        assert_eq!(resolved, Some(expected));
+    }
+
+    #[test]
+    fn resolve_of_a_nonexistent_revision_is_ok_none() {
+        let dir = init_repo();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        git(dir.path(), &["add", "a.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "first"]);
+
+        let source = GitSource::discover(dir.path()).unwrap();
+        assert_eq!(source.resolve("nonexistent-branch").unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_differs_after_an_amend() {
+        let dir = init_repo();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        git(dir.path(), &["add", "a.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "first"]);
+
+        let source = GitSource::discover(dir.path()).unwrap();
+        let before = source.resolve("HEAD").unwrap();
+
+        git(
+            dir.path(),
+            &["commit", "-q", "--amend", "-m", "first (amended)"],
+        );
+        let after = source.resolve("HEAD").unwrap();
+
+        assert_ne!(before, after, "an amend must change what HEAD resolves to");
+    }
+
+    #[test]
+    fn git_path_resolves_relative_to_the_actual_git_dir() {
+        let dir = init_repo();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        git(dir.path(), &["add", "a.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "first"]);
+
+        let source = GitSource::discover(dir.path()).unwrap();
+        let head_path = source.git_path("HEAD").unwrap();
+
+        assert!(
+            head_path.is_file(),
+            "git-path HEAD must resolve to a real file: {head_path:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&head_path).unwrap(),
+            std::fs::read_to_string(dir.path().join(".git").join("HEAD")).unwrap(),
+            "a plain (non-worktree) repo's git-path HEAD is just .git/HEAD"
+        );
     }
 }

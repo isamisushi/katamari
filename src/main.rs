@@ -653,6 +653,25 @@ fn run_diff(
     app.disk_is_new_side =
         !staged && range.is_none() && revision.is_none() && from.is_none() && to.is_none();
     app.scope_label = scope_label;
+    // Issue #8: recorded so a live session can watch this scope for an
+    // amend moving it — see `ui::app::RevisionScope`'s docs. `--from`/
+    // `--to` are conceptually moving too but excluded from V1 the same way
+    // a `..`/`...` range is (see `vcs::is_moving_revision`'s docs); `range`
+    // itself covers both a plain single revision (moving, if the text
+    // itself is) and a two-sided range (never moving, via that same
+    // classifier's `..` check) — no separate branch needed here for which
+    // of those it turned out to be.
+    app.revision_scope = if let Some(revset) = revision.as_deref() {
+        Some(ui::app::RevisionScope {
+            text: revset.to_owned(),
+            via_jj: true,
+        })
+    } else {
+        range.as_deref().map(|range| ui::app::RevisionScope {
+            text: range.to_owned(),
+            via_jj: false,
+        })
+    };
 
     if let Some(frames) = bench_render {
         return run_bench_render(app, frames);

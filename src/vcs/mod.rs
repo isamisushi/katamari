@@ -154,3 +154,112 @@ impl LogBackend {
         }
     }
 }
+
+/// Issue #8: whether `rev` is the kind of revision text that can point at a
+/// *different* commit tomorrow than it does today — `HEAD`, a branch name, a
+/// jj change id (`@`, `@-`, `main`, `ruwywzxw...`) — as opposed to an
+/// already-fixed object id (a full or abbreviated commit hash). Feeds
+/// `ui::mod`'s decision to watch a historical scope (`ktmr diff -r HEAD`,
+/// the scope menu's "Revision…") for amends at all: a scope this returns
+/// `false` for never seeds a `MovingScopeState`, so it's simply never
+/// re-diffed, no matter how many times the underlying ref file changes.
+///
+/// Two deliberate V1 boundaries (not oversights — see issue #8's acceptance
+/// criteria, which only ever describe a single revision, not a range):
+/// - A `..`/`...` range is always classified immutable, even though its
+///   individual endpoints can each be moving — live-refreshing a two-sided
+///   range is out of scope for the first cut of this feature.
+/// - [`looks_like_object_id`] is a conservative, purely lexical guess: a
+///   branch/bookmark name that happens to be 4-40 hex characters (`git
+///   branch dead`, `jj bookmark create face` are both legal) is
+///   misclassified as immutable. That's a false negative — a genuinely
+///   moving revision silently never refreshed — which is the safer failure
+///   mode here: nothing about a raw-looking hash makes a reviewer expect it
+///   to move, so the rare misclassification just costs one scope that never
+///   auto-refreshes, never a scope that spuriously re-diffs on watcher
+///   noise.
+pub fn is_moving_revision(rev: &str) -> bool {
+    !rev.contains("..") && !looks_like_object_id(rev)
+}
+
+/// A conservative "this looks like a git object id" check: 4 to 40
+/// characters (git's shortest unambiguous abbreviation through a full
+/// SHA-1 — a SHA-256 repository's 64-character hashes fall outside this
+/// range and are therefore classified as *moving*, another accepted V1 gap:
+/// katamari has no SHA-256-repo test coverage to validate a wider bound
+/// against), every character ASCII hex. A jj change id is 32 characters
+/// drawn from a reverse-hex-style alphabet of 16 *letters* (see
+/// `vcs::jj`'s tests for real examples, e.g.
+/// `qrlotxzlnnttqlwvzsuyroxsmqlnvror`) that excludes every hex digit
+/// `0`-`9` and `a`-`f` — every ordinary jj change id therefore contains at
+/// least one character outside `[0-9a-f]` and fails this check, which is
+/// exactly what makes `@`/`@-` (and any other change-id revset) correctly
+/// classify as moving despite being a fixed-length identifier the same way
+/// a commit hash superficially is.
+fn looks_like_object_id(rev: &str) -> bool {
+    (4..=40).contains(&rev.len()) && rev.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symbolic_revisions_are_moving() {
+        for rev in ["HEAD", "HEAD~2", "main", "@", "@-"] {
+            assert!(is_moving_revision(rev), "{rev} should be moving");
+        }
+    }
+
+    /// A jj change id (letters-only alphabet, never all-hex) is moving —
+    /// its *content* is mutable under amend even though the id itself is
+    /// jj's stable identity for the change. See real examples in
+    /// `vcs::jj`'s own tests (`parses_log_lines_and_drops_the_sentinel_root_change`).
+    #[test]
+    fn jj_change_ids_are_moving() {
+        assert!(is_moving_revision("qrlotxzlnnttqlwvzsuyroxsmqlnvror"));
+        assert!(is_moving_revision("ruwywzxwqswtomxrprtyprrosylzslyo"));
+    }
+
+    #[test]
+    fn full_and_abbreviated_commit_hashes_are_not_moving() {
+        assert!(!is_moving_revision(
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+        ));
+        assert!(!is_moving_revision("4b825dc"));
+    }
+
+    /// Ranges are excluded via the `..` check regardless of what their
+    /// endpoints look like — the V1 boundary [`is_moving_revision`]'s docs
+    /// describe, pinned down with both range syntaxes and an endpoint that
+    /// would itself classify as moving in isolation.
+    #[test]
+    fn ranges_are_never_moving_even_with_moving_endpoints() {
+        assert!(!is_moving_revision("HEAD~3..HEAD"));
+        assert!(!is_moving_revision("main...feature"));
+        assert!(!is_moving_revision("main..HEAD"));
+    }
+
+    /// [`looks_like_object_id`]'s length bound is inclusive on both ends —
+    /// pinned at the boundary rather than only mid-range, so a future
+    /// off-by-one regresses a test immediately.
+    #[test]
+    fn object_id_length_boundaries() {
+        assert!(!is_moving_revision("abcd")); // 4 hex chars: shortest abbreviation
+        assert!(is_moving_revision("abc")); // 3: too short to be an id, so moving
+        let forty_hex = "a".repeat(40);
+        assert!(!is_moving_revision(&forty_hex)); // 40: a full SHA-1
+        let forty_one_hex = "a".repeat(41);
+        assert!(is_moving_revision(&forty_one_hex)); // 41: too long, so moving
+    }
+
+    /// The documented false-negative: a branch/bookmark name that happens
+    /// to be all lowercase hex digits within the id-length range is
+    /// misclassified as immutable. Pinned down as a *known* gap, not an
+    /// oversight — see [`is_moving_revision`]'s docs.
+    #[test]
+    fn hex_looking_branch_names_are_a_documented_false_negative() {
+        assert!(!is_moving_revision("dead"));
+        assert!(!is_moving_revision("face"));
+    }
+}

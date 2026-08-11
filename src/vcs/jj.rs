@@ -293,6 +293,71 @@ impl JjRepo {
         String::from_utf8(output.stdout).context("jj diff produced non-UTF-8 output")
     }
 
+    /// Issue #8: the *commit* id (not change id — see this method's own
+    /// docs on why that distinction matters) `revset` currently resolves
+    /// to, or `Ok(None)` if it doesn't resolve to anything —
+    /// [`crate::vcs::git::GitSource::resolve`]'s jj-side counterpart, both
+    /// existing so `ui::mod`'s moving-scope refresh can detect an amend
+    /// without caring which backend opened the scope.
+    ///
+    /// A change id is jj's stable identity for a change and deliberately
+    /// does *not* change across an amend (see [`crate::vcs::is_moving_revision`]'s
+    /// docs on why that's exactly what makes `@`/`@-` classify as moving in
+    /// the first place) — the wrong thing to compare here, since "did the
+    /// content actually change" is the question, not "is this still
+    /// logically the same change." The commit id, by contrast, is the
+    /// git-side content hash underneath every jj change: unstable across
+    /// any amend the same way an ordinary git commit hash always is, which
+    /// is what makes it the right "did this scope's target actually move"
+    /// signal. Empirically confirmed against jj 0.44 while building this
+    /// feature: `jj describe -r @- -m ...` changes `commit_id` for `@-`
+    /// while leaving its `change_id` untouched, and a colocated repo's git
+    /// `HEAD` is rewritten to the new commit id in the same operation —
+    /// which is also *why* `watch::spawn_revision_watcher`'s plain git-ref
+    /// watch is sufficient to notice a jj amend at all, with nothing jj-side
+    /// to watch separately (see that function's docs).
+    ///
+    /// `-n1` bounds output to a single line even if `revset` were ever
+    /// widened to something that could match more than one change; `commit_id`
+    /// alone (no explicit trailing separator) relies on `jj log`'s own
+    /// per-entry newline, trimmed away below the same as everywhere else in
+    /// this module.
+    pub fn resolve_commit_id(&self, revset: &str) -> Result<Option<String>> {
+        // Deliberately no `-n1`: the scope menu accepts arbitrary revsets,
+        // and a multi-match one (`@|@-`, `mutable()`) diffs as the *union*
+        // of every matched commit — comparing only one representative id
+        // would silently miss an amend to any of the others, leaving a
+        // stale union diff on screen with live-refresh nominally on. The
+        // returned value is an opaque comparison token (every matched
+        // commit id, newline-joined, in `jj log`'s stable output order),
+        // not necessarily a single id — its only consumer compares it for
+        // equality against the previous tick's value.
+        let output = self
+            .readonly_command()
+            .args([
+                "log",
+                "-r",
+                revset,
+                "--no-graph",
+                "-T",
+                "commit_id ++ \"\\n\"",
+            ])
+            .output()
+            .context("failed to run `jj log`")?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let ids = String::from_utf8(output.stdout)
+            .context("jj log produced non-UTF-8 output")?
+            .trim()
+            .to_owned();
+        // A revset that resolves to zero changes (e.g. `none()`) is still a
+        // *successful* `jj log` — empty output, not a nonzero exit — so this
+        // is a second, distinct way to land on "doesn't resolve to anything"
+        // beyond the `!output.status.success()` check above.
+        Ok((!ids.is_empty()).then_some(ids))
+    }
+
     /// Change ids are never abbreviated (see [`RevisionEntry::id`]'s docs on
     /// why); the visible `zzzzzzzz...` root commit — jj's fixed sentinel
     /// change id, 32 `z`s, always present as the ultimate ancestor of every
@@ -923,6 +988,86 @@ mod tests {
             err.to_string().to_lowercase().contains("doesn't exist")
                 || err.to_string().to_lowercase().contains("failed"),
             "err: {err}"
+        );
+    }
+
+    // ---- resolve_commit_id (issue #8) --------------------------------------
+
+    #[test]
+    fn resolve_commit_id_of_the_working_copy_changes_after_an_edit_and_snapshot() {
+        let Some(fx) = jj_fixture() else {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        };
+        let before = fx.repo.resolve_commit_id("@").unwrap().unwrap();
+
+        std::fs::write(fx.repo.repo_root().join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        let jj_bin = resolve_jj_bin().expect("jj_fixture already confirmed jj is on PATH");
+        // As in `jj_fixture` itself: every query in this module runs
+        // `--ignore-working-copy`, so a real (non-readonly) `jj` invocation
+        // is needed to actually record this edit into `@`'s tree.
+        jj_cmd(&jj_bin, fx.repo.repo_root(), &["status"]);
+
+        let after = fx.repo.resolve_commit_id("@").unwrap().unwrap();
+        assert_ne!(
+            before, after,
+            "editing and snapshotting the working copy must change its commit id"
+        );
+    }
+
+    #[test]
+    fn resolve_commit_id_of_a_historical_change_is_stable_across_a_working_copy_edit() {
+        let Some(fx) = jj_fixture() else {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        };
+        let before = fx.repo.resolve_commit_id("@-").unwrap().unwrap();
+
+        std::fs::write(fx.repo.repo_root().join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        let jj_bin = resolve_jj_bin().expect("jj_fixture already confirmed jj is on PATH");
+        jj_cmd(&jj_bin, fx.repo.repo_root(), &["status"]);
+
+        let after = fx.repo.resolve_commit_id("@-").unwrap().unwrap();
+        assert_eq!(
+            before, after,
+            "@-'s own commit id must not move just because @ changed"
+        );
+    }
+
+    #[test]
+    fn resolve_commit_id_of_an_unresolvable_revset_is_ok_none() {
+        let Some(fx) = jj_fixture() else {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        };
+        assert_eq!(
+            fx.repo.resolve_commit_id("nonexistent-change").unwrap(),
+            None
+        );
+    }
+
+    /// A jj revset can legitimately name several commits at once (`@ | @-`,
+    /// `mine()`, …) — the resolved token must cover *all* of them, so that
+    /// an amend to any member re-diffs. An earlier draft capped `jj log`
+    /// at one line, which would have silently pinned the whole scope to
+    /// whichever member jj happened to list first.
+    #[test]
+    fn resolve_commit_id_of_a_multi_match_revset_covers_every_member() {
+        let Some(fx) = jj_fixture() else {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        };
+        let at = fx.repo.resolve_commit_id("@").unwrap().unwrap();
+        let parent = fx.repo.resolve_commit_id("@-").unwrap().unwrap();
+        let both = fx.repo.resolve_commit_id("@ | @-").unwrap().unwrap();
+        assert!(
+            both.contains(&at) && both.contains(&parent),
+            "a multi-match revset's token must include every member's id; \
+             got {both:?} for @={at:?}, @-={parent:?}"
+        );
+        assert_ne!(
+            both, at,
+            "the multi-match token must be distinguishable from any single member's"
         );
     }
 

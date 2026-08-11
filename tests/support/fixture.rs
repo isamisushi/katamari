@@ -66,7 +66,13 @@ impl FixtureRepo {
 /// with the captured output on failure — a fixture that failed to build is a
 /// test-infrastructure bug, not something a test body should have to check
 /// for.
-fn git(dir: &Path, args: &[&str]) {
+///
+/// `pub` (unlike every other helper in this file) so `tests/e2e/moving_scope.rs`
+/// can drive a real `git commit --amend` *after* a harness has already
+/// spawned against a fixture built here — issue #8's whole point is a
+/// commit changing out from under an already-open session, which no
+/// pre-baked fixture function can express on its own.
+pub fn git(dir: &Path, args: &[&str]) {
     let output = Command::new("git")
         .args([
             "-c",
@@ -121,6 +127,24 @@ pub fn basic_repo() -> FixtureRepo {
     )
     .unwrap();
     std::fs::write(root.join("todo.txt"), "- write more fixtures\n").unwrap();
+
+    FixtureRepo { dir }
+}
+
+/// A single commit ("first") and nothing else uncommitted — the issue #8
+/// live-refresh E2E fixture (`tests/e2e/moving_scope.rs`). Deliberately
+/// *without* `basic_repo`'s dirty working tree: that test amends `HEAD`
+/// itself with `git commit --amend` after the harness is already spawned,
+/// and a perfectly clean tree beforehand means `git add -A` can never sweep
+/// in an edit this test didn't make, so each amend's content is exactly,
+/// unambiguously what the test wrote.
+pub fn moving_scope_repo() -> FixtureRepo {
+    let dir = init_repo();
+    let root = dir.path();
+
+    std::fs::write(root.join("notes.txt"), "alpha\nbeta\ngamma\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "first"]);
 
     FixtureRepo { dir }
 }

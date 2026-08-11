@@ -252,6 +252,22 @@ pub struct UnitFilter {
     pub hunk_ids: HashSet<String>,
 }
 
+/// See [`App::revision_scope`]'s docs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionScope {
+    pub text: String,
+    /// Which backend resolved `text` — a jj revset (`ktmr diff -r`, or the
+    /// scope menu's "Revision…" with a colocated jj repo detected) versus a
+    /// plain git rev/range (the CLI's positional `range`, or the scope
+    /// menu's "Revision…" without jj detected). Stored explicitly rather
+    /// than re-derived from "is a jj repo detected" at refresh time: the
+    /// CLI's positional `range` always means git even inside a colocated jj
+    /// repo (see `main.rs`'s `run_diff`), so which backend actually
+    /// produced this diff can't be inferred from the session's jj-detection
+    /// state alone.
+    pub via_jj: bool,
+}
+
 /// All state the UI needs to render a frame and respond to input.
 pub struct App {
     pub repo_name: String,
@@ -345,6 +361,25 @@ pub struct App {
     /// revision diff, where it's the only thing on screen that says which
     /// revision(s) are being compared.
     pub scope_label: Option<String>,
+    /// Issue #8: the symbolic revision text (and which backend resolved it)
+    /// the current diff was opened *by*, when it's a single-revision scope —
+    /// `Some` for `ktmr diff -r <revset>`/the positional `range` (when it's
+    /// a plain revision, not a `..`/`...` range)/the scope menu's
+    /// "Revision…"; `None` for the working tree, staged changes, a
+    /// two-sided range, or a jj `--from`/`--to` pair (the latter two are
+    /// conceptually moving too, but excluded from V1 — see
+    /// [`crate::vcs::is_moving_revision`]'s docs on why a range's own
+    /// endpoints being individually moving isn't enough). `ui::mod`'s event
+    /// loop filters this through `is_moving_revision` to decide whether to
+    /// seed a `MovingScopeState` that watches this exact scope's target
+    /// commit for changing after an amend. Deliberately independent of
+    /// `scope_label`'s display text: [`Self::apply_refresh`] (the anchor-
+    /// preserving path a moving-scope refresh always uses, unlike
+    /// [`Self::apply_scope_swap`]) never touches `scope_label`, so "r: HEAD"
+    /// stays exactly that even as the commit it names changes underneath
+    /// it — this field is what makes that refresh possible in the first
+    /// place, not what's shown on screen.
+    pub revision_scope: Option<RevisionScope>,
     /// The merged `[units]` config (agent CLI preference, model/effort
     /// tuning), carried on `App` the same way `layout`/`scope_label` are:
     /// set once by `main.rs` after construction, read whenever `u`/`U`
@@ -514,6 +549,7 @@ impl App {
             interactive: true,
             disk_is_new_side: false,
             scope_label: None,
+            revision_scope: None,
             units_config: crate::config::UnitsConfig::default(),
             units_prompt_needed: false,
             expanded_folds: HashMap::new(),
@@ -1256,7 +1292,10 @@ impl App {
     /// new scope happens to touch the same file.
     /// `interactive`/`disk_is_new_side`/`scope_label` are set by the caller
     /// (see `crate::ui::mod::apply_scope_swap`), which is the one place
-    /// that knows which scope this diff came from. Every fold is dropped
+    /// that knows which scope this diff came from — `revision_scope` is set
+    /// by that same caller too, but directly as a field assignment rather
+    /// than through a parameter here, so this method's signature (and its
+    /// own unit tests) never had to change for issue #8. Every fold is dropped
     /// unconditionally rather than pruned — unlike [`Self::apply_refresh`],
     /// a scope swap's new diff has no relationship to the old one at all,
     /// so "does this fold still fit" isn't even a meaningful question to

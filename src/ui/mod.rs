@@ -136,6 +136,18 @@ enum AppEvent {
     /// agent resolving comments via `ktmr comments resolve` shouldn't need
     /// an unrelated file edit to make the reviewer's session notice.
     CommentsChanged,
+    /// Issue #8: a watched git-dir path (`HEAD`, a ref, a reflog,
+    /// `packed-refs`) changed on disk — forwarded by
+    /// [`crate::watch::spawn_revision_watcher`], which like
+    /// [`crate::watch::spawn_comments_watcher`] runs unconditionally for
+    /// every session with a root diff, regardless of watch mode. Named
+    /// distinctly from "Refs" to avoid colliding with `refs_panel`'s own
+    /// naming — this has nothing to do with the find-references overlay.
+    /// A cheap no-op via [`handle_moving_scope_refresh`] whenever the root
+    /// diff isn't currently sitting on a classified-moving revision scope
+    /// (see [`MovingScopeState`]'s docs) — most ticks, in practice, since a
+    /// `git add`/ordinary commit touches several of these same paths too.
+    RevisionChanged,
 }
 
 /// The M5 [`PreRefreshHook`]: snapshots the working copy via jj (see
@@ -309,18 +321,24 @@ pub fn run(
         .then(|| start_watch(stack, app_tx.clone(), debounce_quiet))
         .flatten();
 
+    // Issue #8: unconditional, like the comments watcher just below — see
+    // `start_revision_watch`'s own docs for why this can't gate on watch
+    // mode either.
+    let revision_watch_status = start_revision_watch(stack.top(), app_tx.clone());
+
     // M6: a root diff's comments are loaded and watched unconditionally —
     // unlike the working-tree watcher above, this has nothing to do with
     // whether root live refresh is enabled. See
     // [`AppEvent::CommentsChanged`]'s docs and `watch::spawn_comments_watcher`.
     let (comments_repo_root, initial_comments, comments_startup_status) =
         start_comments(stack.top(), app_tx);
-    // Lowest priority of the three: an available-update notice is
+    // Lowest priority of the four: an available-update notice is
     // informational, never a problem report the way a failed watcher or a
     // capped warm-up is, so it only shows when nothing more actionable
     // claimed this session's one startup status slot.
     let startup_status = startup_status
         .or(comments_startup_status)
+        .or(revision_watch_status)
         .or(available_update.as_ref().map(update::status_bar_notice));
 
     let result = event_loop(
@@ -430,6 +448,47 @@ fn spawn_comments_forwarder(rx: Receiver<()>, tx: Sender<AppEvent>) {
     std::thread::spawn(move || {
         for () in rx {
             if tx.send(AppEvent::CommentsChanged).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Issue #8: starts the ref-watcher behind a moving historical scope's live
+/// refresh, unconditionally, for every session with a [`View::Diff`] root —
+/// exactly [`start_comments`]'s own "don't gate on root live-refresh mode"
+/// reasoning, and for the same underlying reason: a plain `ktmr diff -r
+/// HEAD` session has no other watcher running at all (`start_watch` only
+/// ever spawns for a working-tree root — see `App::disk_is_new_side`'s
+/// callers in `main.rs`), so this is the only thing that can ever notice
+/// `HEAD` (or any other moving scope) pointing at a different commit after
+/// an amend. Spawning it regardless of whether a moving scope happens to be
+/// open *right now* is deliberate too — [`handle_moving_scope_refresh`]'s
+/// own signals are cheap no-ops whenever [`MovingScopeState`] is `None`, and
+/// the scope menu can swap onto a moving revision at any later point in the
+/// session, not just at startup.
+fn start_revision_watch(view: &View, app_tx: Sender<AppEvent>) -> Option<String> {
+    let View::Diff(app) = view else {
+        return None;
+    };
+    let git = GitSource::at(app.repo_root.clone());
+    let (tx, rx) = mpsc::channel::<()>();
+    match watch::spawn_revision_watcher(&git, tx) {
+        Ok(()) => {
+            spawn_revision_forwarder(rx, app_tx);
+            None
+        }
+        Err(e) => Some(format!("scope watch: failed to start: {e}")),
+    }
+}
+
+/// As [`spawn_comments_forwarder`], relaying the revision watcher's bare
+/// `()` signals onto the shared [`AppEvent`] channel as
+/// [`AppEvent::RevisionChanged`].
+fn spawn_revision_forwarder(rx: Receiver<()>, tx: Sender<AppEvent>) {
+    std::thread::spawn(move || {
+        for () in rx {
+            if tx.send(AppEvent::RevisionChanged).is_err() {
                 break;
             }
         }
@@ -561,6 +620,79 @@ impl WatchStatus {
     }
 }
 
+/// Issue #8: live-tracking state for a moving historical scope (`ktmr diff
+/// -r HEAD`, the scope menu's "Revision…" opened onto something like
+/// `HEAD`/`@`/a branch name). `Some` only while the root diff's current
+/// scope is both a revision scope (`App::revision_scope`) *and* classified
+/// moving (`vcs::is_moving_revision` — see [`seed_moving_scope`]); `None` is
+/// deliberately the entire pause mechanism, mirroring `watch_paused`'s
+/// "consumer-side no-op" shape rather than a second boolean threaded
+/// alongside it — see [`handle_moving_scope_refresh`]'s early return.
+/// Independent of `watch_paused`/`watch_active`: a revision scope is never
+/// the working tree, so watch mode is always paused whenever this is `Some`
+/// (see `watch_pause_decision`) — the two states track different concerns
+/// and neither handler ever consults the other's flag.
+struct MovingScopeState {
+    text: String,
+    via_jj: bool,
+    /// The resolved commit/change-content id the scope named as of the
+    /// last check — compared against a fresh resolve on every
+    /// `AppEvent::RevisionChanged` tick in [`handle_moving_scope_refresh`]:
+    /// unequal means the amend actually moved this scope's target; equal
+    /// means some other watched ref path changed (an unrelated branch's
+    /// reflog, a `git add`) and this scope's own target didn't move.
+    /// `None` when the seed-time resolve itself failed (a transient
+    /// repository hiccup at scope-open): tracking stays alive rather than
+    /// silently disabling for the whole session, and the first successful
+    /// resolve re-runs the diff once — a redundant, anchor-preserving
+    /// refresh in the worst case, never a missed amend.
+    last_hash: Option<String>,
+}
+
+/// Builds the event loop's live [`MovingScopeState`] for a freshly opened
+/// (or swapped-to) revision scope — used both at session setup (from
+/// `App::revision_scope`, seeded once before the loop starts) and by
+/// `apply_scope_swap` on every later in-session scope change. `None` for
+/// every scope that isn't [`crate::vcs::is_moving_revision`] (an immutable
+/// commit hash, a range, the working tree/staged, or no scope at all) — the
+/// entire "moving scope refresh" mechanism is a no-op for any of those, by
+/// construction, since a `None` here is also [`handle_moving_scope_refresh`]'s
+/// own early-return condition.
+///
+/// Resolves the scope's *current* target right away (rather than leaving
+/// `last_hash` empty until the first watcher tick) so the first
+/// `AppEvent::RevisionChanged` this session actually receives is compared
+/// against a real baseline, not treated as a spurious "changed" the moment
+/// this session happens to check at all. A resolve failure at seed time
+/// (a momentarily locked repo, say) still seeds — with `last_hash: None` —
+/// because `None` from this function is the feature's *permanent* off
+/// switch, and a transient hiccup at open must not silently disable
+/// live-refresh for the whole session; the caller reports it, and the
+/// first successful later resolve re-runs the diff once (see
+/// `MovingScopeState::last_hash`'s docs). Only a genuinely non-moving or
+/// unresolvable-by-construction scope (no jj repo for a jj revset)
+/// returns `None`.
+fn seed_moving_scope(
+    scope: Option<&app::RevisionScope>,
+    git: &GitSource,
+    jj_repo: Option<&JjRepo>,
+) -> Option<MovingScopeState> {
+    let scope = scope?;
+    if !crate::vcs::is_moving_revision(&scope.text) {
+        return None;
+    }
+    let last_hash = if scope.via_jj {
+        jj_repo?.resolve_commit_id(&scope.text).ok().flatten()
+    } else {
+        git.resolve(&scope.text).ok().flatten()
+    };
+    Some(MovingScopeState {
+        text: scope.text.clone(),
+        via_jj: scope.via_jj,
+        last_hash,
+    })
+}
+
 /// How long a [`WatchStatus`] note stays in the status bar before clearing
 /// itself — long enough to read at a glance, short enough not to crowd out
 /// the hover/goto/LSP notes that share the same status-bar slot.
@@ -672,6 +804,31 @@ fn event_loop(
     // `handle_watch_refresh`'s early-return on this flag.
     let mut watch_paused = false;
     let watch_active = pre_refresh_hook.is_some();
+    // Issue #8: seeded once here from whatever revision scope the session
+    // actually started on (resolving its current target right away, not
+    // waiting for the first ref-watcher tick — see `seed_moving_scope`'s
+    // docs), then re-seeded by `apply_scope_swap` on every later in-session
+    // scope change. Independent of `watch_paused`/`watch_active` above —
+    // see `MovingScopeState`'s docs.
+    let mut moving_scope: Option<MovingScopeState> = match stack.root_mut() {
+        View::Diff(app) => {
+            let git = GitSource::at(app.repo_root.clone());
+            seed_moving_scope(app.revision_scope.as_ref(), &git, jj_repo.as_ref())
+        }
+        _ => None,
+    };
+    // A seed whose baseline resolve failed keeps tracking alive but must
+    // say so — issue #8's transient-failure criterion applies at open just
+    // as much as on a later tick, and this is the one failure the later
+    // tick's own reporting can't cover.
+    if let Some(scope) = &moving_scope
+        && scope.last_hash.is_none()
+    {
+        watch_status = Some(WatchStatus::new(format!(
+            "scope: couldn't resolve {} yet; live refresh will retry",
+            scope.text
+        )));
+    }
     let mut comment_list: Vec<Comment> = initial_comments;
     let mut comment_index: CommentIndex = comments_repo_root
         .as_deref()
@@ -1247,6 +1404,7 @@ fn event_loop(
                                         &mut context_menu,
                                         &mut watch_paused,
                                         &mut watch_status,
+                                        &mut moving_scope,
                                     ) {
                                         Ok(()) => scope_menu = None,
                                         Err(e) => {
@@ -1350,6 +1508,7 @@ fn event_loop(
                                         &mut watch_paused,
                                         watch_active,
                                         &mut watch_status,
+                                        &mut moving_scope,
                                         &mut hints_expanded,
                                         &observer,
                                     );
@@ -1513,6 +1672,7 @@ fn event_loop(
                                         &mut watch_paused,
                                         watch_active,
                                         &mut watch_status,
+                                        &mut moving_scope,
                                         &mut hints_expanded,
                                         &observer,
                                     );
@@ -1586,6 +1746,7 @@ fn event_loop(
                                 &mut watch_paused,
                                 watch_active,
                                 &mut watch_status,
+                                &mut moving_scope,
                                 &mut hints_expanded,
                                 &observer,
                             );
@@ -1833,6 +1994,28 @@ fn event_loop(
                 if let Some(root) = &comments_repo_root {
                     comment_index = comments::build_index(root, &comment_list);
                 }
+            }
+            Ok(AppEvent::RevisionChanged) => {
+                // Same root-only live-search capture as the watch arm above
+                // — see its comment for why the check is safe out here.
+                let live_search = stack
+                    .is_at_root()
+                    .then(|| search_prompt.as_ref().map(|p| (p.input.text(), &p.origin)))
+                    .flatten();
+                handle_moving_scope_refresh(
+                    &mut moving_scope,
+                    stack,
+                    jj_repo.as_ref(),
+                    highlighter,
+                    &mut hover_state,
+                    &mut refs_panel,
+                    &mut context_menu,
+                    &mut watch_status,
+                    live_search,
+                    &mut pointer_hover,
+                    &mut pending_pointer_hover,
+                    &observer,
+                );
             }
             Ok(AppEvent::CommentsChanged) => {
                 // Issue #24 req 5's fifth cancellation hook, easy to miss
@@ -2451,6 +2634,7 @@ fn handle_action(
     watch_paused: &mut bool,
     watch_active: bool,
     watch_status: &mut Option<WatchStatus>,
+    moving_scope: &mut Option<MovingScopeState>,
     hints_expanded: &mut bool,
     observer: &crate::lsp::ObservationHandle,
 ) {
@@ -2580,6 +2764,7 @@ fn handle_action(
                                 watch_paused,
                                 watch_active,
                                 watch_status,
+                                moving_scope,
                                 hints_expanded,
                                 observer,
                             ),
@@ -2653,6 +2838,7 @@ fn handle_action(
                                 context_menu,
                                 watch_paused,
                                 watch_status,
+                                moving_scope,
                             ) {
                                 Ok(()) => *scope_menu = None,
                                 Err(e) => *goto_status = Some(format!("scope: {e}")),
@@ -3636,6 +3822,17 @@ fn warm_up_diff(app: &App, lsp_manager: &LspManager) -> crate::lsp::manager::War
 /// succeeded, so a bad revision or a transient git/jj failure can never
 /// leave a blank or half-updated diff on screen — the error is returned for
 /// the caller to show as a status-bar note instead, per the milestone spec.
+///
+/// Issue #8: also records `app.revision_scope` (`Some` for `Revision`,
+/// `None` for `WorkingTree`/`Staged`) directly as a field assignment rather
+/// than through [`App::apply_scope_swap`]'s own parameter list (see that
+/// method's docs for why), and — only `at_root`, the same gate
+/// [`watch_pause_decision`] uses just below, since [`MovingScopeState`]
+/// only ever tracks the root diff — re-seeds `moving_scope` from the new
+/// scope via [`seed_moving_scope`]. A swap on a *pushed* diff still records
+/// `revision_scope` on that diff's own `app` (for display/introspection
+/// consistency), but never touches `moving_scope`, exactly the way it never
+/// touches `watch_paused` either.
 #[allow(clippy::too_many_arguments)] // one function, every side effect a
 // scope change needs — see `handle_action`'s identical justification for
 // why splitting this into a struct wouldn't reduce how many independent
@@ -3653,6 +3850,7 @@ fn apply_scope_swap(
     context_menu: &mut Option<ContextMenuState>,
     watch_paused: &mut bool,
     watch_status: &mut Option<WatchStatus>,
+    moving_scope: &mut Option<MovingScopeState>,
 ) -> Result<(), String> {
     let git = GitSource::at(app.repo_root.clone());
     let (result, interactive, scope_label): (anyhow::Result<String>, bool, Option<String>) =
@@ -3693,6 +3891,13 @@ fn apply_scope_swap(
         disk_is_new_side,
         scope_label,
     );
+    app.revision_scope = match choice {
+        ScopeChoice::Revision(input) => Some(app::RevisionScope {
+            text: input.trim().to_owned(),
+            via_jj: jj_repo.is_some(),
+        }),
+        ScopeChoice::WorkingTree | ScopeChoice::Staged => None,
+    };
 
     hover_state.invalidate();
     *refs_panel = None;
@@ -3717,6 +3922,19 @@ fn apply_scope_swap(
             ));
         } else if !should_pause && was_paused {
             *watch_status = Some(WatchStatus::new("watch resumed".to_owned()));
+        }
+    }
+    if at_root {
+        *moving_scope = seed_moving_scope(app.revision_scope.as_ref(), &git, jj_repo);
+        // Same unresolved-baseline note the session-start seed emits — see
+        // that call site's comment.
+        if let Some(scope) = &moving_scope
+            && scope.last_hash.is_none()
+        {
+            *watch_status = Some(WatchStatus::new(format!(
+                "scope: couldn't resolve {} yet; live refresh will retry",
+                scope.text
+            )));
         }
     }
     Ok(())
@@ -3853,6 +4071,127 @@ fn handle_watch_refresh(
         }
         .to_owned(),
     ));
+}
+
+/// Issue #8: applies one `AppEvent::RevisionChanged` tick — sibling of
+/// [`handle_watch_refresh`], re-resolving the root diff's moving scope (see
+/// [`MovingScopeState`]) and, only if its target commit actually changed
+/// since the last check, re-running the *exact* diff call the scope was
+/// opened with and swapping it in via [`App::apply_refresh`] — the anchor-
+/// preserving path, not [`apply_scope_swap`]'s reset-to-top-and-relabel one,
+/// since this is a later version of the *same* scope, not a switch to a
+/// different one. The scope label itself is untouched by construction (see
+/// [`App::apply_refresh`]'s docs), so `"r: HEAD"` stays exactly that even
+/// though the commit it names just changed underneath it.
+///
+/// `None` is the entire pause mechanism (see [`MovingScopeState`]'s docs):
+/// every ref-watcher tick this session ever receives is a cheap no-op the
+/// moment the root diff isn't sitting on a classified-moving revision
+/// scope, which covers both "never was" (working tree/staged/an immutable
+/// hash) and "isn't anymore" (swapped away — see [`apply_scope_swap`]'s
+/// reseed). Every failure path (a bad resolve, a failed re-diff) leaves
+/// `app`/`moving_scope` completely untouched and reports a transient status
+/// note instead — the same "never blank the screen over a flaky VCS call"
+/// posture [`apply_scope_swap`]/[`handle_watch_refresh`] both already take.
+#[allow(clippy::too_many_arguments)] // mirrors `handle_watch_refresh`'s
+// identical justification: each parameter is a distinct piece of session
+// state one refresh cycle touches.
+fn handle_moving_scope_refresh(
+    moving_scope: &mut Option<MovingScopeState>,
+    stack: &mut ViewStack,
+    jj_repo: Option<&JjRepo>,
+    highlighter: &mut LineHighlighter,
+    hover_state: &mut hover_popup::HoverState,
+    refs_panel: &mut Option<RefsPanelState>,
+    context_menu: &mut Option<ContextMenuState>,
+    watch_status: &mut Option<WatchStatus>,
+    live_search: Option<(&str, &refresh::Anchor)>,
+    pointer_hover: &mut pointer_hover::PointerHoverState,
+    pending_pointer_hover: &mut Option<PendingHover>,
+    observer: &crate::lsp::ObservationHandle,
+) {
+    let Some(scope) = moving_scope else {
+        return;
+    };
+    let View::Diff(app) = stack.root_mut() else {
+        return; // the moving-scope refresh only ever targets the root diff
+    };
+    let git = GitSource::at(app.repo_root.clone());
+
+    let resolved = if scope.via_jj {
+        match jj_repo {
+            Some(repo) => repo.resolve_commit_id(&scope.text),
+            None => Ok(None),
+        }
+    } else {
+        git.resolve(&scope.text)
+    };
+    let new_hash = match resolved {
+        Ok(Some(hash)) => hash,
+        Ok(None) => {
+            *watch_status = Some(WatchStatus::new(format!(
+                "scope: refresh check failed: {} no longer resolves",
+                scope.text
+            )));
+            return;
+        }
+        Err(e) => {
+            *watch_status = Some(WatchStatus::new(format!(
+                "scope: refresh check failed: {e}"
+            )));
+            return;
+        }
+    };
+    if scope.last_hash.as_deref() == Some(new_hash.as_str()) {
+        return; // some other watched ref path changed; this scope's own target didn't move
+    }
+
+    // The same diff call the scope was opened with — see
+    // `apply_scope_swap`'s `ScopeChoice::Revision` arm, which this mirrors.
+    let diff_result = if scope.via_jj {
+        match jj_repo {
+            Some(repo) => repo.revision_diff(&scope.text),
+            None => Err(anyhow::anyhow!("no jj repository detected")),
+        }
+    } else {
+        git.range_diff(&scope.text)
+    };
+    let files = match diff_result {
+        Ok(text) => parse_unified_diff(&text),
+        Err(e) => {
+            *watch_status = Some(WatchStatus::new(format!("scope: refresh failed: {e}")));
+            return;
+        }
+    };
+
+    // Issue #24 req 5's fourth cancellation hook, unconditional the same
+    // way `handle_watch_refresh` applies it — see that function's docs.
+    cancel_pending_pointer_hover(pointer_hover, pending_pointer_hover, observer);
+
+    let overlay_survives = app.apply_refresh(files);
+    // Same live-search recompute `handle_watch_refresh` does: an open,
+    // unconfirmed `/` prompt's matches were computed against the rows this
+    // refresh just replaced.
+    if let Some((query, origin)) = live_search {
+        app.recompute_search_live(query, origin);
+    }
+    hover_state.bump_generation_for_refresh();
+    highlighter.clear_cache();
+    if !overlay_survives {
+        if hover_state.is_open() {
+            hover_state.close();
+        }
+        if refs_panel.is_some() {
+            *refs_panel = None;
+        }
+    }
+    // Always closes, matching `handle_watch_refresh`'s own req-10 reasoning:
+    // a tree/diff-row menu target has no guaranteed correspondence in the
+    // refreshed content regardless of whether the cursor's own row survived.
+    *context_menu = None;
+
+    scope.last_hash = Some(new_hash);
+    *watch_status = Some(WatchStatus::new(format!("updated: {} moved", scope.text)));
 }
 
 /// Keeps every language server in sync with the files a watch batch
@@ -5479,6 +5818,7 @@ mod tests {
         let mut highlighter = LineHighlighter::new();
         let mut watch_paused = false;
         let mut watch_status: Option<WatchStatus> = None;
+        let mut moving_scope: Option<MovingScopeState> = None;
         let mut hints_expanded = false;
 
         handle_action(
@@ -5506,6 +5846,7 @@ mod tests {
             &mut watch_paused,
             false,
             &mut watch_status,
+            &mut moving_scope,
             &mut hints_expanded,
             observer,
         );
@@ -5817,5 +6158,320 @@ mod tests {
         let mut resolver = keymap.resolver();
         let chord = KeyChord::new(KeyCode::Char('q'), KeyModifiers::NONE);
         assert_eq!(resolver.feed(chord), StepResult::Matched(Action::Quit));
+    }
+
+    // ---- apply_scope_swap seeds moving_scope; handle_moving_scope_refresh
+    // ---- picks up a real amend (issue #8) -----------------------------
+
+    /// End-to-end at the `App`/free-function level (a real `git` repo and a
+    /// real `git commit --amend` subprocess, but no terminal/PTY — that's
+    /// `tests/e2e/moving_scope.rs`'s job): swapping onto the `HEAD` revision
+    /// scope seeds a `MovingScopeState`, and a subsequent
+    /// `handle_moving_scope_refresh` call after a real amend picks up the
+    /// new content via the anchor-preserving `App::apply_refresh` path
+    /// (never `apply_scope_swap`'s reset-to-top one) while leaving the
+    /// scope label untouched.
+    #[test]
+    fn apply_scope_swap_seeds_moving_scope_and_a_later_amend_is_picked_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(path.join("a.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "first"]);
+
+        let app = App::new("repo".to_owned(), path.to_path_buf(), Vec::new());
+        let mut stack = ViewStack::new(View::Diff(app));
+        let mut hover_state = hover_popup::HoverState::default();
+        let mut refs_panel: Option<RefsPanelState> = None;
+        let mut context_menu: Option<ContextMenuState> = None;
+        let mut watch_paused = false;
+        let mut watch_status: Option<WatchStatus> = None;
+        let mut moving_scope: Option<MovingScopeState> = None;
+        let mut highlighter = LineHighlighter::new();
+        let lsp_manager = inert_lsp_manager();
+
+        let at_root = stack.is_at_root();
+        let View::Diff(app) = stack.top_mut() else {
+            unreachable!()
+        };
+        apply_scope_swap(
+            app,
+            &ScopeChoice::Revision("HEAD".to_owned()),
+            at_root,
+            false,
+            None,
+            &lsp_manager,
+            &mut highlighter,
+            &mut hover_state,
+            &mut refs_panel,
+            &mut context_menu,
+            &mut watch_paused,
+            &mut watch_status,
+            &mut moving_scope,
+        )
+        .expect("swapping onto HEAD must succeed");
+        assert!(
+            moving_scope.is_some(),
+            "HEAD is classified moving, so the swap must seed a MovingScopeState"
+        );
+        let View::Diff(app) = stack.top() else {
+            unreachable!()
+        };
+        assert_eq!(app.scope_label.as_deref(), Some("r: HEAD"));
+
+        std::fs::write(path.join("a.txt"), "one\ntwo\n").unwrap();
+        git(&["commit", "-q", "-a", "--amend", "--no-edit"]);
+
+        let mut pointer_hover = pointer_hover::PointerHoverState::default();
+        let mut pending_pointer_hover: Option<PendingHover> = None;
+        let observer = crate::lsp::ObservationStore::in_memory();
+        handle_moving_scope_refresh(
+            &mut moving_scope,
+            &mut stack,
+            None,
+            &mut highlighter,
+            &mut hover_state,
+            &mut refs_panel,
+            &mut context_menu,
+            &mut watch_status,
+            None,
+            &mut pointer_hover,
+            &mut pending_pointer_hover,
+            &observer,
+        );
+
+        let View::Diff(app) = stack.top() else {
+            unreachable!()
+        };
+        assert!(
+            app.files.iter().any(|f| f
+                .hunks
+                .iter()
+                .any(|h| h.rows.iter().any(|r| r.text == "two"))),
+            "the amended content must appear after the refresh; files: {:?}",
+            app.files
+        );
+        // The scope label is untouched by `apply_refresh` — stays symbolic
+        // even though the commit HEAD names has just changed.
+        assert_eq!(app.scope_label.as_deref(), Some("r: HEAD"));
+        assert!(
+            watch_status
+                .as_ref()
+                .is_some_and(|s| s.text == "updated: HEAD moved"),
+            "watch_status: {:?}",
+            watch_status.map(|s| s.text)
+        );
+    }
+
+    /// Issue #8's fourth acceptance criterion — "a transient VCS failure
+    /// leaves the current view intact and reports the failure" — covered at
+    /// this unit level rather than end to end: reliably forcing a *transient*
+    /// `git`/`jj` failure from outside (a mid-rebase repo, a racing lock) in
+    /// a PTY-driven E2E test would be exactly the kind of flaky
+    /// test-infrastructure engineering this suite avoids elsewhere (see
+    /// `support::fixture`'s module docs), whereas a scope whose text simply
+    /// no longer resolves (a deleted branch, same code path as a resolve
+    /// erroring) is trivial to construct directly. Either way,
+    /// `handle_moving_scope_refresh` can't distinguish "resolve returned
+    /// `Ok(None)`" from "resolve errored" in what it does next — see that
+    /// function's own docs — so this exercises the representative case.
+    #[test]
+    fn handle_moving_scope_refresh_leaves_the_view_untouched_on_a_resolve_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(path.join("a.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "first"]);
+
+        let mut app = App::new("repo".to_owned(), path.to_path_buf(), Vec::new());
+        // A scope pointed at a branch name that doesn't exist in this repo
+        // — `git.resolve` (or `resolve_commit_id`, for a jj scope) returns
+        // `Ok(None)`, the same "doesn't resolve" outcome a transient failure
+        // funnels into (see this test's own docs).
+        app.scope_label = Some("r: nonexistent-branch".to_owned());
+        let original_files = app.files.clone();
+        let mut stack = ViewStack::new(View::Diff(app));
+        let mut moving_scope = Some(MovingScopeState {
+            text: "nonexistent-branch".to_owned(),
+            via_jj: false,
+            last_hash: Some("deadbeef".to_owned()),
+        });
+        let mut hover_state = hover_popup::HoverState::default();
+        let mut refs_panel: Option<RefsPanelState> = None;
+        let mut context_menu: Option<ContextMenuState> = None;
+        let mut watch_status: Option<WatchStatus> = None;
+        let mut highlighter = LineHighlighter::new();
+        let mut pointer_hover = pointer_hover::PointerHoverState::default();
+        let mut pending_pointer_hover: Option<PendingHover> = None;
+        let observer = crate::lsp::ObservationStore::in_memory();
+
+        handle_moving_scope_refresh(
+            &mut moving_scope,
+            &mut stack,
+            None,
+            &mut highlighter,
+            &mut hover_state,
+            &mut refs_panel,
+            &mut context_menu,
+            &mut watch_status,
+            None,
+            &mut pointer_hover,
+            &mut pending_pointer_hover,
+            &observer,
+        );
+
+        let View::Diff(app) = stack.top() else {
+            unreachable!()
+        };
+        assert_eq!(
+            app.files, original_files,
+            "a resolve failure must leave the diff completely untouched"
+        );
+        assert_eq!(
+            app.scope_label.as_deref(),
+            Some("r: nonexistent-branch"),
+            "the label must also stay exactly as it was"
+        );
+        assert!(
+            watch_status
+                .as_ref()
+                .is_some_and(|s| s.text.starts_with("scope: refresh check failed")),
+            "watch_status: {:?}",
+            watch_status.map(|s| s.text)
+        );
+        // `moving_scope` itself is untouched too — `last_hash` never
+        // advances past a failed check, so the very next real amend is
+        // still correctly detected as "changed" rather than silently
+        // absorbed into a stale baseline.
+        assert_eq!(moving_scope.unwrap().last_hash.as_deref(), Some("deadbeef"));
+    }
+
+    /// The other half of `MovingScopeState::last_hash` being an `Option`:
+    /// a scope whose *seed* resolve failed (`last_hash: None` — say, the
+    /// view opened mid-rebase) must self-heal on the first tick where the
+    /// resolve succeeds — `None != Some(_)` reads as "moved", so the view
+    /// re-diffs once and the baseline is finally established. Without this,
+    /// a bad first resolve would leave live refresh permanently inert.
+    #[test]
+    fn handle_moving_scope_refresh_recovers_once_a_failed_seed_finally_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(path.join("a.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "first"]);
+
+        let mut app = App::new("repo".to_owned(), path.to_path_buf(), Vec::new());
+        app.scope_label = Some("r: HEAD".to_owned());
+        let mut stack = ViewStack::new(View::Diff(app));
+        let mut moving_scope = Some(MovingScopeState {
+            text: "HEAD".to_owned(),
+            via_jj: false,
+            last_hash: None,
+        });
+        let mut hover_state = hover_popup::HoverState::default();
+        let mut refs_panel: Option<RefsPanelState> = None;
+        let mut context_menu: Option<ContextMenuState> = None;
+        let mut watch_status: Option<WatchStatus> = None;
+        let mut highlighter = LineHighlighter::new();
+        let mut pointer_hover = pointer_hover::PointerHoverState::default();
+        let mut pending_pointer_hover: Option<PendingHover> = None;
+        let observer = crate::lsp::ObservationStore::in_memory();
+
+        handle_moving_scope_refresh(
+            &mut moving_scope,
+            &mut stack,
+            None,
+            &mut highlighter,
+            &mut hover_state,
+            &mut refs_panel,
+            &mut context_menu,
+            &mut watch_status,
+            None,
+            &mut pointer_hover,
+            &mut pending_pointer_hover,
+            &observer,
+        );
+
+        let View::Diff(app) = stack.top() else {
+            unreachable!()
+        };
+        assert!(
+            app.files.iter().any(|f| f
+                .hunks
+                .iter()
+                .any(|h| h.rows.iter().any(|r| r.text == "one"))),
+            "the first successful resolve after a failed seed must re-diff; files: {:?}",
+            app.files
+        );
+        assert!(
+            moving_scope.as_ref().is_some_and(|s| s.last_hash.is_some()),
+            "the baseline must be established by the recovery tick"
+        );
+        // A second tick with nothing changed is back to the cheap no-op —
+        // recovery re-diffs exactly once, not on every subsequent tick.
+        watch_status = None;
+        let View::Diff(app) = stack.top() else {
+            unreachable!()
+        };
+        let settled_files = app.files.clone();
+        handle_moving_scope_refresh(
+            &mut moving_scope,
+            &mut stack,
+            None,
+            &mut highlighter,
+            &mut hover_state,
+            &mut refs_panel,
+            &mut context_menu,
+            &mut watch_status,
+            None,
+            &mut pointer_hover,
+            &mut pending_pointer_hover,
+            &observer,
+        );
+        let View::Diff(app) = stack.top() else {
+            unreachable!()
+        };
+        assert_eq!(app.files, settled_files);
+        assert!(
+            watch_status.is_none(),
+            "an unchanged tick must not report anything; watch_status: {:?}",
+            watch_status.map(|s| s.text)
+        );
     }
 }
