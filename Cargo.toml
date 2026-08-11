@@ -1,6 +1,6 @@
 [package]
 name = "katamari"
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 description = "Terminal diff-review tool with LSP — hover, go-to-definition, references and diagnostics inside a git/jj diff"
 license = "MIT"
