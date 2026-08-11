@@ -1,16 +1,25 @@
-# katamari demo: reviewing an AI agent's TypeScript refactor with
-# ktmr diff — hover, go-to-definition, diagnostics, a review comment,
-# and the v0.4.0 additions: `/` search with n, `z o` fold expansion,
-# the `?` help window, and a closing `ktmr doctor` health check.
-# Recorded against a freshly built local binary (main @ v0.4.0+,
-# soft line-wrap on by default) with --show-keys so the bottom-right
-# key-display chip shows what's being pressed; the comment-typing
-# segment intentionally shows its `[typing…]` masking rather than
-# echoing the typed text.
+# katamari demo: reviewing an AI agent's tangled TypeScript change with
+# ktmr diff — v0.5.x's review units first (`u` groups the diff into a
+# stacked-PR-like reading order, Enter scopes to one unit), then the LSP
+# money shots inside it: a real diagnostic on the agent's mistake, a
+# review comment for the agent to pick up, and hover on the refactored
+# signature found via `/` search. Recorded with --show-keys so the
+# bottom-right chip shows what's being pressed; the comment-typing
+# segment intentionally shows its `[typing…]` masking.
 #
-# NOTE: the two `Hide`-section paths below (fixture repo cd + PATH) are
-# machine-local — update them to wherever your demo repo and freshly
-# built target/release live before running `vhs docs/demo.tape`.
+# Kept deliberately free of dead air: the units panel opens instantly
+# because the grouping cache is seeded before recording (see below), and
+# the LSP warm-up overlaps the units segment instead of being waited out
+# on camera.
+#
+# To re-record:
+#   1. docs/demo-fixture.sh <dir>   — build the throwaway demo repo
+#   2. cd <dir> && ktmr diff --dump-units   — seed the units cache once
+#      (needs `claude` or `codex`; --regroup to reroll bad labels)
+#   3. update the two machine-local Hide paths below (fixture dir + the
+#      release build's PATH), then `vhs docs/demo.tape`
+#
+# NOTE: the two `Hide`-section paths below are machine-local.
 
 Output demo.gif
 
@@ -28,12 +37,12 @@ Set Framerate 15
 Set TypingSpeed 45ms
 
 Hide
-Type "cd /private/tmp/claude-501/-Users-yuya-Downloads-tako/158c067e-92e3-4775-9fef-8ea1da600422/scratchpad/gif-take2/demo-repo"
+Type "cd /tmp/claude-0/-root-projects-github-com-isamisushi-katamari/bdb95d7a-0ff1-4bc3-bfb0-4a61bd3f61ca/scratchpad/demo-repo"
 Enter
 # The on-screen command should read like a normal install (`ktmr diff`),
 # not a developer's target/release path — put the fresh build on PATH
 # out of frame instead.
-Type "export PATH=/Users/yuya/Downloads/katamari/target/release:$PATH"
+Type "export PATH=/root/projects/github.com/isamisushi/katamari/target/release:$PATH"
 Enter
 Type "clear"
 Enter
@@ -43,89 +52,58 @@ Show
 # overlay on so the recording shows what's being pressed.
 Type "ktmr diff --show-keys"
 Enter
-Sleep 2s
+Sleep 2.5s
 
-# Navigate to the correct createUser(...) call site and hover it —
-# money shot #1: real type info from typescript-language-server.
-Type "jjjjjjjjjjjjj"
-Sleep 500ms
-Tab
-Sleep 500ms
-Sleep 10s
-Type "K"
-Sleep 3500ms
-Escape
-Sleep 500ms
+# Money shot #1: `u` — the tangled diff regrouped into ordered review
+# units, instantly (cached). Foundations first, lockfile churn dead last.
+Type "u"
+Sleep 3s
 
-# Go to definition, glance at it (also where the long formatUserSummary
-# line lives, showing the new soft-wrap continuation marker), then jump back.
-Type "gd"
-Sleep 2500ms
-Ctrl+O
-Sleep 1s
+# Scope to the call-site unit and read it as its own diff — the pinned
+# banner names where we are in the stack.
+Type "jj"
+Sleep 800ms
+Enter
+Sleep 2.2s
 
-# Jump to the AI's mistake — money shot #2: a real diagnostic on a
-# changed line, caught inside the diff.
+# Money shot #2: the agent's mistake, caught inside the scoped unit — a
+# real diagnostic from typescript-language-server on a changed line.
 Type "]d"
-Sleep 1500ms
+Sleep 1.2s
 Type "K"
-Sleep 3500ms
+Sleep 3.2s
 Escape
 Sleep 500ms
 
-# Leave a review comment for the agent to pick up — money shot #3.
+# Money shot #3: leave a review comment for the agent to pick up.
 Type "c"
 Sleep 500ms
-Type "wrong arg shape - use the new options object"
+Type "still the old positional call - use the options object"
 Sleep 500ms
 Ctrl+S
-Sleep 2s
+Sleep 1.8s
 
-# v0.4.0: search the diff vim-style — money shot #4. `/` prompts on the
-# status line, matches highlight as you type, n hops between them.
+# Esc widens back from the unit to the full diff.
+Escape
+Sleep 1.2s
+
+# Money shot #4: `/` search finds createUser, `n` hops to the migrated
+# call site, hover shows the refactored signature — real type info,
+# inside the diff.
 Type "/"
 Sleep 400ms
 Type "createUser"
-Sleep 1200ms
+Sleep 1s
 Enter
-Sleep 800ms
+Sleep 700ms
 Type "n"
-Sleep 900ms
+Sleep 500ms
 Type "n"
-Sleep 1200ms
+Sleep 700ms
+Type "K"
+Sleep 3.2s
 Escape
-Sleep 600ms
-
-# v0.4.0: unfold the context git omitted. G lands on the file's trailing
-# `···` fold row; z o splices the real source lines in, LSP-ready.
-Type "G"
-Sleep 800ms
-Type "zo"
-Sleep 2000ms
-Type "zc"
-Sleep 1000ms
-
-# v0.4.0: `?` — every binding, live and filterable. Type a few letters
-# into its `/` filter, then close.
-Type "?"
-Sleep 1500ms
-Type "/"
-Sleep 300ms
-Type "fold"
-Sleep 1500ms
-Escape
-Sleep 400ms
-Escape
-Sleep 600ms
-
-Sleep 1000ms
-Type "q"
 Sleep 500ms
 
-# v0.4.0 closer: `ktmr doctor` — the checkhealth-style report, ending on
-# the live spawn-and-hover probe timings for the repo's language.
-Type "clear"
-Enter
-Type "ktmr doctor"
-Enter
-Sleep 8s
+Type "q"
+Sleep 800ms
