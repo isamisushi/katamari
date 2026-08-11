@@ -1,3 +1,4 @@
+mod acp;
 #[cfg(test)]
 mod cjk_regression;
 mod comments;
@@ -209,6 +210,27 @@ enum Command {
         /// Exit with an error if that many flushes haven't arrived within
         /// this many seconds.
         #[arg(long, default_value_t = 30)]
+        timeout_secs: u64,
+    },
+    /// Spawns an ACP agent adapter, opens a session, sends one prompt, and
+    /// streams the turn's updates to stdout, then exits — an E2E smoke
+    /// test for the `acp` module runnable without a terminal, the same
+    /// role `lsp-check` plays for `lsp`. Not part of the reviewing
+    /// workflow, so hidden from `--help`.
+    #[command(hide = true)]
+    AgentCheck {
+        /// Prompt to send. Defaults to addressing the repository's open
+        /// katamari review comments (the agent runs `ktmr comments`
+        /// itself, exercising the same round trip a reviewing agent uses).
+        #[arg(long)]
+        prompt: Option<String>,
+        /// ACP adapter command override, whitespace-split — e.g.
+        /// "python3 tests/support/fake_acp_agent.py". Without it,
+        /// resolution is claude-agent-acp on PATH, then npx.
+        #[arg(long)]
+        adapter: Option<String>,
+        /// Exit with an error if the turn hasn't finished in this long.
+        #[arg(long, default_value_t = 300)]
         timeout_secs: u64,
     },
     /// Read and update review comments left via `ktmr diff`'s compose
@@ -517,6 +539,11 @@ fn main() -> Result<()> {
             flushes,
             timeout_secs,
         } => run_watch_check(dir, flushes, timeout_secs),
+        Command::AgentCheck {
+            prompt,
+            adapter,
+            timeout_secs,
+        } => acp::check::run(prompt, adapter, timeout_secs).map_err(|e| anyhow::anyhow!(e)),
         Command::Comments { action } => run_comments(action),
         Command::Skill { action } => run_skill(action),
         Command::Lsp { action } => run_lsp(action),
