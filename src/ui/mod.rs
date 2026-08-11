@@ -1571,31 +1571,61 @@ fn event_loop(
                     // scroll out from under it (req 9). `context_menu` has
                     // no `ScrollTarget`/recorded rect for `scroll_at` to
                     // match on at all (see `FrameGeometry::context_menu_rect`'s
-                    // docs on why) — this explicit guard is the whole of
-                    // that block, in place of the coarse-rect-plus-no-op-arm
-                    // shape the three fully-modal overlays below use.
+                    // docs on why), so it needs this explicit guard.
+                    //
+                    // The three fully-modal overlays need the same explicit
+                    // gate, and for the mirror-image reason: they *do*
+                    // record `ScrollTarget` rects, but only spanning the
+                    // diff pane — the sidebar's `DiffFiles` rect (and any
+                    // other strip a modal doesn't cover) stays hittable
+                    // beneath them, so without this guard a wheel tick in
+                    // the sidebar column would scroll the file list out
+                    // from under an open scope menu/compose/units-setup, a
+                    // state no keyboard sequence can produce (issue #20
+                    // req 7). Exactly the click arm's gate below, minus
+                    // `help`: the help popup is itself wheel-scrollable,
+                    // so a blanket block here would kill its own
+                    // scrolling — the finer point-check inside the arm
+                    // handles it instead.
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                        if context_menu.is_none() =>
+                        if context_menu.is_none()
+                            && compose.is_none()
+                            && scope_menu.is_none()
+                            && units_setup.is_none() =>
                     {
-                        let delta = if mouse_event.kind == MouseEventKind::ScrollUp {
-                            -mouse::WHEEL_SCROLL_ROWS
-                        } else {
-                            mouse::WHEEL_SCROLL_ROWS
-                        };
-                        mouse::scroll_at(
-                            &geometry,
-                            mouse_event.column,
-                            mouse_event.row,
-                            delta,
-                            stack,
-                            &mut hover_state,
-                            refs_panel.as_mut().map(|s| &mut s.panel),
-                            units_panel.as_mut(),
-                            help.as_mut(),
-                            keymap,
-                            &mut help_row_count_cache,
-                            area,
-                        );
+                        // Help's centered popup leaves margins on every
+                        // side (the exact gap the click arms' `help.is_none()`
+                        // guards exist for) while the sidebar/diff-pane
+                        // rects beneath stay recorded — so while help is
+                        // open, a tick anywhere *off* the popup is captured
+                        // and discarded rather than falling through
+                        // `hit()` to the pane underneath it.
+                        let over_helps_uncovered_margin = help.is_some()
+                            && !matches!(
+                                geometry.hit(mouse_event.column, mouse_event.row),
+                                Some(mouse::ScrollTarget::HelpPopup)
+                            );
+                        if !over_helps_uncovered_margin {
+                            let delta = if mouse_event.kind == MouseEventKind::ScrollUp {
+                                -mouse::WHEEL_SCROLL_ROWS
+                            } else {
+                                mouse::WHEEL_SCROLL_ROWS
+                            };
+                            mouse::scroll_at(
+                                &geometry,
+                                mouse_event.column,
+                                mouse_event.row,
+                                delta,
+                                stack,
+                                &mut hover_state,
+                                refs_panel.as_mut().map(|s| &mut s.panel),
+                                units_panel.as_mut(),
+                                help.as_mut(),
+                                keymap,
+                                &mut help_row_count_cache,
+                                area,
+                            );
+                        }
                     }
                     // The keyboard path's fully-modal gates apply to clicks
                     // too: compose/scope-menu/units-setup/help intercept
