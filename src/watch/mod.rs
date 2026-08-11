@@ -56,7 +56,9 @@ pub struct WatchBatch {
 /// write (nothing like the "formatter rewrites a whole crate" burst
 /// [`DEBOUNCE_QUIET`] exists for), but still enough to collapse the couple
 /// of raw filesystem events a single `write()` can generate on some
-/// platforms into one reload.
+/// platforms into one reload. A write landing *inside* the window defers
+/// the next signal to the window's expiry rather than being dropped — see
+/// [`CommentsWatchSession::run`].
 const COMMENTS_DEBOUNCE: Duration = Duration::from_millis(100);
 
 /// What the watcher thread sends: either a flushed batch, or a lightweight
@@ -260,6 +262,16 @@ impl CommentsWatchSession {
 
     fn run(self, tx: Sender<()>) {
         let mut last_sent: Option<Instant> = None;
+        // A relevant event that lands inside the debounce window is
+        // *deferred*, never dropped: comment-log writes are routinely
+        // machine-paced (a scripted reviewer running `ktmr comments add`
+        // then `resolve` back to back — the repo's own agent workflow),
+        // so "two distinct writes inside 100ms" is an ordinary sequence
+        // whose second half must still reach the session. The flush check
+        // below runs on every loop iteration — the `recv_timeout` tick
+        // already wakes this loop every [`POLL_TICK`] — so a deferred
+        // signal goes out as soon as the window expires, no extra timer.
+        let mut deferred = false;
         let target_name = self.comments_path.file_name();
         loop {
             match self.notify_rx.recv_timeout(POLL_TICK) {
@@ -267,15 +279,8 @@ impl CommentsWatchSession {
                     let touches_comments =
                         matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_))
                             && event.paths.iter().any(|p| p.file_name() == target_name);
-                    if !touches_comments {
-                        continue;
-                    }
-                    let now = Instant::now();
-                    if last_sent.is_none_or(|t| now.duration_since(t) >= COMMENTS_DEBOUNCE) {
-                        last_sent = Some(now);
-                        if tx.send(()).is_err() {
-                            return;
-                        }
+                    if touches_comments {
+                        deferred = true;
                     }
                 }
                 Ok(Err(_)) => {
@@ -284,6 +289,16 @@ impl CommentsWatchSession {
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
+            }
+            // Leading edge preserved: the first event after a quiet spell
+            // reaches here in its own iteration with the window long
+            // expired, so it still forwards immediately.
+            if deferred && last_sent.is_none_or(|t| t.elapsed() >= COMMENTS_DEBOUNCE) {
+                last_sent = Some(Instant::now());
+                deferred = false;
+                if tx.send(()).is_err() {
+                    return;
+                }
             }
         }
     }
@@ -429,6 +444,7 @@ impl RevisionWatchSession {
 
     fn run(self, tx: Sender<()>) {
         let mut last_sent: Option<Instant> = None;
+        let mut deferred = false;
         loop {
             match self.notify_rx.recv_timeout(POLL_TICK) {
                 Ok(Ok(event)) => {
@@ -446,27 +462,8 @@ impl RevisionWatchSession {
                     let relevant = classify(&event)
                         .iter()
                         .any(|(path, _)| is_revision_relevant(&self.targets, path));
-                    if !relevant {
-                        continue;
-                    }
-                    let now = Instant::now();
-                    // Leading-edge throttle, same shape as the comments
-                    // watcher's: an event inside the window is dropped, not
-                    // deferred — so a *second* amend whose final ref write
-                    // lands within [`REVISION_DEBOUNCE`] of the first's
-                    // forwarded tick would go unnoticed until the next ref
-                    // change. Accepted: a real amend is a git process whose
-                    // several ref/reflog writes each get their own event
-                    // (the trailing ones re-trigger past the window), and
-                    // two complete amends inside 100ms is not a
-                    // human-drivable sequence; a trailing-edge debounce
-                    // would buy that corner at the cost of a timer in a
-                    // loop that deliberately has none.
-                    if last_sent.is_none_or(|t| now.duration_since(t) >= REVISION_DEBOUNCE) {
-                        last_sent = Some(now);
-                        if tx.send(()).is_err() {
-                            return;
-                        }
+                    if relevant {
+                        deferred = true;
                     }
                 }
                 Ok(Err(_)) => {
@@ -475,6 +472,20 @@ impl RevisionWatchSession {
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
+            }
+            // Same defer-then-flush shape as the comments watcher's, and
+            // for the same reason it stopped being a drop-inside-the-window
+            // throttle: a second amend whose ref write lands within
+            // [`REVISION_DEBOUNCE`] of the first's tick is machine-drivable
+            // (a scripted rebase/amend loop) and its re-diff must not wait
+            // for an unrelated third ref change. The window still collapses
+            // one amend's own burst of ref/reflog events into one signal.
+            if deferred && last_sent.is_none_or(|t| t.elapsed() >= REVISION_DEBOUNCE) {
+                last_sent = Some(Instant::now());
+                deferred = false;
+                if tx.send(()).is_err() {
+                    return;
+                }
             }
         }
     }
@@ -533,6 +544,94 @@ mod tests {
         assert!(
             rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "expected a signal within 5s of a real amend"
+        );
+    }
+
+    /// [`RevisionWatchSession`]'s side of the same defer-not-drop
+    /// guarantee the comments test below pins: a second amend launched
+    /// immediately after the first amend's signal was *received* lands its
+    /// ref writes as deep inside [`REVISION_DEBOUNCE`]'s window as a test
+    /// can deterministically get — under the old drop-inside-the-window
+    /// throttle its re-diff waited for an unrelated later ref change,
+    /// which is exactly how a scripted amend/rebase loop went stale. Same
+    /// timing property as the comments test: a stall past the window only
+    /// downgrades this to the leading-edge path, never a false failure.
+    #[test]
+    fn a_second_amend_inside_the_debounce_window_is_deferred_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(path.join("a.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "first"]);
+
+        let source = GitSource::at(path.to_path_buf());
+        let (tx, rx) = mpsc::channel::<()>();
+        spawn_revision_watcher(&source, tx).expect("failed to start revision watcher");
+
+        std::fs::write(path.join("a.txt"), "one\ntwo\n").unwrap();
+        git(&["commit", "-q", "-a", "--amend", "--no-edit"]);
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the first amend must forward on the leading edge"
+        );
+
+        // Distinct content, so this amend genuinely rewrites the ref
+        // rather than risking a byte-identical commit git may not touch.
+        std::fs::write(path.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        git(&["commit", "-q", "-a", "--amend", "--no-edit"]);
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "an amend landing inside the debounce window must still produce \
+             a (deferred) signal, not go stale"
+        );
+    }
+
+    /// The defer-not-drop half of the debounce (see
+    /// [`CommentsWatchSession::run`]): a second write issued immediately
+    /// after the first signal was *received* is as deep inside the
+    /// debounce window as a test can deterministically get — under the old
+    /// drop-inside-the-window throttle it was lost until some unrelated
+    /// later write, which is exactly how a scripted `comments add` +
+    /// `resolve` pair loses its `resolve`. Timing can only make this test
+    /// weaker, never flaky-fail: if the machine stalls past the window
+    /// between the two writes, the second forwards on the leading edge and
+    /// the assertion still holds.
+    #[test]
+    fn a_comments_write_inside_the_debounce_window_is_deferred_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".katamari")).unwrap();
+        let comments = root.join(".katamari/comments.jsonl");
+
+        let (tx, rx) = mpsc::channel::<()>();
+        spawn_comments_watcher(root.to_path_buf(), tx).expect("failed to start comments watcher");
+        // The watcher registers with `notify` before `spawn_comments_watcher`
+        // returns (registration happens in `start`, on this thread), so the
+        // first write below cannot race the watch itself.
+
+        std::fs::write(&comments, "{\"id\":\"one\"}\n").unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the first write must forward on the leading edge"
+        );
+
+        std::fs::write(&comments, "{\"id\":\"one\"}\n{\"id\":\"two\"}\n").unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "a write landing inside the debounce window must still produce \
+             a (deferred) signal, not vanish"
         );
     }
 
