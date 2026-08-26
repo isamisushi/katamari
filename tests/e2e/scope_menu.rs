@@ -7,6 +7,43 @@
 
 use crate::support::harness::DEFAULT_WAIT;
 use crate::support::{Harness, Key, SpawnOptions, fixture};
+use std::process::Command;
+
+/// Repository selection fails before the TUI or an HTTP request starts.
+/// Child-only environment settings keep the developer's GH_REPO out of it.
+#[test]
+fn pr_without_a_remote_explains_how_to_select_the_repository() {
+    let repo = fixture::basic_repo();
+    let output = Command::new(env!("CARGO_BIN_EXE_ktmr"))
+        .args(["diff", "--pr", "42", "--dump"])
+        .current_dir(repo.path())
+        .env_remove("GH_REPO")
+        .env_remove("GH_HOST")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("set GH_REPO"), "{stderr}");
+}
+
+/// An explicit repository is resolved without a remote. A bad host must
+/// fail before any credentials or requests leave the process.
+#[test]
+fn pr_explicit_repository_rejects_an_untrusted_host() {
+    let repo = fixture::basic_repo();
+    let output = Command::new(env!("CARGO_BIN_EXE_ktmr"))
+        .args(["diff", "--pr", "42", "--dump"])
+        .current_dir(repo.path())
+        .env("GH_REPO", "untrusted.example/owner/repo")
+        .env("GH_HOST", "github.com")
+        .env("GH_TOKEN", "test-secret")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("unsupported GitHub host"), "{stderr}");
+    assert!(!stderr.contains("test-secret"), "{stderr}");
+}
 
 #[test]
 fn scope_menu_swaps_to_a_typed_revision_and_back_to_the_working_tree() {

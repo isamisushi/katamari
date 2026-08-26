@@ -326,7 +326,8 @@ pub struct App {
     /// right now — `true` for everything M1 through M10 ever produced (the
     /// working tree, staged changes, a git range/single-revision diff), and
     /// the default. `false` for M11's revision diffs opened via `ktmr diff
-    /// -r`/`--from`/`--to` or from [`crate::ui::log_view::LogView`] (every
+    /// -r`/`--from`/`--to`, remote PR diffs opened via `--pr`, or from
+    /// [`crate::ui::log_view::LogView`] (every
     /// row except its git-only "local changes" one): an arbitrary jj
     /// revset or historical commit can point at content from long before
     /// the file's current on-disk state, so a hover/goto-definition/

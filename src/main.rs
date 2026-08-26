@@ -24,6 +24,7 @@ use diff::{
     parse_unified_diff,
 };
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use ui::app::Layout;
 use ui::timeline_view::TimelineView;
@@ -67,6 +68,11 @@ enum Command {
         /// git. Defaults to the working tree.
         #[arg(conflicts_with_all = ["revision", "from", "to"])]
         range: Option<String>,
+        /// Show a GitHub pull request's diff against its actual base, using
+        /// the GitHub API. Public PRs need no token; private PRs use GH_TOKEN
+        /// or GITHUB_TOKEN. Never fetches or checks out the PR branch.
+        #[arg(long, value_name = "NUMBER", conflicts_with_all = ["range", "staged", "revision", "from", "to", "no_watch"])]
+        pr: Option<NonZeroU64>,
         /// Diff a single jj change against its parent(s) — `jj diff -r
         /// <revset>`'s equivalent. Requires a colocated jj repository (see
         /// `ktmr timeline`'s docs on what "colocated" means here).
@@ -460,6 +466,7 @@ fn main() -> Result<()> {
         layout: LayoutArg::Unified,
         staged: false,
         range: None,
+        pr: None,
         revision: None,
         from: None,
         to: None,
@@ -474,6 +481,7 @@ fn main() -> Result<()> {
             layout,
             staged,
             range,
+            pr,
             revision,
             from,
             to,
@@ -487,6 +495,7 @@ fn main() -> Result<()> {
             layout,
             staged,
             range,
+            pr,
             revision,
             from,
             to,
@@ -544,6 +553,7 @@ fn run_diff(
     layout: LayoutArg,
     staged: bool,
     range: Option<String>,
+    pr: Option<NonZeroU64>,
     revision: Option<String>,
     from: Option<String>,
     to: Option<String>,
@@ -554,10 +564,15 @@ fn run_diff(
     show_keys: bool,
 ) -> Result<()> {
     if no_watch
-        && (staged || range.is_some() || revision.is_some() || from.is_some() || to.is_some())
+        && (staged
+            || range.is_some()
+            || pr.is_some()
+            || revision.is_some()
+            || from.is_some()
+            || to.is_some())
     {
         bail!(
-            "--no-watch only supports the working tree; it cannot be combined with --staged or a revision range"
+            "--no-watch only supports the working tree; it cannot be combined with --staged, --pr, or a revision range"
         );
     }
 
@@ -567,6 +582,7 @@ fn run_diff(
     let config = config::load_merged(&repo_root);
     config::install(&config);
 
+    // `pr` is remote historical content, never the local working tree.
     // `revision`/`from`/`to` are jj-only and mutually exclusive with
     // `staged`/`range`/`no_watch` (see `Command::Diff`'s `conflicts_with_all`
     // attributes) — resolving them first means the `(staged, range)` match
@@ -575,7 +591,13 @@ fn run_diff(
     // `crate::ui::timeline_view::TimelineView`'s "historical content isn't
     // trustworthy enough to ask a language server about" rule — see
     // `App::interactive`'s docs.
-    let (diff_text, scope_label, interactive) = if let Some(revset) = revision.as_deref() {
+    let (diff_text, scope_label, interactive) = if let Some(number) = pr {
+        (
+            vcs::github::pull_request_diff(&repo_root, number)?,
+            Some(format!("PR #{number}")),
+            false,
+        )
+    } else if let Some(revset) = revision.as_deref() {
         let jj_repo = discover_jj_repo_at(&repo_root)?;
         (
             jj_repo.revision_diff(revset)?,
@@ -650,8 +672,12 @@ fn run_diff(
     // revision or a jj revision/range is historical content (see
     // `App::disk_is_new_side`'s docs for why `interactive` alone isn't the
     // right gate: it's `true` for `--staged` too).
-    app.disk_is_new_side =
-        !staged && range.is_none() && revision.is_none() && from.is_none() && to.is_none();
+    app.disk_is_new_side = !staged
+        && range.is_none()
+        && pr.is_none()
+        && revision.is_none()
+        && from.is_none()
+        && to.is_none();
     app.scope_label = scope_label;
     // Issue #8: recorded so a live session can watch this scope for an
     // amend moving it — see `ui::app::RevisionScope`'s docs. `--from`/
@@ -2479,6 +2505,60 @@ fn format_comment_marker(annotation: &CommentAnnotation) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_pr_accepts_a_number_with_existing_display_options() {
+        let cli = Cli::try_parse_from(["ktmr", "diff", "--pr", "42", "--dump", "--layout", "side"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Diff { pr: Some(number), dump: true, layout: LayoutArg::Side, .. })
+                if number.get() == 42
+        ));
+        assert!(Cli::try_parse_from(["ktmr", "diff", "--pr", "42", "--dump-units"]).is_ok());
+    }
+
+    #[test]
+    fn diff_pr_rejects_missing_zero_negative_and_non_numeric_numbers() {
+        assert!(Cli::try_parse_from(["ktmr", "diff", "--pr"]).is_err());
+        for number in ["0", "-1", "abc", "18446744073709551616"] {
+            assert!(
+                Cli::try_parse_from(["ktmr", "diff", "--pr", number]).is_err(),
+                "{number}"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_pr_conflicts_with_every_other_scope_in_either_argument_order() {
+        for other in [
+            vec!["main...feature"],
+            vec!["--staged"],
+            vec!["-r", "@"],
+            vec!["--from", "@-"],
+            vec!["--to", "@"],
+            vec!["--no-watch"],
+        ] {
+            for reverse in [false, true] {
+                let mut args = vec!["ktmr", "diff"];
+                if reverse {
+                    args.extend(&other);
+                    args.extend(["--pr", "42"]);
+                } else {
+                    args.extend(["--pr", "42"]);
+                    args.extend(&other);
+                }
+                let err = Cli::try_parse_from(&args)
+                    .err()
+                    .expect("conflicting scopes");
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "{args:?}: {err}"
+                );
+            }
+        }
+    }
 
     /// Two hunks far enough apart to leave both a known-size gap between
     /// them and an unknown-size one after the last hunk — `ktmr diff

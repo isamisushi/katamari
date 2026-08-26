@@ -7,6 +7,8 @@
 //! into the flat `Vec<RenderRow>` by position, so that vector's order is the
 //! single source of truth for "what's currently on screen."
 
+use std::borrow::Cow;
+
 /// A single line within a hunk, classified by how it differs from HEAD.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffLineKind {
@@ -204,8 +206,8 @@ pub fn parse_unified_diff(text: &str) -> Vec<DiffFile> {
             }
             let (a, b) = split_diff_git_paths(rest);
             current = Some(DiffFile {
-                old_path: a.map(str::to_owned),
-                new_path: b.map(str::to_owned),
+                old_path: a,
+                new_path: b,
                 ..Default::default()
             });
             continue;
@@ -217,10 +219,10 @@ pub fn parse_unified_diff(text: &str) -> Vec<DiffFile> {
 
         if let Some(rest) = line.strip_prefix("rename from ") {
             file.is_renamed = true;
-            file.old_path = Some(rest.to_owned());
+            file.old_path = Some(decode_git_path(rest).into_owned());
         } else if let Some(rest) = line.strip_prefix("rename to ") {
             file.is_renamed = true;
-            file.new_path = Some(rest.to_owned());
+            file.new_path = Some(decode_git_path(rest).into_owned());
         } else if line.starts_with("new file mode") {
             file.is_new = true;
         } else if line.starts_with("deleted file mode") {
@@ -230,14 +232,14 @@ pub fn parse_unified_diff(text: &str) -> Vec<DiffFile> {
                 file.is_new = true;
                 file.old_path = None;
             } else {
-                file.old_path = Some(strip_ab_prefix(rest).to_owned());
+                file.old_path = Some(parse_file_header_path(rest));
             }
         } else if let Some(rest) = line.strip_prefix("+++ ") {
             if rest == "/dev/null" {
                 file.is_deleted = true;
                 file.new_path = None;
             } else {
-                file.new_path = Some(strip_ab_prefix(rest).to_owned());
+                file.new_path = Some(parse_file_header_path(rest));
             }
         } else if line.starts_with("Binary files ") && line.ends_with(" differ") {
             file.is_binary = true;
@@ -327,17 +329,92 @@ fn strip_ab_prefix(path: &str) -> &str {
         .unwrap_or(path)
 }
 
-/// Parses the `a/<path> b/<path>` tail of a `diff --git` line. This is only
-/// a fallback: `---`/`+++`/`rename from`/`rename to` lines are authoritative
-/// and overwrite whatever this finds. Falls back to `(None, None)` for
-/// unusual quoting git applies to paths containing spaces or special
-/// characters, since those cases are resolved by the authoritative lines
-/// anyway.
-fn split_diff_git_paths(rest: &str) -> (Option<&str>, Option<&str>) {
-    match rest.split_once(" b/") {
-        Some((a, b)) => (a.strip_prefix("a/").or(Some(a)), Some(b)),
-        None => (None, None),
+/// Decode bytes before UTF-8: Git's octal escapes encode individual bytes,
+/// not Unicode code points. Return the unused suffix to split diff --git
+/// headers without mistaking spaces or escaped quotes inside a name.
+fn decode_quoted_path(path: &str) -> Option<(String, &str)> {
+    let bytes = path.as_bytes();
+    if bytes.first() != Some(&b'"') {
+        return None;
     }
+    let mut decoded = Vec::new();
+    let mut i = 1;
+    while let Some(&byte) = bytes.get(i) {
+        i += 1;
+        match byte {
+            b'"' => return Some((String::from_utf8(decoded).ok()?, &path[i..])),
+            b'\\' => {
+                let escape = *bytes.get(i)?;
+                i += 1;
+                decoded.push(match escape {
+                    b'a' => 7,
+                    b'b' => 8,
+                    b'f' => 12,
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'v' => 11,
+                    b'\\' => b'\\',
+                    b'"' => b'"',
+                    b'0'..=b'3' => {
+                        let second = *bytes.get(i)?;
+                        let third = *bytes.get(i + 1)?;
+                        if !(b'0'..=b'7').contains(&second) || !(b'0'..=b'7').contains(&third) {
+                            return None;
+                        }
+                        i += 2;
+                        (escape - b'0') * 64 + (second - b'0') * 8 + (third - b'0')
+                    }
+                    _ => return None,
+                });
+            }
+            _ => decoded.push(byte),
+        }
+    }
+    None
+}
+
+/// Unquoted paths are literal, including backslashes. Preserve malformed
+/// quoting or non-UTF-8 names verbatim rather than inventing a different path.
+fn decode_git_path(path: &str) -> Cow<'_, str> {
+    match decode_quoted_path(path) {
+        Some((decoded, "")) => Cow::Owned(decoded),
+        _ => Cow::Borrowed(path),
+    }
+}
+
+/// Git may append a tab delimiter after a ---/+++ pathname with spaces.
+/// That delimiter is outside any quotes; rename metadata has no such suffix.
+fn parse_file_header_path(path: &str) -> String {
+    let path = decode_git_path(path.strip_suffix('\t').unwrap_or(path));
+    strip_ab_prefix(&path).to_owned()
+}
+
+/// These paths are the only names available for binary/mode-only diffs.
+/// Text and rename headers remain authoritative. Preserve the existing
+/// unquoted-space handling while accepting either or both names quoted.
+fn split_diff_git_paths(rest: &str) -> (Option<String>, Option<String>) {
+    let (a, b) = if rest.starts_with('"') {
+        let Some((a, tail)) = decode_quoted_path(rest) else {
+            return (None, None);
+        };
+        let Some(b) = tail.strip_prefix(' ') else {
+            return (None, None);
+        };
+        (Cow::Owned(a), decode_git_path(b))
+    } else {
+        let Some(separator) = rest.find(" \"b/").or_else(|| rest.find(" b/")) else {
+            return (None, None);
+        };
+        (
+            Cow::Borrowed(&rest[..separator]),
+            decode_git_path(&rest[separator + 1..]),
+        )
+    };
+    (
+        Some(strip_ab_prefix(&a).to_owned()),
+        Some(strip_ab_prefix(&b).to_owned()),
+    )
 }
 
 /// Parses `@@ -old_start,old_lines +new_start,new_lines @@ trailing text`.
@@ -890,6 +967,102 @@ mod tests {
     const MULTI_FILE_FIXTURE: &str = include_str!("fixtures/multi_file.diff");
     const JAPANESE_FIXTURE: &str = include_str!("fixtures/japanese.diff");
     const BINARY_FIXTURE: &str = include_str!("fixtures/binary.diff");
+
+    /// GitHub uses Git's default quoting, unlike our local core.quotepath=false.
+    /// Both spellings must describe exactly the same file and unchanged content.
+    #[test]
+    fn quoted_paths_match_unquoted_paths_for_text_and_binary_changes() {
+        let quoted = r#""a/\346\227\245\346\234\254\350\252\236.rs" "b/\346\227\245\346\234\254\350\252\236.rs""#;
+        let old = r#""a/\346\227\245\346\234\254\350\252\236.rs""#;
+        let new = r#""b/\346\227\245\346\234\254\350\252\236.rs""#;
+        for (metadata, old_header, new_header) in [
+            ("", old, new),
+            ("new file mode 100644\n", "/dev/null", new),
+            ("deleted file mode 100644\n", old, "/dev/null"),
+        ] {
+            let escaped = format!(
+                "diff --git {quoted}\n{metadata}--- {old_header}\n+++ {new_header}\n@@ -1 +1 @@\n-old\n+literal \\346\n"
+            );
+            let plain = escaped
+                .replace(quoted, "a/日本語.rs b/日本語.rs")
+                .replace(old, "a/日本語.rs")
+                .replace(new, "b/日本語.rs");
+            let files = parse_unified_diff(&escaped);
+            assert_eq!(files, parse_unified_diff(&plain), "{escaped}");
+            assert_eq!(files[0].display_path(), "日本語.rs");
+            assert_eq!(files[0].hunks[0].rows[1].text, r"literal \346");
+        }
+
+        // Binary and mode-only diffs have no ---/+++ header to repair a
+        // misparsed diff --git line, so that fallback must decode too.
+        for metadata in [
+            "Binary files old and new differ\n",
+            "old mode 100644\nnew mode 100755\n",
+        ] {
+            let files = parse_unified_diff(&format!("diff --git {quoted}\n{metadata}"));
+            assert_eq!(files[0].old_path.as_deref(), Some("日本語.rs"));
+            assert_eq!(files[0].new_path.as_deref(), Some("日本語.rs"));
+            assert!(files[0].hunks.is_empty());
+        }
+    }
+
+    #[test]
+    fn quoted_rename_metadata_preserves_real_a_and_b_directories() {
+        let diff = r#"diff --git "a/a/\346\227\245\346\234\254\350\252\236.rs" "b/b/\346\227\245\346\234\254\350\252\236.rs"
+similarity index 100%
+rename from "a/\346\227\245\346\234\254\350\252\236.rs"
+rename to "b/\346\227\245\346\234\254\350\252\236.rs"
+"#;
+        let files = parse_unified_diff(diff);
+        assert_eq!(files[0].old_path.as_deref(), Some("a/日本語.rs"));
+        assert_eq!(files[0].new_path.as_deref(), Some("b/日本語.rs"));
+        assert!(files[0].is_renamed);
+    }
+
+    #[test]
+    fn diff_header_handles_mixed_quoting_and_unquoted_spaces() {
+        for header in [
+            r#"a/old name.rs "b/new\tname.rs""#,
+            r#""a/old\tname.rs" b/new name.rs"#,
+            r#""a/old\"name.rs" "b/new\\name.rs""#,
+        ] {
+            let files = parse_unified_diff(&format!(
+                "diff --git {header}\nold mode 100644\nnew mode 100755\n"
+            ));
+            let (old, new) = match header {
+                h if h.starts_with("a/") => ("old name.rs", "new\tname.rs"),
+                h if h.ends_with("b/new name.rs") => ("old\tname.rs", "new name.rs"),
+                _ => ("old\"name.rs", "new\\name.rs"),
+            };
+            assert_eq!(files[0].old_path.as_deref(), Some(old));
+            assert_eq!(files[0].new_path.as_deref(), Some(new));
+        }
+    }
+
+    #[test]
+    fn path_headers_decode_c_escapes_but_preserve_unquoted_text() {
+        for (path, expected) in [
+            (
+                r#""a/bell\a\b\f\n\r\t\v\\\".txt""#,
+                "bell\u{7}\u{8}\u{c}\n\r\t\u{b}\\\".txt",
+            ),
+            (
+                r#""a/\346\227\245\346\234\254\350\252\236.txt""#,
+                "日本語.txt",
+            ),
+            ("a/plain 日本語.txt\t", "plain 日本語.txt"),
+            (r"a/literal\346.txt", r"literal\346.txt"),
+            // Invalid quoting/UTF-8 must not panic or silently invent a path.
+            (r#""a/\777.txt""#, r#""a/\777.txt""#),
+            (r#""a/\377.txt""#, r#""a/\377.txt""#),
+            (r#""a/\q.txt""#, r#""a/\q.txt""#),
+            (r#""a/unterminated"#, r#""a/unterminated"#),
+        ] {
+            let files =
+                parse_unified_diff(&format!("diff --git a/x b/x\n--- {path}\n+++ {path}\n"));
+            assert_eq!(files[0].display_path(), expected, "{path}");
+        }
+    }
 
     #[test]
     fn parses_modified_file_hunk_with_line_numbers() {

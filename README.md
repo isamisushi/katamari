@@ -169,6 +169,7 @@ ktmr diff --no-watch   # working tree vs HEAD, without live refresh
 ktmr diff --staged     # staged (index) changes vs HEAD
 ktmr diff <rev>        # one commit's own changes
 ktmr diff <a>..<b>     # a revision range
+ktmr diff --pr 123     # a GitHub pull request, without checking it out
 ```
 
 `--no-watch` is a working-tree-only opt-out; staged and pinned historical
@@ -177,6 +178,22 @@ diffs are already static. A diff opened through a *moving* revision —
 re-resolves live, so amending the commit it points at (`git commit
 --amend`, `jj describe`/`squash`) updates the open diff in place, cursor
 and scroll preserved. A diff opened by commit hash never changes.
+
+`ktmr diff --pr <number>` reviews a GitHub PR against its actual base,
+including PRs from forks, without fetching or checking out either branch.
+Run inside a local clone; katamari selects the `upstream` remote, then
+`origin`, or the sole remote. Set `GH_REPO=OWNER/REPO` to override selection.
+
+Public PRs need no authentication. For private PRs or higher API rate limits,
+set `GH_TOKEN` or `GITHUB_TOKEN` to a token with repository access
+(fine-grained tokens need Pull requests: read or Contents: read).
+For GitHub Enterprise Server, set `GH_HOST=github.example.com` and use
+`GH_ENTERPRISE_TOKEN` or `GITHUB_ENTERPRISE_TOKEN` for authentication.
+
+PR diffs are read-only snapshots: LSP operations, adding local comments,
+and expanding folds from disk are disabled. Reopen the command to retrieve
+updates. `--pr` cannot be combined with a revision/range, `--staged`, jj
+revision flags, or `--no-watch`.
 
 In a colocated jj repository (see [jj colocated setup](#jj-colocated-setup)),
 `ktmr diff` also takes jj revsets, matching `jj diff`'s own flags so jj
