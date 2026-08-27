@@ -94,6 +94,12 @@ pub struct SpawnOptions {
     /// [`spawn`](Harness::spawn)'s docs on why that matters for every test
     /// in this suite, not just the ones about the update check itself.
     pub update_state_json: Option<String>,
+    /// Extra environment variables for the spawned `ktmr` — most usefully
+    /// a rewritten `PATH` that shadows a real CLI with a fake one (a fake
+    /// `gh`, say). A per-child env is the only safe way to do that here:
+    /// tests share one process, so mutating the test runner's own
+    /// environment would race every parallel test in the suite.
+    pub extra_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
 }
 
 impl Default for SpawnOptions {
@@ -104,6 +110,7 @@ impl Default for SpawnOptions {
             kitty_mode: KittyMode::Supported,
             args: Vec::new(),
             update_state_json: None,
+            extra_env: Vec::new(),
         }
     }
 }
@@ -197,16 +204,20 @@ impl Harness {
             .expect("failed to size the pty");
 
         let bin = env!("CARGO_BIN_EXE_ktmr");
-        let child = Command::new(bin)
+        // pty_process's builder consumes and returns `self`, so the
+        // variable is rebound per env var rather than mutated in place.
+        let mut command = Command::new(bin)
             .args(&opts.args)
             .current_dir(cwd)
             .env("TERM", "xterm-256color")
             .env("HOME", env_home.path())
             .env("XDG_CONFIG_HOME", env_home.path().join("config"))
             .env("XDG_DATA_HOME", env_home.path().join("data"))
-            .env("XDG_STATE_HOME", state_home)
-            .spawn(pts)
-            .expect("failed to spawn ktmr in a pty");
+            .env("XDG_STATE_HOME", state_home);
+        for (key, value) in &opts.extra_env {
+            command = command.env(key, value);
+        }
+        let child = command.spawn(pts).expect("failed to spawn ktmr in a pty");
 
         let pty = Arc::new(pty);
         let write_lock = Arc::new(Mutex::new(()));

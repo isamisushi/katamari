@@ -5,7 +5,7 @@
 //! no network, no real GitHub repository. The same shadow-a-CLI-on-PATH
 //! pattern as `support/fake_lsp_server.py`, just small enough to inline.
 
-use crate::support::fixture;
+use crate::support::{Harness, Key, SpawnOptions, fixture};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
@@ -67,6 +67,46 @@ EOF"#,
     // real `gh` would need — the whole contract of the spawn.
     let args = std::fs::read_to_string(repo.path().join("gh-args.txt")).unwrap();
     assert_eq!(args.trim(), "pr diff 7");
+}
+
+#[test]
+fn a_pr_diff_opens_in_the_real_tui_labeled_and_read_only() {
+    let repo = fixture::basic_repo();
+    let gh_dir = tempfile::tempdir().unwrap();
+    // The rendered content must come from the fake gh's snapshot, not
+    // from anything in the fixture repo — the marker line exists nowhere
+    // else, so seeing it on screen proves the PR text is what rendered.
+    write_fake_gh(
+        gh_dir.path(),
+        r#"cat <<'EOF'
+diff --git a/notes.txt b/notes.txt
+index 0000000..1111111 100644
+--- a/notes.txt
++++ b/notes.txt
+@@ -1 +1,2 @@
+ alpha
++PR_ONLY_MARKER_LINE from the pull request
+EOF"#,
+    );
+
+    let h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            args: vec!["diff", "--pr", "25"],
+            extra_env: vec![("PATH".into(), path_with(gh_dir.path()))],
+            ..Default::default()
+        },
+    );
+
+    // The status bar names the scope, and the snapshot's own content is
+    // what's on screen.
+    h.wait_for_text("PR #25");
+    h.wait_for_text("PR_ONLY_MARKER_LINE");
+
+    // Read-only: a comment attempt is refused with the standard
+    // historical-diff note instead of opening the compose overlay.
+    h.send(Key::Char('c'));
+    h.wait_for_text("not available on a historical/read-only diff");
 }
 
 #[test]
