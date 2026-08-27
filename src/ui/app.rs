@@ -277,6 +277,15 @@ pub struct App {
     /// [`crate::lsp::adapter::workspace_root`] searches within when it
     /// walks up from that file looking for a `Cargo.toml`.
     pub repo_root: PathBuf,
+    /// Distinguishes this `App` from every other one constructed in the
+    /// process — a `View::Diff` can be pushed, popped, and replaced (the
+    /// log view pushes a fresh `App` per confirmed entry), so "the top
+    /// view is a `Diff`" is not the same statement as "the top view is
+    /// the diff that asked". Exists for asynchronous work that must land
+    /// on the exact view that requested it (the scope menu's background
+    /// PR fetch) rather than whatever happens to be on screen when the
+    /// result arrives.
+    pub view_token: u64,
     /// The last parsed model, untouched by any fold — the source
     /// [`Self::rederive`] clones on every derivation. `files`/`rows`/
     /// `side_by_side_rows` are the *derived* view (pristine plus whatever
@@ -531,9 +540,11 @@ pub struct App {
 
 impl App {
     pub fn new(repo_name: String, repo_root: PathBuf, files: Vec<DiffFile>) -> Self {
+        static NEXT_VIEW_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let mut app = Self {
             repo_name,
             repo_root,
+            view_token: NEXT_VIEW_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             pristine_files: files,
             files: Vec::new(),
             rows: Vec::new(),
@@ -2760,6 +2771,16 @@ mod tests {
             "unresolvable scope must self-clear"
         );
         assert_eq!(app.rows.len(), full_row_count);
+    }
+
+    #[test]
+    fn every_app_gets_its_own_view_token() {
+        // The token is what lets an async result find the exact view that
+        // requested it (see the field's docs) — two apps sharing one
+        // would let a stale PR fetch land on the wrong diff.
+        let a = App::new("a".into(), PathBuf::from("/tmp"), Vec::new());
+        let b = App::new("b".into(), PathBuf::from("/tmp"), Vec::new());
+        assert_ne!(a.view_token, b.view_token);
     }
 
     #[test]

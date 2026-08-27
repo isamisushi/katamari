@@ -768,6 +768,10 @@ fn event_loop(
     let mut warned_servers: HashSet<(LangKey, PathBuf)> = HashSet::new();
     let mut compose: Option<ComposeState> = None;
     let mut scope_menu: Option<ScopeMenuState> = None;
+    // The "GitHub PR…" entry's background `gh` fetch and its parked
+    // result, if any — see [`PrScopeFetch`]'s docs for the lifecycle.
+    // Polled in the frame preamble beside `pending_units`.
+    let mut pr_scope = PrScopeFetch::default();
     // Issue #23's right-click context menu. `Some` only while it's actually
     // open — like `scope_menu`/`refs_panel`, a transient layer on top of
     // whichever view is on screen, not something the view stack itself
@@ -1013,6 +1017,71 @@ fn event_loop(
                     }
                 }
                 Err(e) => goto_status = Some(format!("units: {e}")),
+            }
+        }
+
+        if let Some((number, view_token, rx)) = &pr_scope.pending
+            && let Ok(result) = rx.try_recv()
+        {
+            let number = *number;
+            let view_token = *view_token;
+            pr_scope.pending = None;
+            match result {
+                // Never applied here directly: parked first, and the
+                // block just below applies it iff the requesting view is
+                // on top — same frame in the common case, later if the
+                // reviewer wandered off to the log/a file view meanwhile.
+                Ok(text) => pr_scope.parked = Some((number, view_token, text)),
+                Err(e) => {
+                    // gh's message can be multi-line; the status bar has
+                    // one line, and the first non-empty one is where gh
+                    // puts the substance.
+                    let first = e
+                        .lines()
+                        .find(|l| !l.trim().is_empty())
+                        .unwrap_or("gh failed")
+                        .to_string();
+                    goto_status = Some(format!("scope: {first}"));
+                }
+            }
+        }
+
+        if let Some((_, view_token, _)) = &pr_scope.parked {
+            let view_token = *view_token;
+            let at_root = stack.is_at_root();
+            // Only the exact view that asked — matched by token, not by
+            // "is a Diff": the log view pushes fresh `App`s, so an
+            // unrelated diff can be on top by the time `gh` answers, and
+            // swapping *that* would overwrite a view the reviewer never
+            // asked to change. Until the requester returns, the result
+            // just stays parked (see `PrScopeFetch`'s docs).
+            if let View::Diff(app) = stack.top_mut()
+                && app.view_token == view_token
+            {
+                let (number, _, text) = pr_scope.parked.take().expect("checked above");
+                finish_scope_swap(
+                    app,
+                    ScopeSwapPayload {
+                        text,
+                        interactive: false,
+                        disk_is_new_side: false,
+                        scope_label: Some(format!("PR #{number}")),
+                        revision_scope: None,
+                        is_working_tree: false,
+                    },
+                    at_root,
+                    watch_active,
+                    jj_repo.as_ref(),
+                    lsp_manager,
+                    highlighter,
+                    &mut hover_state,
+                    &mut refs_panel,
+                    &mut context_menu,
+                    &mut watch_paused,
+                    &mut watch_status,
+                    &mut moving_scope,
+                );
+                goto_status = Some(format!("scope: PR #{number}"));
             }
         }
 
@@ -1379,6 +1448,53 @@ fn event_loop(
                                 search_prompt = None;
                             }
                         }
+                    } else if let Some(ScopeMenuState::PullRequest(input)) = scope_menu.as_mut() {
+                        // Same keymap bypass and typing-mask as the revision
+                        // input below — a PR number is still user-typed text.
+                        key_display.record_typing(Instant::now());
+                        match handle_revision_key(input, key) {
+                            RevisionInputOutcome::Continue => {}
+                            RevisionInputOutcome::Back => {
+                                scope_menu = Some(ScopeMenuState::new_list(jj_repo.is_some()));
+                            }
+                            RevisionInputOutcome::Submit(text) => {
+                                match scope_menu::parse_pr_number(&text) {
+                                    Err(e) => {
+                                        // Leave the input open to fix and
+                                        // retry — the same rejected-choice
+                                        // shape the revision input uses.
+                                        goto_status = Some(format!("scope: {e}"));
+                                    }
+                                    Ok(number) => {
+                                        if let View::Diff(app) = stack.top() {
+                                            // A network call through `gh` —
+                                            // seconds, sometimes worse — so
+                                            // unlike the git/jj choices it
+                                            // never runs on this thread: the
+                                            // diff on screen stays put and
+                                            // fully interactive until the text
+                                            // lands (see the pending poll in
+                                            // the frame preamble).
+                                            let repo_root = app.repo_root.clone();
+                                            let (tx, rx) = std::sync::mpsc::channel();
+                                            std::thread::spawn(move || {
+                                                let result = crate::vcs::github::pull_request_diff(
+                                                    &repo_root, number,
+                                                )
+                                                .map_err(|e| e.to_string());
+                                                let _ = tx.send(result);
+                                            });
+                                            pr_scope.clear();
+                                            pr_scope.pending = Some((number, app.view_token, rx));
+                                            goto_status = Some(format!(
+                                                "scope: fetching PR #{number} via gh …"
+                                            ));
+                                        }
+                                        scope_menu = None;
+                                    }
+                                }
+                            }
+                        }
                     } else if let Some(ScopeMenuState::Revision(input)) = scope_menu.as_mut() {
                         // Bypasses the keymap resolver for the same reason
                         // `compose` does above: a revision string can contain
@@ -1409,7 +1525,10 @@ fn event_loop(
                                         &mut watch_status,
                                         &mut moving_scope,
                                     ) {
-                                        Ok(()) => scope_menu = None,
+                                        Ok(()) => {
+                                            scope_menu = None;
+                                            pr_scope.clear();
+                                        }
                                         Err(e) => {
                                             goto_status = Some(format!("scope: {e}"));
                                             // Leave `scope_menu` open (still
@@ -1504,6 +1623,7 @@ fn event_loop(
                                         jj_repo.as_ref(),
                                         &mut compose,
                                         &mut scope_menu,
+                                        &mut pr_scope,
                                         &mut context_menu,
                                         &mut help,
                                         &mut search_prompt,
@@ -1698,6 +1818,7 @@ fn event_loop(
                                         jj_repo.as_ref(),
                                         &mut compose,
                                         &mut scope_menu,
+                                        &mut pr_scope,
                                         &mut context_menu,
                                         &mut help,
                                         &mut search_prompt,
@@ -1772,6 +1893,7 @@ fn event_loop(
                                 jj_repo.as_ref(),
                                 &mut compose,
                                 &mut scope_menu,
+                                &mut pr_scope,
                                 &mut context_menu,
                                 &mut help,
                                 &mut search_prompt,
@@ -2660,6 +2782,7 @@ fn handle_action(
     jj_repo: Option<&JjRepo>,
     compose: &mut Option<ComposeState>,
     scope_menu: &mut Option<ScopeMenuState>,
+    pr_scope: &mut PrScopeFetch,
     context_menu: &mut Option<ContextMenuState>,
     help: &mut Option<HelpState>,
     search_prompt: &mut Option<search::SearchPromptState>,
@@ -2790,6 +2913,7 @@ fn handle_action(
                                 jj_repo,
                                 compose,
                                 scope_menu,
+                                pr_scope,
                                 context_menu,
                                 help,
                                 search_prompt,
@@ -2850,6 +2974,9 @@ fn handle_action(
                     ScopeMenuEntry::Revision => {
                         *scope_menu = Some(ScopeMenuState::new_revision_input());
                     }
+                    ScopeMenuEntry::PullRequest => {
+                        *scope_menu = Some(ScopeMenuState::new_pr_input());
+                    }
                     ScopeMenuEntry::WorkingTree | ScopeMenuEntry::Staged => {
                         let choice = if entry == ScopeMenuEntry::WorkingTree {
                             ScopeChoice::WorkingTree
@@ -2873,7 +3000,15 @@ fn handle_action(
                                 watch_status,
                                 moving_scope,
                             ) {
-                                Ok(()) => *scope_menu = None,
+                                Ok(()) => {
+                                    *scope_menu = None;
+                                    // A completed swap supersedes any PR
+                                    // fetch still in flight — without this,
+                                    // its late arrival would overwrite the
+                                    // scope the reviewer picked more
+                                    // recently.
+                                    pr_scope.clear();
+                                }
                                 Err(e) => *goto_status = Some(format!("scope: {e}")),
                             }
                         } else {
@@ -3799,6 +3934,38 @@ fn open_or_close_lsp_inspector(
 /// [`open_or_close_log`]/[`open_or_close_timeline`] instead), which push a
 /// new view rather than replacing this one's content, so they never become
 /// a `ScopeChoice`.
+/// The scope menu's background `gh pr diff` machinery: at most one fetch
+/// in flight, and at most one fetched-but-unapplied result *parked*
+/// because the view that asked wasn't on top when the text arrived. Both
+/// halves carry the requesting diff's [`App::view_token`] — the result
+/// must land on that exact view, never just "whichever `Diff` is on top
+/// when it arrives" (the log view pushes fresh `App`s, so those can
+/// differ) — and a parked result applies automatically the moment its
+/// view is back on top, rather than asking the reviewer to retype the
+/// request. Any completed scope swap, or a newer fetch, clears both: a
+/// more recent choice always supersedes an older fetch, however far that
+/// fetch got. A parked result whose view was popped for good simply sits
+/// until then — it's one string, and applying it anywhere else would be
+/// worse than the memory.
+type PendingPrFetch = (
+    std::num::NonZeroU64,
+    u64,
+    std::sync::mpsc::Receiver<Result<String, String>>,
+);
+
+#[derive(Default)]
+struct PrScopeFetch {
+    pending: Option<PendingPrFetch>,
+    parked: Option<(std::num::NonZeroU64, u64, String)>,
+}
+
+impl PrScopeFetch {
+    fn clear(&mut self) {
+        self.pending = None;
+        self.parked = None;
+    }
+}
+
 enum ScopeChoice {
     WorkingTree,
     Staged,
@@ -3917,20 +4084,92 @@ fn apply_scope_swap(
     // `Staged`'s is the index, and `Revision`'s is historical (see
     // `App::disk_is_new_side`'s docs for why this can't just reuse
     // `interactive`, which is `true` for `Staged` too).
-    let disk_is_new_side = matches!(choice, ScopeChoice::WorkingTree);
+    let payload = ScopeSwapPayload {
+        text,
+        interactive,
+        disk_is_new_side: matches!(choice, ScopeChoice::WorkingTree),
+        scope_label,
+        revision_scope: match choice {
+            ScopeChoice::Revision(input) => Some(app::RevisionScope {
+                text: input.trim().to_owned(),
+                via_jj: jj_repo.is_some(),
+            }),
+            ScopeChoice::WorkingTree | ScopeChoice::Staged => None,
+        },
+        is_working_tree: matches!(choice, ScopeChoice::WorkingTree),
+    };
+    finish_scope_swap(
+        app,
+        payload,
+        at_root,
+        watch_active,
+        jj_repo,
+        lsp_manager,
+        highlighter,
+        hover_state,
+        refs_panel,
+        context_menu,
+        watch_paused,
+        watch_status,
+        moving_scope,
+    );
+    Ok(())
+}
+
+/// Everything [`finish_scope_swap`] needs to know about the diff a scope
+/// swap resolved to — split from the resolution itself so a swap whose
+/// text arrives asynchronously (the "GitHub PR…" entry's background `gh`
+/// fetch) applies through the exact same code as the synchronous git/jj
+/// choices, instead of a drifting copy of it.
+struct ScopeSwapPayload {
+    text: String,
+    interactive: bool,
+    disk_is_new_side: bool,
+    scope_label: Option<String>,
+    revision_scope: Option<app::RevisionScope>,
+    is_working_tree: bool,
+}
+
+/// The application half of a scope swap: parse and install the new diff,
+/// drop every overlay anchored to the old one, and settle watch/moving-
+/// scope state. Infallible by design — by the time a payload exists, the
+/// only fallible work (resolving a diff out of git/jj/`gh`) already
+/// happened.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "threads the run loop's overlay/watch locals through, same as apply_scope_swap"
+)]
+fn finish_scope_swap(
+    app: &mut App,
+    payload: ScopeSwapPayload,
+    at_root: bool,
+    watch_active: bool,
+    jj_repo: Option<&JjRepo>,
+    lsp_manager: &LspManager,
+    highlighter: &mut LineHighlighter,
+    hover_state: &mut hover_popup::HoverState,
+    refs_panel: &mut Option<RefsPanelState>,
+    context_menu: &mut Option<ContextMenuState>,
+    watch_paused: &mut bool,
+    watch_status: &mut Option<WatchStatus>,
+    moving_scope: &mut Option<MovingScopeState>,
+) {
+    let git = GitSource::at(app.repo_root.clone());
+    let ScopeSwapPayload {
+        text,
+        interactive,
+        disk_is_new_side,
+        scope_label,
+        revision_scope,
+        is_working_tree,
+    } = payload;
     app.apply_scope_swap(
         parse_unified_diff(&text),
         interactive,
         disk_is_new_side,
         scope_label,
     );
-    app.revision_scope = match choice {
-        ScopeChoice::Revision(input) => Some(app::RevisionScope {
-            text: input.trim().to_owned(),
-            via_jj: jj_repo.is_some(),
-        }),
-        ScopeChoice::WorkingTree | ScopeChoice::Staged => None,
-    };
+    app.revision_scope = revision_scope;
 
     hover_state.invalidate();
     *refs_panel = None;
@@ -3945,7 +4184,6 @@ fn apply_scope_swap(
         warm_up_diff(app, lsp_manager);
     }
 
-    let is_working_tree = matches!(choice, ScopeChoice::WorkingTree);
     if let Some(should_pause) = watch_pause_decision(watch_active, at_root, is_working_tree) {
         let was_paused = *watch_paused;
         *watch_paused = should_pause;
@@ -3970,7 +4208,6 @@ fn apply_scope_swap(
             )));
         }
     }
-    Ok(())
 }
 
 /// Applies one flushed watch batch: runs the M5 pre-refresh hook, re-runs
@@ -5869,6 +6106,7 @@ mod tests {
         let mut jump_stack = JumpStack::new();
         let diagnostics = DiagnosticsStore::new();
         let mut scope_menu: Option<ScopeMenuState> = None;
+        let mut pr_scope = PrScopeFetch::default();
         let mut help: Option<HelpState> = None;
         let mut search_prompt: Option<search::SearchPromptState> = None;
         let mut highlighter = LineHighlighter::new();
@@ -5895,6 +6133,7 @@ mod tests {
             None,
             compose,
             &mut scope_menu,
+            &mut pr_scope,
             context_menu,
             &mut help,
             &mut search_prompt,

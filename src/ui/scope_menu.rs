@@ -41,6 +41,7 @@ pub enum ScopeMenuEntry {
     Log,
     Timeline,
     Revision,
+    PullRequest,
 }
 
 impl ScopeMenuEntry {
@@ -51,6 +52,7 @@ impl ScopeMenuEntry {
             ScopeMenuEntry::Log => "Log — browse commits/changes",
             ScopeMenuEntry::Timeline => "Timeline (jj)",
             ScopeMenuEntry::Revision => "Revision…",
+            ScopeMenuEntry::PullRequest => "GitHub PR…",
         }
     }
 }
@@ -62,6 +64,11 @@ impl ScopeMenuEntry {
 /// jj is colocated. `Timeline (jj)` is the one entry that's actually
 /// conditional, gated on the exact same detection [`crate::keymap::Action::ToggleTimeline`]
 /// (`t`) already uses — see `crate::ui::mod::detect_jj_repo`.
+/// `GitHub PR…` is deliberately *not* conditional the way `Timeline` is:
+/// whether it can work is `gh`'s call (login, remote, host), and katamari
+/// parsing remotes to pre-judge that would rebuild exactly the GitHub
+/// knowledge `--pr` exists to not own — a repo where it can't work gets
+/// `gh`'s own explanation in the status bar instead of a hidden entry.
 pub fn available_entries(jj_available: bool) -> Vec<ScopeMenuEntry> {
     let mut entries = vec![
         ScopeMenuEntry::WorkingTree,
@@ -72,6 +79,7 @@ pub fn available_entries(jj_available: bool) -> Vec<ScopeMenuEntry> {
         entries.push(ScopeMenuEntry::Timeline);
     }
     entries.push(ScopeMenuEntry::Revision);
+    entries.push(ScopeMenuEntry::PullRequest);
     entries
 }
 
@@ -189,6 +197,11 @@ pub fn handle_revision_key(input: &mut RevisionInput, key: KeyEvent) -> Revision
 pub enum ScopeMenuState {
     List(ScopeMenuList),
     Revision(RevisionInput),
+    /// The "GitHub PR…" number field — the same [`RevisionInput`] buffer
+    /// and key handling, its own variant only so submit routes to the
+    /// background `gh` fetch instead of a synchronous git/jj call (see
+    /// `crate::ui::mod`'s pending-PR-scope handling).
+    PullRequest(RevisionInput),
 }
 
 impl ScopeMenuState {
@@ -199,6 +212,24 @@ impl ScopeMenuState {
     pub fn new_revision_input() -> Self {
         ScopeMenuState::Revision(RevisionInput::new())
     }
+
+    pub fn new_pr_input() -> Self {
+        ScopeMenuState::PullRequest(RevisionInput::new())
+    }
+}
+
+/// Parses a submitted PR-number string. Accepts surrounding whitespace and
+/// a leading `#` (people paste "#123" straight from GitHub); anything else
+/// non-numeric is an error naming what was typed, so the status bar can
+/// explain a rejection without the input having gone anywhere.
+pub fn parse_pr_number(text: &str) -> Result<std::num::NonZeroU64, String> {
+    let trimmed = text.trim().trim_start_matches('#');
+    if trimmed.is_empty() {
+        return Err("enter a PR number first".to_owned());
+    }
+    trimmed
+        .parse::<std::num::NonZeroU64>()
+        .map_err(|_| format!("not a PR number: {}", text.trim()))
 }
 
 /// Roughly centered in `area`, sized to the content rather than a fixed
@@ -228,6 +259,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &ScopeMenuState, jj_availabl
     match state {
         ScopeMenuState::List(list) => render_list(frame, area, list),
         ScopeMenuState::Revision(input) => render_revision_input(frame, area, input, jj_available),
+        ScopeMenuState::PullRequest(input) => render_pr_input(frame, area, input),
     }
 }
 
@@ -295,6 +327,32 @@ fn render_revision_input(frame: &mut Frame, area: Rect, input: &RevisionInput, j
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn render_pr_input(frame: &mut Frame, area: Rect, input: &RevisionInput) {
+    let rect = popup_rect(area, 5);
+    frame.render_widget(Clear, rect);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" scope: github pr ");
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "pull request number — fetched via your logged-in gh",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )),
+        cursor_marked_line(input.text(), input.cursor()),
+        Line::from(Span::styled(
+            REVISION_HINT,
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,6 +371,7 @@ mod tests {
                 ScopeMenuEntry::Staged,
                 ScopeMenuEntry::Log,
                 ScopeMenuEntry::Revision,
+                ScopeMenuEntry::PullRequest,
             ]
         );
     }
@@ -328,8 +387,26 @@ mod tests {
                 ScopeMenuEntry::Log,
                 ScopeMenuEntry::Timeline,
                 ScopeMenuEntry::Revision,
+                ScopeMenuEntry::PullRequest,
             ]
         );
+    }
+
+    // ---- parse_pr_number ---------------------------------------------------
+
+    #[test]
+    fn parse_pr_number_accepts_plain_and_hash_prefixed_numbers() {
+        assert_eq!(parse_pr_number("123").unwrap().get(), 123);
+        assert_eq!(parse_pr_number(" #123 ").unwrap().get(), 123);
+    }
+
+    #[test]
+    fn parse_pr_number_rejects_zero_junk_and_emptiness_by_name() {
+        assert!(parse_pr_number("0").is_err());
+        assert!(parse_pr_number("").is_err());
+        assert!(parse_pr_number("  #  ").is_err());
+        let err = parse_pr_number("abc").unwrap_err();
+        assert!(err.contains("abc"), "{err}");
     }
 
     #[test]

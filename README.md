@@ -209,7 +209,9 @@ errors surface directly: a missing login says `gh auth login`, an
 ambiguous multi-remote repo says `gh repo set-default`. Like any other
 historical scope the snapshot is read-only — hover/go-to-definition and
 comments are unavailable on it — and the status bar labels it
-`PR #123`, so what's on screen is never ambiguous.
+`PR #123`, so what's on screen is never ambiguous. Also reachable
+mid-session: the scope menu (`o`) has a **GitHub PR…** entry that asks
+for the number and fetches in the background.
 
 `ktmr log` opens a browsable revision history instead of a single diff: jj
 changes (including the working copy, `@`, as a real entry) in a colocated jj
@@ -365,6 +367,13 @@ session is reviewing without restarting `ktmr diff` with new CLI flags.
   bookmark name, ...) work exactly as they do on the command line. An
   invalid revision reports the VCS's own error in the status bar and
   leaves whatever was on screen untouched.
+- **GitHub PR…** opens the same kind of input for a pull request number
+  (`#123` pasted straight from GitHub works too) — the mid-session twin
+  of `ktmr diff --pr`. The `gh` fetch runs in the background: the diff
+  already on screen stays put and fully interactive until the PR's text
+  actually lands, and a failure (not logged in, no GitHub remote, no
+  such PR) surfaces `gh`'s own message in the status bar instead of
+  touching the current view.
 
 Swapping to anything other than the working tree pauses live refresh's
 refresh loop (the watcher itself keeps running) until you swap back;

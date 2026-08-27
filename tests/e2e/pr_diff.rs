@@ -110,6 +110,128 @@ EOF"#,
 }
 
 #[test]
+fn the_scope_menu_switches_to_a_pr_and_back_mid_session() {
+    let repo = fixture::basic_repo();
+    let gh_dir = tempfile::tempdir().unwrap();
+    write_fake_gh(
+        gh_dir.path(),
+        r#"cat <<'EOF'
+diff --git a/notes.txt b/notes.txt
+index 0000000..1111111 100644
+--- a/notes.txt
++++ b/notes.txt
+@@ -1 +1,2 @@
+ alpha
++PR_ONLY_MARKER_LINE from the pull request
+EOF"#,
+    );
+
+    let h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            args: vec!["diff"],
+            extra_env: vec![("PATH".into(), path_with(gh_dir.path()))],
+            ..Default::default()
+        },
+    );
+    h.wait_for_text("This is line two, updated.");
+
+    // `o` → the menu lists the PR entry; without jj the order is
+    // Working tree / Staged / Log / Revision… / GitHub PR…, so four
+    // downs land on it.
+    h.send(Key::Char('o'));
+    h.wait_for_text("GitHub PR…");
+    for _ in 0..4 {
+        h.send(Key::Char('j'));
+    }
+    h.send(Key::Enter);
+    h.wait_for_text("scope: github pr");
+
+    for c in ['2', '5'] {
+        h.send(Key::Char(c));
+    }
+    h.send(Key::Enter);
+
+    // The fetch is asynchronous; the label and the snapshot's own
+    // content arriving proves the background hand-off worked end to end.
+    h.wait_for_text("PR #25");
+    h.wait_for_text("PR_ONLY_MARKER_LINE");
+
+    // And back: reopening the menu starts on Working tree, and confirming
+    // it restores the live diff.
+    h.send(Key::Char('o'));
+    h.wait_for_text("Working tree");
+    h.send(Key::Enter);
+    h.wait_for_text("This is line two, updated.");
+}
+
+#[test]
+fn a_pr_fetch_that_lands_off_view_parks_until_its_view_returns() {
+    let repo = fixture::basic_repo();
+    let gh_dir = tempfile::tempdir().unwrap();
+    // The sleep holds the fetch open long enough to navigate away from
+    // the diff that requested it before the result lands.
+    write_fake_gh(
+        gh_dir.path(),
+        r#"sleep 1
+cat <<'EOF'
+diff --git a/notes.txt b/notes.txt
+index 0000000..1111111 100644
+--- a/notes.txt
++++ b/notes.txt
+@@ -1 +1,2 @@
+ alpha
++PR_ONLY_MARKER_LINE from the pull request
+EOF"#,
+    );
+
+    let h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            args: vec!["diff"],
+            extra_env: vec![("PATH".into(), path_with(gh_dir.path()))],
+            ..Default::default()
+        },
+    );
+    h.wait_for_text("This is line two, updated.");
+
+    h.send(Key::Char('o'));
+    h.wait_for_text("GitHub PR…");
+    for _ in 0..4 {
+        h.send(Key::Char('j'));
+    }
+    h.send(Key::Enter);
+    h.wait_for_text("scope: github pr");
+    for c in ['4', '2'] {
+        h.send(Key::Char(c));
+    }
+    h.send(Key::Enter);
+
+    // Leave the requesting diff before the fetch lands: the log view is
+    // on top when the result arrives, so it must NOT be applied there —
+    // it parks, and the log view keeps showing its own content.
+    h.send(Key::Char('L'));
+    h.wait_for_text("local changes");
+
+    // The fake's latency is a fixture-controlled constant (sleep 1), so
+    // three times that bounds the arrival deterministically; the parked
+    // result is invisible by design while the log view is up, so there
+    // is nothing on screen to wait for until we return.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let screen_before = h.screen_contents();
+    assert!(
+        !screen_before.contains("PR_ONLY_MARKER_LINE"),
+        "the parked PR text must not leak into the log view:\n{screen_before}"
+    );
+
+    // Returning to the diff that asked applies the parked result — the
+    // reviewer never has to retype the request.
+    h.send(Key::Esc);
+    h.wait_for_text("PR #42");
+    h.wait_for_text("PR_ONLY_MARKER_LINE");
+}
+
+#[test]
 fn pr_diff_surfaces_ghs_own_error_text() {
     let repo = fixture::basic_repo();
     let gh_dir = tempfile::tempdir().unwrap();
