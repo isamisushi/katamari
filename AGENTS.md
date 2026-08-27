@@ -38,10 +38,17 @@ mise exec -- cargo fmt --check
 ## Architecture pointers
 
 - `src/vcs/` — abstracts git/jj behind one trait so `diff::model` and the
-  UI never call either directly.
+  UI never call either directly; `github.rs` sits beside the trait, not
+  behind it — it fetches a PR's diff text through the user's `gh` CLI
+  (`ktmr diff --pr`), deliberately shipping no GitHub client of our own.
 - `src/lsp/` — talks to language servers over LSP; `adapter.rs` resolves
   which server per language, `manager.rs` owns spawn/lifecycle,
   `install.rs` handles auto-install.
+- `src/acp/` — an ACP (Agent Client Protocol) v1 client: katamari spawns
+  and owns a persistent agent process (the `claude-agent-acp` adapter)
+  the way it owns language servers, to push review comments at it.
+  Same three-thread transport shape as `src/lsp/`, newline-delimited
+  framing; `ktmr agent-check` (hidden) is its headless smoke test.
 - `src/ui/` — ratatui rendering + the event loop (`ui/mod.rs`); `app.rs` is
   the diff view's state machine.
 - `src/diff/coords.rs` — the width/position core: converts one line of text
