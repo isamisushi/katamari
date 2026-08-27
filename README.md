@@ -22,7 +22,8 @@ without leaving the terminal.
 - **Live refresh** — working-tree diffs refresh as an agent's edits land on
   disk by default; pass `--no-watch` for a static session
 - **Any scope of change** — working tree, staged, one commit, a range, a jj
-  change or revset; browse and pick from `ktmr log`, or switch mid-session
+  change or revset, or a GitHub pull request by number (`--pr`, through
+  your own `gh`); browse and pick from `ktmr log`, or switch mid-session
   with a popup (`o`)
 - **jj snapshot timeline** — step through every save of an agent's session,
   not just the final state
@@ -169,6 +170,7 @@ ktmr diff --no-watch   # working tree vs HEAD, without live refresh
 ktmr diff --staged     # staged (index) changes vs HEAD
 ktmr diff <rev>        # one commit's own changes
 ktmr diff <a>..<b>     # a revision range
+ktmr diff --pr 123     # a GitHub pull request, via your logged-in `gh`
 ```
 
 `--no-watch` is a working-tree-only opt-out; staged and pinned historical
@@ -194,6 +196,20 @@ revision diff shows historical content, not necessarily what's on disk right
 now, so hover/go-to-definition/find-references are unavailable on it (the
 status bar names the scope being shown, e.g. `r: <id>` or `<from>..<to>`, so
 this is never ambiguous on screen).
+
+`ktmr diff --pr <number>` opens a GitHub pull request's diff against its
+actual base — no branch to fetch, no checkout, nothing written into the
+repository. It runs through your own logged-in
+[GitHub CLI](https://cli.github.com) (`gh pr diff` under the hood), so
+private repositories and GitHub Enterprise work exactly as well as your
+`gh` does — katamari deliberately ships no GitHub client, tokens, or
+HTTP code of its own, the same philosophy as review units spawning your
+own `claude`/`codex` instead of bundling an LLM client. `gh`'s own
+errors surface directly: a missing login says `gh auth login`, an
+ambiguous multi-remote repo says `gh repo set-default`. Like any other
+historical scope the snapshot is read-only — hover/go-to-definition and
+comments are unavailable on it — and the status bar labels it
+`PR #123`, so what's on screen is never ambiguous.
 
 `ktmr log` opens a browsable revision history instead of a single diff: jj
 changes (including the working copy, `@`, as a real entry) in a colocated jj

@@ -503,7 +503,7 @@ fn spawn_revision_forwarder(rx: Receiver<()>, tx: Sender<AppEvent>) {
 /// diff knows why some files' diagnostics gutters stay quiet until touched.
 fn warm_up_root(view: &View, lsp_manager: &LspManager) -> Option<String> {
     match view {
-        View::Diff(app) => {
+        View::Diff(app) if app.interactive => {
             let summary = warm_up_diff(app, lsp_manager);
             summary.capped().then(|| {
                 format!(
@@ -512,6 +512,9 @@ fn warm_up_root(view: &View, lsp_manager: &LspManager) -> Option<String> {
                 )
             })
         }
+        // A remote PR or historical revision need not match local files.
+        // Do not start/install language servers for unrelated disk content.
+        View::Diff(_) => None,
         View::File(file) => {
             if !file.highlight_skipped
                 && let Some(path) = file.file_path()
@@ -4838,6 +4841,29 @@ fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn historical_root_does_not_start_a_language_server_for_local_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = root.join("a.rs");
+        std::fs::write(&file, "fn unrelated_local_code() {}\n").unwrap();
+        let mut app = selectable_diff_app();
+        app.repo_root = root.clone();
+        app.interactive = false;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let overrides = std::collections::HashMap::from([(
+            "rust".to_owned(),
+            crate::config::ServerOverride {
+                command: root.join("missing-test-server").display().to_string(),
+                ..Default::default()
+            },
+        )]);
+        let manager = LspManager::new(tx, std::sync::Arc::new(overrides), false);
+
+        assert!(warm_up_root(&View::Diff(app), &manager).is_none());
+        assert_eq!(manager.state(&file, &root), ServerState::NotStarted);
+    }
 
     // ---- watch_pause_decision ---------------------------------------------
 

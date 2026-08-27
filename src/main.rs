@@ -25,6 +25,7 @@ use diff::{
     parse_unified_diff,
 };
 use std::collections::HashMap;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use ui::app::Layout;
 use ui::timeline_view::TimelineView;
@@ -82,6 +83,15 @@ enum Command {
         /// See `--from`.
         #[arg(long, value_name = "REVSET", conflicts_with_all = ["revision", "range", "staged", "no_watch"])]
         to: Option<String>,
+        /// Show a GitHub pull request's diff against its actual base,
+        /// resolved and fetched through your own logged-in `gh` CLI —
+        /// katamari deliberately ships no GitHub client of its own, the
+        /// same way semantic units spawn your `claude`/`codex` rather
+        /// than bundling an LLM client. Never fetches refs or touches
+        /// the working tree; the snapshot is read-only (no LSP, no
+        /// comments), like any other historical scope.
+        #[arg(long, value_name = "NUMBER", conflicts_with_all = ["range", "staged", "revision", "from", "to", "no_watch"])]
+        pr: Option<NonZeroU64>,
         /// Disable automatic live refresh for an interactive working-tree
         /// diff. Staged and historical scopes are already non-watching and
         /// cannot be combined with this opt-out.
@@ -485,6 +495,7 @@ fn main() -> Result<()> {
         revision: None,
         from: None,
         to: None,
+        pr: None,
         no_watch: false,
         dump_units: false,
         regroup: false,
@@ -499,6 +510,7 @@ fn main() -> Result<()> {
             revision,
             from,
             to,
+            pr,
             no_watch,
             dump_units,
             regroup,
@@ -512,6 +524,7 @@ fn main() -> Result<()> {
             revision,
             from,
             to,
+            pr,
             no_watch,
             dump_units,
             regroup,
@@ -574,6 +587,7 @@ fn run_diff(
     revision: Option<String>,
     from: Option<String>,
     to: Option<String>,
+    pr: Option<NonZeroU64>,
     no_watch: bool,
     dump_units: bool,
     regroup: bool,
@@ -581,10 +595,15 @@ fn run_diff(
     show_keys: bool,
 ) -> Result<()> {
     if no_watch
-        && (staged || range.is_some() || revision.is_some() || from.is_some() || to.is_some())
+        && (staged
+            || range.is_some()
+            || revision.is_some()
+            || from.is_some()
+            || to.is_some()
+            || pr.is_some())
     {
         bail!(
-            "--no-watch only supports the working tree; it cannot be combined with --staged or a revision range"
+            "--no-watch only supports the working tree; it cannot be combined with --staged, --pr, or a revision range"
         );
     }
 
@@ -602,7 +621,16 @@ fn run_diff(
     // `crate::ui::timeline_view::TimelineView`'s "historical content isn't
     // trustworthy enough to ask a language server about" rule — see
     // `App::interactive`'s docs.
-    let (diff_text, scope_label, interactive) = if let Some(revset) = revision.as_deref() {
+    // `--pr` is remote historical content fetched through `gh` — never the
+    // local working tree, so it's non-interactive for the same reason a jj
+    // revision diff is.
+    let (diff_text, scope_label, interactive) = if let Some(number) = pr {
+        (
+            vcs::github::pull_request_diff(&repo_root, number)?,
+            Some(format!("PR #{number}")),
+            false,
+        )
+    } else if let Some(revset) = revision.as_deref() {
         let jj_repo = discover_jj_repo_at(&repo_root)?;
         (
             jj_repo.revision_diff(revset)?,
@@ -677,8 +705,12 @@ fn run_diff(
     // revision or a jj revision/range is historical content (see
     // `App::disk_is_new_side`'s docs for why `interactive` alone isn't the
     // right gate: it's `true` for `--staged` too).
-    app.disk_is_new_side =
-        !staged && range.is_none() && revision.is_none() && from.is_none() && to.is_none();
+    app.disk_is_new_side = !staged
+        && range.is_none()
+        && revision.is_none()
+        && from.is_none()
+        && to.is_none()
+        && pr.is_none();
     app.scope_label = scope_label;
     // Issue #8: recorded so a live session can watch this scope for an
     // amend moving it — see `ui::app::RevisionScope`'s docs. `--from`/
@@ -2547,6 +2579,43 @@ index 1111111..2222222 100644\n\
             .copied()
             .expect("a trailing gap exists");
         assert_eq!(format_render_row(&files, gap), "  GAP unchanged (to EOF)\n");
+    }
+
+    #[test]
+    fn diff_pr_accepts_a_number_alongside_existing_display_options() {
+        let cli = Cli::try_parse_from(["ktmr", "diff", "--pr", "42", "--dump", "--layout", "side"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Diff { pr: Some(number), dump: true, layout: LayoutArg::Side, .. })
+                if number.get() == 42
+        ));
+    }
+
+    #[test]
+    fn diff_pr_rejects_missing_zero_negative_and_non_numeric_numbers() {
+        assert!(Cli::try_parse_from(["ktmr", "diff", "--pr"]).is_err());
+        for number in ["0", "-1", "abc", "18446744073709551616"] {
+            assert!(
+                Cli::try_parse_from(["ktmr", "diff", "--pr", number]).is_err(),
+                "{number}"
+            );
+        }
+    }
+
+    #[test]
+    fn diff_pr_conflicts_with_every_other_scope_and_no_watch() {
+        for conflicting in [
+            vec!["--staged"],
+            vec!["HEAD~2..HEAD"],
+            vec!["-r", "@"],
+            vec!["--from", "@-"],
+            vec!["--no-watch"],
+        ] {
+            let mut args = vec!["ktmr", "diff", "--pr", "42"];
+            args.extend(conflicting.iter());
+            assert!(Cli::try_parse_from(&args).is_err(), "{conflicting:?}");
+        }
     }
 
     #[test]

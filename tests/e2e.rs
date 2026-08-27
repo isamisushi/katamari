@@ -45,6 +45,8 @@ mod mouse;
 mod moving_scope;
 #[path = "e2e/navigation.rs"]
 mod navigation;
+#[path = "e2e/pr_diff.rs"]
+mod pr_diff;
 #[path = "e2e/range_comment.rs"]
 mod range_comment;
 #[path = "e2e/rendering.rs"]
