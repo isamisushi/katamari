@@ -375,11 +375,18 @@ fn right_click_retargets_a_valid_new_row_and_closes_on_a_miss() {
     h.wait_for_text("Add comment");
     let after_first = h.screen_contents();
 
-    // file001's own Context row (flat index 11: FileHeader(7)/HunkHeader(8)/
-    // Del(9)/Add(10)/Context(11) — screen row 12) — a second, different
-    // valid target. A retarget must actually move the cursor onto it, not
-    // just leave the same popup sitting where it was.
-    click(&h, MouseButton::Right, 90, 12);
+    // file002's own Add row (flat index 17: file000's own 7 rows [0-6] +
+    // file001's own 7 rows [7-13] + FileHeader(14)/HunkHeader(15)/Del(16)/
+    // Add(17) — screen row 18) — a second, different valid target, chosen
+    // to sit outside the popup's own footprint rather than file001's rows
+    // immediately below the first click: the menu is now 9 rows tall (two
+    // more entries — "Ask agent about this"/"Push open comments to
+    // agent" — than when this test was first written), so it covers
+    // screen rows 5-13, and every one of file001's own rows falls inside
+    // that span in this fixture's small 3-line hunks. A retarget must
+    // actually move the cursor onto the new row, not just leave the same
+    // popup sitting where it was.
+    click(&h, MouseButton::Right, 90, 18);
     h.wait_for_text("Add comment"); // still showing a menu, just retargeted
     h.wait_until(Duration::from_secs(3), |screen| {
         screen.contents() != after_first

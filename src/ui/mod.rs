@@ -13,7 +13,9 @@
 //! onto one channel (see [`AppEvent`]) so the render loop has a single place
 //! to wait, with a short timeout, for "anything worth redrawing for."
 
+pub mod agent_panel;
 pub mod app;
+pub mod ask;
 pub mod clipboard;
 pub mod compose;
 pub mod context_menu;
@@ -51,6 +53,8 @@ pub use file_view::FileView;
 pub use refresh::{NoopPreRefreshHook, PreRefreshHook};
 pub use view::{View, ViewStack};
 
+use crate::acp;
+use crate::acp::session::{AcpNotice, AgentHandle, TurnState};
 use crate::comments::{self, Comment, CommentIndex, CommentStore};
 use crate::config::{self, Config};
 use crate::diff::{RenderRow, parse_unified_diff};
@@ -101,7 +105,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout as RatatuiLayout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use std::collections::HashSet;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -153,6 +157,16 @@ enum AppEvent {
     /// (see [`MovingScopeState`]'s docs) — most ticks, in practice, since a
     /// `git add`/ordinary commit touches several of these same paths too.
     RevisionChanged,
+    /// Something the resident ACP agent session's manager thread (see
+    /// [`crate::acp::session::run_session`]) needs the event loop to react
+    /// to even while `View::Agent`'s panel is closed — a turn finishing, a
+    /// permission request arriving, a spawn failure, or the connection
+    /// closing. Deliberately thin, the same reason `Lsp` only ever carries
+    /// `$/progress`/diagnostics rather than the whole LSP journal: ordinary
+    /// streaming transcript lines are written straight into
+    /// [`crate::acp::session::AgentStore`] and picked up by an open panel
+    /// on its own next render, never routed through this channel at all.
+    Acp(AcpNotice),
 }
 
 /// The M5 [`PreRefreshHook`]: snapshots the working copy via jj (see
@@ -341,6 +355,15 @@ pub fn run(
         Some(observer.clone()),
     );
 
+    // The resident ACP agent session (see `crate::acp::session`) — this
+    // only starts the manager thread; per that module's own docs, no
+    // adapter process is spawned until the first ask/push actually happens
+    // (a session nobody asks anything of never shells out to `npx`/
+    // `claude-agent-acp` at all).
+    let (agent_handle, acp_rx) =
+        acp::session::start(config.agent.adapter.clone(), root_repo_path(stack.top()));
+    spawn_acp_forwarder(acp_rx, app_tx.clone());
+
     // Proactively `didOpen`s the files this session starts out looking at,
     // so diagnostics gutters have something to show without the user
     // hovering first — see `LspManager::warm_up`'s docs for why hovering
@@ -413,6 +436,7 @@ pub fn run(
         observer.clone(),
         config.mouse,
         config.mouse_hover,
+        agent_handle.clone(),
     );
 
     restore_terminal(&mut terminal)?;
@@ -425,6 +449,9 @@ pub fn run(
     // this). Runs after the terminal is already restored so this brief,
     // bounded wait doesn't leave the user staring at a frozen screen.
     lsp_manager.shutdown_all();
+    // Same guarantee for the ACP adapter, if one was ever spawned — see
+    // `AgentStore::shutdown`'s docs for the bounded wait.
+    agent_handle.shutdown();
     observer.shutdown();
 
     // A normal quit only — a session that exited via an `Err` already has
@@ -582,7 +609,27 @@ fn warm_up_root(view: &View, lsp_manager: &LspManager) -> Option<String> {
         // / `LogView::hover_query`'s docs) — a timeline or log session,
         // whether reached via `ktmr timeline`/`ktmr log` or by toggling from
         // the root diff, has nothing for `LspManager` to warm up.
-        View::Timeline(_) | View::Log(_) | View::LspInspector(_) => None,
+        View::Timeline(_) | View::Log(_) | View::LspInspector(_) | View::Agent(_) => None,
+    }
+}
+
+/// The absolute repository path the resident agent session's `session/new`
+/// should be rooted at (see `acp::session::start`) — every relative path
+/// the agent's own tools touch resolves against this. `View::Diff`/
+/// `View::File` both know their own repo/git root already; the other root
+/// shapes (`ktmr timeline`/`ktmr log` standalone) have no such field on
+/// `TimelineView`/`LogView` today, so this falls back to the process's
+/// current directory — correct in the overwhelmingly common case (both are
+/// only ever invoked from inside the repository they browse), and a
+/// reasonable v1 scope limit rather than adding a repo-root accessor to two
+/// more view types for a secondary entry point.
+fn root_repo_path(view: &View) -> PathBuf {
+    match view {
+        View::Diff(app) => app.repo_root.clone(),
+        View::File(file) => file.git_root().to_path_buf(),
+        View::Timeline(_) | View::Log(_) | View::LspInspector(_) | View::Agent(_) => {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        }
     }
 }
 
@@ -622,6 +669,20 @@ fn spawn_watch_forwarder(rx: Receiver<WatchSignal>, tx: Sender<AppEvent>) {
     std::thread::spawn(move || {
         for signal in rx {
             if tx.send(AppEvent::Watch(signal)).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Relays the agent session's [`AcpNotice`]s onto the shared [`AppEvent`]
+/// channel — byte-for-byte [`spawn_lsp_forwarder`]'s shape, for the same
+/// reason: [`crate::acp::session`] stays free of any dependency on `ui`'s
+/// event-loop plumbing.
+fn spawn_acp_forwarder(rx: Receiver<AcpNotice>, tx: Sender<AppEvent>) {
+    std::thread::spawn(move || {
+        for notice in rx {
+            if tx.send(AppEvent::Acp(notice)).is_err() {
                 break;
             }
         }
@@ -676,6 +737,20 @@ impl WatchStatus {
             set_at: Instant::now(),
         }
     }
+}
+
+/// A `session/request_permission` request waiting on a human decision (see
+/// [`crate::acp::session`]) — lives outside any [`View`] the same way
+/// `compose`/`context_menu`/`scope_menu` do (an event-loop local, not
+/// `App` state), because it must be answerable regardless of which view is
+/// currently on top: an ask/push can be sent from any view, and the
+/// permission request that follows has to reach the reviewer wherever they
+/// are. Only the tool title is kept here — the full request (id + options)
+/// stays on the session's own manager thread (see
+/// [`crate::acp::session::AgentStore`]'s docs), since only that thread ever
+/// needs it; the UI only ever has to say yes or no.
+struct PermissionPromptState {
+    tool_title: String,
 }
 
 /// Issue #8: live-tracking state for a moving historical scope (`ktmr diff
@@ -782,6 +857,7 @@ fn event_loop(
     observer: crate::lsp::ObservationHandle,
     mouse_enabled: bool,
     mouse_hover_enabled: bool,
+    agent_handle: AgentHandle,
 ) -> Result<()> {
     let mut key_display = key_display::KeyDisplayState::new(show_keys);
     let mut hover_state = hover_popup::HoverState::default();
@@ -823,6 +899,10 @@ fn event_loop(
     // key would be wrong.
     let mut warned_servers: HashSet<(LangKey, PathBuf)> = HashSet::new();
     let mut compose: Option<ComposeState> = None;
+    // The "ask the agent" overlay and the permission-decision modal — see
+    // `ui::ask`'s and `PermissionPromptState`'s own docs.
+    let mut ask_compose: Option<ask::AskComposeState> = None;
+    let mut agent_permission: Option<PermissionPromptState> = None;
     let mut scope_menu: Option<ScopeMenuState> = None;
     // The "GitHub PR…" entry's background `gh` fetch and its parked
     // result, if any — see [`PrScopeFetch`]'s docs for the lifecycle.
@@ -973,6 +1053,13 @@ fn event_loop(
                 (log_view::layout(area, status_height).list.height, 0, None)
             }
             View::LspInspector(_) => (area.height.saturating_sub(2), area.width as usize, None),
+            // Same full-screen-minus-border shape the inspector uses —
+            // `AgentPanelView::render` carves out its own border/footer, so
+            // the viewport height it's told here only needs to roughly
+            // bound scroll math, not match pixel-for-pixel (its own
+            // `set_viewport_height` call inside `render` is what actually
+            // stays authoritative — see that method's docs).
+            View::Agent(_) => (area.height.saturating_sub(2), area.width as usize, None),
         };
         stack.top_mut().set_viewport_height(content_height as usize);
         stack.top_mut().set_content_width(content_width);
@@ -1313,6 +1400,8 @@ fn event_loop(
                 hints_expanded,
                 &mut geometry,
                 compose_keymap,
+                ask_compose.as_mut(),
+                agent_permission.as_ref(),
             )
         })?;
 
@@ -1335,7 +1424,31 @@ fn event_loop(
                         &mut pending_pointer_hover,
                         &observer,
                     );
-                    if let Some(state) = compose.as_mut() {
+                    if agent_permission.is_some() {
+                        // A permission request from the resident agent (see
+                        // `crate::acp::session`) always wins the keypress,
+                        // ahead of even `compose` — defensive ordering only:
+                        // sending a prompt always closes `compose` first
+                        // (the `ask_compose`/`compose` arms below), and a
+                        // second prompt is rejected outright while a turn is
+                        // running (see `AgentStore::is_turn_running`), so a
+                        // permission request can never actually arrive while
+                        // either overlay is open. Two bindings only — Enter/
+                        // `y` allows, Esc/`n` rejects — and nothing else does
+                        // anything: this must never auto-resolve, so any
+                        // other key is simply swallowed, leaving the modal up.
+                        match key.code {
+                            KeyCode::Enter | KeyCode::Char('y') => {
+                                agent_handle.answer_permission(true);
+                                agent_permission = None;
+                            }
+                            KeyCode::Esc | KeyCode::Char('n') => {
+                                agent_handle.answer_permission(false);
+                                agent_permission = None;
+                            }
+                            _ => {}
+                        }
+                    } else if let Some(state) = compose.as_mut() {
                         // The compose overlay wants raw characters, not
                         // `Action`s — see `ui::compose::handle_key`'s docs on
                         // why this bypasses the keymap resolver entirely rather
@@ -1406,6 +1519,54 @@ fn event_loop(
                                 } else {
                                     status
                                 });
+                            }
+                        }
+                    } else if let Some(state) = ask_compose.as_mut() {
+                        // The "ask the agent" overlay — a sibling of
+                        // `compose` above, same raw-key bypass and the same
+                        // `compose::handle_key` core (see `ui::ask`'s module
+                        // docs), sitting immediately after `compose` in this
+                        // chain since the two are structurally exclusive
+                        // (neither ever opens while the other is already
+                        // open — both only ever open from the same
+                        // `Action` dispatch site in `handle_action`).
+                        key_display.record_typing(Instant::now());
+                        match compose::handle_key(state.buffer_mut(), key, compose_keymap) {
+                            ComposeOutcome::Continue => {}
+                            ComposeOutcome::Cancel => ask_compose = None,
+                            ComposeOutcome::Save => {
+                                if state.buffer().is_blank() {
+                                    goto_status = Some("ask: discarded (empty)".to_owned());
+                                    ask_compose = None;
+                                } else if agent_handle.is_turn_running() {
+                                    // Checked synchronously here (not just
+                                    // inside the session thread's own
+                                    // reject-don't-queue handling) so the
+                                    // overlay can report the rejection right
+                                    // away rather than leaving the reviewer
+                                    // wondering whether their question was
+                                    // even sent — see `ui::ask`'s module
+                                    // docs.
+                                    goto_status = Some(
+                                        "agent: a turn is already running — wait for it to finish"
+                                            .to_owned(),
+                                    );
+                                    ask_compose = None;
+                                } else {
+                                    let prompt_text =
+                                        ask::build_prompt(state.context(), &state.buffer().text());
+                                    agent_handle.send_prompt(prompt_text);
+                                    ask_compose = None;
+                                    // Only cleared on an actual send (not on
+                                    // the empty/already-running rejections
+                                    // above) — the reviewer may still want to
+                                    // see exactly what they selected if they
+                                    // need to retry.
+                                    if let View::Diff(app) = stack.top_mut() {
+                                        app.cancel_visual();
+                                    }
+                                    goto_status = Some("ask: sent".to_owned());
+                                }
                             }
                         }
                     } else if let Some(state) = help.as_mut() {
@@ -1699,6 +1860,10 @@ fn event_loop(
                                         &mut moving_scope,
                                         &mut hints_expanded,
                                         &observer,
+                                        &agent_handle,
+                                        &mut ask_compose,
+                                        comments_repo_root.as_deref(),
+                                        &comment_list,
                                     );
                                 }
                                 StepResult::Pending => {
@@ -1894,6 +2059,10 @@ fn event_loop(
                                         &mut moving_scope,
                                         &mut hints_expanded,
                                         &observer,
+                                        &agent_handle,
+                                        &mut ask_compose,
+                                        comments_repo_root.as_deref(),
+                                        &comment_list,
                                     );
                                 }
                                 // else: the border/title row — captured, no-op.
@@ -1969,6 +2138,10 @@ fn event_loop(
                                 &mut moving_scope,
                                 &mut hints_expanded,
                                 &observer,
+                                &agent_handle,
+                                &mut ask_compose,
+                                comments_repo_root.as_deref(),
+                                &comment_list,
                             );
                         }
                     }
@@ -2291,6 +2464,35 @@ fn event_loop(
                 // from jj, so reopening it later picks up this snapshot
                 // anyway.
             }
+            Ok(AppEvent::Acp(notice)) => match notice {
+                AcpNotice::TurnFinished { stop_reason } => {
+                    // No extra note needed when the panel is already open —
+                    // it shows the finished state inline on its own next
+                    // redraw (it pulls from `AgentStore`, never pushed to),
+                    // identical reasoning to why `AppEvent::Lsp`'s
+                    // diagnostics arm needs no view-open check either.
+                    if !matches!(stack.top(), View::Agent(_)) {
+                        goto_status = Some(format!("agent: turn finished ({stop_reason})"));
+                    }
+                }
+                AcpNotice::PermissionRequested => {
+                    let tool_title = match agent_handle.state() {
+                        TurnState::AwaitingPermission { tool_title } => tool_title,
+                        // Shouldn't happen — this notice only ever follows
+                        // the manager thread setting exactly this state —
+                        // but a generic fallback title costs nothing if it
+                        // somehow raced.
+                        _ => "(tool)".to_owned(),
+                    };
+                    agent_permission = Some(PermissionPromptState { tool_title });
+                }
+                AcpNotice::SpawnFailed(e) => {
+                    goto_status = Some(format!("agent: {e}"));
+                }
+                AcpNotice::Closed(reason) => {
+                    goto_status = Some(format!("agent: connection closed ({reason})"));
+                }
+            },
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
@@ -2876,6 +3078,10 @@ fn handle_action(
     moving_scope: &mut Option<MovingScopeState>,
     hints_expanded: &mut bool,
     observer: &crate::lsp::ObservationHandle,
+    agent_handle: &AgentHandle,
+    ask_compose: &mut Option<ask::AskComposeState>,
+    comments_repo_root: Option<&Path>,
+    comment_list: &[Comment],
 ) {
     // The inspector is a full-screen modal view.  Route every action to it
     // before hover/references/scope overlays can consume Esc or navigation
@@ -3007,6 +3213,10 @@ fn handle_action(
                                 moving_scope,
                                 hints_expanded,
                                 observer,
+                                agent_handle,
+                                ask_compose,
+                                comments_repo_root,
+                                comment_list,
                             ),
                             MenuCommand::ExpandAllDescendants
                             | MenuCommand::CollapseAllDescendants => {
@@ -3431,7 +3641,11 @@ fn handle_action(
                 // having to reselect (req 3).
                 Err(reason) => *goto_status = Some(reason.message().to_owned()),
             },
-            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+            View::File(_)
+            | View::Timeline(_)
+            | View::Log(_)
+            | View::LspInspector(_)
+            | View::Agent(_) => {
                 *goto_status = Some("comment: only available in the diff view".to_owned());
             }
         },
@@ -3452,7 +3666,11 @@ fn handle_action(
                 }
                 _ => *goto_status = Some("fold: nothing to expand here".to_owned()),
             },
-            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+            View::File(_)
+            | View::Timeline(_)
+            | View::Log(_)
+            | View::LspInspector(_)
+            | View::Agent(_) => {
                 *goto_status = Some("fold: only available in the diff view".to_owned());
             }
         },
@@ -3462,7 +3680,11 @@ fn handle_action(
                     *goto_status = Some("fold: nothing to collapse here".to_owned());
                 }
             }
-            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+            View::File(_)
+            | View::Timeline(_)
+            | View::Log(_)
+            | View::LspInspector(_)
+            | View::Agent(_) => {
                 *goto_status = Some("fold: only available in the diff view".to_owned());
             }
         },
@@ -3489,7 +3711,11 @@ fn handle_action(
                     }
                 };
             }
-            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+            View::File(_)
+            | View::Timeline(_)
+            | View::Log(_)
+            | View::LspInspector(_)
+            | View::Agent(_) => {
                 *goto_status = Some("visual: only available in the diff view".to_owned());
             }
         },
@@ -3508,35 +3734,100 @@ fn handle_action(
                 } else {
                     let selected = app.selected_rows();
                     let lines = clipboard::resolve_selection(&app.rows, &app.files, &selected);
-                    *goto_status = Some(match clipboard::format_diff_selection(lines) {
-                        Err(clipboard::YankError::Empty) => {
-                            "yank: selection has no diff lines to copy".to_owned()
-                        }
-                        Err(clipboard::YankError::TooLarge { byte_count }) => format!(
-                            "yank selection is {byte_count} bytes; copy limit is {}",
-                            clipboard::OSC52_MAX_BYTES
-                        ),
-                        Ok(formatted) => match clipboard::write_osc52(&formatted.text) {
-                            Ok(()) => {
-                                app.cancel_visual();
-                                format!(
-                                    "yanked {} line(s) across {} file(s) ({} bytes) via OSC 52; terminal support required",
-                                    formatted.line_count,
-                                    formatted.file_count,
-                                    formatted.byte_count
-                                )
+                    *goto_status = Some(
+                        match clipboard::format_diff_selection(lines, clipboard::OSC52_MAX_BYTES) {
+                            Err(clipboard::YankError::Empty) => {
+                                "yank: selection has no diff lines to copy".to_owned()
                             }
-                            // Keep the selection on failure (req 8): nothing
-                            // was actually copied, so there's nothing to
-                            // clear — the reviewer can retry or trim it.
-                            Err(error) => format!("yank failed: {error}"),
+                            Err(clipboard::YankError::TooLarge { byte_count }) => format!(
+                                "yank selection is {byte_count} bytes; copy limit is {}",
+                                clipboard::OSC52_MAX_BYTES
+                            ),
+                            Ok(formatted) => match clipboard::write_osc52(&formatted.text) {
+                                Ok(()) => {
+                                    app.cancel_visual();
+                                    format!(
+                                        "yanked {} line(s) across {} file(s) ({} bytes) via OSC 52; terminal support required",
+                                        formatted.line_count,
+                                        formatted.file_count,
+                                        formatted.byte_count
+                                    )
+                                }
+                                // Keep the selection on failure (req 8): nothing
+                                // was actually copied, so there's nothing to
+                                // clear — the reviewer can retry or trim it.
+                                Err(error) => format!("yank failed: {error}"),
+                            },
                         },
-                    });
+                    );
                 }
             }
-            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+            View::File(_)
+            | View::Timeline(_)
+            | View::Log(_)
+            | View::LspInspector(_)
+            | View::Agent(_) => {
                 *goto_status = Some("yank: only available in the diff view".to_owned());
             }
+        },
+        // Resident-agent trio (see `crate::acp::session`) — `AskAgent`'s
+        // eligibility deliberately mirrors `YankSelection`'s own looser
+        // rule (any selection, or the bare cursor row, on any diff
+        // including a read-only one) rather than `AddComment`'s stricter
+        // one; see `ui::ask`'s module docs for why.
+        Action::AskAgent => match stack.top() {
+            View::Diff(app) => {
+                let selected: Vec<usize> = if app.visual_active() {
+                    app.selected_rows()
+                } else {
+                    vec![app.cursor]
+                };
+                match ask::build_ask_context(&app.rows, &app.files, &selected) {
+                    Ok(ctx) => *ask_compose = Some(ask::AskComposeState::new(ctx)),
+                    Err(ask::AskContextError::Empty) => {
+                        *goto_status = Some("ask: no diff content on this row".to_owned());
+                    }
+                    Err(ask::AskContextError::TooLarge { byte_count }) => {
+                        *goto_status = Some(format!(
+                            "ask: selection is {byte_count} bytes; trim it first"
+                        ));
+                    }
+                }
+            }
+            View::File(_)
+            | View::Timeline(_)
+            | View::Log(_)
+            | View::LspInspector(_)
+            | View::Agent(_) => {
+                *goto_status = Some("ask: only available in the diff view".to_owned());
+            }
+        },
+        Action::ToggleAgentPanel => {
+            cancel_pending_lsp_requests(hover_state, pending_hover, pending_goto, observer);
+            open_or_close_agent_panel(stack, agent_handle);
+        }
+        Action::PushCommentsToAgent => match comments_repo_root {
+            Some(_) => {
+                let open_count = comment_list
+                    .iter()
+                    .filter(|c| c.status == comments::Status::Open)
+                    .count();
+                if open_count == 0 {
+                    *goto_status = Some("agent: no open comments to push".to_owned());
+                } else if agent_handle.is_turn_running() {
+                    *goto_status =
+                        Some("agent: a turn is already running — wait for it to finish".to_owned());
+                } else {
+                    agent_handle.send_prompt(acp::check::DEFAULT_PROMPT.to_owned());
+                    // Opens (never closes) so the push is visible right
+                    // away — a one-line difference from `A`'s own toggle
+                    // (see `open_agent_panel`'s docs): pressing `p` must
+                    // never close an already-open panel out from under
+                    // whatever it's showing.
+                    open_agent_panel(stack, agent_handle);
+                }
+            }
+            None => *goto_status = Some("agent: no comments repo for this session".to_owned()),
         },
         // Opens the prompt (see `search::SearchPromptState`'s docs); the
         // origin `Anchor` is captured *here*, from the cursor/scroll `/`
@@ -3565,7 +3856,11 @@ fn handle_action(
                         jump_from,
                     });
                 }
-                View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+                View::File(_)
+                | View::Timeline(_)
+                | View::Log(_)
+                | View::LspInspector(_)
+                | View::Agent(_) => {
                     *goto_status = Some("search: only available in the diff view".to_owned());
                 }
             }
@@ -3602,7 +3897,11 @@ fn handle_action(
                         hover_state.invalidate();
                     }
                 }
-                View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+                View::File(_)
+                | View::Timeline(_)
+                | View::Log(_)
+                | View::LspInspector(_)
+                | View::Agent(_) => {
                     *goto_status = Some("search: only available in the diff view".to_owned());
                 }
             }
@@ -3694,7 +3993,11 @@ fn handle_action(
                     spawn_units_generation(app, pending_units, units_status);
                 }
             }
-            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+            View::File(_)
+            | View::Timeline(_)
+            | View::Log(_)
+            | View::LspInspector(_)
+            | View::Agent(_) => {
                 *goto_status = Some("units: only available in the diff view".to_owned());
             }
         },
@@ -3718,7 +4021,11 @@ fn handle_action(
                     spawn_units_generation(app, pending_units, units_status);
                 }
             }
-            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+            View::File(_)
+            | View::Timeline(_)
+            | View::Log(_)
+            | View::LspInspector(_)
+            | View::Agent(_) => {
                 *goto_status = Some("units: only available in the diff view".to_owned());
             }
         },
@@ -3743,7 +4050,11 @@ fn handle_action(
         }
         Action::OpenScopeMenu => match stack.top() {
             View::Diff(_) => *scope_menu = Some(ScopeMenuState::new_list(jj_repo.is_some())),
-            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+            View::File(_)
+            | View::Timeline(_)
+            | View::Log(_)
+            | View::LspInspector(_)
+            | View::Agent(_) => {
                 *goto_status = Some("scope: only available in the diff view".to_owned());
             }
         },
@@ -3890,7 +4201,14 @@ fn cancel_diff_view(
                 app.clear_search();
             }
         }
-        View::Diff(_) | View::File(_) | View::Timeline(_) | View::Log(_) => {
+        // `View::Agent` joins this bucket rather than getting its own
+        // top-of-`handle_action` interception the way `LspInspector` does
+        // below: unlike the inspector (which special-cases `YankSelection`
+        // too), the agent panel has no second action needing its own
+        // routing quirk, so a plain pop-on-Cancel here is all it needs —
+        // functionally identical to `AgentPanelView::update`'s own
+        // `Cancel` arm, just reached through the stack directly instead.
+        View::Diff(_) | View::File(_) | View::Timeline(_) | View::Log(_) | View::Agent(_) => {
             if stack.pop() {
                 cancel_pending_lsp_requests(hover_state, pending_hover, pending_goto, observer);
             }
@@ -3971,7 +4289,7 @@ fn open_or_close_timeline(
         // The timeline only relates to the root diff; a `FileView`/
         // `LogView` pushed on top of it (via goto-definition or `L`) has
         // nothing for `t` to open.
-        View::File(_) | View::Log(_) | View::LspInspector(_) => {}
+        View::File(_) | View::Log(_) | View::LspInspector(_) | View::Agent(_) => {}
     }
 }
 
@@ -3988,7 +4306,7 @@ fn open_or_close_log(stack: &mut ViewStack, goto_status: &mut Option<String>) {
                 Err(e) => *goto_status = Some(format!("log: {e}")),
             }
         }
-        View::File(_) | View::Timeline(_) | View::LspInspector(_) => {}
+        View::File(_) | View::Timeline(_) | View::LspInspector(_) | View::Agent(_) => {}
     }
 }
 
@@ -4009,6 +4327,40 @@ fn open_or_close_lsp_inspector(
     stack.push(View::LspInspector(lsp_inspector::LspInspectorView::new(
         observer.clone(),
         preferred,
+    )));
+}
+
+/// `Action::ToggleAgentPanel`'s handling — reachable from any view, exactly
+/// [`open_or_close_lsp_inspector`]'s own shape: re-wraps the same
+/// [`crate::acp::session::AgentHandle`] into a fresh
+/// [`agent_panel::AgentPanelView`] every time it's (re)opened, so the
+/// underlying session — which keeps running while the panel is closed, see
+/// [`crate::acp::session`]'s docs — is never touched here, only the view on
+/// top of it.
+fn open_or_close_agent_panel(
+    stack: &mut ViewStack,
+    agent_handle: &crate::acp::session::AgentHandle,
+) {
+    if let View::Agent(panel) = stack.top_mut() {
+        panel.should_quit = true;
+        return;
+    }
+    stack.push(View::Agent(agent_panel::AgentPanelView::new(
+        agent_handle.clone(),
+    )));
+}
+
+/// `Action::PushCommentsToAgent`'s counterpart to [`open_or_close_agent_panel`]
+/// that only ever *opens* — used after queuing the push prompt so the
+/// reviewer sees it land immediately. A one-line difference from the toggle
+/// above, but a deliberate one: unlike `A`, pressing `p` a second time must
+/// never close an already-open panel out from under whatever it's showing.
+fn open_agent_panel(stack: &mut ViewStack, agent_handle: &crate::acp::session::AgentHandle) {
+    if matches!(stack.top(), View::Agent(_)) {
+        return;
+    }
+    stack.push(View::Agent(agent_panel::AgentPanelView::new(
+        agent_handle.clone(),
     )));
 }
 
@@ -4836,6 +5188,8 @@ fn draw(
     hints_expanded: bool,
     geometry: &mut mouse::FrameGeometry,
     compose_keymap: &ComposeKeymap,
+    ask_compose: Option<&mut ask::AskComposeState>,
+    agent_permission: Option<&PermissionPromptState>,
 ) {
     match view {
         View::Diff(app) => {
@@ -4931,7 +5285,14 @@ fn draw(
             if let Some(state) = compose
                 && let Some(row) = view.cursor_screen_row()
             {
-                compose::render(frame, diff_area, row, state, compose_keymap);
+                let title = format!(" comment: {} ", state.target.location_label());
+                compose::render(frame, diff_area, row, state, compose_keymap, &title);
+                geometry.record(diff_area, mouse::ScrollTarget::ComposeModal);
+            }
+            if let Some(state) = ask_compose
+                && let Some(row) = view.cursor_screen_row()
+            {
+                ask::render(frame, diff_area, row, state, compose_keymap);
                 geometry.record(diff_area, mouse::ScrollTarget::ComposeModal);
             }
             if let Some(state) = scope_menu {
@@ -4998,6 +5359,9 @@ fn draw(
         View::LspInspector(inspector) => {
             inspector.render(frame, frame.area(), geometry);
         }
+        View::Agent(panel) => {
+            panel.render(frame, frame.area(), geometry);
+        }
     }
 
     // Rendered once, unconditionally, *outside* the match above rather than
@@ -5012,6 +5376,48 @@ fn draw(
     if let Some(state) = help {
         help::render(frame, frame.area(), state, keymap, geometry);
     }
+
+    // The permission-decision modal (see `PermissionPromptState`'s docs)
+    // renders last of all, for the same "must win every hit-test" reason
+    // `help` does — a permission request must be answerable, and visible,
+    // regardless of which view or overlay happened to be on top when it
+    // arrived. In practice the two never coincide (see `PermissionPromptState`'s
+    // own docs on why), so the ordering between them is only ever a
+    // defensive one, never actually exercised.
+    if let Some(prompt) = agent_permission {
+        render_permission_prompt(frame, frame.area(), prompt);
+    }
+}
+
+/// A small, centered modal: the tool the resident agent wants permission
+/// for, and the two keys that decide it. Deliberately not built on
+/// [`compose::render`]/[`ask::render`] — this has no text buffer, just a
+/// yes/no decision, so a dedicated (much smaller) widget reads more
+/// honestly than routing a non-editable prompt through the editor overlay.
+fn render_permission_prompt(frame: &mut Frame, area: Rect, prompt: &PermissionPromptState) {
+    let width = ((area.width as u32 * 3) / 5).clamp(24, area.width.max(24) as u32) as u16;
+    let height = 5u16.min(area.height.max(1));
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" agent permission ");
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let lines = vec![
+        Line::from(prompt.tool_title.clone()),
+        Line::default(),
+        Line::from(Span::styled(
+            "y / Enter allow once  ·  n / Esc reject",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 struct DiffAreas {
@@ -6497,6 +6903,9 @@ mod tests {
         let mut watch_status: Option<WatchStatus> = None;
         let mut moving_scope: Option<MovingScopeState> = None;
         let mut hints_expanded = false;
+        let agent_handle = crate::acp::session::for_test();
+        let mut ask_compose: Option<ask::AskComposeState> = None;
+        let comment_list: Vec<Comment> = Vec::new();
 
         handle_action(
             action,
@@ -6527,6 +6936,10 @@ mod tests {
             &mut moving_scope,
             &mut hints_expanded,
             observer,
+            &agent_handle,
+            &mut ask_compose,
+            None,
+            &comment_list,
         );
     }
 

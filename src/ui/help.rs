@@ -42,7 +42,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 /// `(group, one-line description)` for `action` — the help copy itself.
 /// Groups (fixed display order, see [`GROUPS`]): Navigation, Diff, LSP,
-/// Comments, View, General. Descriptions are user-facing, kept to roughly
+/// Comments, Agent, View, General. Descriptions are user-facing, kept to roughly
 /// 52 characters or under — long enough to say something real, short
 /// enough that they rarely clip even at a narrow popup width (see this
 /// module's docs on why nothing here wraps).
@@ -85,6 +85,12 @@ pub fn describe(action: Action) -> (&'static str, &'static str) {
         Action::PrevDiagnostic => ("LSP", "Jump to the previous diagnostic"),
         Action::AddComment => ("Comments", "Add a comment on this row or visual range"),
         Action::ToggleComments => ("Comments", "Show or hide inline comment bodies"),
+        Action::AskAgent => (
+            "Agent",
+            "Ask the resident agent about this line or selection",
+        ),
+        Action::ToggleAgentPanel => ("Agent", "Open or close the agent transcript panel"),
+        Action::PushCommentsToAgent => ("Agent", "Push every open review comment to the agent"),
         Action::ToggleSidebar => ("View", "Show or hide the file sidebar"),
         Action::ToggleLayout => ("View", "Toggle unified/side-by-side layout"),
         Action::ToggleTimeline => ("View", "Open or close the jj snapshot timeline"),
@@ -107,7 +113,15 @@ pub fn describe(action: Action) -> (&'static str, &'static str) {
 /// Display order for the popup's group headers — fixed, independent of
 /// [`Action`]'s own declaration order or `describe`'s match arm order,
 /// since neither is meant to double as UI layout.
-const GROUPS: [&str; 6] = ["Navigation", "Diff", "LSP", "Comments", "View", "General"];
+const GROUPS: [&str; 7] = [
+    "Navigation",
+    "Diff",
+    "LSP",
+    "Comments",
+    "Agent",
+    "View",
+    "General",
+];
 
 /// Every [`Action`] variant, once. [`crate::keymap::mod`]'s own
 /// round-trip test keeps an equivalent list, but it's private to that
@@ -148,6 +162,9 @@ const ALL_ACTIONS: &[Action] = &[
     Action::PrevDiagnostic,
     Action::AddComment,
     Action::ToggleComments,
+    Action::AskAgent,
+    Action::ToggleAgentPanel,
+    Action::PushCommentsToAgent,
     Action::ToggleSidebar,
     Action::ToggleLayout,
     Action::ToggleTimeline,

@@ -15,6 +15,9 @@ An unrecognized key warns once to stderr and is otherwise ignored — a
 typo or a field from a newer katamari version never stops a session from
 starting. All sections are optional.
 
+One exception to "later wins per field": `[agent] adapter` (below) is
+honored only from the home file, never the repo file — see its own note.
+
 ```toml
 # Which built-in keymap preset to start from.
 keymap = "vim"  # or "emacs"
@@ -135,4 +138,21 @@ claude_effort = "high"
 # configuration in charge.
 # codex_model = "gpt-5-codex"
 # codex_effort = "medium"
+
+[agent]
+# The command that speaks ACP (Agent Client Protocol) for `a`/`A`/`p` (see
+# "Ask the agent" in the Keybindings chapter) — split on whitespace
+# (program, then args). Unset resolves `claude-agent-acp` on PATH, then
+# `npx -y @agentclientprotocol/claude-agent-acp`.
+#
+# Honored ONLY from this home file, never a repo-local
+# .katamari/config.toml, unlike every other section on this page —
+# deliberately: `adapter` is an unrestricted shell command, so allowing a
+# repo-local file to set it would let a cloned repository silently choose
+# which command every `ktmr diff` session in that clone executes, the
+# moment you open it. `[units] agent` above has no such risk (it only ever
+# picks between two already-installed, well-known binaries by name); a
+# repo-local `[agent]` table is parsed just enough to warn about it, then
+# discarded.
+# adapter = "claude-agent-acp"
 ```

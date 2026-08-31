@@ -213,6 +213,13 @@ pub struct Config {
     /// *something*, in config or through that popup (which writes
     /// config), after which asking again would be nagging.
     pub units_configured: bool,
+    /// `[agent]` — the resident ACP agent session's own tuning (see
+    /// [`crate::acp::session`]). Unset means [`crate::acp::adapter::resolve`]'s
+    /// own PATH→npx fallback, exactly `agent-check --adapter`'s absence
+    /// today. See [`AgentConfig`]'s own docs for why this is honored only
+    /// from the *global* config file, never a repo-local one — unlike
+    /// every other field on this struct.
+    pub agent: AgentConfig,
 }
 
 /// `[units] claude_model`'s default. The evergreen alias, not a pinned
@@ -266,6 +273,29 @@ impl Default for UnitsConfig {
     }
 }
 
+/// The `[agent]` table — tuning for the resident ACP agent session (see
+/// [`crate::acp::session`]), not to be confused with `[units].agent`
+/// (which only ever picks between two already-installed, well-known
+/// binaries by name). `adapter` is a whitespace-split, unrestricted shell
+/// command — [`crate::acp::adapter::resolve`]'s own docs — resolved the
+/// same way `agent-check --adapter` already works.
+///
+/// This table is honored **only** out of the user's global
+/// `~/.config/katamari/config.toml`; a `[agent]` table found in a
+/// repo-local `.katamari/config.toml` is parsed (so it can still be
+/// flagged) but discarded before merging, with a warning — see
+/// [`merge_from_file`]'s `allow_agent` parameter. `[units]`'s CLI override
+/// is safe to take from either location because it only ever chooses
+/// between `claude`/`codex`, both already-installed binaries a reviewer
+/// trusts independently of this repo; `[agent].adapter` has no such
+/// restriction; without this asymmetry, a file that ships inside a cloned
+/// repository could silently point every `ktmr diff` session opened in
+/// that clone at an arbitrary executable.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AgentConfig {
+    pub adapter: Option<String>,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -286,6 +316,7 @@ impl Default for Config {
             offer_install: true,
             units: UnitsConfig::default(),
             units_configured: false,
+            agent: AgentConfig::default(),
         }
     }
 }
@@ -325,6 +356,7 @@ pub(crate) struct RawFile {
     update: Option<RawUpdate>,
     skill: Option<RawSkill>,
     units: Option<RawUnits>,
+    agent: Option<RawAgent>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -384,8 +416,14 @@ struct RawUnits {
     codex_effort: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawAgent {
+    adapter: Option<String>,
+}
+
 const TOP_LEVEL_KEYS: &[&str] = &[
-    "keymap", "keys", "lsp", "ui", "watch", "update", "skill", "units",
+    "keymap", "keys", "lsp", "ui", "watch", "update", "skill", "units", "agent",
 ];
 const LSP_KEYS: &[&str] = &["servers", "auto_install", "logging"];
 const LOGGING_KEYS: &[&str] = &[
@@ -421,6 +459,7 @@ const UNITS_KEYS: &[&str] = &[
     "codex_model",
     "codex_effort",
 ];
+const AGENT_KEYS: &[&str] = &["adapter"];
 
 /// Merges `overlay`'s present fields onto `base`, in place — the field-level
 /// (not whole-file) precedence rule the module docs describe: a file that
@@ -527,6 +566,16 @@ fn merge_raw(base: &mut RawFile, overlay: RawFile) {
             base_units.codex_effort = overlay_units.codex_effort;
         }
     }
+    // `overlay.agent` has already been stripped out by `merge_from_file`
+    // for a repo-local file by the time this runs (see `AgentConfig`'s own
+    // docs on why) — this merge arm itself doesn't need to know which file
+    // `overlay` came from, only how to fold in whatever's left.
+    if let Some(overlay_agent) = overlay.agent {
+        let base_agent = base.agent.get_or_insert_with(RawAgent::default);
+        if overlay_agent.adapter.is_some() {
+            base_agent.adapter = overlay_agent.adapter;
+        }
+    }
 }
 
 /// Loads and merges every config file that exists for `repo_root` (see the
@@ -540,18 +589,35 @@ fn merge_raw(base: &mut RawFile, overlay: RawFile) {
 pub fn load_merged(repo_root: &Path) -> Config {
     let mut raw = RawFile::default();
     if let Some(home_path) = home_config_path() {
-        merge_from_file(&mut raw, &home_path);
+        merge_from_file(&mut raw, &home_path, true);
     }
     let repo_path = repo_root.join(".katamari").join("config.toml");
-    merge_from_file(&mut raw, &repo_path);
+    merge_from_file(&mut raw, &repo_path, false);
     finalize(raw)
 }
 
-fn merge_from_file(base: &mut RawFile, path: &Path) {
+/// `allow_agent` is `false` for a repo-local `.katamari/config.toml` and
+/// `true` for the global `~/.config/katamari/config.toml` — see
+/// [`AgentConfig`]'s docs on why `[agent]` is the one table this asymmetry
+/// applies to. A repo-local `[agent]` table is still parsed (so
+/// [`warn_unknown_keys`] can flag a genuinely misspelled key inside it) but
+/// discarded, with its own warning, before it ever reaches [`merge_raw`].
+fn merge_from_file(base: &mut RawFile, path: &Path, allow_agent: bool) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return; // absent (or unreadable) config file: not an error, just nothing to merge
     };
-    merge_raw(base, parse_and_warn(path, &text));
+    let mut overlay = parse_and_warn(path, &text);
+    if !allow_agent && overlay.agent.is_some() {
+        overlay.agent = None;
+        eprintln!(
+            "katamari: warning: {}: [agent] is ignored here — the agent adapter is only \
+             honored from the global config (~/.config/katamari/config.toml), never a \
+             repo-local one, so a cloned repository can never silently choose which command a \
+             review session executes",
+            path.display()
+        );
+    }
+    merge_raw(base, overlay);
 }
 
 pub(crate) fn home_config_path() -> Option<PathBuf> {
@@ -710,6 +776,9 @@ fn warn_unknown_keys(path: &Path, table: &toml::Table, warnings: &mut Vec<String
     if let Some(units) = table.get("units").and_then(toml::Value::as_table) {
         warn_extra(path, "units.", units, UNITS_KEYS, warnings);
     }
+    if let Some(agent) = table.get("agent").and_then(toml::Value::as_table) {
+        warn_extra(path, "agent.", agent, AGENT_KEYS, warnings);
+    }
 }
 
 fn warn_extra(
@@ -774,6 +843,11 @@ fn finalize(raw: RawFile) -> Config {
         codex_effort: units_raw.codex_effort,
     };
     let logging = lsp.logging.unwrap_or_default();
+    // No vocabulary to validate `adapter` against — pass through verbatim,
+    // same stance `units.claude_model` takes (see its own docs).
+    let agent = AgentConfig {
+        adapter: raw.agent.unwrap_or_default().adapter,
+    };
     Config {
         keymap,
         key_overrides: raw.keys.unwrap_or_default(),
@@ -800,6 +874,7 @@ fn finalize(raw: RawFile) -> Config {
         offer_install: skill.offer_install.unwrap_or(true),
         units,
         units_configured,
+        agent,
     }
 }
 

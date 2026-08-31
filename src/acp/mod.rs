@@ -20,4 +20,5 @@
 pub mod adapter;
 pub mod check;
 pub mod client;
+pub mod session;
 pub mod transport;

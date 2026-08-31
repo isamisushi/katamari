@@ -19,6 +19,8 @@ mod support;
 // one file.
 #[path = "e2e/agent_check.rs"]
 mod agent_check;
+#[path = "e2e/agent_panel.rs"]
+mod agent_panel;
 #[path = "e2e/compose.rs"]
 mod compose;
 #[path = "e2e/context_menu.rs"]

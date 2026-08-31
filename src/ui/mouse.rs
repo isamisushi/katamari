@@ -531,7 +531,11 @@ fn handle_files_click(
             col,
             row,
         ),
-        View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => None,
+        View::File(_)
+        | View::Timeline(_)
+        | View::Log(_)
+        | View::LspInspector(_)
+        | View::Agent(_) => None,
     }) else {
         return;
     };
@@ -542,7 +546,11 @@ fn handle_files_click(
         // `Some` inside the `View::Diff` arm — but `stack.top_mut()` is a
         // second, independent lookup, so this stays exhaustive rather than
         // assuming the view didn't change between the two calls.
-        View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => return,
+        View::File(_)
+        | View::Timeline(_)
+        | View::Log(_)
+        | View::LspInspector(_)
+        | View::Agent(_) => return,
     };
     if let FilesConfirmOutcome::Opened(to) = outcome {
         record_jump(jump_stack, from, Some(to));
@@ -593,7 +601,11 @@ fn handle_diff_pane_click(
         // from `draw`'s `View::Diff` arm — unreachable in practice, same
         // defensiveness as `handle_files_click`'s identical `View::File`
         // fallback above.
-        View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => return false,
+        View::File(_)
+        | View::Timeline(_)
+        | View::Log(_)
+        | View::LspInspector(_)
+        | View::Agent(_) => return false,
     };
     if stack.top().hover_cursor_key() != before_hover {
         hover_state.invalidate();
@@ -643,7 +655,11 @@ fn handle_file_pane_click(
     let from = stack.top().jump_entry();
     let matched = match stack.top_mut() {
         View::File(file) => file.position_cursor_from_click(resolved.row_idx, resolved.display_col),
-        View::Diff(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => return false,
+        View::Diff(_)
+        | View::Timeline(_)
+        | View::Log(_)
+        | View::LspInspector(_)
+        | View::Agent(_) => return false,
     };
     if stack.top().hover_cursor_key() != before_hover {
         hover_state.invalidate();
@@ -773,9 +789,11 @@ pub fn handle_right_click(
                     VisibleKind::File { .. } => RightClickOutcome::Target(MenuTarget::TreeFile),
                 }
             }
-            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
-                RightClickOutcome::Miss
-            }
+            View::File(_)
+            | View::Timeline(_)
+            | View::Log(_)
+            | View::LspInspector(_)
+            | View::Agent(_) => RightClickOutcome::Miss,
         },
         Some((_, ScrollTarget::DiffPane)) => {
             diff_pane_menu_target(geometry, stack, hover_state, col, row)
@@ -816,7 +834,11 @@ fn diff_pane_menu_target(
         View::Diff(app) => {
             app.position_cursor_from_click(resolved.row_idx, resolved.display_col);
         }
-        View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+        View::File(_)
+        | View::Timeline(_)
+        | View::Log(_)
+        | View::LspInspector(_)
+        | View::Agent(_) => {
             return RightClickOutcome::Miss;
         }
     }
@@ -845,7 +867,11 @@ fn file_pane_menu_target(
         View::File(file) => {
             file.position_cursor_from_click(resolved.row_idx, resolved.display_col);
         }
-        View::Diff(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
+        View::Diff(_)
+        | View::Timeline(_)
+        | View::Log(_)
+        | View::LspInspector(_)
+        | View::Agent(_) => {
             return RightClickOutcome::Miss;
         }
     }

@@ -2,16 +2,34 @@
 """A minimal ACP agent for the E2E suite.
 
 Speaks just enough of ACP v1 (newline-delimited JSON-RPC 2.0 over stdio)
-for `tests/e2e/agent_check.rs` to prove the whole client loop against a
-real subprocess: answer `initialize` and `session/new` (advertising an
-`acceptEdits` mode so the client's mode-selection path runs), then on
+for `tests/e2e/agent_check.rs` (a headless single-turn `ktmr agent-check`
+run) and `tests/e2e/agent_panel.rs` (the resident TUI session, many turns
+across one process) to prove the whole client loop against a real
+subprocess: answer `initialize` and `session/new` (advertising an
+`acceptEdits` mode so the client's mode-selection path runs), then on each
 `session/prompt` stream a couple of `session/update` notifications, raise
-one `session/request_permission` for a fake edit, and — only if the
-client grants it — write `acp-marker.txt` into the cwd before finishing
-the turn with `end_turn`. The marker file is the point: it exists on disk
-iff the permission round trip actually gated the "edit", which is the
-property the E2E test asserts. A rejected permission ends the turn with
-`refusal` and writes nothing.
+one `session/request_permission` for a fake edit, and — only if the client
+grants it — write a marker file into the cwd before finishing the turn
+with `end_turn`. The marker file is the point: it exists on disk iff the
+permission round trip actually gated the "edit", which is the property
+both E2E suites assert. A rejected permission ends the turn with `refusal`
+and writes nothing.
+
+Two markers are written on a grant, not one: the always-same-named
+`acp-marker.txt` (`agent_check.rs`'s own original assertion, kept exactly
+as it was) and a per-turn-unique `acp-marker-<n>.txt` (`agent_panel.rs`'s
+multi-turn-on-one-session tests, which need turn N's own witness
+independent of turn N-1's without the second turn's grant clobbering the
+first turn's file). `n` is a plain in-process counter — this script never
+forks, so a module-level counter is exactly as safe as a real per-session
+turn counter would be.
+
+The first `agent_message_chunk` (`"reading the review comments"`) is
+`agent_check.rs`'s own original text, kept verbatim; a second chunk right
+after it echoes the received prompt's own text
+(`f"received: {text[:80]}"`) so `agent_panel.rs` can assert on constructed
+prompt context (the ask template, or `check::DEFAULT_PROMPT`'s exact text)
+without parsing raw JSON-RPC off the wire.
 
 Unlike `fake_lsp_server.py` there are no timing knobs: the ACP client has
 no readiness gate to race, so the fixture only needs protocol shape, not
@@ -21,6 +39,8 @@ than being left to hang, for the same reason the LSP fake does it.
 
 import json
 import sys
+
+_turn = 0
 
 
 def send(obj):
@@ -50,7 +70,17 @@ def send_update(session_id, update):
 
 
 def handle_prompt(msg):
+    global _turn
+    _turn += 1
+    turn = _turn
+    tool_call_id = f"tc-{turn}"
     session_id = msg["params"]["sessionId"]
+    prompt_text = ""
+    try:
+        prompt_text = msg["params"]["prompt"][0]["text"]
+    except (KeyError, IndexError, TypeError):
+        pass
+
     send_update(
         session_id,
         {
@@ -61,8 +91,15 @@ def handle_prompt(msg):
     send_update(
         session_id,
         {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": f"received: {prompt_text[:80]}"},
+        },
+    )
+    send_update(
+        session_id,
+        {
             "sessionUpdate": "tool_call",
-            "toolCallId": "tc-1",
+            "toolCallId": tool_call_id,
             "title": "Edit acp-marker.txt",
             "kind": "edit",
             "status": "pending",
@@ -71,11 +108,11 @@ def handle_prompt(msg):
     send(
         {
             "jsonrpc": "2.0",
-            "id": 1000,
+            "id": 1000 + turn,
             "method": "session/request_permission",
             "params": {
                 "sessionId": session_id,
-                "toolCall": {"toolCallId": "tc-1", "title": "Edit acp-marker.txt"},
+                "toolCall": {"toolCallId": tool_call_id, "title": "Edit acp-marker.txt"},
                 "options": [
                     {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
                     {"optionId": "reject", "name": "Reject", "kind": "reject_once"},
@@ -91,9 +128,15 @@ def handle_prompt(msg):
     if granted:
         with open("acp-marker.txt", "w") as f:
             f.write("edited after permission was granted\n")
+        with open(f"acp-marker-{turn}.txt", "w") as f:
+            f.write("edited after permission was granted\n")
         send_update(
             session_id,
-            {"sessionUpdate": "tool_call_update", "toolCallId": "tc-1", "status": "completed"},
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": tool_call_id,
+                "status": "completed",
+            },
         )
         send_update(
             session_id,
@@ -106,7 +149,11 @@ def handle_prompt(msg):
     else:
         send_update(
             session_id,
-            {"sessionUpdate": "tool_call_update", "toolCallId": "tc-1", "status": "failed"},
+            {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": tool_call_id,
+                "status": "failed",
+            },
         )
         send({"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "refusal"}})
 

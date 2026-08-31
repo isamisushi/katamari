@@ -499,11 +499,14 @@ fn visual_row_for(line_ranges: &[Vec<Range<usize>>], row: usize, sub_row: usize)
     rows_before + sub_row
 }
 
-/// Advances `state.scroll_offset` to keep the cursor's *visual* row —
+/// Advances `*scroll_offset` to keep the cursor's *visual* row —
 /// `cursor_visual_row`, its wrapped sub-row counted across the whole
 /// buffer, not just which logical line it's on — inside a `text_height`-row
-/// window. Split out from [`render`] so scroll-follow is testable without a
-/// `ratatui::Frame`.
+/// window. Split out from [`render_editor`] so scroll-follow is testable
+/// without a `ratatui::Frame`. Takes the offset directly rather than a
+/// `&mut ComposeState` — the only thing this function ever touched — so
+/// [`render_editor`] can share it between [`ComposeState`]'s own field and
+/// [`crate::ui::ask::AskComposeState`]'s equivalent one.
 ///
 /// This is plain sliding-window arithmetic, not
 /// [`crate::ui::scroll::clamp_scroll`]: that function's `row_height`
@@ -526,18 +529,18 @@ fn visual_row_for(line_ranges: &[Vec<Range<usize>>], row: usize, sub_row: usize)
 /// [`total_visual_rows`] is what keeps a shrinking buffer or a widened
 /// terminal from leaving the offset stranded past the end.
 fn follow_cursor(
-    state: &mut ComposeState,
+    scroll_offset: &mut usize,
     line_ranges: &[Vec<Range<usize>>],
     cursor_visual_row: usize,
     text_height: usize,
 ) {
-    if cursor_visual_row < state.scroll_offset {
-        state.scroll_offset = cursor_visual_row;
-    } else if cursor_visual_row >= state.scroll_offset + text_height {
-        state.scroll_offset = cursor_visual_row + 1 - text_height;
+    if cursor_visual_row < *scroll_offset {
+        *scroll_offset = cursor_visual_row;
+    } else if cursor_visual_row >= *scroll_offset + text_height {
+        *scroll_offset = cursor_visual_row + 1 - text_height;
     }
     let total = total_visual_rows(line_ranges);
-    state.scroll_offset = state.scroll_offset.min(total.saturating_sub(text_height));
+    *scroll_offset = (*scroll_offset).min(total.saturating_sub(text_height));
 }
 
 /// Draws the overlay near `cursor_screen_row`, reusing
@@ -561,29 +564,83 @@ fn follow_cursor(
 /// display row would mean up/down sometimes lands mid-line depending on
 /// where earlier lines happened to wrap, a surprise this overlay's small,
 /// prose-shaped buffers don't need to take on.
+/// `title` is the overlay's border title, verbatim — this call site passes
+/// `state.target.location_label()` (formatted as `" comment: <location> "`
+/// by the caller in `ui::mod`); [`crate::ui::ask`]'s own overlay reuses
+/// [`render_editor`] below with a `" ask: <location> "` title instead — the
+/// only thing that differs between the two overlays, which is the point of
+/// splitting the title (and the buffer/scroll-offset it operates on) out of
+/// this function rather than duplicating it.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     cursor_screen_row: u16,
     state: &mut ComposeState,
     keys: &ComposeKeymap,
+    title: &str,
+) {
+    render_editor(
+        frame,
+        area,
+        cursor_screen_row,
+        &mut state.buffer,
+        &mut state.scroll_offset,
+        keys,
+        title,
+    );
+}
+
+/// The actual overlay body — everything [`render`] used to do once its one
+/// [`ComposeState`]-specific line (the title derivation) is gone: given
+/// just a buffer, a scroll offset, and a title, this doesn't know or care
+/// whether it's drawing a saved-comment editor or [`crate::ui::ask`]'s
+/// one-shot question editor. `pub(crate)` (not `pub`) — this module's own
+/// `render` is still the one real entry point for [`ComposeState`]; `ask`
+/// is the only other caller, and it lives in this same crate.
+///
+/// Issue #29: long lines soft-wrap at the panel's content width (no
+/// gutter here, unlike the diff pane, so that's simply `inner.width`) and
+/// the panel scroll-follows the cursor's *visual* row via
+/// [`follow_cursor`] — mutable access to `scroll_offset` is only for that
+/// scroll bookkeeping, never the buffer text itself, which stays exactly
+/// what [`handle_key`] left it as. Because the offset is now
+/// visual-row-granular (see [`ComposeState::scroll_offset`]'s doc comment),
+/// the row-emission loop below walks the buffer's wrapped rows as one flat
+/// `(line_idx, sub_idx)` sequence and can start mid-line — the window shown
+/// is whatever `text_height` rows begin at `*scroll_offset` in that
+/// sequence, not always a run of whole lines from their own first wrapped
+/// row. Cursor *movement* (`ComposeBuffer::move_up`/`move_down`)
+/// deliberately stays logical-line based rather than visual-row based:
+/// jumping by wrapped display row would mean up/down sometimes lands
+/// mid-line depending on where earlier lines happened to wrap, a surprise
+/// this overlay's small, prose-shaped buffers don't need to take on.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_editor(
+    frame: &mut Frame,
+    area: Rect,
+    cursor_screen_row: u16,
+    buffer: &mut ComposeBuffer,
+    scroll_offset: &mut usize,
+    keys: &ComposeKeymap,
+    title: &str,
 ) {
     let rect = popup_rect(area, cursor_screen_row);
     frame.render_widget(Clear, rect);
 
-    let title = format!(" comment: {} ", state.target.location_label());
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title.to_owned());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
     let text_height = inner.height.saturating_sub(1) as usize; // last row is the hint
     let width = inner.width as usize;
 
-    let line_ranges = wrap_lines(&state.buffer, width);
-    let (cursor_row, cursor_col) = state.buffer.cursor();
+    let line_ranges = wrap_lines(buffer, width);
+    let (cursor_row, cursor_col) = buffer.cursor();
     let cursor_sub_row = wrap_row_for_col(&line_ranges[cursor_row], cursor_col);
     let cursor_visual_row = visual_row_for(&line_ranges, cursor_row, cursor_sub_row);
-    follow_cursor(state, &line_ranges, cursor_visual_row, text_height);
+    follow_cursor(scroll_offset, &line_ranges, cursor_visual_row, text_height);
 
     // Flatten every line's wrapped rows into one `(line_idx, sub_idx,
     // range)` sequence and take the `text_height`-row window starting at
@@ -600,10 +657,10 @@ pub fn render(
                 .enumerate()
                 .map(move |(sub_idx, range)| (line_idx, sub_idx, range))
         })
-        .skip(state.scroll_offset)
+        .skip(*scroll_offset)
         .take(text_height)
         .map(|(line_idx, sub_idx, range)| {
-            let text = &state.buffer.lines()[line_idx];
+            let text = &buffer.lines()[line_idx];
             let sub_text = char_range_str(text, range);
             if line_idx == cursor_row && sub_idx == cursor_sub_row {
                 cursor_marked_line(sub_text, cursor_col - range.start)
@@ -1141,7 +1198,7 @@ mod tests {
         let text_height = 2;
 
         let (ranges, _, visual) = cursor_visual(&state, width);
-        follow_cursor(&mut state, &ranges, visual, text_height);
+        follow_cursor(&mut state.scroll_offset, &ranges, visual, text_height);
         assert_eq!(
             state.scroll_offset, 0,
             "cursor sits on line0's own first wrapped row (visual row 0), \
@@ -1150,7 +1207,7 @@ mod tests {
 
         state.buffer.move_down(); // cursor -> line1 (visual row 2)
         let (ranges, _, visual) = cursor_visual(&state, width);
-        follow_cursor(&mut state, &ranges, visual, text_height);
+        follow_cursor(&mut state.scroll_offset, &ranges, visual, text_height);
         assert_eq!(
             state.scroll_offset, 1,
             "line1's visual row (2) needs a 2-row window starting at 1 to \
@@ -1159,7 +1216,7 @@ mod tests {
 
         state.buffer.move_down(); // cursor -> line2 (visual row 3)
         let (ranges, _, visual) = cursor_visual(&state, width);
-        follow_cursor(&mut state, &ranges, visual, text_height);
+        follow_cursor(&mut state.scroll_offset, &ranges, visual, text_height);
         assert_eq!(
             state.scroll_offset, 2,
             "line2's visual row (3) needs the window to advance to [2, 4) — \
@@ -1170,7 +1227,7 @@ mod tests {
         state.buffer.move_up();
         state.buffer.move_up(); // cursor -> line0 (visual row 0)
         let (ranges, _, visual) = cursor_visual(&state, width);
-        follow_cursor(&mut state, &ranges, visual, text_height);
+        follow_cursor(&mut state.scroll_offset, &ranges, visual, text_height);
         assert_eq!(
             state.scroll_offset, 0,
             "cursor moved above the visible window snaps the offset \
@@ -1193,7 +1250,7 @@ mod tests {
         for c in "abcdefghijklmno".chars() {
             state.buffer.insert_char(c);
             let (ranges, sub_row, visual) = cursor_visual(&state, width);
-            follow_cursor(&mut state, &ranges, visual, text_height);
+            follow_cursor(&mut state.scroll_offset, &ranges, visual, text_height);
 
             let (cursor_row, _) = state.buffer.cursor();
             assert!(
@@ -1235,7 +1292,7 @@ mod tests {
             state.buffer.insert_char(c);
         }
         let (ranges, _, visual) = cursor_visual(&state, width);
-        follow_cursor(&mut state, &ranges, visual, text_height);
+        follow_cursor(&mut state.scroll_offset, &ranges, visual, text_height);
         assert!(
             state.scroll_offset > 0,
             "typing past the panel's height must have scrolled forward"
@@ -1246,7 +1303,7 @@ mod tests {
         }
         let (ranges, _, visual) = cursor_visual(&state, width);
         assert_eq!(visual, 0, "cursor is back at the very start of the line");
-        follow_cursor(&mut state, &ranges, visual, text_height);
+        follow_cursor(&mut state.scroll_offset, &ranges, visual, text_height);
         assert_eq!(
             state.scroll_offset, 0,
             "moving the cursor back above the visible window must scroll \
@@ -1278,7 +1335,7 @@ mod tests {
         let mut offsets = Vec::new();
         for _ in 0..6 {
             let (ranges, _, visual) = cursor_visual(&state, width);
-            follow_cursor(&mut state, &ranges, visual, text_height);
+            follow_cursor(&mut state.scroll_offset, &ranges, visual, text_height);
             offsets.push(state.scroll_offset);
             state.buffer.move_down();
         }
@@ -1329,7 +1386,14 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render(frame, area, 0, &mut state, &ComposeKeymap::default());
+                render(
+                    frame,
+                    area,
+                    0,
+                    &mut state,
+                    &ComposeKeymap::default(),
+                    " comment: a.rs:1 ",
+                );
             })
             .unwrap();
 

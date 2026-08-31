@@ -266,6 +266,39 @@ pub enum Action {
     /// [`crate::ui::view::View::Diff`]/the inspector's Journal focus,
     /// mirroring `ToggleVisualLine`.
     YankSelection,
+    /// Asks the resident ACP agent (see [`crate::acp::session`]) about the
+    /// cursor's current row, or a whole visual selection when one is active
+    /// — opens a compose-style overlay for the question, reusing
+    /// [`crate::ui::compose::handle_key`] verbatim (see
+    /// [`crate::ui::ask::AskComposeState`]). `ui::mod`'s event loop
+    /// intercepts this rather than forwarding it through `App::update`: it
+    /// needs the agent handle and the diff's rows/files to build the
+    /// question's context, neither of which `App` owns. Deliberately
+    /// *looser* than `AddComment`'s eligibility — any selectable line on
+    /// *any* diff (including a historical/read-only one) is fair game, the
+    /// same stance `ToggleVisualLine`/`YankSelection` already take, since a
+    /// one-shot question has none of a saved comment's need to survive
+    /// being re-anchored later. A no-op outside
+    /// [`crate::ui::view::View::Diff`], or when there's nothing selectable
+    /// under the cursor.
+    AskAgent,
+    /// Opens or closes the live agent transcript panel — like
+    /// `ToggleLspInspector`, reachable from any view, and the underlying
+    /// session keeps running while the panel is closed (see
+    /// [`crate::acp::session::AgentStore`]'s docs): this only toggles
+    /// whether the transcript is currently on screen, never the session
+    /// itself.
+    ToggleAgentPanel,
+    /// Pushes every open review comment to the resident agent, using the
+    /// same [`crate::acp::check`] `DEFAULT_PROMPT` text `ktmr agent-check`
+    /// sends — one shared prompt, not two that could drift. `ui::mod`
+    /// intercepts this the same way `ToggleAgentPanel` is intercepted (it
+    /// needs the agent handle and the loaded comment list, neither of
+    /// which `App` owns); gated only on a comments repo root being known
+    /// at all, not on `View::Diff`, since pushing touches no per-row `App`
+    /// state — reachable from any view once a session has one, mirroring
+    /// `ToggleAgentPanel`'s own universality.
+    PushCommentsToAgent,
 }
 
 /// One key press, normalized for matching: the SHIFT modifier is dropped
@@ -699,6 +732,9 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("N", Action::PrevMatch),
         ("z o", Action::ExpandFold),
         ("z c", Action::CollapseFold),
+        ("a", Action::AskAgent),
+        ("A", Action::ToggleAgentPanel),
+        ("p", Action::PushCommentsToAgent),
         ("q", Action::Quit),
         ("?", Action::OpenHelp),
     ]);
@@ -817,6 +853,13 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         // fit to be worth a different binding here).
         ("z o", Action::ExpandFold),
         ("z c", Action::CollapseFold),
+        // Same vim-keys-for-things-with-no-emacs-identity rule as `V`/`y`
+        // above: the resident-agent actions have no emacs convention of
+        // their own to defer to, so this preset reuses vim's `a`/`A`/`p`
+        // verbatim.
+        ("a", Action::AskAgent),
+        ("A", Action::ToggleAgentPanel),
+        ("p", Action::PushCommentsToAgent),
         ("q", Action::Quit),
         // Same vim-keys-for-things-with-no-emacs-identity rule as `q`/`b`/
         // `s` above: `?` is unbound and not a prefix of anything else in
@@ -892,6 +935,9 @@ pub fn action_name(action: Action) -> &'static str {
         Action::ToggleDirectory => "toggle-directory",
         Action::ToggleVisualLine => "toggle-visual-line",
         Action::YankSelection => "yank-selection",
+        Action::AskAgent => "ask-agent",
+        Action::ToggleAgentPanel => "toggle-agent-panel",
+        Action::PushCommentsToAgent => "push-comments-to-agent",
     }
 }
 
@@ -946,6 +992,9 @@ pub fn action_by_name(name: &str) -> Option<Action> {
         "toggle-directory" => Action::ToggleDirectory,
         "toggle-visual-line" => Action::ToggleVisualLine,
         "yank-selection" => Action::YankSelection,
+        "ask-agent" => Action::AskAgent,
+        "toggle-agent-panel" => Action::ToggleAgentPanel,
+        "push-comments-to-agent" => Action::PushCommentsToAgent,
         _ => return None,
     })
 }
@@ -1359,6 +1408,9 @@ mod tests {
             Action::ToggleDirectory,
             Action::ToggleVisualLine,
             Action::YankSelection,
+            Action::AskAgent,
+            Action::ToggleAgentPanel,
+            Action::PushCommentsToAgent,
         ];
         for action in all {
             let name = action_name(action);
@@ -1539,7 +1591,7 @@ mod tests {
     /// `open_help_binds_to_plain_question_mark_in_both_presets` test.
     #[test]
     fn every_vim_and_emacs_binding_covers_every_action_exactly_once() {
-        const ACTION_COUNT: usize = 45;
+        const ACTION_COUNT: usize = 48;
         for ci_distinguishable in [false, true] {
             for preset in [
                 vim_preset(ci_distinguishable),

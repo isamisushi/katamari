@@ -361,6 +361,22 @@ pub fn diff_view_items(keymap: &Keymap, expanded: bool) -> Vec<HintItem> {
         // a search is confirmed.
         HintItem::for_actions(keymap, &[Action::ToggleVisualLine], "visual"),
         HintItem::for_actions(keymap, &[Action::YankSelection], "yank"),
+        // Lowest-priority tail, alongside `visual`/`yank`: asking/opening
+        // the resident agent means nothing until a reviewer has selected
+        // something and gone looking for `?` — same reasoning as `n`/`N`/
+        // `V`/`y` above. One combined item (`a`/`A` share the "agent"
+        // label, the same "related-but-different actions, one hint" shape
+        // `u`/`U` already use for units) rather than two separate ones —
+        // real estate at a realistic terminal width is scarce enough here
+        // that quit/the toggle must still win it (see
+        // `fold_and_help_hints_do_not_push_quit_off_the_status_bar_at_a_realistic_width`).
+        // `PushCommentsToAgent` (`p`) gets no hint item of its own for the
+        // same reason `n`/`N` don't: `?` is where it's documented.
+        HintItem::for_actions(
+            keymap,
+            &[Action::AskAgent, Action::ToggleAgentPanel],
+            "agent",
+        ),
         HintItem::for_actions(keymap, &[Action::Quit], "quit"),
         toggle_item(keymap, true),
     ]

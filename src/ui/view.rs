@@ -7,6 +7,7 @@
 
 use crate::keymap::Action;
 use crate::lsp::DiagnosticsStore;
+use crate::ui::agent_panel::AgentPanelView;
 use crate::ui::app::App;
 use crate::ui::file_view::FileView;
 use crate::ui::hover_popup::HoverQuery;
@@ -25,6 +26,11 @@ pub enum View {
     Timeline(TimelineView),
     Log(LogView),
     LspInspector(LspInspectorView),
+    /// The resident ACP agent's transcript (see [`crate::acp::session`]) —
+    /// like `LspInspector`, a full-screen, closable, reopenable window onto
+    /// state that lives outside this view entirely: popping it off the
+    /// stack never touches the underlying session.
+    Agent(AgentPanelView),
 }
 
 impl View {
@@ -43,6 +49,7 @@ impl View {
             View::Timeline(timeline) => timeline.should_quit,
             View::Log(log) => log.should_quit,
             View::LspInspector(inspector) => inspector.should_quit,
+            View::Agent(panel) => panel.should_quit,
         }
     }
 
@@ -53,6 +60,7 @@ impl View {
             View::Timeline(timeline) => timeline.update(action),
             View::Log(log) => log.update(action),
             View::LspInspector(inspector) => inspector.update(action),
+            View::Agent(panel) => panel.update(action),
         }
     }
 
@@ -63,6 +71,7 @@ impl View {
             View::Timeline(timeline) => timeline.set_viewport_height(height),
             View::Log(log) => log.set_viewport_height(height),
             View::LspInspector(inspector) => inspector.set_viewport_height(height),
+            View::Agent(panel) => panel.set_viewport_height(height),
         }
     }
 
@@ -78,6 +87,7 @@ impl View {
             View::File(file) => file.set_content_width(width),
             View::Timeline(_) | View::Log(_) => {}
             View::LspInspector(inspector) => inspector.set_content_width(width),
+            View::Agent(panel) => panel.set_content_width(width),
         }
     }
 
@@ -88,6 +98,7 @@ impl View {
             View::Timeline(timeline) => timeline.pending_keys = keys,
             View::Log(log) => log.pending_keys = keys,
             View::LspInspector(inspector) => inspector.pending_keys = keys,
+            View::Agent(panel) => panel.pending_keys = keys,
         }
     }
 
@@ -105,6 +116,7 @@ impl View {
             View::Timeline(timeline) => timeline.hover_query(),
             View::Log(log) => log.hover_query(),
             View::LspInspector(inspector) => inspector.hover_query(),
+            View::Agent(panel) => panel.hover_query(),
         }
     }
 
@@ -120,7 +132,7 @@ impl View {
         match self {
             View::Diff(app) => app.hover_query_at(row_idx, display_col),
             View::File(file) => file.hover_query_at(row_idx, display_col),
-            View::Timeline(_) | View::Log(_) | View::LspInspector(_) => None,
+            View::Timeline(_) | View::Log(_) | View::LspInspector(_) | View::Agent(_) => None,
         }
     }
 
@@ -136,6 +148,7 @@ impl View {
             View::Timeline(timeline) => timeline.cursor_key(),
             View::Log(log) => log.cursor_key(),
             View::LspInspector(inspector) => inspector.cursor_key(),
+            View::Agent(panel) => panel.cursor_key(),
         }
     }
 
@@ -151,7 +164,9 @@ impl View {
             // Never opens a hover popup — see `TimelineView::hover_query`'s
             // / `LogView::hover_query`'s docs — so there's no anchor row to
             // report here.
-            View::Timeline(_) | View::Log(_) | View::LspInspector(_) => return None,
+            View::Timeline(_) | View::Log(_) | View::LspInspector(_) | View::Agent(_) => {
+                return None;
+            }
         };
         u16::try_from(cursor.checked_sub(scroll_offset)?).ok()
     }
@@ -164,7 +179,7 @@ impl View {
         match self {
             View::Diff(app) => app.jump_to_diagnostic(diagnostics, forward),
             View::File(file) => file.jump_to_diagnostic(diagnostics, forward),
-            View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {} // no diagnostics in a read-only list
+            View::Timeline(_) | View::Log(_) | View::LspInspector(_) | View::Agent(_) => {} // no diagnostics in a read-only list
         }
     }
 }

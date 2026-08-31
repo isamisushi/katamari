@@ -194,10 +194,17 @@ fn marker_char(kind: DiffLineKind) -> char {
 /// distinct paths, not header groups, so a (currently unreachable)
 /// re-entrant selection still reports the true number of files touched.
 ///
-/// The [`OSC52_MAX_BYTES`] bound is checked on the assembled plain text,
-/// before base64 — matching [`write_osc52`]'s own pre-encoding bound.
+/// `max_bytes` is checked against the assembled plain text — issue #17's
+/// `y` passes [`OSC52_MAX_BYTES`] (matching [`write_osc52`]'s own
+/// pre-encoding bound, since that's the payload's eventual destination);
+/// `ui::ask::build_ask_context` passes its own, more generous
+/// `ASK_CONTEXT_MAX_BYTES` instead — a prompt handed to an agent has no
+/// terminal-escape-sequence reason to stay under an OSC 52 payload's much
+/// tighter ceiling, so this function takes the bound as a parameter rather
+/// than hardcoding the one its first caller happened to need.
 pub fn format_diff_selection(
     lines: Vec<SelectedLine<'_>>,
+    max_bytes: usize,
 ) -> Result<FormattedSelection, YankError> {
     if lines.is_empty() {
         return Err(YankError::Empty);
@@ -238,7 +245,7 @@ pub fn format_diff_selection(
     text.pop();
 
     let byte_count = text.len();
-    if byte_count > OSC52_MAX_BYTES {
+    if byte_count > max_bytes {
         return Err(YankError::TooLarge { byte_count });
     }
     Ok(FormattedSelection {
@@ -313,7 +320,8 @@ mod tests {
                 text: "deleted line",
             },
         ];
-        let formatted = format_diff_selection(lines).expect("non-empty selection formats");
+        let formatted =
+            format_diff_selection(lines, OSC52_MAX_BYTES).expect("non-empty selection formats");
         assert_eq!(
             formatted.text,
             "src/lib.rs\n\
@@ -411,7 +419,7 @@ mod tests {
             .filter(|&idx| matches!(rows[idx], RenderRow::Line { .. }))
             .collect();
         let resolved = resolve_selection(&rows, &files, &selected);
-        let formatted = format_diff_selection(resolved).unwrap();
+        let formatted = format_diff_selection(resolved, OSC52_MAX_BYTES).unwrap();
         assert_eq!(formatted.file_count, 2);
         assert_eq!(formatted.line_count, 2);
         // "a.rs" must appear, in full, before "b.rs" — selection order, not
@@ -451,7 +459,7 @@ mod tests {
                 text: "second a",
             },
         ];
-        let formatted = format_diff_selection(lines).unwrap();
+        let formatted = format_diff_selection(lines, OSC52_MAX_BYTES).unwrap();
         assert_eq!(
             formatted.text.matches("a.rs").count(),
             2,
@@ -467,7 +475,10 @@ mod tests {
 
     #[test]
     fn empty_selection_reports_the_empty_error() {
-        assert_eq!(format_diff_selection(Vec::new()), Err(YankError::Empty));
+        assert_eq!(
+            format_diff_selection(Vec::new(), OSC52_MAX_BYTES),
+            Err(YankError::Empty)
+        );
     }
 
     #[test]
@@ -479,7 +490,7 @@ mod tests {
             new_line: Some(1),
             text: "\tindented\tこんにちは世界",
         }];
-        let formatted = format_diff_selection(lines).unwrap();
+        let formatted = format_diff_selection(lines, OSC52_MAX_BYTES).unwrap();
         assert!(
             formatted.text.contains("\tindented\tこんにちは世界"),
             "text must copy exactly, no trim/tab-expand: {}",
@@ -497,7 +508,7 @@ mod tests {
             new_line: Some(1),
             text: &long_text,
         }];
-        match format_diff_selection(lines) {
+        match format_diff_selection(lines, OSC52_MAX_BYTES) {
             Err(YankError::TooLarge { byte_count }) => {
                 assert!(byte_count > OSC52_MAX_BYTES);
                 // Pre-base64: the reported count is the plain text's own

@@ -325,6 +325,11 @@ impl FileView {
             | Action::ToggleRangeSelect
             | Action::ToggleDirectory
             | Action::OpenScopeMenu
+            // Same bucket as `ToggleLspInspector`: reachable from any view,
+            // needs the agent handle `App`/`FileView` don't own — see
+            // `crate::acp::session`.
+            | Action::ToggleAgentPanel
+            | Action::PushCommentsToAgent
             | Action::AddComment
             | Action::ToggleComments
             | Action::ExpandFold
@@ -338,7 +343,10 @@ impl FileView {
             // select over. Issue #17's `YankSelection` joins it for the
             // same reason: nothing to yank without a selection to yank.
             | Action::ToggleVisualLine
-            | Action::YankSelection => {}
+            | Action::YankSelection
+            // Same story: asking the agent about a selection is a
+            // diff-view-only concept, no different from `AddComment`.
+            | Action::AskAgent => {}
             // `ui::mod` intercepts this before it reaches here, same as
             // every other action in the `Hover`/`Cancel`/... group above —
             // opening `ui::help`'s popup needs the live `Keymap`, which

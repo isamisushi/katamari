@@ -91,6 +91,8 @@ and the scope-menu popup (`o`) for switching mid-session.
   every save of an agent's session
 - **GitHub PR review** — `ktmr diff --pr 123` opens a pull request's diff
   through your own `gh`, no checkout
+- **Ask the agent** (`a`/`A`/`p`) — question a resident coding-agent session
+  about any selection, with every edit gated on your own `y`/`n`
 - **Your keybindings** — vim (default) and emacs presets, every action
   remappable
 

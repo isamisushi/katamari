@@ -27,7 +27,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 /// comment workflow rather than inlining the comments, so the check
 /// exercises the same `ktmr comments` round trip a real reviewing agent
 /// uses (and the repo's installed review skill, when present, applies).
-const DEFAULT_PROMPT: &str = "Address the open katamari review comments in this repository: run \
+/// `pub(crate)` so `ui::mod`'s `Action::PushCommentsToAgent` handler can
+/// send this exact same text — one source of truth for "what does pushing
+/// open comments to the agent actually say," shared by the headless check
+/// and the live TUI session rather than two prompts that could drift.
+pub(crate) const DEFAULT_PROMPT: &str = "Address the open katamari review comments in this repository: run \
      `ktmr comments list --json` to see them, make each requested change, and mark each one \
      resolved with `ktmr comments resolve <id>`.";
 

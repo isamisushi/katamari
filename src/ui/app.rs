@@ -1725,7 +1725,15 @@ impl App {
             | Action::ToggleUnits
             | Action::RegenerateUnits
             | Action::ToggleHints
-            | Action::ToggleRangeSelect => {}
+            | Action::ToggleRangeSelect
+            // Same bucket as `ToggleLspInspector`: `ui::mod` intercepts all
+            // three resident-agent actions (see `crate::acp::session`) —
+            // building the question overlay, opening the transcript panel,
+            // and pushing comments all need the agent handle, which `App`
+            // doesn't own.
+            | Action::AskAgent
+            | Action::ToggleAgentPanel
+            | Action::PushCommentsToAgent => {}
             // `ui::mod` intercepts this before it reaches here too, same
             // bucket as `ToggleTimeline`/`ToggleLogView`/`OpenScopeMenu`
             // above — opening `ui::help`'s popup needs the live `Keymap` to

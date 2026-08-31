@@ -183,8 +183,8 @@ fn visual_entry(visual_active: bool, can_start_visual: bool) -> MenuEntry {
 /// whitespace). `comment`/`visual_active`/`can_start_visual` are exactly
 /// `App::comment_target()`/`App::visual_active()`/"is the cursor row a
 /// `RenderRow::Line`" — see `ui::mod`'s one call site for how they're
-/// gathered. Bounded 2..6 entries (comment and the visual toggle are always
-/// present), never empty.
+/// gathered. Bounded 4..8 entries (comment, the visual toggle, and the two
+/// resident-agent entries are always present), never empty.
 pub fn diff_row_entries(
     symbol: Option<SymbolReadiness>,
     comment: Result<CommentTarget, CommentTargetError>,
@@ -211,6 +211,30 @@ pub fn diff_row_entries(
             MenuCommand::Action(Action::YankSelection),
         ));
     }
+    // The resident-agent pair (see `crate::acp::session`): eligibility
+    // mirrors the visual-selection entry just above rather than `comment`'s
+    // — `Action::AskAgent`'s own docs explain why asking is looser than
+    // commenting (any selectable line, on any diff, no re-anchoring
+    // concern). "Push open comments" is unconditionally offered, same as
+    // the comment/visual entries above — whether there's anything open to
+    // push is a fact the agent handle, not this pure function, would need
+    // to answer, so `ui::mod::handle_action`'s own `PushCommentsToAgent`
+    // arm is where an empty comment list turns into a status note instead.
+    let ask_enabled = if visual_active || can_start_visual {
+        Ok(())
+    } else {
+        Err("ask: no selectable source line here".to_owned())
+    };
+    entries.push(MenuEntry::new(
+        "Ask agent about this",
+        ask_enabled,
+        MenuCommand::Action(Action::AskAgent),
+    ));
+    entries.push(MenuEntry::new(
+        "Push open comments to agent",
+        Ok(()),
+        MenuCommand::Action(Action::PushCommentsToAgent),
+    ));
     entries
 }
 
@@ -540,7 +564,11 @@ mod tests {
                 .iter()
                 .all(|e| e.command != MenuCommand::Action(Action::GotoDefinition))
         );
-        assert_eq!(entries.len(), 2, "just comment + visual-toggle");
+        assert_eq!(
+            entries.len(),
+            4,
+            "comment + visual-toggle + ask-agent + push-comments-to-agent"
+        );
     }
 
     #[test]
@@ -687,8 +715,8 @@ mod tests {
                             can_start_visual,
                         );
                         assert!(!entries.is_empty());
-                        assert!(entries.len() <= 6, "{}", entries.len());
-                        assert!(entries.len() >= 2, "{}", entries.len());
+                        assert!(entries.len() <= 8, "{}", entries.len());
+                        assert!(entries.len() >= 4, "{}", entries.len());
                     }
                 }
             }

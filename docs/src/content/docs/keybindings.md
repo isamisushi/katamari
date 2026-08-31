@@ -5,7 +5,7 @@ description: Every keybinding in the vim and emacs presets, plus mouse support a
 
 Vim bindings are the default; set `keymap = "emacs"` in config (see
 [Configuration](/katamari/configuration/)) for the emacs column. `q` quits katamari from anywhere — a pushed
-`FileView`/timeline/log/inspector included, never "back" to whatever's
+`FileView`/timeline/log/inspector/agent panel included, never "back" to whatever's
 underneath. `Esc` is the generic "get me out of this": it dismisses the
 nearest open overlay (a popup, the hover card, the references panel), and
 with nothing local left open it pops exactly the one view a `gd`/`L`/`t`/`I`
@@ -58,6 +58,9 @@ table below never has to live in your head.
 | Add comment | `c` | `C-c C-c` |
 | (in comment compose) newline / save / cancel | `Enter` / `C-s` / `Esc` | same |
 | Toggle inline comment bodies | `C` | `C` |
+| Ask the agent about this line/selection | `a` | `a` |
+| Toggle agent transcript panel | `A` | `A` |
+| Push open comments to the agent | `p` | `p` |
 | Quit | `q` | `q` |
 
 \* Jump-forward matches neovim: it's `C-i` in terminals that implement the
@@ -148,6 +151,31 @@ and returns to scrolling; `Esc` while scrolling the list closes the window
 outright, same as `q`/`?`, whether or not a filter is still narrowing it.
 The window is modal while open — every key goes to it, not whatever view
 is underneath.
+
+## Ask the agent
+
+`a` opens a small compose box (reusing the comment overlay's own text
+editor) anchored to the cursor's row or a visual selection (`V`), and sends
+your typed question — together with the selected diff content (path,
+old/new line numbers, and each line's marker) — to a resident coding-agent
+session (Claude, via [ACP](https://agentclientprotocol.com)), spawned lazily
+the first time you ask or push. Unlike `c` (add comment), asking works on
+*any* diff, including a historical/read-only one and a selection that
+crosses a deletion — there's nothing to re-anchor later, so nothing to
+restrict. `A` opens or closes a full-screen transcript panel showing the
+conversation so far; closing it never stops the session, so reopening it
+later picks up right where you left off. `p` pushes every currently-open
+review comment to the agent in one message, the same prompt
+`ktmr agent-check` sends, and opens the panel so you can watch it work.
+
+Whenever the agent wants to make an edit, katamari shows a small modal
+naming the tool and waits for `y`/`Enter` (allow) or `n`/`Esc` (reject) —
+it is never auto-approved. Only one turn runs at a time; asking again while
+one is already in flight reports that on the status line rather than
+queuing a second question. Set the adapter command with `[agent] adapter`
+in your **global** `~/.config/katamari/config.toml` only — see
+[Configuration](/katamari/configuration/) for why a repo-local
+`.katamari/config.toml` can never choose it.
 
 ## Search
 
