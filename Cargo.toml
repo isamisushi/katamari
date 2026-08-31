@@ -34,6 +34,16 @@ ignore = "0.4.33"
 lsp-types = "0.97.0"
 notify = "8.2.0"
 ratatui = "0.30.2"
+# Only for `set_client` on the `AxoUpdater` above: axoupdater's own default
+# client has no request timeout (see `update::SELF_UPDATE_NETWORK_TIMEOUT`'s
+# doc comment), and the only way to change that is to build one ourselves
+# and hand it in. `default-features = false` adds nothing new to the build —
+# axoasset (an axoupdater dependency) already requests this same crate at
+# this same version with "json"/"default-tls", which Cargo's feature
+# unification applies regardless of what this line asks for; declaring
+# fewer features here just keeps this crate's own request minimal and
+# honest about what it actually uses (`Client::builder().timeout(..)`).
+reqwest = { version = "0.13.4", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tree-sitter = "0.26.11"

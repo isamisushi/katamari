@@ -1836,6 +1836,17 @@ fn run_self_update() -> Result<()> {
         std::process::exit(1);
     }
 
+    // axoupdater's own default client has no request timeout at all (see
+    // `update::SELF_UPDATE_NETWORK_TIMEOUT`'s doc comment) — set one before
+    // `run_sync` makes the only network calls this command performs, so a
+    // stalled connection reports and exits instead of hanging forever with
+    // no way out but Ctrl+C.
+    let client = reqwest::Client::builder()
+        .timeout(update::SELF_UPDATE_NETWORK_TIMEOUT)
+        .build()
+        .context("failed to build the HTTP client for ktmr self-update")?;
+    updater.set_client(client);
+
     match updater.run_sync() {
         Ok(Some(result)) => {
             match result.old_version {

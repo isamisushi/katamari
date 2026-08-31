@@ -87,10 +87,12 @@ auto-install's executable-bit handling — assume a Unix filesystem.)
 
 ## Updating
 
-The right command depends on which method above you used — a session's
-on-quit notice (`vX.Y.Z is available — ...`) already names the correct one
-for the running binary, so this is only worth memorizing if you'd rather not
-wait for that notice.
+The right command depends on which method above you used. A session's
+on-quit notice (`vX.Y.Z is available — ...`) recognizes the install script,
+Homebrew, and `cargo install`, and names the matching command straight away;
+for anything else — including mise — it falls back to pointing at the
+[release page](https://github.com/isamisushi/katamari/releases), so a mise
+install should use `mise upgrade` regardless of what the notice says.
 
 **Install script**: the installer leaves behind a receipt recording where
 and how it installed katamari; `ktmr self-update` reads it and re-runs

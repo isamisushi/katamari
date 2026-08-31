@@ -57,6 +57,28 @@ const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
 /// more than one request a day.
 const STALE_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// The request timeout `main.rs::run_self_update` sets on the
+/// `reqwest::Client` it hands `axoupdater` via `set_client`, before
+/// `run_sync`. `axoupdater` 0.10.2 builds its own default client as a bare
+/// `reqwest::Client::new()` with no timeout set anywhere in the crate, so
+/// left alone, every request that client makes — the GitHub releases-API
+/// lookup and the fetch of the installer script itself, both routed through
+/// that one client (the actual binary download happens later, as a
+/// subprocess running that fetched shell script, outside `axoupdater`'s
+/// `reqwest` client entirely) — can hang forever against a connection that
+/// accepts a TCP handshake but never completes a response (a firewall/VPN
+/// blackhole, a stalled TLS handshake, some corporate proxies), with no
+/// feedback and no way out but Ctrl+C. That's exactly the failure mode this
+/// module's other network call ([`fetch_latest_release_tag`], bounded by
+/// [`NETWORK_TIMEOUT`]) is designed to avoid — `run_self_update` is the one
+/// command here that runs synchronously in the foreground, so it can't lean
+/// on "a background thread nobody's waiting on" the way [`refresh_cache`]
+/// does. Sized well above [`NETWORK_TIMEOUT`]'s 3s (a single small JSON GET)
+/// since a shell-installer script is a bigger, if still modest, payload —
+/// but nowhere near what a multi-megabyte binary would need, because this
+/// client never actually carries one.
+pub(crate) const SELF_UPDATE_NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A newer release than the one running now — the only thing either display
 /// surface needs to know. Carrying just the version string (not the whole
 /// [`Cache`]) keeps [`on_startup`]'s return type honest about what's
@@ -244,29 +266,36 @@ fn compare_versions(a: &str, b: &str) -> Option<Ordering> {
 /// The exact command to hand a reviewer for the install this binary is
 /// running from, inferred from `exe_path` (expected already canonicalized —
 /// see [`detect_upgrade_command`]) and `has_receipt` (see
-/// [`has_install_receipt`]). Checked in an order that's about correctness,
-/// not convenience: a Homebrew Cellar path gets `brew upgrade` and a
-/// `~/.cargo/bin` path gets `cargo install --git ...` *before* the receipt
-/// check ever runs, because both package managers own that binary — an
-/// `axoupdater`-driven self-update would fight brew's Cellar bookkeeping (or
-/// silently no-op against a `cargo install` binary axoupdater doesn't
-/// recognize) rather than genuinely update it, so a receipt happening to
-/// exist alongside one of those installs must never win. Only once neither
-/// matches does a receipt get to suggest `ktmr self-update`; anything left —
-/// a manually downloaded release binary with no receipt, a distro package, a
-/// source build run in place — gets pointed at the releases page rather than
-/// guessed at, since no single command is honest for all of those.
+/// [`has_install_receipt`]). A Homebrew Cellar path always gets `brew
+/// upgrade` first, unconditionally — brew owns that binary outright, and
+/// nothing else ever installs into a Cellar path, so a receipt can never
+/// legitimately coexist with one. Past that, a present receipt wins over the
+/// `.cargo/bin` guess, deliberately *not* the other way around: cargo-dist's
+/// default install layout (what `katamari-installer.sh` uses unless
+/// `KATAMARI_INSTALL_DIR`/`CARGO_DIST_FORCE_INSTALL_DIR`/`UNMANAGED_INSTALL`
+/// override it — see `dist-workspace.toml`, which sets no install-path
+/// override) puts the shell installer's own binary at `~/.cargo/bin/ktmr`,
+/// the exact path a `.cargo/bin`-first check would misread as "a `cargo
+/// install`-owned binary" on essentially every dev machine (rustup creates
+/// `~/.cargo` unconditionally). A receipt is written only by that same shell
+/// installer, so its presence is strictly more specific evidence than the
+/// path guess; a real `cargo install --git ...` binary has no receipt and
+/// still falls through to the `.cargo/bin` branch below correctly. Anything
+/// left — a manually downloaded release binary with no receipt, a distro
+/// package, a source build run in place — gets pointed at the releases page
+/// rather than guessed at, since no single command is honest for all of
+/// those.
 fn upgrade_command(exe_path: &Path, home: Option<&Path>, has_receipt: bool) -> String {
     if exe_path.to_string_lossy().contains("/Cellar/") {
         return "brew upgrade katamari".to_owned();
+    }
+    if has_receipt {
+        return "ktmr self-update".to_owned();
     }
     if let Some(home) = home
         && exe_path.starts_with(home.join(".cargo").join("bin"))
     {
         return "cargo install --git https://github.com/isamisushi/katamari".to_owned();
-    }
-    if has_receipt {
-        return "ktmr self-update".to_owned();
     }
     "https://github.com/isamisushi/katamari/releases".to_owned()
 }
@@ -293,32 +322,47 @@ pub(crate) fn detect_upgrade_command() -> String {
 
 // --- Install receipt detection ------------------------------------------
 
-/// The cargo-dist install receipt path for `app_name`: the one location
-/// `katamari-installer.sh` (see its `RECEIPT_HOME` variable) ever writes
-/// one to, and the first location `axoupdater`'s own `load_receipt` checks
-/// (`$XDG_CONFIG_HOME/<app_name>` when set and non-empty, else
-/// `$HOME/.config/<app_name>`) — kept as a plain path computation, no I/O,
+/// The candidate receipt *directories* for `app_name`, in the exact order
+/// and with the exact fallback rule `axoupdater`'s own lookup uses
+/// (`axoupdater::receipt::get_config_paths`, mirrored here by hand rather
+/// than called into — see the module docs on why this stays a dependency-
+/// free fs check): `$XDG_CONFIG_HOME/<app_name>` is a candidate *only* when
+/// that directory already exists — an XDG base that's configured but empty
+/// doesn't count — and `$HOME/.config/<app_name>` is *always* also a
+/// candidate, appended unconditionally, even when `XDG_CONFIG_HOME` is set
+/// to somewhere else entirely. That "always also," not "else," is the part
+/// an earlier either/or version of this function got wrong: picking exactly
+/// one location based on whether `XDG_CONFIG_HOME` happened to be set meant
+/// a real receipt sitting at the `$HOME/.config` fallback went unseen
+/// whenever `XDG_CONFIG_HOME` pointed at some other, receipt-less directory
+/// — a false "no receipt" that `axoupdater`'s own `load_receipt` wouldn't
+/// have produced for the identical filesystem state. Kept as a plain path
+/// computation, no I/O beyond the one `exists()` gate on the XDG candidate,
 /// so a test can hand it a fabricated pair without touching the real
 /// filesystem or `axoupdater` needing to be involved at all.
-fn receipt_path(
+fn receipt_dir_candidates(
     app_name: &str,
     xdg_config_home: Option<&Path>,
     home: Option<&Path>,
-) -> Option<PathBuf> {
-    let config_home = match xdg_config_home {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
-        _ => home?.join(".config"),
-    };
-    Some(
-        config_home
-            .join(app_name)
-            .join(format!("{app_name}-receipt.json")),
-    )
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(dir) = xdg_config_home
+        && !dir.as_os_str().is_empty()
+    {
+        let xdg_app_dir = dir.join(app_name);
+        if xdg_app_dir.exists() {
+            candidates.push(xdg_app_dir);
+        }
+    }
+    if let Some(home) = home {
+        candidates.push(home.join(".config").join(app_name));
+    }
+    candidates
 }
 
-/// Whether a cargo-dist install receipt for `app_name` exists at
-/// [`receipt_path`] — the one bit of actual I/O in this pair (a plain
-/// `Path::exists`, no network), which is what lets
+/// Whether a cargo-dist install receipt for `app_name` exists in any of
+/// [`receipt_dir_candidates`] — the actual I/O in this pair (plain
+/// `Path::exists` calls, no network), which is what lets
 /// [`detect_upgrade_command`] point a shell-installer install at `ktmr
 /// self-update` instead of the generic releases-page fallback. Doesn't
 /// parse or validate the receipt's contents — that's `axoupdater`'s
@@ -330,7 +374,9 @@ fn has_install_receipt(
     xdg_config_home: Option<&Path>,
     home: Option<&Path>,
 ) -> bool {
-    receipt_path(app_name, xdg_config_home, home).is_some_and(|p| p.exists())
+    receipt_dir_candidates(app_name, xdg_config_home, home)
+        .into_iter()
+        .any(|dir| dir.join(format!("{app_name}-receipt.json")).exists())
 }
 
 // --- Staleness -----------------------------------------------------------
@@ -575,11 +621,21 @@ mod tests {
     }
 
     #[test]
-    fn a_cargo_bin_path_wins_over_a_present_receipt() {
+    fn a_present_receipt_wins_over_a_cargo_bin_path() {
+        // This is cargo-dist's *default* install layout, not an edge case:
+        // `katamari-installer.sh` installs to `~/.cargo/bin` unless an env
+        // var overrides it (`dist-workspace.toml` sets no override), so a
+        // receipt-backed shell-installer install lands at exactly this path
+        // on any machine rustup has already touched. If `.cargo/bin` won
+        // here, the on-quit hint would tell the common case to
+        // `cargo install --git ...` instead of `ktmr self-update`.
         let home = Path::new("/home/someone");
         let exe = home.join(".cargo").join("bin").join("ktmr");
+        assert_eq!(upgrade_command(&exe, Some(home), true), "ktmr self-update");
+        // Same path, no receipt: the genuine `cargo install --git ...` case
+        // still falls through to the cargo guess correctly.
         assert_eq!(
-            upgrade_command(&exe, Some(home), true),
+            upgrade_command(&exe, Some(home), false),
             "cargo install --git https://github.com/isamisushi/katamari"
         );
     }
@@ -595,56 +651,63 @@ mod tests {
 
     // --- install receipt detection ------------------------------------------
 
-    #[test]
-    fn receipt_path_prefers_xdg_config_home_when_set() {
-        let path = receipt_path(
-            "katamari",
-            Some(Path::new("/custom/config")),
-            Some(Path::new("/home/someone")),
-        );
-        assert_eq!(
-            path,
-            Some(PathBuf::from(
-                "/custom/config/katamari/katamari-receipt.json"
-            ))
-        );
-    }
-
-    #[test]
-    fn receipt_path_falls_back_to_home_config_when_xdg_unset() {
-        let path = receipt_path("katamari", None, Some(Path::new("/home/someone")));
-        assert_eq!(
-            path,
-            Some(PathBuf::from(
-                "/home/someone/.config/katamari/katamari-receipt.json"
-            ))
-        );
-    }
-
-    #[test]
-    fn receipt_path_ignores_an_empty_xdg_config_home() {
-        let path = receipt_path(
-            "katamari",
-            Some(Path::new("")),
-            Some(Path::new("/home/someone")),
-        );
-        assert_eq!(
-            path,
-            Some(PathBuf::from(
-                "/home/someone/.config/katamari/katamari-receipt.json"
-            ))
-        );
-    }
-
-    #[test]
-    fn receipt_path_is_none_without_xdg_or_home() {
-        assert_eq!(receipt_path("katamari", None, None), None);
-    }
-
     fn fixture_receipt_dir() -> PathBuf {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::temp_dir().join(format!("ktmr-receipt-test-{}-{n}", std::process::id()))
+    }
+
+    #[test]
+    fn receipt_dir_candidates_skips_a_missing_xdg_app_dir_but_still_offers_home() {
+        // The XDG base itself may exist without ever having a `katamari`
+        // subdirectory in it (nothing katamari-related was ever installed
+        // under it) — that must not be treated as "no home fallback
+        // either," which is exactly the bug this replaced.
+        let xdg = fixture_receipt_dir();
+        std::fs::create_dir_all(&xdg).unwrap();
+        let home = Path::new("/home/someone");
+        assert_eq!(
+            receipt_dir_candidates("katamari", Some(&xdg), Some(home)),
+            vec![home.join(".config").join("katamari")],
+        );
+    }
+
+    #[test]
+    fn receipt_dir_candidates_includes_xdg_first_when_its_app_dir_exists() {
+        let xdg = fixture_receipt_dir();
+        let xdg_app_dir = xdg.join("katamari");
+        std::fs::create_dir_all(&xdg_app_dir).unwrap();
+        let home = Path::new("/home/someone");
+        assert_eq!(
+            receipt_dir_candidates("katamari", Some(&xdg), Some(home)),
+            vec![xdg_app_dir, home.join(".config").join("katamari")],
+        );
+    }
+
+    #[test]
+    fn receipt_dir_candidates_falls_back_to_home_config_when_xdg_unset() {
+        let home = Path::new("/home/someone");
+        assert_eq!(
+            receipt_dir_candidates("katamari", None, Some(home)),
+            vec![home.join(".config").join("katamari")],
+        );
+    }
+
+    #[test]
+    fn receipt_dir_candidates_ignores_an_empty_xdg_config_home() {
+        let home = Path::new("/home/someone");
+        assert_eq!(
+            receipt_dir_candidates("katamari", Some(Path::new("")), Some(home)),
+            vec![home.join(".config").join("katamari")],
+        );
+    }
+
+    #[test]
+    fn receipt_dir_candidates_is_empty_without_xdg_or_home() {
+        assert_eq!(
+            receipt_dir_candidates("katamari", None, None),
+            Vec::<PathBuf>::new(),
+        );
     }
 
     #[test]
@@ -654,12 +717,28 @@ mod tests {
     }
 
     #[test]
-    fn has_install_receipt_is_true_when_the_file_exists() {
+    fn has_install_receipt_is_true_when_the_file_exists_under_xdg() {
         let xdg = fixture_receipt_dir();
         let dir = xdg.join("katamari");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("katamari-receipt.json"), "{}").unwrap();
         assert!(has_install_receipt("katamari", Some(&xdg), None));
+    }
+
+    #[test]
+    fn has_install_receipt_is_true_via_the_home_fallback_even_with_xdg_config_home_set() {
+        // Reproduces the axoupdater-vs-katamari drift from the review: a
+        // real receipt sits only at `$HOME/.config/<app>`, while
+        // `XDG_CONFIG_HOME` is set to some other, existing-but-unrelated
+        // directory. `axoupdater`'s own lookup still finds it via the
+        // unconditional home fallback; this must too.
+        let xdg = fixture_receipt_dir();
+        std::fs::create_dir_all(&xdg).unwrap();
+        let home = fixture_receipt_dir();
+        let home_app_dir = home.join(".config").join("katamari");
+        std::fs::create_dir_all(&home_app_dir).unwrap();
+        std::fs::write(home_app_dir.join("katamari-receipt.json"), "{}").unwrap();
+        assert!(has_install_receipt("katamari", Some(&xdg), Some(&home)));
     }
 
     // --- cache read/write round trip ----------------------------------------
