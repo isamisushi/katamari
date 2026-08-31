@@ -325,7 +325,9 @@ enum Command {
     Reset {
         /// Remove the regenerable caches: this repository's grouping cache
         /// (`.katamari/groups.jsonl`) and the state directory holding the
-        /// update-check cache and language-server index caches.
+        /// update-check cache, the per-terminal kitty-keyboard-protocol
+        /// probe cache (see `ui::probe_cache`'s module docs), and
+        /// language-server index caches.
         #[arg(long)]
         cache: bool,
         /// Strip the `[units]` table from both config files (repo and
@@ -1902,7 +1904,11 @@ fn run_reset(
     if !(cache || units_config || servers || comments) {
         println!("katamari state (nothing removed — pass a flag to remove):\n");
         report_target("grouping cache", groups_path.as_deref(), "--cache");
-        report_target("update/index caches", Some(&state_dir), "--cache");
+        report_target(
+            "update/kitty-probe/index caches",
+            Some(&state_dir),
+            "--cache",
+        );
         report_target(
             "repo config [units]",
             repo_config.as_deref(),
@@ -1921,7 +1927,7 @@ fn run_reset(
 
     if cache {
         remove_path("grouping cache", groups_path.as_deref())?;
-        remove_path("update/index caches", Some(&state_dir))?;
+        remove_path("update/kitty-probe/index caches", Some(&state_dir))?;
     }
     if units_config {
         strip_units_from("repo config", repo_config.as_deref())?;

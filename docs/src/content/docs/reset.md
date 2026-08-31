@@ -10,7 +10,7 @@ remove it.
 
 ```
 ktmr reset                  # report only: what exists where; removes nothing
-ktmr reset --cache          # the repo's grouping cache (.katamari/groups.jsonl) + katamari's state dir — update-check cache, index caches, and the per-session LSP journals
+ktmr reset --cache          # the repo's grouping cache (.katamari/groups.jsonl) + katamari's state dir — update-check cache, the per-terminal kitty-keyboard-protocol probe cache, index caches, and the per-session LSP journals
 ktmr reset --units-config   # strip the [units] table from both config files
 ktmr reset --servers        # katamari-managed language-server installs (large downloads, hence not part of --cache)
 ktmr reset --comments       # .katamari/comments.jsonl — review data, never implied by --all

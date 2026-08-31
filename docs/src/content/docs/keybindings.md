@@ -66,8 +66,14 @@ table below never has to live in your head.
 literal Tab keypress apart from `Ctrl-i` on the wire — without it they arrive
 as the same byte, and Tab already means focus-next-pane, so katamari
 uses `M-Right` as jump-forward's canonical binding there instead (notably
-Terminal.app, which doesn't implement the protocol). Detected once at
-startup. `M-Left`/`M-Right` are unconditional aliases for back/forward in
+Terminal.app, which doesn't implement the protocol). Detection asks the
+terminal directly and, on some terminals, can take a couple of seconds to
+hear nothing back — so the answer is cached per terminal (`$XDG_STATE_HOME/
+katamari/kitty-probe.json`, keyed by `TERM`/`TERM_PROGRAM`/
+`TERM_PROGRAM_VERSION`) after the first launch in it; every later launch in
+that same terminal skips the wait entirely. `ktmr reset --cache` clears the
+cache if you switch terminal emulators and want it re-detected.
+`M-Left`/`M-Right` are unconditional aliases for back/forward in
 both cases — the always-available, terminal-agnostic pair — while `C-i`
 itself is simply left unbound when the terminal can't distinguish it from
 Tab. `Ctrl-]` and `Ctrl-t` have no default binding at all: katamari has one

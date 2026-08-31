@@ -30,6 +30,7 @@ pub mod mouse;
 pub mod navigation;
 mod pane;
 mod pointer_hover;
+pub(crate) mod probe_cache;
 pub mod refresh;
 pub mod refs_panel;
 pub mod scope_menu;
@@ -255,14 +256,26 @@ pub fn run(
 
     let mut terminal = init_terminal()?;
 
+    // Looked up before the splash draw below (not just before the probe
+    // itself) so the splash can tell a genuinely slow launch — this
+    // terminal's fingerprint has no cached verdict, so
+    // `enable_kitty_keyboard_protocol` is about to run the real probe —
+    // apart from a cache-hit one that's about to skip it entirely. See
+    // `probe_cache`'s module docs for the fingerprint and staleness
+    // reasoning, and `render_startup_splash`'s docs for what it does with
+    // `cached_kitty_support.is_none()` below.
+    let probe_cache_path = probe_cache::cache_file_path();
+    let probe_fingerprint = probe_cache::fingerprint_from_env();
+    let cached_kitty_support = probe_cache::look_up(&probe_cache_path, &probe_fingerprint);
+
     // Between `init_terminal` entering the alternate screen and the event
     // loop's first real `terminal.draw` (below, past config/keymap/LSP
-    // setup and `enable_kitty_keyboard_protocol`'s own possibly-2s probe),
-    // nothing would otherwise touch stdout — a real user hit exactly that:
-    // a terminal that doesn't answer the probe leaves them staring at a
-    // black screen with just a cursor, indistinguishable from "stuck." See
-    // `draw_startup_splash`'s docs.
-    draw_startup_splash(&mut terminal)?;
+    // setup and `enable_kitty_keyboard_protocol`'s own possibly-2s probe on
+    // a cache miss), nothing would otherwise touch stdout — a real user hit
+    // exactly that: a terminal that doesn't answer the probe leaves them
+    // staring at a black screen with just a cursor, indistinguishable from
+    // "stuck." See `draw_startup_splash`'s docs.
+    draw_startup_splash(&mut terminal, cached_kitty_support.is_none())?;
 
     // Must happen before `spawn_input_thread` below starts its own
     // blocking `event::read()` loop — see `enable_kitty_keyboard_protocol`'s
@@ -270,8 +283,9 @@ pub fn run(
     // event-reader lock. Drawing the splash just above writes to stdout
     // only, so it doesn't need to respect that ordering itself — it's safe
     // on either side of this call, and goes first so the probe's up-to-2s
-    // wait never runs against a still-black screen.
-    let ci_distinguishable = enable_kitty_keyboard_protocol();
+    // wait (on a cache miss) never runs against a still-black screen.
+    let ci_distinguishable =
+        enable_kitty_keyboard_protocol(cached_kitty_support, &probe_cache_path, &probe_fingerprint);
 
     // Issue #20: unlike the kitty probe above, this is a plain write with
     // no reply to race against `spawn_input_thread`'s reader — the ordering
@@ -5005,44 +5019,72 @@ fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
 /// already uses for crossterm's probe bytes. Keep the two in sync.
 const STARTUP_SPLASH_TEXT: &str = "katamari — starting…";
 
+/// The splash's second, dimmer line — drawn only when `run`'s
+/// `probe_cache::look_up` missed, i.e. `enable_kitty_keyboard_protocol` is
+/// about to run crossterm's real (possibly ~2s) probe rather than skip it.
+/// Every other launch in this same terminal, past this first one, never
+/// shows this line at all: the plain [`STARTUP_SPLASH_TEXT`] frame still
+/// flashes by (a real `terminal.draw` call before the event loop's own
+/// first one, however fast the rest of startup is — see `draw_startup_splash`'s
+/// docs), but it's replaced by the real UI too quickly to read.
+const STARTUP_SPLASH_PROBE_PENDING_TEXT: &str =
+    "checking terminal keyboard support (first run in this terminal)…";
+
 /// Renders [`STARTUP_SPLASH_TEXT`] centered and dimmed onto `frame` — split
 /// out from [`draw_startup_splash`] the same way every other pane in this
 /// module keeps its cell-drawing logic in a plain `render(frame, ...)`
 /// function separate from whatever calls `terminal.draw` around it, so it
 /// can be exercised in a unit test against a [`ratatui::backend::TestBackend`]
-/// without a real terminal.
-fn render_startup_splash(frame: &mut Frame) {
+/// without a real terminal. `probe_pending` adds
+/// [`STARTUP_SPLASH_PROBE_PENDING_TEXT`] as a second line beneath the first
+/// — see that constant's docs for when `run` passes `true`.
+fn render_startup_splash(frame: &mut Frame, probe_pending: bool) {
     let area = frame.area();
     let dim = Style::default()
         .fg(Color::DarkGray)
         .add_modifier(Modifier::DIM);
-    let line = Line::from(Span::styled(STARTUP_SPLASH_TEXT, dim));
+    let mut lines = vec![Line::from(Span::styled(STARTUP_SPLASH_TEXT, dim))];
+    if probe_pending {
+        lines.push(Line::from(Span::styled(
+            STARTUP_SPLASH_PROBE_PENDING_TEXT,
+            dim,
+        )));
+    }
     // Same "shrink to the text's own height, center via `Alignment` for
     // the horizontal half" split `render_empty_state` in `diff_view.rs`
-    // uses — one line here, so `top_pad` alone does all the vertical
-    // centering.
-    let top_pad = area.height.saturating_sub(1) / 2;
+    // uses — `lines.len()` rows here (one or two, depending on
+    // `probe_pending`) rather than the fixed `1` a single-line splash could
+    // hardcode, so `top_pad` still centers the whole block vertically.
+    let height = lines.len() as u16;
+    let top_pad = area.height.saturating_sub(height) / 2;
     let text_area = Rect {
         x: area.x,
         y: area.y + top_pad,
         width: area.width,
-        height: area.height.min(1),
+        height: area.height.min(height),
     };
-    frame.render_widget(Paragraph::new(line).alignment(Alignment::Center), text_area);
+    frame.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center),
+        text_area,
+    );
 }
 
 /// Draws one [`render_startup_splash`] frame straight onto `terminal`.
 /// Called from `run` immediately after `init_terminal` and before
 /// `enable_kitty_keyboard_protocol`, whose crossterm-internal probe blocks
-/// on a real synchronous tty read that it only bounds at 2s — on a
-/// terminal that never answers (stock Terminal.app, some tmux setups),
-/// nothing else would touch the alternate screen `init_terminal` just
-/// entered until the event loop's first real `terminal.draw` call, well
-/// past config/keymap/LSP setup, so a user on such a terminal was staring
-/// at a black screen with just a blinking cursor for up to 2s with no way
-/// to tell "starting" from "stuck." This is cheap enough (one small
-/// paragraph, no layout beyond centering) to draw unconditionally rather
-/// than only on terminals suspected of being slow.
+/// on a real synchronous tty read that it only bounds at 2s *on a cache
+/// miss* (see `probe_cache`'s module docs) — on a terminal with no cached
+/// verdict that also never answers the probe (stock Terminal.app, some tmux
+/// setups), nothing else would touch the alternate screen `init_terminal`
+/// just entered until the event loop's first real `terminal.draw` call,
+/// well past config/keymap/LSP setup, so a user on such a terminal was
+/// staring at a black screen with just a blinking cursor for up to 2s with
+/// no way to tell "starting" from "stuck." This is cheap enough (one or two
+/// small paragraph lines, no layout beyond centering) to draw
+/// unconditionally rather than only on terminals suspected of being slow —
+/// `probe_pending` (see [`STARTUP_SPLASH_PROBE_PENDING_TEXT`]) is what
+/// tells a cache-miss launch (about to actually wait) apart from a
+/// cache-hit one (about to draw this frame and move straight past it).
 ///
 /// Takes no [`Keymap`]/[`config::KeymapPreset`] and renders no key hints —
 /// both depend on `ci_distinguishable`, which only exists once the very
@@ -5051,8 +5093,11 @@ fn render_startup_splash(frame: &mut Frame) {
 /// have to wait for the probe first, defeating the point of drawing before
 /// it. Drawn once and never refreshed; the real UI takes over at the event
 /// loop's own first `terminal.draw`.
-fn draw_startup_splash(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
-    terminal.draw(render_startup_splash)?;
+fn draw_startup_splash(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    probe_pending: bool,
+) -> Result<()> {
+    terminal.draw(|frame| render_startup_splash(frame, probe_pending))?;
     Ok(())
 }
 
@@ -5072,6 +5117,23 @@ fn draw_startup_splash(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Res
 /// contract this session asks the terminal for is exactly as wide as what
 /// it actually acts on.
 ///
+/// `cached` is `run`'s `probe_cache::look_up(cache_path, fingerprint)` —
+/// this terminal's previously-recorded verdict, if any (see
+/// [`probe_cache`]'s module docs). A hit skips crossterm's real probe
+/// entirely: `Some(true)` pushes the enhancement flags directly with no
+/// query round trip at all, which is safe to do unconditionally — an
+/// unrecognized CSI final byte is conventionally a no-op per ECMA-48, so a
+/// terminal that stops understanding it between runs (see the module docs'
+/// staleness note) just silently ignores the write, same as it always did
+/// for `restore_terminal`'s unconditional pop on the way out — and a cached
+/// verdict came from this exact fingerprint answering the real probe `yes`
+/// before, so there is nothing left to ask. `Some(false)` returns `false`
+/// immediately, same reasoning in the other direction. Only `None` (no
+/// cached verdict yet — a first launch in this terminal, or one since
+/// `ktmr reset --cache`) runs the real probe below, and — regardless of
+/// which way it answers — records that answer via `probe_cache::record`
+/// before this terminal is ever asked again.
+///
 /// Must run after [`enable_raw_mode`] (crossterm's probe blocks on a real
 /// synchronous read from the tty — it doesn't work otherwise) and before
 /// [`spawn_input_thread`] starts its own blocking `event::read()` loop on a
@@ -5080,16 +5142,37 @@ fn draw_startup_splash(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Res
 /// probe's response bytes being stolen by the input thread instead (or a
 /// deadlock, depending on timing) rather than a hang or a crash, which is
 /// worse to debug. `supports_keyboard_enhancement` already bounds its own
-/// wait (2s) and turns "no response," "not a tty" (e.g. output piped in a
-/// test harness), or any other I/O hiccup into `Ok(false)`/`Err` — both
-/// treated identically here as "not supported," so a plain terminal or a
-/// pipe never makes startup fail or hang, it just keeps `M-Right` as the
-/// sole working binding for `JumpForward` (see [`Action::JumpBack`]'s
-/// docs).
-fn enable_kitty_keyboard_protocol() -> bool {
+/// wait (2s — crossterm 0.29.0's `Duration::from_millis(2000)` in
+/// `terminal/sys/unix.rs::query_keyboard_enhancement_flags_raw`, verified
+/// against the vendored source this build actually compiles against) and
+/// turns "no response," "not a tty" (e.g. output piped in a test harness),
+/// or any other I/O hiccup into `Ok(false)`/`Err` — both treated
+/// identically here as "not supported," so a plain terminal or a pipe never
+/// makes startup fail or hang, it just keeps `M-Right` as the sole working
+/// binding for `JumpForward` (see [`Action::JumpBack`]'s docs) — and, as of
+/// the probe cache, never pays that 2s bound more than once per terminal
+/// either.
+fn enable_kitty_keyboard_protocol(
+    cached: Option<bool>,
+    cache_path: &Path,
+    fingerprint: &str,
+) -> bool {
+    if let Some(supported) = cached {
+        return supported && push_kitty_enhancement_flags();
+    }
     let Ok(true) = supports_keyboard_enhancement() else {
+        probe_cache::record(cache_path, fingerprint, false);
         return false;
     };
+    probe_cache::record(cache_path, fingerprint, true);
+    push_kitty_enhancement_flags()
+}
+
+/// The actual `PushKeyboardEnhancementFlags` write, shared by
+/// [`enable_kitty_keyboard_protocol`]'s freshly-probed-`true` path and its
+/// cached-`true` path — both need the identical write, and neither needs to
+/// know which one the other took.
+fn push_kitty_enhancement_flags() -> bool {
     execute!(
         io::stdout(),
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
@@ -6191,7 +6274,13 @@ mod tests {
         let height = 10;
         let backend = TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(render_startup_splash).unwrap();
+        // `probe_pending: false` — the cache-hit case, and the one every
+        // pre-existing assertion below (single centered row) was written
+        // against; the two-line, `probe_pending: true` case gets its own
+        // test just below.
+        terminal
+            .draw(|frame| render_startup_splash(frame, false))
+            .unwrap();
         let buffer = terminal.backend().buffer();
 
         // Same "concatenate one row's cells" reader `diff_view`'s own
@@ -6250,6 +6339,61 @@ mod tests {
             (left_gap - right_gap).abs() <= 1,
             "left gap {left_gap} and right gap {right_gap} must differ by at \
              most one column for text centered via Alignment::Center"
+        );
+    }
+
+    #[test]
+    fn startup_splash_adds_a_second_line_only_when_the_probe_is_pending() {
+        use ratatui::backend::TestBackend;
+
+        // Wide enough for `STARTUP_SPLASH_PROBE_PENDING_TEXT` (64 chars) to
+        // render on one row without truncating — `Paragraph` clips rather
+        // than wraps here (no `.wrap(...)` call), so a narrower width would
+        // make the `contains` check below fail for a reason that has
+        // nothing to do with the claim this test exists to prove.
+        let width = 80;
+        let height = 10;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_startup_splash(frame, true))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+
+        let row_text = |y: u16| -> String {
+            (0..width)
+                .map(|x| buffer.cell((x, y)).map_or(" ", |c| c.symbol()))
+                .collect()
+        };
+        let contents: Vec<String> = (0..height).map(row_text).collect();
+
+        let marker_row = contents
+            .iter()
+            .position(|row| row.contains(STARTUP_SPLASH_TEXT))
+            .expect("the first line must still render on a cache miss");
+        let pending_row = contents
+            .iter()
+            .position(|row| row.contains(STARTUP_SPLASH_PROBE_PENDING_TEXT))
+            .expect(
+                "probe_pending: true must render the second, \
+                 first-run-in-this-terminal line",
+            );
+
+        // Two lines, block-centered: the pending line sits directly beneath
+        // the marker line, and together they occupy the same vertically
+        // centered pair of rows `render_startup_splash`'s `top_pad` formula
+        // computes for a height-2 block — not the single-line row the
+        // `probe_pending: false` test above lands on.
+        assert_eq!(
+            pending_row,
+            marker_row + 1,
+            "the pending line must render immediately below the marker line"
+        );
+        assert_eq!(
+            marker_row,
+            ((height - 2) / 2) as usize,
+            "a two-line block must start one row above where the single-line \
+             splash centers, per top_pad = (area.height - lines.len()) / 2"
         );
     }
 

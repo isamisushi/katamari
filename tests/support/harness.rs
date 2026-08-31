@@ -126,6 +126,19 @@ pub struct SpawnOptions {
     /// — without waiting out that function's real ~2s timeout to prove it:
     /// see `kitty::splash_is_visible_while_the_kitty_probe_is_still_pending`.
     pub probe_reply_delay: Option<Duration>,
+    /// Overrides `$XDG_STATE_HOME` with a caller-supplied path instead of
+    /// the fresh-per-spawn `env_home.path().join("state")`. `None` (the
+    /// default) keeps that per-spawn isolation, exactly like every other
+    /// test in this suite. Exists only so a test can spawn `ktmr` twice
+    /// against the *same* state directory — the one way to prove a second
+    /// launch in an already-probed terminal actually reuses
+    /// `ui::probe_cache`'s cached verdict rather than merely answering the
+    /// probe again just as fast: see
+    /// `kitty::a_second_launch_writes_then_reuses_the_kitty_probe_cache`.
+    /// The caller creates and owns this directory's lifetime (typically a
+    /// `tempfile::TempDir` held across both `Harness::spawn` calls); this
+    /// field only ever borrows its path.
+    pub state_home: Option<std::path::PathBuf>,
 }
 
 impl Default for SpawnOptions {
@@ -138,6 +151,7 @@ impl Default for SpawnOptions {
             update_state_json: None,
             extra_env: Vec::new(),
             probe_reply_delay: None,
+            state_home: None,
         }
     }
 }
@@ -240,7 +254,17 @@ impl Harness {
             .tempdir()
             .expect("failed to create per-test $HOME tempdir");
 
-        let state_home = env_home.path().join("state");
+        // `opts.state_home`, when supplied, points `$XDG_STATE_HOME` at a
+        // directory the caller owns and can reuse across two separate
+        // `spawn_without_ready_wait` calls (see its docs) — everything else
+        // below (`$HOME` itself, `$XDG_CONFIG_HOME`/`$XDG_DATA_HOME`) still
+        // comes from this spawn's own fresh `env_home`, since only the
+        // kitty-probe cache (and the update-check cache seeded right below)
+        // need to persist between the two launches a reusing test makes.
+        let state_home = opts
+            .state_home
+            .clone()
+            .unwrap_or_else(|| env_home.path().join("state"));
         let update_state_json = opts.update_state_json.clone().unwrap_or_else(|| {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

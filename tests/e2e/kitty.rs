@@ -22,7 +22,7 @@
 use crate::support::harness::SPLASH_MARKER;
 use crate::support::screen::underlined_cells;
 use crate::support::{Harness, Key, KittyMode, SpawnOptions, fixture};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Sends `key` and waits until the status bar shows no `"jump:"` note at
 /// all — clearing whatever `Ctrl-o`/`Ctrl-i`/`M-Left`/`M-Right` status text
@@ -282,6 +282,114 @@ fn splash_is_visible_while_the_kitty_probe_is_still_pending() {
     h.send(Key::Char('q'));
     let status = h.wait_exit(Duration::from_secs(5));
     assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+// ---- kitty probe cache: a second launch skips the probe entirely ---------
+
+/// The actual fix, proven end to end: a first `ktmr` launch in a terminal
+/// with no cached verdict yet runs the real probe (as
+/// `splash_is_visible_while_the_kitty_probe_is_still_pending` above already
+/// proves can stall) and, on answering, must persist that verdict to
+/// `ui::probe_cache`'s on-disk cache before this process exits — so a
+/// *second* launch against the exact same state directory (and hence the
+/// same cache file) finds it there. This harness's terminal fingerprint is
+/// always the same across every spawn (`TERM=xterm-256color`, no
+/// `TERM_PROGRAM`/`TERM_PROGRAM_VERSION` — see
+/// `Harness::spawn_without_ready_wait`), so [`SpawnOptions::state_home`] is
+/// the only variable that decides whether the second launch sees a fresh
+/// cache (the default, every other test in this file) or a warm one (only
+/// here).
+#[test]
+fn a_second_launch_writes_then_reuses_the_kitty_probe_cache() {
+    let repo = fixture::basic_repo();
+    let state_home = tempfile::tempdir().expect("tempdir for a shared $XDG_STATE_HOME");
+    let cache_path = state_home.path().join("katamari").join("kitty-probe.json");
+
+    // First launch: nothing cached yet, so `ktmr` runs the real probe (this
+    // harness's default `KittyMode::Supported`, answered immediately — no
+    // `probe_reply_delay` here, this half isn't about the stall) and must
+    // write this terminal's fingerprint and verdict before it exits.
+    {
+        let mut h = Harness::spawn(
+            repo.path(),
+            SpawnOptions {
+                state_home: Some(state_home.path().to_path_buf()),
+                ..Default::default()
+            },
+        );
+        h.send(Key::Char('q'));
+        let status = h.wait_exit(Duration::from_secs(5));
+        assert!(
+            status.success(),
+            "first launch should exit 0, got {status:?}"
+        );
+    }
+
+    let cache_text = std::fs::read_to_string(&cache_path).unwrap_or_else(|e| {
+        panic!(
+            "expected {} to exist after the first launch: {e}",
+            cache_path.display()
+        )
+    });
+    let cache_json: serde_json::Value =
+        serde_json::from_str(&cache_text).expect("cache file must be valid JSON");
+    let entries = cache_json
+        .as_object()
+        .expect("cache file's top level must be a fingerprint -> verdict object");
+    assert_eq!(
+        entries.len(),
+        1,
+        "exactly one fingerprint should have been recorded: {cache_text}"
+    );
+    let (fingerprint, verdict) = entries.iter().next().unwrap();
+    assert!(
+        fingerprint.contains("term=xterm-256color"),
+        "the recorded fingerprint must be built from this harness's own \
+         TERM, got {fingerprint:?}"
+    );
+    assert_eq!(
+        verdict["supported"],
+        serde_json::Value::Bool(true),
+        "KittyMode::Supported (this harness's default) must cache a `true` \
+         verdict: {cache_text}"
+    );
+
+    // Second launch, same state home — so the same fingerprint now has a
+    // cached verdict — with the probe reply withheld far longer than any
+    // real startup should ever take. If the cache is actually consulted
+    // (not merely a fast reply racing a slow one), `ktmr` never even sends
+    // the probe query, so this reply is never read at all: see
+    // `spawn_reader_thread`'s docs on why a withheld reply to a query that
+    // was never sent is simply inert.
+    let long_delay = Duration::from_secs(4);
+    let start = Instant::now();
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            state_home: Some(state_home.path().to_path_buf()),
+            probe_reply_delay: Some(long_delay),
+            ..Default::default()
+        },
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < long_delay / 2,
+        "a cache-hit launch must skip the probe entirely rather than \
+         merely outrace a withheld reply; ready in {elapsed:?} against a \
+         {long_delay:?} withheld reply"
+    );
+    assert!(
+        h.screen_contents().contains("README.md"),
+        "the real diff view, not just any non-splash frame, must have \
+         rendered by the time Harness::spawn's readiness wait returns"
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(
+        status.success(),
+        "second launch should exit 0, got {status:?}"
+    );
 }
 
 // ---- issue #13's emacs preset: M-f/M-b over real wire bytes ---------------

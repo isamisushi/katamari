@@ -16,7 +16,13 @@
 //!   [`crate::config::parse_with_warnings`] rather than [`crate::config::load_merged`]'s
 //!   own stderr-only warnings, so a parse problem becomes a `Check` a caller
 //!   can render or serialize instead of a side effect it has no way to
-//!   observe.
+//!   observe. Also reports the current terminal's kitty-keyboard-protocol
+//!   probe fingerprint and cached verdict (see [`crate::ui::probe_cache`]),
+//!   the one static, self-diagnosable answer to "why did this launch's
+//!   splash linger" — a `warn` on a cache miss (the *next* launch in this
+//!   terminal, not necessarily this one, is what would actually probe and
+//!   wait) rather than an `error`, since a first launch or one since `ktmr
+//!   reset --cache` is completely ordinary, expected state.
 //! - **lsp (resolution)**: static, offline — where each of the six built-in
 //!   languages' server would resolve from today, plus any
 //!   `[lsp.servers.<id>]` custom entry — built on [`crate::lsp::adapter::diagnose`],
@@ -55,6 +61,7 @@ use crate::config::{self, ServerOverride};
 use crate::lsp::adapter::{self, Diagnosis, LangKey, Language};
 use crate::lsp::manager::ServerState;
 use crate::lsp::{self, LspManager};
+use crate::ui::probe_cache;
 use crate::vcs::git::GitSource;
 use crate::vcs::{self, DiffSource, jj};
 use anyhow::{Result, bail};
@@ -504,9 +511,40 @@ fn config_section(effective_root: &Path) -> Section {
     }
     let repo_path = effective_root.join(".katamari").join("config.toml");
     checks.push(config_path_check("repo config", &repo_path));
+    checks.push(kitty_probe_check());
     Section {
         title: "config".to_owned(),
         checks,
+    }
+}
+
+/// Reports this terminal's kitty-keyboard-protocol probe cache state — the
+/// same fingerprint and lookup [`crate::ui::enable_kitty_keyboard_protocol`]
+/// itself would use on the next real `ktmr` launch (see
+/// [`crate::ui::probe_cache`]'s module docs), read here purely for display:
+/// running `ktmr doctor` never probes or writes anything itself. A hit
+/// (either verdict) is `ok` — the next launch in this terminal skips the
+/// real probe either way; a miss is `warn`, since it means the *next*
+/// launch, not this `doctor` run, will pay crossterm's up-to-2s wait.
+fn kitty_probe_check() -> Check {
+    let fingerprint = probe_cache::fingerprint_from_env();
+    let label = "kitty keyboard probe cache";
+    match probe_cache::look_up(&probe_cache::cache_file_path(), &fingerprint) {
+        Some(true) => Check::ok(
+            label,
+            format!("hit, supported ({fingerprint}) — startup skips the probe"),
+        ),
+        Some(false) => Check::ok(
+            label,
+            format!("hit, not supported ({fingerprint}) — startup skips the probe"),
+        ),
+        None => Check::warn(
+            label,
+            format!(
+                "miss ({fingerprint}) — the next launch in this terminal probes \
+                 and may wait up to ~2s before caching a verdict"
+            ),
+        ),
     }
 }
 
