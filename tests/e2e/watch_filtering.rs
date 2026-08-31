@@ -158,6 +158,123 @@ fn nested_checkout_never_wakes_the_watcher() {
     );
 }
 
+/// Finding #1 regression: a directory that arrives via `mv`/`git mv`
+/// (rather than `mkdir`) must still end up dynamically watched. On
+/// inotify, `notify` reports a directory moved into a watched tree as
+/// `Modify(Name(RenameMode::To))`, not `Create` — a
+/// `maybe_register_new_dir` gate that only reacted to `Created` (as it
+/// once did) silently never gave the renamed-in directory a watch
+/// descriptor at all, so nothing written inside it afterward generated any
+/// event, for the rest of the session. `ktmr watch-check` is the right
+/// level (see `nested_checkout_never_wakes_the_watcher`'s own docs on
+/// why): no TUI, no diff computation, just "did `watch::spawn` itself
+/// notice" — `--flushes 2` asks for both the rename's own flush *and* a
+/// second one from the write that follows, so this fails exactly the way
+/// the finding's own repro did if the renamed-in directory never got a
+/// watch.
+///
+/// Cross-platform in principle (a plain renamed-in directory isn't
+/// gitignored or a nested checkout), but `#[cfg]`-gated to inotify-family
+/// targets anyway: FSEvents/`ReadDirectoryChangesW`'s single recursive
+/// root watch already covers this by construction, so it would only prove
+/// the platform backend works, not this module's own dynamic-registration
+/// logic — the thing Finding #1 was actually about.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[test]
+fn a_directory_renamed_into_the_tree_is_dynamically_watched() {
+    let repo = tempfile::tempdir().expect("failed to create a repo tempdir");
+    let outside = tempfile::tempdir().expect("failed to create a staging tempdir");
+    let staged = outside.path().join("newmod");
+    std::fs::create_dir_all(&staged).expect("failed to create the pre-rename directory");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_ktmr"))
+        .arg("watch-check")
+        .arg("--dir")
+        .arg(repo.path())
+        .arg("--flushes")
+        .arg("2")
+        .arg("--timeout-secs")
+        .arg("10")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ktmr watch-check");
+
+    // A brief head start for registration, unlike the nested-checkout
+    // negative test above: this test wants to prove the positive case, not
+    // win the tightest possible race against setup.
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::rename(&staged, repo.path().join("newmod"))
+        .expect("failed to rename the directory into the watched tree");
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(
+        repo.path().join("newmod").join("after_rename.txt"),
+        "content WATCH_FILTERING_RENAME_MARKER\n",
+    )
+    .expect("failed to write into the renamed-in directory");
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for ktmr watch-check");
+    assert!(
+        output.status.success(),
+        "a directory renamed into the watched tree must be watched, so a write \
+         inside it must flush; stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// Finding #2 regression: a `!`-negated pattern inside an otherwise wholly
+/// excluded directory (`build/\n!build/keep/\n`, the common "keep one
+/// grandfathered subdirectory" idiom) must still end up watched for that
+/// negated subdirectory specifically. The registration walk must not prune
+/// descent into `build/` just because `build/` itself doesn't get its own
+/// watch — pruning there would make everything beneath it, negated
+/// descendants included, permanently unreachable to register at all. See
+/// [`fixture::negated_gitignore_repo`]'s own docs for the exact shape.
+///
+/// Linux/inotify-family only, for the same reason
+/// `nested_checkout_never_wakes_the_watcher` is: on macOS/Windows,
+/// [`watch::register`] keeps the single recursive native root watch, so
+/// the registration walk this finding is about doesn't run there at all.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[test]
+fn a_negated_gitignore_subdirectory_is_still_watched() {
+    let repo = fixture::negated_gitignore_repo();
+
+    let child = Command::new(env!("CARGO_BIN_EXE_ktmr"))
+        .arg("watch-check")
+        .arg("--dir")
+        .arg(repo.path())
+        .arg("--flushes")
+        .arg("1")
+        .arg("--timeout-secs")
+        .arg("10")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn ktmr watch-check");
+
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::write(
+        repo.path().join("build").join("keep").join("file.txt"),
+        "changed WATCH_FILTERING_NEGATION_MARKER\n",
+    )
+    .expect("failed to edit the negated fixture file");
+
+    let output = child
+        .wait_with_output()
+        .expect("failed to wait for ktmr watch-check");
+    assert!(
+        output.status.success(),
+        "a file inside a gitignore-negated subdirectory must still be watched; \
+         stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
 /// A directory that doesn't exist yet at spawn time — unlike the fixture's
 /// pre-existing `ignored/`/`agent-worktree/`, which only the *initial*
 /// registration walk ever has a chance to prune or admit — must still end

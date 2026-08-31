@@ -10,21 +10,27 @@
 //!
 //! Registration (getting `notify` to actually watch the right set of
 //! directories) is platform-split — see [`WatchSession::start`]'s call
-//! into the cfg-gated `register` — because the two backends this crate
-//! ships for have opposite cost shapes: FSEvents (macOS) watches an entire
-//! subtree with one kernel-level call, so a single [`RecursiveMode::Recursive`]
-//! registration at `repo_root` is both simplest and fastest; inotify
-//! (Linux and friends) has no subtree primitive at all — `notify`'s own
-//! `Recursive` mode on that backend is already just a walk-and-register-
-//! every-directory loop done for you, gitignore-blind. On inotify-family
-//! platforms this module does that same walk itself instead, with
-//! [`ignore::WalkBuilder`], so a directory that's gitignored, hardcoded-
-//! excluded, or a nested checkout (a linked worktree, a vendored repo)
-//! never gets a watch descriptor — and therefore never gets recursed into
-//! — in the first place, rather than being registered and then filtered
-//! event-by-event forever after. See [`walk_admits`] for the shared
-//! decision both that walk and this module's per-event filtering
-//! ([`is_excluded`]) are built from.
+//! into the cfg-gated `register` — because `notify`'s backend families fall
+//! into two cost shapes, not one-per-platform: FSEvents (macOS) and
+//! `ReadDirectoryChangesW` (Windows) each watch an entire subtree with one
+//! kernel-level call and a native recursive flag, so a single
+//! [`RecursiveMode::Recursive`] registration at `repo_root` is both
+//! simplest and fastest on either; inotify (Linux and every other target
+//! this crate builds for) has no subtree primitive at all — `notify`'s own
+//! `Recursive` mode there is already just a walk-and-register-every-
+//! directory loop done for you, gitignore-blind. On that family this
+//! module does that same walk itself instead, with [`ignore::WalkBuilder`],
+//! so a directory that's gitignored, hardcoded-excluded, or a nested
+//! checkout (a linked worktree, a vendored repo) never gets a watch
+//! descriptor in the first place, rather than being registered and then
+//! filtered event-by-event forever after — though the walk still
+//! *descends* into a plain gitignore-matched directory even when it won't
+//! register one for it, because a `!`-negated pattern deeper inside (e.g.
+//! `!build/keep/` under a wholesale `build/` exclude) can re-admit a
+//! descendant that only a walk which actually reaches it can discover; see
+//! [`walk_descends`] for the pruning rule this needs, distinct from
+//! [`walk_admits`], the shared registration decision both that walk and
+//! this module's per-event filtering ([`is_excluded`]) are built from.
 
 pub mod debounce;
 
@@ -33,7 +39,7 @@ pub use debounce::{ChangeKind, ChangedPath};
 use crate::vcs::git::GitSource;
 use debounce::Debounce;
 use ignore::Match;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use ignore::WalkBuilder;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -157,16 +163,27 @@ pub fn spawn(repo_root: PathBuf, tx: Sender<WatchSignal>, quiet: Duration) {
 /// One watcher connection: the underlying OS watcher, the gitignore filter
 /// built once at start, and the debounce state that accumulates across the
 /// session. `watcher` stays live for more than its `Drop` on the filtered
-/// (non-macOS) registration strategy — [`WatchSession::maybe_register_new_dir`]
-/// calls `.watch()` on it again whenever a new directory appears mid-
-/// session; on macOS's single-recursive-watch strategy nothing ever calls
-/// it again after [`WatchSession::start`], hence the lint escape hatch.
+/// (inotify-family) registration strategy — [`WatchSession::maybe_register_new_dir`]
+/// calls `.watch()` on it again whenever a directory appears mid-session;
+/// on the recursive strategy (macOS and Windows both — see the module
+/// docs) nothing ever calls it again after [`WatchSession::start`], hence
+/// the lint escape hatch. `registered_dirs` exists only for the filtered
+/// strategy: every directory [`register_subtree`]'s walk has already
+/// visited this session, watched or not (see that function's docs), so a
+/// later event on a directory already in this set short-circuits before
+/// re-walking its subtree — without it, widening
+/// [`WatchSession::maybe_register_new_dir`]'s trigger to any directory
+/// event rather than just `Created` (needed so a directory renamed/moved
+/// in is ever picked up at all) would turn every ordinary metadata-only
+/// `Modify` on an already-watched directory into a full re-walk of it.
 struct WatchSession {
     repo_root: PathBuf,
     ignore: Gitignore,
     notify_rx: mpsc::Receiver<notify::Result<Event>>,
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    #[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
     watcher: RecommendedWatcher,
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    registered_dirs: std::collections::HashSet<PathBuf>,
 }
 
 impl WatchSession {
@@ -176,13 +193,32 @@ impl WatchSession {
         let mut watcher = notify::recommended_watcher(move |res| {
             let _ = notify_tx.send(res);
         })?;
-        register(&repo_root, &ignore, &mut watcher)?;
-        Ok(Self {
-            repo_root,
-            ignore,
-            notify_rx,
-            watcher,
-        })
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            register(&repo_root, &ignore, &mut watcher)?;
+            Ok(Self {
+                repo_root,
+                ignore,
+                notify_rx,
+                watcher,
+            })
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            // `register`'s return value seeds `registered_dirs` with every
+            // directory the initial walk already visited, so a later event
+            // on one of them (an ordinary mtime bump, say) doesn't look
+            // "new" to `maybe_register_new_dir` and trigger a redundant
+            // re-walk — see that field's docs.
+            let registered_dirs = register(&repo_root, &ignore, &mut watcher)?;
+            Ok(Self {
+                repo_root,
+                ignore,
+                notify_rx,
+                watcher,
+                registered_dirs,
+            })
+        }
     }
 
     /// Runs the classify → filter → debounce pipeline until `tx`'s receiver
@@ -244,35 +280,59 @@ impl WatchSession {
         }
     }
 
-    /// On the filtered (non-macOS) registration strategy, notices a newly
-    /// created directory and gives it (and everything ignore-admitted
-    /// beneath it — a burst-created subtree, e.g. `mkdir -p a/b/c`, can
-    /// bring more than one directory into existence before this session
-    /// reacts at all) its own watch, the same way [`register`] did for
-    /// every directory that already existed at startup. A no-op on macOS:
-    /// FSEvents' single recursive root watch already covers new
-    /// subdirectories on its own — nothing to register.
+    /// On the filtered (inotify-family) registration strategy, notices a
+    /// directory this session hasn't already registered — a brand-new one
+    /// (`Created`), or one that just moved into the tree via `mv`/`git mv`
+    /// (on inotify, `notify` reports that as `Modify(Name(RenameMode::
+    /// To/Both))`, which [`classify`] maps to `Changed` — a directory
+    /// arriving this way used to be permanently unwatched, since the old
+    /// `kind == Created` gate never called this for it at all, and no
+    /// OS-level watch descriptor was ever placed on it as a result) — and
+    /// gives it (and everything admitted beneath it — a burst-created
+    /// subtree, e.g. `mkdir -p a/b/c`, can bring more than one directory
+    /// into existence before this session reacts at all) its own watch,
+    /// the same way [`register`] did for every directory that already
+    /// existed at startup. A no-op on the recursive strategy (macOS and
+    /// Windows both): their native subtree watch already covers new or
+    /// renamed-in subdirectories on its own — nothing to register.
     ///
-    /// `kind`/`path.is_dir()` gate this to directory-create events only —
-    /// re-stat rather than trusting `notify`'s `CreateKind` (which some
-    /// backends report as an uninformative `Any`), matching how
-    /// [`is_excluded`] already re-stats for the same reason. If the
-    /// directory admits (see [`walk_admits`] — a plain new directory does;
-    /// a newly created nested checkout or gitignored directory doesn't),
-    /// registering it best-effort (see [`register_subtree`]'s docs on why
-    /// a failure here doesn't tear down the session) closes a second,
-    /// narrower async-setup-shaped race than [`spawn`]'s startup one: any
-    /// write that lands inside the new directory between the OS creating
-    /// it and the `watcher.watch()` call landing is invisible to `notify`
-    /// forever — no watch was covering that path yet to generate an event
-    /// for it. Recorded into `debounce` as a synthetic `Changed` entry
-    /// (not sent immediately) so it collapses into the same flush as
-    /// every other event in the current window instead of forcing an
-    /// extra, undebounced refresh — the directory's own `Created` record
-    /// (added by the caller right after this returns) would otherwise
-    /// already trigger a refresh on its own, but that alone wouldn't
-    /// prove anything written *inside* it was actually seen.
-    #[cfg(target_os = "macos")]
+    /// `path.is_dir()` alone gates this now — `kind` isn't consulted for
+    /// the trigger any more (a deleted path fails `is_dir()` on its own, so
+    /// no separate exclusion is needed for that case) — re-stat rather than
+    /// trusting `notify`'s `CreateKind`/`ModifyKind` (which some backends
+    /// report as an uninformative `Any`), matching how [`is_excluded`]
+    /// already re-stats for the same reason. `registered_dirs` (see that
+    /// field's docs) then gates the actual work: a directory already in the
+    /// set is skipped outright before touching the filesystem again, so a
+    /// routine `Modify` on a directory this session registered minutes ago
+    /// (a child being added bumps the parent's mtime) costs one `HashSet`
+    /// lookup, not a re-walk.
+    ///
+    /// The walk-or-not decision for a not-yet-seen directory is
+    /// [`walk_descends`], not [`walk_admits`] — deliberately more
+    /// permissive: a directory that's itself gitignored (a `build/` just
+    /// `mv`'d in, say) still gets walked, so a negated descendant inside it
+    /// (`build/keep/`) can still be found and registered even though
+    /// `build/` itself won't be (see the module docs and
+    /// [`walk_descends`]'s). Only a hardcoded exclude or a nested checkout
+    /// (a newly arrived worktree or vendored repo) skips the walk
+    /// entirely; [`register_subtree`]'s own [`walk_admits`] check then
+    /// decides, directory by directory, which of what the walk finds
+    /// actually gets a watch. Best-effort either way (see
+    /// [`register_subtree`]'s docs on why a failure here doesn't tear down
+    /// the session): it closes a second, narrower async-setup-shaped race
+    /// than [`spawn`]'s startup one — any write that lands inside the new
+    /// directory between the OS creating it and the `watcher.watch()` call
+    /// landing is invisible to `notify` forever, since no watch was
+    /// covering that path yet to generate an event for it. Recorded into
+    /// `debounce` as a synthetic `Changed` entry (not sent immediately) so
+    /// it collapses into the same flush as every other event in the
+    /// current window instead of forcing an extra, undebounced refresh —
+    /// the directory's own record (added by the caller right after this
+    /// returns) would otherwise already trigger a refresh on its own, but
+    /// that alone wouldn't prove anything written *inside* it was actually
+    /// seen.
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn maybe_register_new_dir(
         &mut self,
         _path: &Path,
@@ -282,21 +342,32 @@ impl WatchSession {
     ) {
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn maybe_register_new_dir(
         &mut self,
         path: &Path,
-        kind: ChangeKind,
+        _kind: ChangeKind,
         debounce: &mut Debounce,
         start: Instant,
     ) {
-        if kind != ChangeKind::Created || !path.is_dir() {
+        if !path.is_dir() {
             return;
         }
-        if !walk_admits(&self.repo_root, path, &self.ignore) {
-            return; // e.g. a brand-new nested checkout — see `walk_admits`
+        if !walk_descends(&self.repo_root, path) {
+            return; // hardcoded-excluded, or a nested checkout — see `walk_descends`
         }
-        if register_subtree(&self.repo_root, path, &self.ignore, &mut self.watcher).is_ok() {
+        if self.registered_dirs.contains(path) {
+            return; // already registered/walked this session
+        }
+        if register_subtree(
+            &self.repo_root,
+            path,
+            &self.ignore,
+            &mut self.watcher,
+            &mut self.registered_dirs,
+        )
+        .is_ok()
+        {
             debounce.record(start.elapsed(), path.to_path_buf(), ChangeKind::Changed);
         }
     }
@@ -316,6 +387,24 @@ fn classify(event: &Event) -> Vec<(PathBuf, ChangeKind)> {
     event.paths.iter().cloned().map(|p| (p, kind)).collect()
 }
 
+/// The [`HARDCODED_EXCLUDES`] half of [`is_excluded`], factored out so
+/// [`walk_descends`] can prune on it too without pulling in the
+/// `.gitignore` check alongside it — unlike a hardcoded exclude, a
+/// gitignore match admits negation and so must never prune walk *descent*
+/// on its own (see that function's docs and the module docs' Finding-#2
+/// note). Same fail-open rule for a `path` outside `repo_root` as
+/// `is_excluded`.
+fn is_hardcoded_excluded(repo_root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(repo_root) else {
+        return false;
+    };
+    relative.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|name| HARDCODED_EXCLUDES.contains(&name))
+    })
+}
+
 /// Whether `path` (absolute, somewhere under `repo_root`) should never
 /// reach the debounce window at all: inside a [`HARDCODED_EXCLUDES`]
 /// directory, or matched by the repository's root `.gitignore`. Paths
@@ -325,17 +414,12 @@ fn classify(event: &Event) -> Vec<(PathBuf, ChangeKind)> {
 /// prefix) fail open rather than being silently dropped, since a missed
 /// refresh is a worse failure mode than an extra one.
 fn is_excluded(repo_root: &Path, path: &Path, ignore: &Gitignore) -> bool {
+    if is_hardcoded_excluded(repo_root, path) {
+        return true;
+    }
     let Ok(relative) = path.strip_prefix(repo_root) else {
         return false;
     };
-    let in_hardcoded_exclude = relative.components().any(|c| {
-        c.as_os_str()
-            .to_str()
-            .is_some_and(|name| HARDCODED_EXCLUDES.contains(&name))
-    });
-    if in_hardcoded_exclude {
-        return true;
-    }
     let is_dir = path.is_dir();
     matches!(
         ignore.matched_path_or_any_parents(relative, is_dir),
@@ -344,14 +428,18 @@ fn is_excluded(repo_root: &Path, path: &Path, ignore: &Gitignore) -> bool {
 }
 
 /// Registers `repo_root` with `watcher` — see the module docs for why this
-/// is platform-split. The macOS/FSEvents strategy: subtree watching is
-/// O(1) at the kernel level there, so a single recursive call is both the
-/// simplest and the fastest option; walking the tree ourselves the way the
-/// other platforms' strategy does would only add per-directory `watch()`
-/// call overhead FSEvents doesn't need and gain nothing (no ignore-
-/// awareness benefit either, since FSEvents has no per-directory
-/// registration to skip in the first place).
-#[cfg(target_os = "macos")]
+/// is platform-split. The macOS/FSEvents and Windows/`ReadDirectoryChangesW`
+/// strategy: subtree watching is a single native kernel-level call on
+/// either backend (FSEvents recurses by construction; `notify`'s Windows
+/// backend passes `RecursiveMode::Recursive` straight through as
+/// `ReadDirectoryChangesW`'s own `bWatchSubtree` flag), so one recursive
+/// registration at `repo_root` is both the simplest and the fastest option
+/// on both platforms; walking the tree ourselves the way the inotify-family
+/// strategy does would only add per-directory `watch()` call overhead
+/// neither backend needs and gain nothing (no ignore-awareness benefit
+/// either, since neither has a per-directory registration to skip in the
+/// first place).
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn register(
     repo_root: &Path,
     _ignore: &Gitignore,
@@ -360,36 +448,75 @@ fn register(
     watcher.watch(repo_root, RecursiveMode::Recursive)
 }
 
-/// Registers `repo_root` with `watcher` on inotify-family platforms: a
-/// non-recursive watch per ignore-admitted directory, walked and filtered
-/// by [`walk_admits`] (see the module docs for the full rationale). This
-/// costs no *more* watch descriptors than `notify`'s own `RecursiveMode::
-/// Recursive` did before this change — on this backend family, `notify`
-/// already registers one inotify watch per directory under the hood to
-/// emulate recursion, since inotify itself has no subtree primitive; doing
-/// that walk ourselves instead just means some of those directories (the
-/// gitignored, hardcoded-excluded, and nested-checkout ones) never get a
-/// descriptor at all. Strictly fewer, never more — nothing here should
-/// raise "watch limit" concerns.
-#[cfg(not(target_os = "macos"))]
+/// Registers `repo_root` with `watcher` on inotify-family platforms (every
+/// target other than macOS/Windows — see the module docs): a non-recursive
+/// watch per ignore-admitted directory, walked and filtered by
+/// [`walk_admits`]/[`walk_descends`] (see the module docs for the full
+/// rationale). This costs no *more* watch descriptors than `notify`'s own
+/// `RecursiveMode::Recursive` did before this change — on this backend
+/// family, `notify` already registers one inotify watch per directory
+/// under the hood to emulate recursion, since inotify itself has no
+/// subtree primitive; doing that walk ourselves instead just means some of
+/// those directories (the gitignored, hardcoded-excluded, and
+/// nested-checkout ones) never get a descriptor at all. Strictly fewer,
+/// never more — nothing here should raise "watch limit" concerns.
+///
+/// Returns every directory the registration walk visited, watched or not
+/// (see [`register_subtree`]) — the caller seeds
+/// [`WatchSession`]'s `registered_dirs` with it, so a later event on one of
+/// them can't trigger a redundant re-walk of the whole subtree.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn register(
     repo_root: &Path,
     ignore: &Gitignore,
     watcher: &mut RecommendedWatcher,
-) -> notify::Result<()> {
-    register_subtree(repo_root, repo_root, ignore, watcher)
+) -> notify::Result<std::collections::HashSet<PathBuf>> {
+    let mut registered_dirs = std::collections::HashSet::new();
+    register_subtree(repo_root, repo_root, ignore, watcher, &mut registered_dirs)?;
+    Ok(registered_dirs)
 }
 
-/// Whether the filtered registration walk keeps `path` at all — for a
-/// directory, both "does this directory get its own `notify` watch" and
-/// "does the walk descend into it" ([`walk_watchable_dirs`]'s
-/// `filter_entry` treats a `false` verdict as both simultaneously, which is
-/// exactly what's wanted here: there's no useful "watch it but don't
-/// recurse" state for a directory-granularity ignore decision). `repo_root`
-/// itself is always kept regardless of what `ignore` says about it (an
-/// empty or absent `.gitignore` must never make the walk refuse its own
-/// starting point). Every other directory is dropped for one of two
-/// reasons:
+/// Whether the filtered registration walk should descend into `path` at
+/// all — independent of whether `path` itself ends up with its own watch
+/// (that's [`walk_admits`], below). Only two reasons ever prune descent
+/// here, and both share the property that no `.gitignore` negation could
+/// ever reverse them: a [`HARDCODED_EXCLUDES`] name (not a gitignore
+/// concept at all — [`is_excluded`] never lets a pattern override these
+/// either) and a nested checkout's own `.git` boundary (a different
+/// repository entirely, not this one's ignore rules to interpret). A plain
+/// gitignore-matched directory is deliberately *not* pruned here — see the
+/// module docs and [`walk_admits`]'s: a directory-level exclude alone must
+/// never stop the walk from reaching a `!`-negated descendant, or that
+/// negation becomes unreachable regardless of how correctly `walk_admits`
+/// would answer for the descendant directly.
+fn walk_descends(repo_root: &Path, path: &Path) -> bool {
+    if path == repo_root {
+        return true;
+    }
+    if is_hardcoded_excluded(repo_root, path) {
+        return false;
+    }
+    !path.join(".git").exists()
+}
+
+/// Whether `path` should get its own `notify` watch — used by
+/// [`register_subtree`] to decide, directory by directory, which of what
+/// [`walk_watchable_dirs`] visits actually gets a `watcher.watch()` call.
+/// Distinct from — and stricter than — [`walk_descends`], which decides
+/// whether the walk visits `path` at all: a plain gitignore-matched
+/// directory fails `walk_admits` (no watch of its own) but still passes
+/// `walk_descends` (still visited), because a `!`-negated pattern deeper
+/// inside it can re-admit a descendant that only a walk which reaches it
+/// can discover. Before that split existed, the two questions shared one
+/// verdict, which was exactly the bug: pruning descent the moment a
+/// directory itself matched meant a negated child could never be reached
+/// to ask about, no matter how correctly this function would have answered
+/// for it.
+///
+/// `repo_root` itself is always kept regardless of what `ignore` says
+/// about it (an empty or absent `.gitignore` must never make the walk
+/// refuse its own starting point). Every other directory is refused a
+/// watch for one of two reasons:
 ///
 /// - [`is_excluded`] the same way an individual changed *file* there would
 ///   be (hardcoded excludes, gitignored) — the one decision this function
@@ -415,36 +542,43 @@ fn walk_admits(repo_root: &Path, path: &Path, ignore: &Gitignore) -> bool {
 }
 
 /// Walks `walk_root`'s subtree collecting every directory the filtered
-/// registration strategy should give its own `notify` watch to —
-/// `walk_root` itself is excluded from the result; both call sites
-/// ([`register`] with `walk_root = repo_root`, and dynamic re-registration
-/// via [`register_subtree`] with `walk_root` = a just-created directory)
-/// register that one directly, unconditionally, before calling this.
+/// registration strategy *visits* — not just the ones that end up with a
+/// watch (that filter is [`register_subtree`]'s, via [`walk_admits`], on
+/// what this returns); `walk_root` itself is excluded from the result:
+/// both call sites ([`register`] with `walk_root = repo_root`, and dynamic
+/// re-registration via [`register_subtree`] with `walk_root` = a
+/// just-created or just-renamed-in directory) handle that one directly,
+/// unconditionally, before calling this.
+///
+/// Pruned only by [`walk_descends`] — a hardcoded exclude or a nested
+/// checkout — deliberately *not* by [`walk_admits`]'s fuller gitignore
+/// check: a plain gitignore-matched directory (`build/`) is still walked
+/// into, so a `!`-negated descendant (`build/keep/`) is still found and
+/// handed to the caller to register, even though `build/` itself won't be.
+/// See the module docs and [`walk_descends`]'s for why collapsing that
+/// distinction (as this function used to) silently breaks gitignore
+/// negation.
 ///
 /// `repo_root` is threaded through separately from `walk_root` because
-/// [`walk_admits`] (via [`is_excluded`]) needs the repository's *true*
-/// root to compute a gitignore-relative path correctly, even when
-/// `walk_root` is some deeper directory that just appeared mid-session —
-/// using `walk_root` there instead would match an unrelated top-level
-/// `.gitignore` pattern against the wrong (too-short) relative path.
+/// [`walk_descends`] needs the repository's *true* root to compute a
+/// hardcoded-exclude-relative path correctly, even when `walk_root` is
+/// some deeper directory that just appeared mid-session.
 ///
 /// Built on [`ignore::WalkBuilder`] purely as a directory walker: all of
 /// its own gitignore/hidden-file machinery is switched off
-/// (`standard_filters(false)`) so [`walk_admits`] — driven by the same
-/// `Gitignore` event-time filtering already uses — is the *only* thing
-/// deciding what gets pruned, rather than layering two independently-
-/// configured ignore engines that could quietly disagree. `hidden` in
-/// particular must stay off: a dotdir like `.github/` is ordinary, watched
-/// content today (nothing hardcoded-excludes it, nothing gitignores it by
-/// default) — `WalkBuilder`'s own default would otherwise silently stop
-/// watching it.
-#[cfg(not(target_os = "macos"))]
-fn walk_watchable_dirs(repo_root: &Path, walk_root: &Path, ignore: &Gitignore) -> Vec<PathBuf> {
+/// (`standard_filters(false)`) so [`walk_descends`] is the only thing
+/// deciding what gets pruned here, rather than layering a second,
+/// independently-configured ignore engine that could quietly disagree with
+/// [`is_excluded`]/[`walk_admits`]. `hidden` in particular must stay off: a
+/// dotdir like `.github/` is ordinary, watched content today (nothing
+/// hardcoded-excludes it, nothing gitignores it by default) —
+/// `WalkBuilder`'s own default would otherwise silently stop watching it.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn walk_watchable_dirs(repo_root: &Path, walk_root: &Path) -> Vec<PathBuf> {
     let mut builder = WalkBuilder::new(walk_root);
     builder.standard_filters(false).hidden(false);
     let root = repo_root.to_path_buf();
-    let admits_ignore = ignore.clone();
-    builder.filter_entry(move |entry| walk_admits(&root, entry.path(), &admits_ignore));
+    builder.filter_entry(move |entry| walk_descends(&root, entry.path()));
     builder
         .build()
         .filter_map(Result::ok)
@@ -454,34 +588,55 @@ fn walk_watchable_dirs(repo_root: &Path, walk_root: &Path, ignore: &Gitignore) -
         .collect()
 }
 
-/// Registers `dir` itself and walks everything [`walk_admits`] keeps
-/// beneath it, registering each as its own non-recursive watch — used both
-/// for the initial registration walk ([`register`], `dir = repo_root`) and
-/// for dynamic re-registration when a new directory appears mid-session
-/// (`WatchSession::maybe_register_new_dir`, `dir` = the new directory):
-/// the exact same "watch this subtree, ignore-aware" operation either way,
-/// just rooted somewhere other than the repository root the second time.
+/// Walks everything [`walk_watchable_dirs`] visits beneath `dir` (`dir`
+/// itself included) and gives each directory [`walk_admits`] approves its
+/// own non-recursive watch — used both for the initial registration walk
+/// ([`register`], `dir = repo_root`) and for dynamic re-registration when a
+/// directory appears mid-session (`WatchSession::maybe_register_new_dir`,
+/// `dir` = the new or renamed-in directory): the exact same "watch this
+/// subtree, ignore-aware" operation either way, just rooted somewhere other
+/// than the repository root the second time.
 ///
-/// Only `dir`'s own `watch()` call can fail this function — everything
-/// beneath it is best-effort (`let _ = watcher.watch(...)`, one directory
-/// at a time): a descendant that vanished between being walked and being
-/// registered (a real, if narrow, race) or one this process can't read for
-/// permission reasons shouldn't take the whole registration down, the same
-/// "a narrower failure mode beats a session-ending one" call
-/// [`is_excluded`]'s own fail-open behavior makes. `dir` itself gets no
-/// such leniency: for the initial call this is `repo_root`, and a session
-/// that can't watch its own repository root has nothing left to watch at
-/// all, so that failure must propagate.
-#[cfg(not(target_os = "macos"))]
+/// `seen` collects every directory the walk visited, watched or not (see
+/// [`walk_watchable_dirs`]'s docs on why a gitignore-matched-but-not-
+/// hardcoded directory is still visited without being watched), so the
+/// caller can fold it into [`WatchSession`]'s own registered-directories
+/// tracking and never pay to walk the same subtree twice.
+///
+/// `dir` itself is registered only when [`walk_admits`] approves it —
+/// always true for `repo_root` (see that function's docs), but not
+/// necessarily for a directory arriving mid-session: one might itself be a
+/// gitignore match (a `build/` just `mv`'d in from outside), which still
+/// needs walking for negated descendants but must not get a watch of its
+/// own — the Finding-#2 distinction `walk_admits` vs. `walk_descends`
+/// exists to make. Everything beneath `dir` is best-effort regardless
+/// (`let _ = watcher.watch(...)`, one directory at a time, still gated by
+/// `walk_admits`): a descendant that vanished between being walked and
+/// being registered (a real, if narrow, race) or one this process can't
+/// read for permission reasons shouldn't take the whole registration down,
+/// the same "a narrower failure mode beats a session-ending one" call
+/// [`is_excluded`]'s own fail-open behavior makes. Only `dir`'s own
+/// `watch()` call (when attempted) can fail this function at all: for the
+/// initial call `dir` is `repo_root`, and a session that can't watch its
+/// own repository root has nothing left to watch at all, so that failure
+/// must propagate.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn register_subtree(
     repo_root: &Path,
     dir: &Path,
     ignore: &Gitignore,
     watcher: &mut RecommendedWatcher,
+    seen: &mut std::collections::HashSet<PathBuf>,
 ) -> notify::Result<()> {
-    watcher.watch(dir, RecursiveMode::NonRecursive)?;
-    for path in walk_watchable_dirs(repo_root, dir, ignore) {
-        let _ = watcher.watch(&path, RecursiveMode::NonRecursive);
+    seen.insert(dir.to_path_buf());
+    if walk_admits(repo_root, dir, ignore) {
+        watcher.watch(dir, RecursiveMode::NonRecursive)?;
+    }
+    for path in walk_watchable_dirs(repo_root, dir) {
+        seen.insert(path.clone());
+        if walk_admits(repo_root, &path, ignore) {
+            let _ = watcher.watch(&path, RecursiveMode::NonRecursive);
+        }
     }
     Ok(())
 }
@@ -1053,9 +1208,32 @@ mod tests {
         ));
     }
 
-    // ---- walk_admits (filtered registration, inotify-family only) --------
+    /// Finding #2's grounding primitive, isolated from the registration
+    /// walk entirely: `Gitignore::matched_path_or_any_parents` resolves a
+    /// `!`-negated pattern nested under a wholesale directory exclude by
+    /// checking the full path directly, not by refusing to look past an
+    /// excluded parent the way a real directory-pruning walk would — so
+    /// `build/` itself stays excluded while `build/keep/` (and everything
+    /// under it) does not. `walk_descends`/`walk_admits`'s split exists
+    /// entirely so the registration walk can actually reach this correct
+    /// answer for `build/keep` instead of pruning past it at `build/`.
+    #[test]
+    fn gitignore_negation_re_admits_a_nested_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".gitignore", "build/\n!build/keep/\n");
+        write(dir.path(), "build/keep/file.txt", "content\n");
+        let ignore = build_ignore(dir.path());
+        assert!(is_excluded(dir.path(), &dir.path().join("build"), &ignore));
+        assert!(!is_excluded(
+            dir.path(),
+            &dir.path().join("build/keep/file.txt"),
+            &ignore
+        ));
+    }
 
-    #[cfg(not(target_os = "macos"))]
+    // ---- walk_descends / walk_admits (filtered registration, inotify-family only) --
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[test]
     fn walk_admits_keeps_the_repo_root_regardless_of_ignore_content() {
         let dir = tempfile::tempdir().unwrap();
@@ -1067,7 +1245,7 @@ mod tests {
         assert!(walk_admits(dir.path(), dir.path(), &ignore));
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[test]
     fn walk_admits_skips_a_gitignored_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -1077,7 +1255,7 @@ mod tests {
         assert!(!walk_admits(dir.path(), &dir.path().join("build"), &ignore));
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[test]
     fn walk_admits_skips_a_nested_checkout_with_a_dot_git_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -1093,7 +1271,7 @@ mod tests {
         assert!(!walk_admits(dir.path(), &worktree, &ignore));
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[test]
     fn walk_admits_skips_a_nested_checkout_with_a_dot_git_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -1103,7 +1281,7 @@ mod tests {
         assert!(!walk_admits(dir.path(), &vendored, &ignore));
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[test]
     fn walk_admits_keeps_an_ordinary_directory() {
         let dir = tempfile::tempdir().unwrap();
@@ -1111,6 +1289,176 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         let ignore = build_ignore(dir.path());
         assert!(walk_admits(dir.path(), &src, &ignore));
+    }
+
+    /// Finding #2, at the `walk_descends` level directly: a plain
+    /// gitignore-matched directory must still be descended into (contrast
+    /// with `walk_admits_skips_a_gitignored_directory` above, which is
+    /// correctly false for the same directory) — otherwise a walk pruning
+    /// on `walk_descends` alone would never reach `build/keep/` to
+    /// register it.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn walk_descends_does_not_prune_a_plain_gitignored_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".gitignore", "build/\n");
+        std::fs::create_dir_all(dir.path().join("build")).unwrap();
+        assert!(walk_descends(dir.path(), &dir.path().join("build")));
+    }
+
+    /// `walk_descends`'s two real pruning reasons — a hardcoded exclude and
+    /// a nested checkout — neither of which is a gitignore concept, so
+    /// neither should ever be reachable by negation the way a plain
+    /// gitignore match is.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn walk_descends_skips_hardcoded_excludes_and_nested_checkouts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join(".git"), "gitdir: /elsewhere\n").unwrap();
+
+        assert!(!walk_descends(dir.path(), &dir.path().join("target")));
+        assert!(!walk_descends(dir.path(), &worktree));
+        assert!(walk_descends(dir.path(), dir.path()));
+    }
+
+    /// End-to-end proof of Finding #2's fix at the walk level: given the
+    /// exact `build/\n!build/keep/\n` shape the finding reproduced against
+    /// a real compiled binary, the registration walk must still *visit*
+    /// `build/keep` (via `walk_watchable_dirs`, pruned only by
+    /// `walk_descends`) even though `build` itself correctly fails
+    /// `walk_admits` and so never gets a watch of its own — proving the
+    /// two-question split actually closes the gap, not just that each
+    /// question answers correctly in isolation.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn walk_watchable_dirs_still_reaches_a_negated_descendant() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".gitignore", "build/\n!build/keep/\n");
+        std::fs::create_dir_all(dir.path().join("build/keep")).unwrap();
+        std::fs::write(dir.path().join("build/keep/file.txt"), "content\n").unwrap();
+        let ignore = build_ignore(dir.path());
+
+        let visited = walk_watchable_dirs(dir.path(), dir.path());
+        assert!(
+            visited.contains(&dir.path().join("build")),
+            "the walk must still visit build/ to reach its negated child"
+        );
+        assert!(
+            visited.contains(&dir.path().join("build/keep")),
+            "the negated descendant must be visited: {visited:?}"
+        );
+
+        assert!(!walk_admits(dir.path(), &dir.path().join("build"), &ignore));
+        assert!(walk_admits(
+            dir.path(),
+            &dir.path().join("build/keep"),
+            &ignore
+        ));
+    }
+
+    // ---- WatchSession::maybe_register_new_dir (Finding #1) ----------------
+
+    /// Finding #1's real-`notify` reproduction: a directory that arrives by
+    /// `mv` (not `mkdir`) generates a `Modify(Name(RenameMode::To))` event
+    /// on inotify — `classify` maps that to `Changed`, not `Created` — so
+    /// the old `kind == Created` gate never even looked at it, and it never
+    /// got a watch descriptor of its own for the rest of the session.
+    /// Mirrors `spawn_revision_watcher_fires_on_a_real_amend`'s "drive the
+    /// real backend, not a hand-built `Event`" shape, since this is exactly
+    /// the kind of platform-event-mapping detail a pure unit test over
+    /// hand-built `Event`s can't prove.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn a_directory_renamed_into_the_tree_is_dynamically_watched() {
+        // Blocks until a `Flushed` signal arrives (or the 5s deadline
+        // passes), silently skipping any `Pending` heads-up along the way
+        // — every recorded change opens with one of those before its own
+        // window ever flushes, and this test only cares about flushes.
+        fn recv_flushed(rx: &mpsc::Receiver<WatchSignal>) -> Option<WatchBatch> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return None;
+                }
+                match rx.recv_timeout(remaining) {
+                    Ok(WatchSignal::Flushed(batch)) => return Some(batch),
+                    Ok(WatchSignal::Pending) => continue,
+                    _ => return None,
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let staged = outside.path().join("newmod");
+        std::fs::create_dir_all(&staged).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        spawn(dir.path().to_path_buf(), tx, DEBOUNCE_QUIET);
+
+        // Drain the guaranteed startup catch-up flush (see `spawn`'s docs)
+        // so it can't be mistaken for either flush this test waits on.
+        assert!(
+            recv_flushed(&rx).is_some(),
+            "expected the guaranteed startup catch-up flush"
+        );
+
+        std::fs::rename(&staged, dir.path().join("newmod")).unwrap();
+        // Let the rename's own flush land on its own first, so the write
+        // below can only be satisfying a *second*, distinct flush — proof
+        // the directory itself is now watched, not just that this one
+        // rename event was classified and debounced correctly.
+        assert!(
+            recv_flushed(&rx).is_some(),
+            "the rename event itself must flush"
+        );
+
+        std::fs::write(dir.path().join("newmod").join("after_rename.txt"), "x\n").unwrap();
+        assert!(
+            recv_flushed(&rx).is_some(),
+            "a write inside a directory renamed into the tree must flush — \
+             the directory must have gotten its own watch when it arrived"
+        );
+    }
+
+    /// Finding #1's dedup guard: once a directory is registered this
+    /// session, a later event on that exact path (an ordinary metadata-only
+    /// `Modify`, say — a child being added bumps the parent's mtime) must
+    /// short-circuit before `register_subtree`'s filesystem walk runs
+    /// again, which is exactly the perf regression the finding's own fix
+    /// note warned a naive "trigger on any `ChangeKind`" widening would
+    /// otherwise reintroduce. Observed through `debounce`:
+    /// `maybe_register_new_dir` only ever calls `debounce.record` when it
+    /// actually attempts registration, so a second call that stays a no-op
+    /// leaves `debounce` exactly as empty as it started.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn a_directory_already_registered_this_session_is_not_rewalked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = WatchSession::start(dir.path().to_path_buf()).unwrap();
+        let sub = dir.path().join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let start = Instant::now();
+        let mut debounce = Debounce::new(DEBOUNCE_QUIET, DEBOUNCE_MAX_LATENCY);
+        session.maybe_register_new_dir(&sub, ChangeKind::Created, &mut debounce, start);
+        assert!(
+            !debounce.is_empty(),
+            "the first sighting of a new directory must register and record it"
+        );
+        debounce.flush();
+        assert!(debounce.is_empty());
+
+        session.maybe_register_new_dir(&sub, ChangeKind::Changed, &mut debounce, start);
+        assert!(
+            debounce.is_empty(),
+            "an already-registered directory must short-circuit before \
+             recording anything, proving the walk didn't run again"
+        );
     }
 
     #[test]

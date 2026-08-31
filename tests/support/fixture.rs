@@ -256,6 +256,34 @@ pub fn nested_checkout_repo() -> FixtureRepo {
     FixtureRepo { dir }
 }
 
+/// A repo whose `.gitignore` excludes `build/` wholesale but re-admits
+/// `build/keep/` via negation (`build/\n!build/keep/\n`) — the common
+/// "keep one grandfathered subdirectory inside an otherwise-ignored
+/// directory" idiom (a config file inside `build/`/`dist/`/`vendor/`,
+/// say), built with `build/keep/file.txt` already present *before* the
+/// session ever spawns, the same "only the initial registration walk ever
+/// reaches a pre-existing directory" reasoning [`watch_filtering_repo`]'s
+/// own docs explain. For `ktmr watch-check`-driven coverage of the
+/// registration walk's Finding-#2 regression: pruning descent into
+/// `build/` the moment `build/` itself fails to admit its own watch would
+/// make `build/keep/` — which *does* admit one, by the same `Gitignore`
+/// `is_excluded` already resolves correctly — unreachable for the walk to
+/// ever register at all.
+pub fn negated_gitignore_repo() -> FixtureRepo {
+    let dir = init_repo();
+    let root = dir.path();
+
+    std::fs::write(root.join(".gitignore"), "build/\n!build/keep/\n").unwrap();
+    std::fs::create_dir_all(root.join("build").join("keep")).unwrap();
+    std::fs::write(
+        root.join("build").join("keep").join("file.txt"),
+        "original\n",
+    )
+    .unwrap();
+
+    FixtureRepo { dir }
+}
+
 /// Whether `jj` is on `PATH` — [`python3_available`]'s jj-side counterpart,
 /// the same self-skip pattern for the same reason: `jj` is mise-managed
 /// (`mise.toml`'s `[tools]` pins a version), so it resolves in this
