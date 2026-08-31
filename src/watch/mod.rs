@@ -218,9 +218,15 @@ fn is_excluded(repo_root: &Path, path: &Path, ignore: &Gitignore) -> bool {
 /// a root diff, so live comment reload works in a plain `ktmr diff` just as
 /// much as it does in any other diff session.
 ///
-/// Creates `.katamari/` if it doesn't exist yet (nobody has written a
-/// comment in this repo before) so there's always a directory to watch —
-/// `notify` can't watch a path that isn't there.
+/// Creates `.katamari/` (and its `.gitignore`) if it doesn't exist yet
+/// (nobody has written a comment in this repo before) so there's always a
+/// directory to watch — `notify` can't watch a path that isn't there. Goes
+/// through [`crate::comments::CommentStore::ensure_dir`] rather than a raw
+/// `create_dir_all` so this — the watcher, which starts unconditionally on
+/// every `ktmr diff` and so is usually what actually creates `.katamari/`
+/// first — seeds the `.gitignore` too, instead of leaving that to whichever
+/// comment gets appended first (which may never happen in a session where
+/// nobody comments).
 pub fn spawn_comments_watcher(repo_root: PathBuf, tx: Sender<()>) -> notify::Result<()> {
     let session = CommentsWatchSession::start(repo_root)?;
     std::thread::spawn(move || session.run(tx));
@@ -239,14 +245,15 @@ impl CommentsWatchSession {
         // `CommentStore::path` (rather than hardcoding `.katamari`/
         // `comments.jsonl` here too) keeps the on-disk layout decision
         // owned by exactly one place — see that method's docs.
-        let comments_path = crate::comments::CommentStore::new(&repo_root)
-            .path()
-            .to_path_buf();
+        let store = crate::comments::CommentStore::new(&repo_root);
+        let comments_path = store.path().to_path_buf();
         let dir = comments_path
             .parent()
             .expect("comments.jsonl always has a parent")
             .to_path_buf();
-        std::fs::create_dir_all(&dir).map_err(notify::Error::io)?;
+        store
+            .ensure_dir()
+            .map_err(|e| notify::Error::generic(&e.to_string()))?;
 
         let (notify_tx, notify_rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(move |res| {
@@ -632,6 +639,32 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "a write landing inside the debounce window must still produce \
              a (deferred) signal, not vanish"
+        );
+    }
+
+    /// Regression test for the bug where `.katamari/.gitignore` never got
+    /// written in the ordinary `ktmr diff` startup path: this watcher spawns
+    /// unconditionally on every diff session, usually *before* any comment
+    /// is ever appended, so if it created `.katamari/` with a raw
+    /// `create_dir_all` (as it once did) instead of going through
+    /// [`crate::comments::CommentStore::ensure_dir`], the directory would
+    /// already exist by the time a comment write got around to it — and
+    /// `ensure_dir`'s `is_new` gate (see its docs) means the `.gitignore`
+    /// then never lands at all. Starting against a repo root with no
+    /// `.katamari/` yet, as here, is exactly the "nobody has commented in
+    /// this session" case the old bug shipped in.
+    #[test]
+    fn starting_on_a_fresh_repo_seeds_the_katamari_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(!root.join(".katamari").exists());
+
+        let (tx, _rx) = mpsc::channel::<()>();
+        spawn_comments_watcher(root.to_path_buf(), tx).expect("failed to start comments watcher");
+
+        assert_eq!(
+            std::fs::read_to_string(root.join(".katamari").join(".gitignore")).unwrap(),
+            "*\n"
         );
     }
 
