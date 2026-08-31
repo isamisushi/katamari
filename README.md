@@ -38,7 +38,9 @@ mise use -g "ubi:isamisushi/katamari[exe=ktmr]"
 
 Prebuilt binaries (with a per-target archive table), building from source,
 and running under Windows/WSL are all covered in the
-[Installation chapter](https://isamisushi.github.io/katamari/installation/).
+[Installation chapter](https://isamisushi.github.io/katamari/installation/),
+which also covers [updating](https://isamisushi.github.io/katamari/installation/#updating)
+(`ktmr self-update` for install-script installs).
 
 ## Quickstart
 

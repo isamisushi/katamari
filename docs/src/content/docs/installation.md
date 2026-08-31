@@ -84,3 +84,43 @@ it inside [WSL](https://learn.microsoft.com/windows/wsl/) and follow the
 Linux instructions there. (A native `cargo install` may compile, but parts
 of the tool — `ktmr skill install`'s symlinks (`--user` included), LSP
 auto-install's executable-bit handling — assume a Unix filesystem.)
+
+## Updating
+
+The right command depends on which method above you used — a session's
+on-quit notice (`vX.Y.Z is available — ...`) already names the correct one
+for the running binary, so this is only worth memorizing if you'd rather not
+wait for that notice.
+
+**Install script**: the installer leaves behind a receipt recording where
+and how it installed katamari; `ktmr self-update` reads it and re-runs
+itself at the latest release.
+
+```
+ktmr self-update
+```
+
+**Homebrew**:
+
+```
+brew upgrade katamari
+```
+
+**mise**:
+
+```
+mise upgrade
+```
+
+**cargo**, or any other install with no receipt to read (prebuilt binaries
+installed by hand, a `cargo install --path .` from-source build): `ktmr
+self-update` has nothing to work from for these and says so, pointing at
+the right command instead — for a `cargo install`-managed binary, that's
+
+```
+cargo install --git https://github.com/isamisushi/katamari
+```
+
+and for a hand-installed prebuilt binary, downloading the new
+[release](https://github.com/isamisushi/katamari/releases) archive and
+replacing it in place.

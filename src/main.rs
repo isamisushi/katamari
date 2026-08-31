@@ -16,6 +16,7 @@ mod vcs;
 mod watch;
 
 use anyhow::{Context, Result, bail};
+use axoupdater::{AxoUpdater, AxoupdateError};
 use clap::{Parser, Subcommand, ValueEnum};
 use comments::{
     Comment, CommentAnnotation, CommentIndex, CommentStore, Status as CommentStatus, location_label,
@@ -301,6 +302,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Upgrades this install to the latest GitHub release, via the same
+    /// cargo-dist install receipt the shell installer
+    /// (`katamari-installer.sh`) writes — read through `axoupdater`
+    /// (axodotdev's own updater library, same vendor as cargo-dist) to find
+    /// what was installed where, then re-run at the latest tag. Only an
+    /// install that actually has a receipt can be updated this way; a
+    /// Homebrew, `cargo install`, or `mise`-managed install has none, so
+    /// this instead prints the right command for *that* install and exits
+    /// non-zero — nothing was updated. The daily on-quit hint
+    /// (`update.rs::print_exit_notice`) already knows which of the two
+    /// outcomes to expect and names this command only when a receipt
+    /// exists.
+    SelfUpdate,
     /// Remove katamari's accumulated state, returning it to a fresh
     /// install. With no flags, only *reports* every piece of state and its
     /// location — nothing is removed without an explicit flag, because the
@@ -576,6 +590,7 @@ fn main() -> Result<()> {
             language,
             json,
         } => run_doctor(no_live, language, json),
+        Command::SelfUpdate => run_self_update(),
         Command::Reset {
             cache,
             units_config,
@@ -1790,6 +1805,54 @@ fn run_doctor(no_live: bool, language: Option<String>, json: bool) -> Result<()>
     use std::io::Write;
     let _ = std::io::stdout().flush();
     std::process::exit(doctor::exit_code(&report));
+}
+
+/// `ktmr self-update` — see `Command::SelfUpdate`'s docs for the overview.
+/// Loading the receipt (`AxoUpdater::load_receipt`) is a plain fs lookup,
+/// same as `update::has_install_receipt`, so it fails fast (no network)
+/// against a Homebrew/cargo/mise install; only `run_sync` past that point
+/// talks to the network and re-invokes the shell installer.
+///
+/// `run_sync` is `axoupdater`'s `blocking`-feature entry point: it spins up
+/// a minimal current-thread tokio runtime *inside itself* for the one
+/// `block_on` call this needs, then tears it down before returning. Nothing
+/// about that leaks tokio into the rest of katamari — AGENTS.md's
+/// "std threads, no tokio" rule is about the TUI event loop `src/ui/` owns
+/// staying that way, not about every dependency; this is a leaf CLI command
+/// that runs once, updates or reports, and exits, never touching that loop.
+fn run_self_update() -> Result<()> {
+    let mut updater = AxoUpdater::new_for(update::APP_NAME);
+    if let Err(err) = updater.load_receipt() {
+        let why = if matches!(err, AxoupdateError::NoReceipt { .. }) {
+            "this install of katamari has no cargo-dist install receipt \
+             (the shell installer didn't set it up), so ktmr self-update \
+             has nothing to work from."
+                .to_owned()
+        } else {
+            format!("ktmr self-update couldn't read the install receipt: {err}")
+        };
+        eprintln!("{why}");
+        eprintln!("upgrade with: {}", update::detect_upgrade_command());
+        std::process::exit(1);
+    }
+
+    match updater.run_sync() {
+        Ok(Some(result)) => {
+            match result.old_version {
+                Some(old) => println!("katamari updated: v{old} -> v{}", result.new_version),
+                None => println!("katamari updated to v{}", result.new_version),
+            }
+            Ok(())
+        }
+        Ok(None) => {
+            println!(
+                "katamari is already up to date (v{})",
+                env!("CARGO_PKG_VERSION")
+            );
+            Ok(())
+        }
+        Err(err) => bail!("self-update failed: {err}"),
+    }
 }
 
 /// `ktmr reset` — see `Command::Reset`'s docs for the flag semantics. The

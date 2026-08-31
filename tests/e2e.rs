@@ -57,6 +57,8 @@ mod rendering;
 mod scope_menu;
 #[path = "e2e/search.rs"]
 mod search;
+#[path = "e2e/self_update.rs"]
+mod self_update;
 #[path = "e2e/show_keys.rs"]
 mod show_keys;
 #[path = "e2e/skill_install.rs"]

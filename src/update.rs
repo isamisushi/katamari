@@ -11,6 +11,14 @@
 //! its docs for why headless/plumbing subcommands like `ktmr comments` or
 //! `--dump` never reach it at all).
 //!
+//! This module also owns the *upgrade-command* half of the story —
+//! [`detect_upgrade_command`], shared with `ktmr self-update`
+//! (`main.rs::run_self_update`) so the two never drift: this module decides
+//! *whether* a receipt-managed self-update is possible (a cheap fs check,
+//! see [`has_install_receipt`]) without depending on the `axoupdater` crate
+//! itself, and `run_self_update` is what actually drives that crate to
+//! perform one.
+//!
 //! The cache lives under `$XDG_STATE_HOME/katamari/update-check.json`
 //! (falling back to `~/.local/state/katamari/` — see [`state_dir_from_env`]),
 //! deliberately separate from [`crate::lsp::install::prefix_dir`]'s
@@ -29,6 +37,15 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// The app name cargo-dist's shell installer writes into the install
+/// receipt (`source.app_name`/`name` in `katamari-installer.sh`'s
+/// `RECEIPT` template) and the name a receipt file itself is stamped
+/// with (`<app_name>-receipt.json`) — the package name, not either `[[bin]]`
+/// name (`katamari`, not `ktmr`). Shared between [`has_install_receipt`]
+/// here and `main.rs::run_self_update`'s `AxoUpdater::new_for`, so the two
+/// can never name-mismatch and silently look at different receipts.
+pub(crate) const APP_NAME: &str = "katamari";
 
 const RELEASES_URL: &str = "https://api.github.com/repos/isamisushi/katamari/releases/latest";
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -226,14 +243,20 @@ fn compare_versions(a: &str, b: &str) -> Option<Ordering> {
 
 /// The exact command to hand a reviewer for the install this binary is
 /// running from, inferred from `exe_path` (expected already canonicalized —
-/// see [`detect_upgrade_command`]): a Homebrew Cellar path gets `brew
-/// upgrade`; a `~/.cargo/bin` path (a `cargo install --git ...`-managed
-/// binary, since this crate isn't published to crates.io) gets the same
-/// `cargo install --git` invocation back; anything else — a manually
-/// downloaded release binary, a distro package, a source build run in
-/// place — gets pointed at the releases page rather than guessed at, since
-/// no single command is honest for all of those.
-fn upgrade_command(exe_path: &Path, home: Option<&Path>) -> String {
+/// see [`detect_upgrade_command`]) and `has_receipt` (see
+/// [`has_install_receipt`]). Checked in an order that's about correctness,
+/// not convenience: a Homebrew Cellar path gets `brew upgrade` and a
+/// `~/.cargo/bin` path gets `cargo install --git ...` *before* the receipt
+/// check ever runs, because both package managers own that binary — an
+/// `axoupdater`-driven self-update would fight brew's Cellar bookkeeping (or
+/// silently no-op against a `cargo install` binary axoupdater doesn't
+/// recognize) rather than genuinely update it, so a receipt happening to
+/// exist alongside one of those installs must never win. Only once neither
+/// matches does a receipt get to suggest `ktmr self-update`; anything left —
+/// a manually downloaded release binary with no receipt, a distro package, a
+/// source build run in place — gets pointed at the releases page rather than
+/// guessed at, since no single command is honest for all of those.
+fn upgrade_command(exe_path: &Path, home: Option<&Path>, has_receipt: bool) -> String {
     if exe_path.to_string_lossy().contains("/Cellar/") {
         return "brew upgrade katamari".to_owned();
     }
@@ -242,21 +265,72 @@ fn upgrade_command(exe_path: &Path, home: Option<&Path>) -> String {
     {
         return "cargo install --git https://github.com/isamisushi/katamari".to_owned();
     }
+    if has_receipt {
+        return "ktmr self-update".to_owned();
+    }
     "https://github.com/isamisushi/katamari/releases".to_owned()
 }
 
 /// [`upgrade_command`] against the real running process: `current_exe`
 /// canonicalized (so a `~/.cargo/bin/ktmr` that's actually a symlink, or a
 /// relative launch path, resolves to the real installed location before the
-/// `/Cellar/`/`.cargo/bin` checks run) and the real `$HOME`. Falls back to
-/// the releases-page message if either lookup fails — the same "don't
-/// guess" default [`upgrade_command`] uses for a path it doesn't recognize.
-fn detect_upgrade_command() -> String {
+/// `/Cellar/`/`.cargo/bin` checks run), the real `$HOME`, and a real
+/// [`has_install_receipt`] check against `$XDG_CONFIG_HOME`/`$HOME`. Falls
+/// back to the releases-page message if every lookup fails — the same
+/// "don't guess" default [`upgrade_command`] uses for a path it doesn't
+/// recognize. `pub(crate)` so `main.rs::run_self_update` can reuse this
+/// exact detection for its own no-receipt guidance, rather than
+/// re-deriving it.
+pub(crate) fn detect_upgrade_command() -> String {
     let exe = std::env::current_exe()
         .and_then(|p| p.canonicalize())
         .unwrap_or_default();
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    upgrade_command(&exe, home.as_deref())
+    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let has_receipt = has_install_receipt(APP_NAME, xdg_config_home.as_deref(), home.as_deref());
+    upgrade_command(&exe, home.as_deref(), has_receipt)
+}
+
+// --- Install receipt detection ------------------------------------------
+
+/// The cargo-dist install receipt path for `app_name`: the one location
+/// `katamari-installer.sh` (see its `RECEIPT_HOME` variable) ever writes
+/// one to, and the first location `axoupdater`'s own `load_receipt` checks
+/// (`$XDG_CONFIG_HOME/<app_name>` when set and non-empty, else
+/// `$HOME/.config/<app_name>`) — kept as a plain path computation, no I/O,
+/// so a test can hand it a fabricated pair without touching the real
+/// filesystem or `axoupdater` needing to be involved at all.
+fn receipt_path(
+    app_name: &str,
+    xdg_config_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let config_home = match xdg_config_home {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+        _ => home?.join(".config"),
+    };
+    Some(
+        config_home
+            .join(app_name)
+            .join(format!("{app_name}-receipt.json")),
+    )
+}
+
+/// Whether a cargo-dist install receipt for `app_name` exists at
+/// [`receipt_path`] — the one bit of actual I/O in this pair (a plain
+/// `Path::exists`, no network), which is what lets
+/// [`detect_upgrade_command`] point a shell-installer install at `ktmr
+/// self-update` instead of the generic releases-page fallback. Doesn't
+/// parse or validate the receipt's contents — that's `axoupdater`'s
+/// `load_receipt`'s job, in `run_self_update` itself; a corrupt receipt
+/// here still means "try `ktmr self-update`," and that command will report
+/// the real reason it can't proceed.
+fn has_install_receipt(
+    app_name: &str,
+    xdg_config_home: Option<&Path>,
+    home: Option<&Path>,
+) -> bool {
+    receipt_path(app_name, xdg_config_home, home).is_some_and(|p| p.exists())
 }
 
 // --- Staleness -----------------------------------------------------------
@@ -450,7 +524,7 @@ mod tests {
     #[test]
     fn a_cellar_path_gets_brew_upgrade() {
         let exe = Path::new("/opt/homebrew/Cellar/katamari/0.1.0/bin/ktmr");
-        assert_eq!(upgrade_command(exe, None), "brew upgrade katamari");
+        assert_eq!(upgrade_command(exe, None, false), "brew upgrade katamari");
     }
 
     #[test]
@@ -458,7 +532,7 @@ mod tests {
         let home = Path::new("/home/someone");
         let exe = home.join(".cargo").join("bin").join("ktmr");
         assert_eq!(
-            upgrade_command(&exe, Some(home)),
+            upgrade_command(&exe, Some(home), false),
             "cargo install --git https://github.com/isamisushi/katamari"
         );
     }
@@ -467,7 +541,7 @@ mod tests {
     fn any_other_path_points_at_the_releases_page() {
         let exe = Path::new("/usr/local/bin/ktmr");
         assert_eq!(
-            upgrade_command(exe, Some(Path::new("/home/someone"))),
+            upgrade_command(exe, Some(Path::new("/home/someone")), false),
             "https://github.com/isamisushi/katamari/releases"
         );
     }
@@ -478,9 +552,114 @@ mod tests {
         // check can't run at all — falls back rather than guessing.
         let exe = Path::new("/home/someone/.cargo/bin/ktmr");
         assert_eq!(
-            upgrade_command(exe, None),
+            upgrade_command(exe, None, false),
             "https://github.com/isamisushi/katamari/releases"
         );
+    }
+
+    #[test]
+    fn a_receipt_present_with_no_package_manager_match_gets_self_update() {
+        let exe = Path::new("/usr/local/bin/ktmr");
+        assert_eq!(
+            upgrade_command(exe, Some(Path::new("/home/someone")), true),
+            "ktmr self-update"
+        );
+    }
+
+    #[test]
+    fn a_cellar_path_wins_over_a_present_receipt() {
+        // A brew-managed binary must never be told to self-update — brew
+        // owns that Cellar path and axoupdater doesn't know about it.
+        let exe = Path::new("/opt/homebrew/Cellar/katamari/0.1.0/bin/ktmr");
+        assert_eq!(upgrade_command(exe, None, true), "brew upgrade katamari");
+    }
+
+    #[test]
+    fn a_cargo_bin_path_wins_over_a_present_receipt() {
+        let home = Path::new("/home/someone");
+        let exe = home.join(".cargo").join("bin").join("ktmr");
+        assert_eq!(
+            upgrade_command(&exe, Some(home), true),
+            "cargo install --git https://github.com/isamisushi/katamari"
+        );
+    }
+
+    #[test]
+    fn no_receipt_and_no_package_manager_match_falls_back_to_releases() {
+        let exe = Path::new("/usr/local/bin/ktmr");
+        assert_eq!(
+            upgrade_command(exe, Some(Path::new("/home/someone")), false),
+            "https://github.com/isamisushi/katamari/releases"
+        );
+    }
+
+    // --- install receipt detection ------------------------------------------
+
+    #[test]
+    fn receipt_path_prefers_xdg_config_home_when_set() {
+        let path = receipt_path(
+            "katamari",
+            Some(Path::new("/custom/config")),
+            Some(Path::new("/home/someone")),
+        );
+        assert_eq!(
+            path,
+            Some(PathBuf::from(
+                "/custom/config/katamari/katamari-receipt.json"
+            ))
+        );
+    }
+
+    #[test]
+    fn receipt_path_falls_back_to_home_config_when_xdg_unset() {
+        let path = receipt_path("katamari", None, Some(Path::new("/home/someone")));
+        assert_eq!(
+            path,
+            Some(PathBuf::from(
+                "/home/someone/.config/katamari/katamari-receipt.json"
+            ))
+        );
+    }
+
+    #[test]
+    fn receipt_path_ignores_an_empty_xdg_config_home() {
+        let path = receipt_path(
+            "katamari",
+            Some(Path::new("")),
+            Some(Path::new("/home/someone")),
+        );
+        assert_eq!(
+            path,
+            Some(PathBuf::from(
+                "/home/someone/.config/katamari/katamari-receipt.json"
+            ))
+        );
+    }
+
+    #[test]
+    fn receipt_path_is_none_without_xdg_or_home() {
+        assert_eq!(receipt_path("katamari", None, None), None);
+    }
+
+    fn fixture_receipt_dir() -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!("ktmr-receipt-test-{}-{n}", std::process::id()))
+    }
+
+    #[test]
+    fn has_install_receipt_is_false_when_the_file_is_missing() {
+        let xdg = fixture_receipt_dir();
+        assert!(!has_install_receipt("katamari", Some(&xdg), None));
+    }
+
+    #[test]
+    fn has_install_receipt_is_true_when_the_file_exists() {
+        let xdg = fixture_receipt_dir();
+        let dir = xdg.join("katamari");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("katamari-receipt.json"), "{}").unwrap();
+        assert!(has_install_receipt("katamari", Some(&xdg), None));
     }
 
     // --- cache read/write round trip ----------------------------------------

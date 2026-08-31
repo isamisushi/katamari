@@ -17,6 +17,17 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
+# `ktmr self-update`'s only dependency: axodotdev's own updater library, the
+# same one cargo-dist's generated `<app>-update` binary uses to read the
+# install receipt the shell installer writes and re-run it at the latest
+# tag. `default-features = false` drops nothing we'd otherwise get for
+# free here (0.10.2's only non-default feature is `blocking`) — this is
+# deliberate about the two features we do want: `blocking` for a sync
+# call (see `run_self_update`'s doc comment on why that's still
+# no-tokio-in-the-TUI-safe) instead of hand-rolling a runtime, and
+# `github_releases` (on by default upstream) since GitHub is the only
+# release host this crate ships to.
+axoupdater = { version = "0.10.2", default-features = false, features = ["blocking", "github_releases"] }
 clap = { version = "4.6.5", features = ["derive"] }
 crossterm = "0.29.0"
 ignore = "0.4.33"
