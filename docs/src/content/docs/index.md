@@ -3,7 +3,7 @@ title: katamari
 description: A terminal diff-review tool with LSP inside the diff, a persistent agent you can ask, durable resolvable comments, and read-only review units.
 template: splash
 hero:
-  tagline: The only terminal diff viewer with a language server inside it. Ask a resident coding-agent session about any selection, leave comments it resolves, and turn a tangled diff into a stack you can actually read — all without creating a single branch.
+  tagline: '<a href="/katamari/compared-to-other-tools/">The only terminal diff viewer with a language server inside it.</a> Ask a resident coding-agent session about any selection, leave comments it resolves, and turn a tangled diff into a stack you can actually read — all without creating a single branch.'
   image:
     html: '<video autoplay loop muted playsinline poster="/katamari/demo-poster.png" width="1370" height="760" style="max-width: min(44rem, 100%); height: auto; border-radius: 0.5rem;" aria-label="katamari demo: reviewing a diff in the terminal, with hover and go-to-definition"><source src="/katamari/demo.webm" type="video/webm" /><source src="/katamari/demo.mp4" type="video/mp4" /></video>'
   actions:
@@ -16,7 +16,8 @@ hero:
       variant: minimal
 ---
 
-**The only terminal diff viewer with a language server inside it.** `ktmr
+**[The only terminal diff viewer with a language server inside
+it.](/katamari/compared-to-other-tools/)** `ktmr
 diff` shows a `git diff` with hover/go-to-definition/find-references/live
 diagnostics from real language servers, a resident coding-agent session
 you can ask about any selection, review comments it reads back and
@@ -27,7 +28,9 @@ leaving the terminal.
 - **LSP inside the diff** — hover, go-to-definition, find-references, and
   live diagnostics on changed lines (Rust / TypeScript / Python / Go /
   Kotlin / Java; servers auto-install on first use; `[lsp.servers.<id>]`
-  wires up a custom server for any other filetype)
+  wires up a custom server for any other filetype) — works on a live
+  working tree or `HEAD`; read-only on a fixed commit, `--staged`, a jj
+  range, or `--pr`
 - **Ask the agent** (`a`/`A`/`p`) — question a resident coding-agent
   session (Claude, via [ACP](https://agentclientprotocol.com)) about any
   selection, watch it work in a streaming transcript panel, and push every

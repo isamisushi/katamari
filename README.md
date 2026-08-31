@@ -1,7 +1,8 @@
 # katamari
 
-**The only terminal diff viewer with a language server inside it.** `ktmr
-diff` shows a `git diff` with hover/go-to-definition/find-references/live
+**[The only terminal diff viewer with a language server inside
+it.](https://isamisushi.github.io/katamari/compared-to-other-tools/)**
+`ktmr diff` shows a `git diff` with hover/go-to-definition/find-references/live
 diagnostics from real language servers, a resident coding-agent session
 you can ask about any selection, review comments it reads back and
 resolves, and `u` to regroup a tangled diff into ordered, stacked-PR-like
@@ -83,7 +84,9 @@ and the scope-menu popup (`o`) for switching mid-session.
 
 - **LSP inside the diff** — hover, go-to-definition, find-references, and
   live diagnostics on changed lines (Rust / TypeScript / Python / Go /
-  Kotlin / Java, plus any language via `[lsp.servers.<id>]`)
+  Kotlin / Java, plus any language via `[lsp.servers.<id>]`), on a live
+  working tree or `HEAD` — read-only on a fixed commit, `--staged`, a jj
+  range, or `--pr`
 - **Ask the agent** (`a`/`A`/`p`) — question a resident coding-agent session
   about any selection, watch it work in a streaming panel, and push every
   open comment to it in one message, with every edit gated on your own
