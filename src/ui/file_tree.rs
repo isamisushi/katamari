@@ -186,6 +186,60 @@ fn sort_siblings(nodes: &mut [Node]) {
     });
 }
 
+/// The file order (issue #26) that keeps the diff pane and the sidebar tree
+/// from ever disagreeing: a permutation of `0..files.len()` obtained by
+/// walking [`build`]'s own tree — the identical directories-before-files,
+/// lexicographic-by-component ordering [`sort_siblings`] gives the
+/// sidebar — and reading out each leaf's `file_idx` depth-first. Built by
+/// walking `build`'s output rather than re-deriving the same comparison
+/// from scratch specifically so the two panes structurally *can't* drift:
+/// whatever `sort_siblings` decides is exactly what this decides, because
+/// it's the same code path, not a parallel one that happens to agree today.
+///
+/// `App::canonicalize` applies this to `files`'s raw (git diff / parser
+/// header) order at every point a fresh parse enters `App`, high enough up
+/// that everything downstream — `flatten`'s `RenderRow::FileHeader
+/// { file_idx }`, hunk enumeration, comment anchoring (path-based, so
+/// untouched either way) — just sees a files slice that was always in this
+/// order and needs no further changes. `main.rs`'s headless `--dump` path
+/// (which never constructs an `App` at all) applies it the same way,
+/// directly.
+pub fn canonical_file_order(files: &[DiffFile]) -> Vec<usize> {
+    let tree = build(files);
+    let mut order = Vec::with_capacity(files.len());
+    collect_file_order(&tree.roots, &mut order);
+    order
+}
+
+fn collect_file_order(nodes: &[Node], out: &mut Vec<usize>) {
+    for node in nodes {
+        match &node.kind {
+            NodeKind::File { file_idx } => out.push(*file_idx),
+            NodeKind::Directory { children } => collect_file_order(children, out),
+        }
+    }
+}
+
+/// Moves `items` into the order named by `order` (as returned by
+/// [`canonical_file_order`]) — a move, not a clone, since a [`DiffFile`]
+/// owns hunk/row `String`s a reviewer's diff can run to many kilobytes of,
+/// and this runs on every rederive. `order` is assumed to be a permutation
+/// of `0..items.len()` — the only thing that ever produces one — so an
+/// out-of-bounds or repeated index is a caller bug, not a runtime
+/// condition to recover from.
+pub fn apply_order<T>(items: Vec<T>, order: &[usize]) -> Vec<T> {
+    debug_assert_eq!(items.len(), order.len(), "order must be a full permutation");
+    let mut slots: Vec<Option<T>> = items.into_iter().map(Some).collect();
+    order
+        .iter()
+        .map(|&i| {
+            slots[i]
+                .take()
+                .expect("canonical_file_order yields each index exactly once")
+        })
+        .collect()
+}
+
 /// Every changed file nested under `node`, regardless of any directory's
 /// collapsed state — the post-order rollup [`flatten_visible`] reads for
 /// [`VisibleKind::Directory::descendant_files`].
@@ -536,6 +590,72 @@ mod tests {
                 expanded: true,
                 descendant_files: 2,
             }
+        );
+    }
+
+    // ---- canonical_file_order (issue #26) ----------------------------------
+
+    #[test]
+    fn canonical_file_order_of_already_sorted_files_is_the_identity_permutation() {
+        let files = [file("assets/logo.png"), file("src/a.rs"), file("src/b.rs")];
+        assert_eq!(canonical_file_order(&files), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn canonical_file_order_mirrors_sort_siblings_directories_before_files() {
+        // The same fixture `build_sorts_directories_before_files_then_
+        // lexicographically` uses, but read out as a file-index
+        // permutation instead of node labels — the two must always agree,
+        // since this is `build`'s own tree walked, not a parallel
+        // comparison that merely happens to match today.
+        let files = [
+            file("src/zeta.rs"),     // 0
+            file("README.md"),       // 1
+            file("src/alpha.rs"),    // 2
+            file("assets/logo.png"), // 3
+        ];
+        // assets/logo.png (3), src/alpha.rs (2), src/zeta.rs (0), README.md (1)
+        assert_eq!(canonical_file_order(&files), vec![3, 2, 0, 1]);
+    }
+
+    #[test]
+    fn canonical_file_order_ranks_a_directory_ahead_of_a_same_named_file_sibling() {
+        // git's own diff order (and plain per-component lexicographic
+        // comparison of the *unsplit* path) would put `foo-bar.txt` ahead
+        // of `foo/` — `-` (0x2D) sorts before `/` (0x2F) — but the tree
+        // splits on `/` first, so `foo` (the directory implied by
+        // `foo/baz.rs`) and `foo-bar.txt` are siblings at the *root*
+        // level, where the directories-before-files rule (not raw byte
+        // comparison) decides: `foo` must win regardless of the `-`/`/`
+        // byte order git would use.
+        let files = [file("foo-bar.txt"), file("foo/baz.rs")];
+        assert_eq!(canonical_file_order(&files), vec![1, 0]);
+    }
+
+    #[test]
+    fn canonical_file_order_is_a_permutation_of_every_index_exactly_once() {
+        let files = [
+            file("src/nested/deep/marker.rs"),
+            file("aaa.txt"),
+            file("src/nested/other.rs"),
+            file("zzz.txt"),
+            file("src/top.rs"),
+        ];
+        let mut order = canonical_file_order(&files);
+        order.sort_unstable();
+        assert_eq!(order, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn apply_order_moves_files_into_the_given_positions() {
+        let files = vec![file("c.rs"), file("a.rs"), file("b.rs")];
+        let reordered = apply_order(files, &[1, 2, 0]);
+        assert_eq!(
+            reordered
+                .iter()
+                .map(DiffFile::display_path)
+                .collect::<Vec<_>>(),
+            vec!["a.rs", "b.rs", "c.rs"]
         );
     }
 

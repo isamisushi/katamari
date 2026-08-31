@@ -9,31 +9,9 @@
 //! needs its own app-level gate (see that arm's docs in `ui::mod`) rather
 //! than relying solely on `EnableMouseCapture` never having been sent.
 
-use crate::support::screen::{row_has_reversed_cell, underlined_cells};
+use crate::support::screen::{region_text, row_has_reversed_cell, underlined_cells};
 use crate::support::{Harness, Key, MouseButton, MouseKey, SpawnOptions, fixture};
 use std::time::Duration;
-
-/// The text every cell in columns `[col_start, col_end)` renders, one line
-/// per screen row — lets a test compare (or search) one pane's own content
-/// without a substring that might also appear in a neighboring pane (a
-/// sidebar file name and that same file's diff header both contain the
-/// file name, for instance). `col_end` is clamped to the screen's actual
-/// width so a caller can always just pass an oversized upper bound (e.g.
-/// `100` on a 100-column terminal) for "to the right edge."
-fn region_text(screen: &vt100::Screen, col_start: u16, col_end: u16) -> String {
-    let (rows, cols) = screen.size();
-    let col_end = col_end.min(cols);
-    let mut text = String::new();
-    for row in 0..rows {
-        for col in col_start..col_end {
-            if let Some(cell) = screen.cell(row, col) {
-                text.push_str(cell.contents());
-            }
-        }
-        text.push('\n');
-    }
-    text
-}
 
 /// `diff_layout`'s sidebar column span at the default `SpawnOptions` width
 /// (`SIDEBAR_WIDTH = 30`, sidebar first) — shared by every test below that
@@ -348,10 +326,14 @@ fn clicking_a_directory_row_toggles_only_that_directory() {
     // Row 2 is "nested" — collapsing it hides rows 3/4 ("deep" and the
     // marker file) but must leave "src" (row 1, still expanded) and its
     // other child "new_name.txt" (row 7, a sibling of "nested" — not a
-    // descendant) completely alone.
+    // descendant) completely alone. Scoped to the sidebar's own columns
+    // (issue #26): the marker file now sorts first in canonical (tree)
+    // order, so its diff-pane header is on screen regardless of the
+    // sidebar's collapse state — a whole-screen check would no longer be
+    // an unambiguous witness for the *sidebar* row disappearing.
     click(&h, MouseButton::Left, TREE_CLICK_COL, 2);
     h.wait_until(Duration::from_secs(3), |screen| {
-        !screen.contents().contains("NESTED_MARKER_UNIQUE")
+        !region_text(screen, SIDEBAR_COLS.0, SIDEBAR_COLS.1).contains("NESTED_MARKER_UNIQUE")
     });
     h.wait_for_text("\u{25b8}"); // the collapsed glyph now exists somewhere
     assert!(
@@ -377,20 +359,31 @@ fn clicking_a_directory_row_toggles_only_that_directory() {
 fn clicking_a_file_row_opens_it_keeps_files_focus_and_ctrl_o_reverses_it() {
     let (_repo, mut h) = spawn_tree_repo();
 
-    // A real source location to leave from, reached purely by keyboard:
-    // two `j` presses from the initial file-header cursor land on
-    // `aaa_padding.txt`'s own first content line (row 0 = FileHeader, row
-    // 1 = HunkHeader, row 2 = the first `Line`).
-    h.send(Key::Char('j'));
-    h.send(Key::Char('j'));
-    h.wait_for_text("padding line 1");
+    // A real source location to leave from, reached purely by keyboard.
+    // The initial diff cursor now lands on the *first* file in canonical
+    // (tree) order (issue #26) — the tiny nested marker file, sorted ahead
+    // of every plain file directly under `src` — so `] f` (next-file)
+    // moves on to `aaa_padding.txt`'s own header first. Both files
+    // together no longer overflow the viewport the way `aaa_padding.txt`
+    // alone used to when it was first (its whole point per `tree_repo`'s
+    // own docs), so 44 further `j` presses (row 0 = FileHeader, row 1 =
+    // HunkHeader, row `n + 1` = content line `n`) land deep enough into
+    // its 60 lines that the click below genuinely has to scroll to reach
+    // the marker file instead.
+    h.send(Key::Char(']'));
+    h.send(Key::Char('f'));
+    for _ in 0..44 {
+        h.send(Key::Char('j'));
+    }
+    h.wait_for_text("padding line 43");
 
-    // Row 4 is the nested marker file — a different file entirely, so
-    // landing there should scroll `padding line 1` out of view.
+    // Row 4 is the nested marker file — a different file entirely, and
+    // near the very top of the diff pane, so landing there should scroll
+    // `padding line 43` out of view.
     click(&h, MouseButton::Left, TREE_CLICK_COL, 4);
     h.wait_for_text("MARKER_CONTENT_LINE_UNIQUE");
     h.wait_until(Duration::from_secs(3), |screen| {
-        !region_text(screen, DIFF_COLS.0, DIFF_COLS.1).contains("padding line 1")
+        !region_text(screen, DIFF_COLS.0, DIFF_COLS.1).contains("padding line 43")
     });
 
     // The req-2 crux: the clicked row reads as *selected* (reversed), not
@@ -406,7 +399,7 @@ fn clicking_a_file_row_opens_it_keeps_files_focus_and_ctrl_o_reverses_it() {
     // Ctrl-o retraces the click's own jump, landing back on the exact row
     // it left from regardless of which pane currently has keyboard focus.
     h.send(Key::CtrlO);
-    h.wait_for_text("padding line 1");
+    h.wait_for_text("padding line 43");
 
     h.send(Key::Char('q'));
     let status = h.wait_exit(Duration::from_secs(5));
@@ -427,10 +420,12 @@ fn clicking_an_ancestor_directory_of_the_selection_reselects_that_directory() {
     h.send(Key::Char('j')); // the marker file itself
 
     // Click "nested" (row 2) — its descendant (the marker file, currently
-    // selected) is about to be hidden by the collapse.
+    // selected) is about to be hidden by the collapse. Sidebar-scoped —
+    // see `clicking_a_directory_row_toggles_only_that_directory`'s own
+    // docs on why a whole-screen check no longer works (issue #26).
     click(&h, MouseButton::Left, TREE_CLICK_COL, 2);
     h.wait_until(Duration::from_secs(3), |screen| {
-        !screen.contents().contains("NESTED_MARKER_UNIQUE")
+        !region_text(screen, SIDEBAR_COLS.0, SIDEBAR_COLS.1).contains("NESTED_MARKER_UNIQUE")
     });
     assert!(
         h.with_screen(|screen| row_has_reversed_cell(screen, 2, SIDEBAR_COLS.0, SIDEBAR_COLS.1)),
@@ -1440,15 +1435,24 @@ fn mouse_hover_disabled_via_config_suppresses_the_passive_popup_but_not_clicks()
         return;
     }
     let repo = fixture::lsp_readiness_repo(0.0, 0.0);
-    // `lsp_readiness_repo` already writes `.katamari/config.toml` for the
-    // fake server's own `[lsp.servers.stubls]` section (see that
-    // function's docs) — append `[ui] mouse_hover = false` to it rather
-    // than overwriting, the same one-file-two-concerns shape a real
-    // reviewer's own config would have.
+    // `lsp_readiness_repo` already writes (and, issue #26, commits)
+    // `.katamari/config.toml` for the fake server's own `[lsp.servers.stubls]`
+    // section (see that function's docs) — append `[ui] mouse_hover = false`
+    // to it rather than overwriting, the same one-file-two-concerns shape a
+    // real reviewer's own config would have. Committed again immediately:
+    // left as an uncommitted change, `.katamari` (a directory) would sort
+    // ahead of `main.stub` in the diff pane's canonical order, breaking
+    // this test's own fixed-keypress navigation to `main.stub`'s content
+    // below — a config edit has nothing to do with what this test covers.
     let config_path = repo.path().join(".katamari").join("config.toml");
     let mut config = std::fs::read_to_string(&config_path).unwrap();
     config.push_str("\n[ui]\nmouse_hover = false\n");
     std::fs::write(&config_path, config).unwrap();
+    // `add` just this one file, not `-a`/`-A` — `main.stub`'s own
+    // uncommitted `GOTO_TARGET_TOKEN` edit (from `lsp_readiness_repo`) must
+    // stay right where this test needs it: in the working-tree diff.
+    fixture::git(repo.path(), &["add", ".katamari/config.toml"]);
+    fixture::git(repo.path(), &["commit", "-q", "-m", "mouse_hover = false"]);
 
     let mut h = Harness::spawn(
         repo.path(),

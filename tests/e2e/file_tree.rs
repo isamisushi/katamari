@@ -8,8 +8,16 @@
 //! state against the screen rather than the diff pane's (which never
 //! changes in response to a tree toggle at all).
 
+use crate::support::screen::region_text;
 use crate::support::{Harness, Key, SpawnOptions, fixture};
 use std::time::Duration;
+
+/// `diff_layout`'s sidebar column span at the default `SpawnOptions` width
+/// — mirrors `tests/e2e/mouse.rs`'s own `SIDEBAR_COLS`, needed here for the
+/// same reason: scoping a screen check to the sidebar's own columns so it
+/// can't be satisfied by the diff pane's unrelated content instead (issue
+/// #26 — see the two `wait_until` calls below).
+const SIDEBAR_COLS: (u16, u16) = (0, 30);
 
 #[test]
 fn tab_navigate_collapse_expand_and_open_a_nested_file() {
@@ -26,11 +34,7 @@ fn tab_navigate_collapse_expand_and_open_a_nested_file() {
     // (staged) diff at all — `fixture::tree_repo`'s own docs explain why an
     // ordinary working-tree diff could never show one. The tree starts
     // fully expanded (req 4), so the marker file's own sidebar row is
-    // already visible too — at the default 100x30 terminal,
-    // `src/aaa_padding.txt`'s 60 added lines push its *diff-pane* header
-    // well below the initial viewport, which is what makes the collapse
-    // check below an unambiguous sidebar witness rather than a coincidence
-    // of diff-pane scroll.
+    // already visible too.
     h.wait_for_text("new_name.txt");
     h.wait_for_text("NESTED_MARKER_UNIQUE");
 
@@ -46,13 +50,15 @@ fn tab_navigate_collapse_expand_and_open_a_nested_file() {
     h.send(Key::Char('j'));
 
     // Space collapses "nested": its descendants ("deep" and the marker
-    // file within it) disappear from the sidebar — and since the marker
-    // text was never on screen in the diff pane to begin with, its total
-    // absence from the screen now unambiguously witnesses the sidebar
-    // collapse, not a diff-pane scroll coincidence.
+    // file within it) disappear from the sidebar. Scoped to the sidebar's
+    // own columns (issue #26): the diff pane's file order now matches the
+    // tree's, so the marker file's header can be on screen there
+    // regardless of the sidebar's own collapse state — a whole-screen
+    // check would no longer unambiguously witness the sidebar row itself
+    // disappearing.
     h.send(Key::Char(' '));
     h.wait_until(Duration::from_secs(3), |screen| {
-        !screen.contents().contains("NESTED_MARKER_UNIQUE")
+        !region_text(screen, SIDEBAR_COLS.0, SIDEBAR_COLS.1).contains("NESTED_MARKER_UNIQUE")
     });
     // A collapsed directory still shows its own row and the collapsed
     // disclosure glyph.
@@ -113,11 +119,10 @@ fn enter_toggles_a_directory_row_without_moving_focus_to_diff() {
     h.send(Key::Char('j'));
 
     // Enter (not Space) collapses "nested" — same witness as the Space
-    // test: its descendants ("deep" and the marker file within it)
-    // disappear from the sidebar.
+    // test above, sidebar-scoped for the same reason (issue #26).
     h.send(Key::Enter);
     h.wait_until(Duration::from_secs(3), |screen| {
-        !screen.contents().contains("NESTED_MARKER_UNIQUE")
+        !region_text(screen, SIDEBAR_COLS.0, SIDEBAR_COLS.1).contains("NESTED_MARKER_UNIQUE")
     });
 
     // Had Enter wrongly taken the `Opened` arm instead of `Toggled`, focus

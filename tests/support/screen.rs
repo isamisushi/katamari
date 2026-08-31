@@ -46,6 +46,30 @@ pub fn underlined_cells(screen: &vt100::Screen) -> Vec<(u16, u16)> {
     cells
 }
 
+/// The text every cell in columns `[col_start, col_end)` renders, one line
+/// per screen row — lets a test compare (or search) one pane's own content
+/// without a substring that might also appear in a neighboring pane (a
+/// sidebar file name and that same file's diff header both contain the
+/// file name, for instance — or, since issue #26 made the diff pane's file
+/// order match the sidebar tree's, a file name that's simply visible in
+/// both at once). `col_end` is clamped to the screen's actual width so a
+/// caller can always just pass an oversized upper bound (e.g. `100` on a
+/// 100-column terminal) for "to the right edge."
+pub fn region_text(screen: &vt100::Screen, col_start: u16, col_end: u16) -> String {
+    let (rows, cols) = screen.size();
+    let col_end = col_end.min(cols);
+    let mut text = String::new();
+    for row in 0..rows {
+        for col in col_start..col_end {
+            if let Some(cell) = screen.cell(row, col) {
+                text.push_str(cell.contents());
+            }
+        }
+        text.push('\n');
+    }
+    text
+}
+
 /// Whether any cell in `row`, within `[col_start, col_end)`, is currently
 /// rendered reverse-video — issue #21's screen-level proof that a clicked
 /// tree row is *selected* (`Modifier::REVERSED`, per `sidebar::render`'s

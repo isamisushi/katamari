@@ -614,11 +614,17 @@ fn lsp_readiness_repo_inner(
         "target line one\ntarget line two\n",
     )
     .unwrap();
-    git(root, &["add", "-A"]);
-    git(root, &["commit", "-q", "-m", "initial commit"]);
-
-    std::fs::write(root.join("main.stub"), "alpha\nbeta\nGOTO_TARGET_TOKEN\n").unwrap();
-
+    // `.katamari/config.toml` is committed alongside the two `.stub` files
+    // rather than left untracked (issue #26): a directory always sorts
+    // ahead of a sibling file in canonical (tree) order regardless of
+    // name, so an untracked `.katamari/` would land *ahead* of `main.stub`
+    // in the diff pane — every test below navigates to `main.stub`'s own
+    // added row by a fixed number of keypresses from the top, an
+    // assumption a config file jumping the queue would break for no
+    // reason relevant to what these tests actually cover (LSP readiness,
+    // not the sidebar/diff-pane's file ordering — that's issue #26's own
+    // `file_tree`/`app` coverage). Committing it here keeps it out of the
+    // working-tree diff entirely, exactly like `other.stub` above.
     let server_script = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/support/fake_lsp_server.py"
@@ -634,6 +640,10 @@ fn lsp_readiness_repo_inner(
         ),
     )
     .unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "initial commit"]);
+
+    std::fs::write(root.join("main.stub"), "alpha\nbeta\nGOTO_TARGET_TOKEN\n").unwrap();
 
     FixtureRepo { dir }
 }

@@ -545,7 +545,7 @@ impl App {
             repo_name,
             repo_root,
             view_token: NEXT_VIEW_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            pristine_files: files,
+            pristine_files: Self::canonicalize(files),
             files: Vec::new(),
             rows: Vec::new(),
             side_by_side_rows: Vec::new(),
@@ -613,6 +613,26 @@ impl App {
         // slate.
         app.resolve_and_set_selection(None);
         app
+    }
+
+    /// Reorders freshly parsed `files` into [`file_tree::canonical_file_order`]
+    /// — the same directories-before-files, lexicographic order the sidebar
+    /// tree renders in (issue #26). Called at every point raw diff output
+    /// enters `pristine_files` ([`Self::new`], [`Self::apply_refresh`],
+    /// [`Self::apply_scope_swap`]) rather than once on `self.files` inside
+    /// [`Self::rederive`], because [`Self::full_files`] reads
+    /// `pristine_files` directly whenever derived state is active, bypassing
+    /// `rederive`'s splice/filter pipeline entirely — reordering only the
+    /// derived `files` would leave `pristine_files` (and so the
+    /// units-grouping cache key `full_files` feeds) in raw parse order
+    /// while any fold was open, drifting back to canonical order the moment
+    /// every fold collapsed. Canonicalizing here means `pristine_files` is
+    /// *always* in this order, so every downstream derivation
+    /// (`rederive`'s splice/unit-filter, both of which preserve relative
+    /// order) inherits it for free and the two readings can never disagree.
+    fn canonicalize(files: Vec<DiffFile>) -> Vec<DiffFile> {
+        let order = file_tree::canonical_file_order(&files);
+        file_tree::apply_order(files, &order)
     }
 
     /// Rebuilds `files`/`rows`/`side_by_side_rows`/`gap_cache` from
@@ -1221,7 +1241,7 @@ impl App {
             .map(|r| r.id.clone());
 
         self.prune_stale_folds(&files);
-        self.pristine_files = files;
+        self.pristine_files = Self::canonicalize(files);
         self.rederive();
         self.active_symbol = 0;
 
@@ -1332,7 +1352,7 @@ impl App {
             .visible_rows
             .get(self.files_selection)
             .map(|r| r.id.clone());
-        self.pristine_files = files;
+        self.pristine_files = Self::canonicalize(files);
         self.expanded_folds.clear();
         self.trailing_probed_empty.clear();
         // Same reasoning as the fold state above: a unit grouping
@@ -2839,6 +2859,98 @@ mod tests {
             }
         }
         assert_eq!(visited_files, vec![1, 2, 3, 4]);
+    }
+
+    /// Issue #26: the diff pane and the sidebar tree must never disagree
+    /// on file order. `FIXTURE`'s own `git diff` header order (`lib.rs`,
+    /// `new_module.rs`, `old_module.rs`, `renamed_to.rs`,
+    /// `no_trailing_newline.rs`) is deliberately *not* the expected
+    /// order here — `no_trailing_newline.rs` sorts lexicographically
+    /// ahead of `old_module.rs`, which is exactly the kind of drift a
+    /// bug reintroducing raw parse order would still pass a same-two-
+    /// panes-agree-with-each-other check for if it broke both panes
+    /// identically, so this pins the real file names too.
+    #[test]
+    fn rederive_orders_files_to_match_the_sidebar_tree_not_raw_parse_order() {
+        let app = test_app();
+        let diff_pane_order: Vec<usize> = app
+            .rows
+            .iter()
+            .filter_map(|row| match row {
+                RenderRow::FileHeader { file_idx } => Some(*file_idx),
+                _ => None,
+            })
+            .collect();
+        let tree_order: Vec<usize> = app
+            .visible_rows
+            .iter()
+            .filter_map(|row| match row.kind {
+                file_tree::VisibleKind::File { file_idx } => Some(file_idx),
+                file_tree::VisibleKind::Directory { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            diff_pane_order, tree_order,
+            "the diff pane's FileHeader order must match the sidebar tree's own file order"
+        );
+
+        let paths: Vec<&str> = app.files.iter().map(DiffFile::display_path).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "src/lib.rs",
+                "src/new_module.rs",
+                "src/no_trailing_newline.rs",
+                "src/old_module.rs",
+                "src/renamed_to.rs",
+            ]
+        );
+    }
+
+    /// Regression guard for [`App::canonicalize`]'s own docs: canonicalizing
+    /// only `self.files` inside `rederive` (rather than `pristine_files` at
+    /// every intake point, which is what `canonicalize` actually does)
+    /// would leave [`App::full_files`] reading raw parse order the moment
+    /// [`Self::apply_refresh`] ran while any derived state was active,
+    /// since that method sets `pristine_files` directly and `full_files`
+    /// reads it straight back in that case — silently invalidating the
+    /// units-grouping cache key on the next watch refresh after a fold
+    /// opened, for a reason that has nothing to do with units at all.
+    /// `trailing_probed_empty` alone is enough to force the "some fold
+    /// state" branch, with no real, disk-matching gap needed.
+    #[test]
+    fn full_files_stays_canonical_after_a_refresh_while_derived_state_is_active() {
+        let mut app = test_app();
+        app.trailing_probed_empty.insert("src/lib.rs".to_owned());
+        // Populates `pristine_files` (empty since construction's own
+        // rederive already moved it into `files`) via `rederive`'s one-
+        // time resync-from-`files` branch — see that branch's own docs.
+        // Without this, `apply_refresh`'s `prune_stale_folds` below would
+        // find no old `src/lib.rs` to match against (an empty
+        // `pristine_files` looks like every file just vanished) and drop
+        // the marker before `rederive` ever sees it, defeating the setup.
+        app.rederive();
+
+        // Re-parsing the same `FIXTURE` text is enough — this is purely
+        // about `apply_refresh`'s intake path, not about any actual
+        // content change.
+        app.apply_refresh(parse_unified_diff(FIXTURE));
+
+        let full: Vec<&str> = app
+            .full_files()
+            .iter()
+            .map(DiffFile::display_path)
+            .collect();
+        assert_eq!(
+            full,
+            vec![
+                "src/lib.rs",
+                "src/new_module.rs",
+                "src/no_trailing_newline.rs",
+                "src/old_module.rs",
+                "src/renamed_to.rs",
+            ]
+        );
     }
 
     #[test]
@@ -5462,15 +5574,19 @@ index 1111111..2222222 100644\n\
 
     // -- Issue #19: range comment target ---------------------------------
     //
-    // `test_app()` (`FIXTURE` = `multi_file.diff`) rows relevant below:
+    // `test_app()` (`FIXTURE` = `multi_file.diff`) rows relevant below, in
+    // `App::rederive`'s canonical (tree) file order — issue #26 — not
+    // `FIXTURE`'s own header order, so `src/old_module.rs` sorts after
+    // `src/no_trailing_newline.rs`:
     // 0 FileHeader(src/lib.rs), 1 HunkHeader,
     // 2 ctx new1 "fn helper() {}", 3 del (old2, no new_line),
     // 4 add new2 "fn new_name() {}", 5 add new3 "fn new_name2() {}",
     // 6 ctx new4 "fn tail() {}", 7 ctx new5 "fn unchanged() {}",
     // 8 Gap, 9 FileHeader(src/new_module.rs), 10 HunkHeader,
     // 11 add new1, 12 add new2,
-    // 13 FileHeader(src/old_module.rs, deleted), 14 HunkHeader,
-    // 15 del old1 (no new_line), 16 del old2 (no new_line).
+    // 13 FileHeader(src/no_trailing_newline.rs), 14 HunkHeader, 15 add line1,
+    // 16 FileHeader(src/old_module.rs, deleted), 17 HunkHeader,
+    // 18 del old1 (no new_line), 19 del old2 (no new_line).
 
     #[test]
     fn single_line_comment_target_is_unchanged_by_the_result_type() {
@@ -5599,9 +5715,9 @@ index 1111111..2222222 100644\n\
         // first would make `DeletedFile` unreachable (see
         // `App::range_comment_target`'s docs on the priority order).
         let mut app = test_app();
-        app.cursor = 15; // src/old_module.rs, del old1
+        app.cursor = 18; // src/old_module.rs, del old1
         app.toggle_visual();
-        app.cursor = 16; // del old2
+        app.cursor = 19; // del old2
         assert_eq!(app.comment_target(), Err(CommentTargetError::DeletedFile));
     }
 

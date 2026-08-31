@@ -667,6 +667,15 @@ fn run_diff(
         // diff.
         let loaded = CommentStore::new(&repo_root).load().unwrap_or_default();
         let comments = comments::build_index(&repo_root, &loaded);
+        // Issue #26: `--dump`'s headless output bypasses `App::rederive`
+        // entirely, so it needs its own copy of the same reorder that
+        // keeps the interactive TUI's diff pane and file tree agreeing —
+        // shadowed locally rather than reordering the outer `files`, since
+        // `dump_units`'s grouping just below wants the raw parser order
+        // its own cache key was built from (see `groups::diff_key`'s docs
+        // on file order affecting the key).
+        let order = ui::file_tree::canonical_file_order(&files);
+        let files = ui::file_tree::apply_order(files, &order);
         let text = match layout {
             LayoutArg::Unified => format_dump(&files, &comments),
             LayoutArg::Side => format_dump_side_by_side(&files, &comments),

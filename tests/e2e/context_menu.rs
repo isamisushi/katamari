@@ -17,9 +17,13 @@
 //! resize primitive) nor a unit test (it lives inline in `run`'s match, not
 //! as an extractable pure function) — a real gap, not an oversight.
 
-use crate::support::screen::underlined_cells;
+use crate::support::screen::{region_text, underlined_cells};
 use crate::support::{Harness, Key, MouseButton, MouseKey, SpawnOptions, fixture};
 use std::time::Duration;
+
+/// `diff_layout`'s sidebar column span at the default `SpawnOptions` width
+/// — mirrors `tests/e2e/mouse.rs`'s own `SIDEBAR_COLS`; see its docs.
+const SIDEBAR_COLS: (u16, u16) = (0, 30);
 
 /// A full press-then-release pair, mirroring `tests/e2e/mouse.rs::click` —
 /// `ui::mod`'s dispatch only ever reacts to `Down`, but a real terminal
@@ -279,10 +283,13 @@ fn right_click_a_directory_row_and_confirming_the_toggle_collapses_it() {
     click(&h, MouseButton::Left, col + 1, row);
 
     // Collapsing "src/nested" hides its descendants — "deep" and the
-    // marker file nested inside it both disappear from the sidebar, the
-    // same unambiguous witness `file_tree.rs`'s own collapse test uses.
+    // marker file nested inside it both disappear from the sidebar.
+    // Sidebar-scoped (issue #26): the diff pane's file order now matches
+    // the tree's, so the marker file's header can be on screen there
+    // regardless of the sidebar's own collapse state — see
+    // `file_tree.rs`'s own collapse tests for the same fix.
     h.wait_until(Duration::from_secs(3), |screen| {
-        !screen.contents().contains("NESTED_MARKER_UNIQUE")
+        !region_text(screen, SIDEBAR_COLS.0, SIDEBAR_COLS.1).contains("NESTED_MARKER_UNIQUE")
     });
     assert!(!h.screen_contents().contains("Collapse directory"));
 
