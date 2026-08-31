@@ -254,7 +254,8 @@ enum Command {
         action: CommentsCommand,
     },
     /// Installs the bundled `katamari-review` Claude Code skill into the
-    /// current repository, so an agent working in it picks up the
+    /// current repository (or, with `--user`, into `$HOME` once for every
+    /// repository), so an agent working in it picks up the
     /// `ktmr comments` workflow automatically.
     Skill {
         #[command(subcommand)]
@@ -463,7 +464,17 @@ enum SkillCommand {
     /// `<repo_root>/CLAUDE.md` linked to that — see
     /// [`crate::skill::install`]'s docs for the full layout and migration
     /// rules.
-    Install,
+    Install {
+        /// Install into `$HOME` instead of the current repo: just the
+        /// skill files (`~/.agents/skills/katamari-review` +
+        /// `~/.claude/skills/katamari-review`), no `AGENTS.md`/`CLAUDE.md`
+        /// — every repo worked in then inherits the same skill from one
+        /// place, and it works from outside any git repo too. See
+        /// [`crate::skill::install_user`]'s docs for why the repo-scoped
+        /// pieces don't apply here.
+        #[arg(long)]
+        user: bool,
+    },
 }
 
 /// `--layout`'s value space in clap-friendly form. `ui::app::Layout` is the
@@ -1147,6 +1158,20 @@ fn comments_repo_root() -> Result<PathBuf> {
     GitSource::discover(&cwd)?.repo_root()
 }
 
+/// The `$HOME` `ktmr skill install --user` installs into. Unlike
+/// [`comments_repo_root`], which callers are free to treat as "no repo
+/// here, carry on" (see `ui::mod`'s prompt gate), there's no sensible
+/// fallback for a missing `$HOME`: nothing else would be the one shared
+/// place every other repo on the machine could actually find, so this
+/// hard-errors instead of silently picking somewhere `--user` didn't ask
+/// for.
+fn user_home_dir() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty());
+    home.map(PathBuf::from).with_context(
+        || "$HOME is not set; ktmr skill install --user needs a home directory to install into",
+    )
+}
+
 fn comment_status_label(status: CommentStatus) -> &'static str {
     match status {
         CommentStatus::Open => "open",
@@ -1379,7 +1404,8 @@ fn run_comments_set_status(id: String, status: CommentStatus) -> Result<()> {
 
 fn run_skill(action: SkillCommand) -> Result<()> {
     match action {
-        SkillCommand::Install => run_skill_install(),
+        SkillCommand::Install { user: false } => run_skill_install(),
+        SkillCommand::Install { user: true } => run_skill_install_user(),
     }
 }
 
@@ -1405,6 +1431,26 @@ fn run_skill_install() -> Result<()> {
     println!("{}", report.link);
     println!("{}", report.agents_md);
     println!("{}", report.claude_md);
+    Ok(())
+}
+
+/// `ktmr skill install --user` — writes just the skill files into `$HOME`
+/// (see [`skill::install_user`]'s docs for why `AGENTS.md`/`CLAUDE.md`
+/// don't apply at this scope) so every repo worked on this machine
+/// inherits the same review skill without a separate per-repo install.
+/// Deliberately never calls [`comments_repo_root`]/`GitSource::discover`,
+/// unlike [`run_skill_install`]: user-scope install has to work from
+/// outside any git repo, since running it once, anywhere, is the entire
+/// point.
+fn run_skill_install_user() -> Result<()> {
+    let home = user_home_dir()?;
+    let report = skill::install_user(&home).map_err(|e| anyhow::anyhow!("{e}"))?;
+    if report.skill_md_changed {
+        println!("wrote {}", report.skill_md_path.display());
+    } else {
+        println!("{} already up to date", report.skill_md_path.display());
+    }
+    println!("{}", report.link);
     Ok(())
 }
 

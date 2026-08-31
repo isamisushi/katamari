@@ -26,7 +26,20 @@
 //! Unix-like platforms (macOS/Linux — every target this project ships for).
 //! On anything else, [`install`] reports a clear error rather than silently
 //! doing nothing or panicking.
+//!
+//! [`install_user`] is the `ktmr skill install --user` variant: the same
+//! skill-files half of the layout above (real files + symlink), written
+//! into `$HOME` instead of a repo root, and nothing else — a home directory
+//! has no `AGENTS.md`/`CLAUDE.md` of its own to splice a katamari section
+//! into (those two pieces are meant to sit alongside the project they
+//! document), so an agent working in *any* repo on the machine inherits the
+//! skill from one shared place rather than needing a separate per-repo
+//! install. [`user_skill_installed`] is the presence check this feeds into
+//! gating the TUI's first-comment prompt (see `ui::mod`'s event loop): a
+//! repo that already inherits the skill from `$HOME` shouldn't be re-offered
+//! a redundant per-repo copy.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -289,15 +302,7 @@ fn io_err(path: &Path, source: io::Error) -> InstallError {
 /// [`ClaudeMdOutcome::ForeignEntryLeftAlone`]), the content each would point
 /// at stays current. Only the links themselves are ever skipped.
 pub fn install(repo_root: &Path) -> Result<InstallReport, InstallError> {
-    let agents_dir = repo_root.join(AGENTS_REL);
-    fs::create_dir_all(&agents_dir).map_err(|e| io_err(&agents_dir, e))?;
-    let skill_md_path = agents_dir.join("SKILL.md");
-    let skill_md_changed = write_if_changed(&skill_md_path, SKILL_MD)?;
-
-    let claude_skills_dir = repo_root.join(".claude").join("skills");
-    fs::create_dir_all(&claude_skills_dir).map_err(|e| io_err(&claude_skills_dir, e))?;
-    let claude_dest = repo_root.join(CLAUDE_REL);
-    let link = ensure_claude_link(&claude_dest)?;
+    let (skill_md_path, skill_md_changed, link) = install_skill_files(repo_root)?;
 
     // AGENTS.md always runs before the CLAUDE.md link below: if CLAUDE.md
     // doesn't exist yet, its symlink is created pointing at AGENTS.md
@@ -313,6 +318,56 @@ pub fn install(repo_root: &Path) -> Result<InstallReport, InstallError> {
         link,
         agents_md,
         claude_md,
+    })
+}
+
+/// The skill-files half of [`install`] — `SKILL.md` under
+/// [`AGENTS_REL`] and the `.claude/skills/katamari-review` symlink to it —
+/// factored out so [`install_user`] can reuse it verbatim against `$HOME`
+/// without also dragging along the `AGENTS.md`/`CLAUDE.md` steps that only
+/// make sense for a repo root. `root` is deliberately generic (a repo root
+/// or a home directory): every helper this calls (`write_if_changed`,
+/// `ensure_claude_link`) is already root-agnostic, so there's nothing
+/// home-specific to special-case here.
+fn install_skill_files(root: &Path) -> Result<(PathBuf, bool, LinkOutcome), InstallError> {
+    let agents_dir = root.join(AGENTS_REL);
+    fs::create_dir_all(&agents_dir).map_err(|e| io_err(&agents_dir, e))?;
+    let skill_md_path = agents_dir.join("SKILL.md");
+    let skill_md_changed = write_if_changed(&skill_md_path, SKILL_MD)?;
+
+    let claude_skills_dir = root.join(".claude").join("skills");
+    fs::create_dir_all(&claude_skills_dir).map_err(|e| io_err(&claude_skills_dir, e))?;
+    let claude_dest = root.join(CLAUDE_REL);
+    let link = ensure_claude_link(&claude_dest)?;
+
+    Ok((skill_md_path, skill_md_changed, link))
+}
+
+/// What one [`install_user`] call did — the `$HOME`-scoped analogue of
+/// [`InstallReport`], minus `agents_md`/`claude_md`: those two point an
+/// agent at *a project's* review workflow, and `$HOME` isn't a project.
+#[derive(Debug)]
+pub struct UserInstallReport {
+    /// Where the current `SKILL.md` content was written —
+    /// `<home>/.agents/skills/katamari-review/SKILL.md`.
+    pub skill_md_path: PathBuf,
+    /// Whether that file's content actually changed — see
+    /// [`InstallReport::skill_md_changed`].
+    pub skill_md_changed: bool,
+    pub link: LinkOutcome,
+}
+
+/// `ktmr skill install --user`'s implementation: installs (or refreshes)
+/// just the skill files into `home` instead of a repo root — see the
+/// module docs for why `AGENTS.md`/`CLAUDE.md` are deliberately skipped.
+/// Idempotent the same way [`install`] is (re-running only re-checks; see
+/// [`UserInstallReport::skill_md_changed`], [`LinkOutcome::AlreadyLinked`]).
+pub fn install_user(home: &Path) -> Result<UserInstallReport, InstallError> {
+    let (skill_md_path, skill_md_changed, link) = install_skill_files(home)?;
+    Ok(UserInstallReport {
+        skill_md_path,
+        skill_md_changed,
+        link,
     })
 }
 
@@ -556,6 +611,30 @@ fn claude_md_linked(repo_root: &Path) -> bool {
 /// mention costs little.
 pub fn harness_installed(repo_root: &Path) -> bool {
     skill_installed(repo_root) && agents_md_has_section(repo_root) && claude_md_linked(repo_root)
+}
+
+/// Whether `$HOME` already has a working `katamari-review` skill install —
+/// the user-scope presence check [`install_user`] feeds, gating the TUI's
+/// first-comment prompt so a repo that already inherits the skill from
+/// `$HOME` isn't re-offered a redundant per-repo copy (see `ui::mod`'s
+/// event loop). Deliberately just [`skill_installed`] against `$HOME`
+/// rather than a specialized check — per the module docs, nothing about
+/// "is the skill installed at this path" is actually home-specific.
+///
+/// Reads the real `$HOME` directly; [`user_skill_installed_from_env`] is
+/// the pure form every test exercises instead; unset or empty (a bare
+/// container, a stripped CI env) reads as "not installed" rather than
+/// panicking or guessing a fallback location, the same rule
+/// `update::state_dir_from_env` applies to a missing `$HOME`.
+pub fn user_skill_installed() -> bool {
+    user_skill_installed_from_env(std::env::var_os("HOME"))
+}
+
+fn user_skill_installed_from_env(home: Option<OsString>) -> bool {
+    match home {
+        Some(home) if !home.is_empty() => skill_installed(Path::new(&home)),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -890,5 +969,130 @@ mod tests {
         // A full `install` completes it.
         install(repo.path()).unwrap();
         assert!(harness_installed(repo.path()));
+    }
+
+    // --- install_user / user_skill_installed --------------------------
+
+    #[test]
+    fn install_user_writes_the_skill_but_never_agents_or_claude_md() {
+        let home = repo();
+        let report = install_user(home.path()).unwrap();
+
+        assert!(report.skill_md_changed);
+        assert_eq!(fs::read_to_string(&report.skill_md_path).unwrap(), SKILL_MD);
+        assert!(matches!(report.link, LinkOutcome::Created));
+
+        let claude_dest = home.path().join(CLAUDE_REL);
+        assert_eq!(
+            fs::read_link(&claude_dest).unwrap(),
+            Path::new(SYMLINK_TARGET),
+            "the symlink target is the same relative hop under $HOME as under a repo root"
+        );
+        assert_eq!(
+            fs::read_to_string(claude_dest.join("SKILL.md")).unwrap(),
+            SKILL_MD
+        );
+
+        // The whole point of `--user`: no AGENTS.md/CLAUDE.md — a home
+        // directory has no single project for either to point at.
+        assert!(!home.path().join("AGENTS.md").exists());
+        assert!(!home.path().join("CLAUDE.md").exists());
+    }
+
+    #[test]
+    fn install_user_is_idempotent() {
+        let home = repo();
+        install_user(home.path()).unwrap();
+        let second = install_user(home.path()).unwrap();
+
+        assert!(
+            !second.skill_md_changed,
+            "re-running against an already-current install shouldn't rewrite SKILL.md"
+        );
+        assert!(matches!(second.link, LinkOutcome::AlreadyLinked));
+    }
+
+    #[test]
+    fn install_user_refreshes_a_stale_skill_md() {
+        let home = repo();
+        install_user(home.path()).unwrap();
+        let agents_skill_md = home.path().join(AGENTS_REL).join("SKILL.md");
+        fs::write(&agents_skill_md, "stale content from an older version").unwrap();
+
+        let report = install_user(home.path()).unwrap();
+        assert!(report.skill_md_changed);
+        assert_eq!(fs::read_to_string(&agents_skill_md).unwrap(), SKILL_MD);
+        assert!(matches!(report.link, LinkOutcome::AlreadyLinked));
+    }
+
+    #[test]
+    fn install_user_migrates_a_legacy_real_directory() {
+        let home = repo();
+        let legacy_dir = home.path().join(CLAUDE_REL);
+        fs::create_dir_all(&legacy_dir).unwrap();
+        fs::write(legacy_dir.join("SKILL.md"), "a reviewer's customized skill").unwrap();
+
+        let report = install_user(home.path()).unwrap();
+        let LinkOutcome::MigratedLegacyDir { backup } = &report.link else {
+            panic!("expected MigratedLegacyDir, got {:?}", report.link);
+        };
+        assert_eq!(
+            fs::read_to_string(backup.join("SKILL.md")).unwrap(),
+            "a reviewer's customized skill"
+        );
+        assert!(skill_installed(home.path()));
+    }
+
+    #[test]
+    fn install_user_leaves_a_foreign_symlink_untouched_and_reports_it() {
+        let home = repo();
+        let claude_skills_dir = home.path().join(".claude").join("skills");
+        fs::create_dir_all(&claude_skills_dir).unwrap();
+        let elsewhere = home.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, claude_skills_dir.join("katamari-review")).unwrap();
+
+        let report = install_user(home.path()).unwrap();
+        let LinkOutcome::ForeignEntryLeftAlone { target } = &report.link else {
+            panic!("expected ForeignEntryLeftAlone, got {:?}", report.link);
+        };
+        assert_eq!(target, &elsewhere);
+        assert_eq!(
+            fs::read_link(claude_skills_dir.join("katamari-review")).unwrap(),
+            elsewhere,
+            "untouched: still points at `elsewhere`"
+        );
+        // The single source of truth still got the current skill content —
+        // only the .claude-side link was left alone.
+        assert_eq!(
+            fs::read_to_string(home.path().join(AGENTS_REL).join("SKILL.md")).unwrap(),
+            SKILL_MD
+        );
+    }
+
+    #[test]
+    fn user_skill_installed_from_env_is_false_before_any_install() {
+        let home = repo();
+        assert!(!user_skill_installed_from_env(Some(
+            home.path().as_os_str().to_owned()
+        )));
+    }
+
+    #[test]
+    fn user_skill_installed_from_env_is_true_after_install_user() {
+        let home = repo();
+        install_user(home.path()).unwrap();
+        assert!(user_skill_installed_from_env(Some(
+            home.path().as_os_str().to_owned()
+        )));
+    }
+
+    #[test]
+    fn user_skill_installed_from_env_is_false_for_unset_or_empty_home() {
+        // Never mutate the real $HOME here — cargo test runs in parallel,
+        // so exercise the pure env-parameterized form instead (mirroring
+        // `update::state_dir_from_env`'s tests).
+        assert!(!user_skill_installed_from_env(None));
+        assert!(!user_skill_installed_from_env(Some(OsString::new())));
     }
 }

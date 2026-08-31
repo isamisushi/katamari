@@ -1316,22 +1316,30 @@ fn event_loop(
                                 // (`skill_prompt_offered`), only after a comment
                                 // actually persisted (not a discarded-empty or
                                 // failed save), only when the reviewer hasn't
-                                // opted out (`offer_skill_install`), and only
-                                // when this repo doesn't already have the full
+                                // opted out (`offer_skill_install`), only when
+                                // this repo doesn't already have the full
                                 // harness — skill, AGENTS.md, and CLAUDE.md, see
                                 // `skill::harness_installed`'s docs on why *any*
                                 // missing piece re-offers (M17 extended this
                                 // from a skill-only check so a repo that only
                                 // ran an older `ktmr skill install` still gets
-                                // offered the rest) — any one of those false
-                                // means a plain status message, same as before
-                                // M16.
+                                // offered the rest) — and only when `$HOME`
+                                // doesn't already carry the skill via `ktmr
+                                // skill install --user`: a repo that inherits
+                                // it from there is functionally already done,
+                                // even though `harness_installed` (which only
+                                // ever looks inside the repo) can't see that —
+                                // offering a per-repo copy on top would just be
+                                // redundant, not incomplete. Any one of those
+                                // false means a plain status message, same as
+                                // before M16.
                                 let offer = saved
                                     && offer_skill_install
                                     && !skill_prompt_offered
                                     && comments_repo_root
                                         .as_deref()
-                                        .is_some_and(|root| !skill::harness_installed(root));
+                                        .is_some_and(|root| !skill::harness_installed(root))
+                                    && !skill::user_skill_installed();
                                 goto_status = Some(if offer {
                                     skill_prompt_offered = true;
                                     awaiting_skill_prompt_key = true;

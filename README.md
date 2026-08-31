@@ -157,8 +157,8 @@ none of that is required to build or run it.
 No prebuilt binaries, and katamari isn't tested natively on Windows — run
 it inside [WSL](https://learn.microsoft.com/windows/wsl/) and follow the
 Linux instructions there. (A native `cargo install` may compile, but parts
-of the tool — `ktmr skill install`'s symlinks, LSP auto-install's
-executable-bit handling — assume a Unix filesystem.)
+of the tool — `ktmr skill install`'s symlinks (`--user` included), LSP
+auto-install's executable-bit handling — assume a Unix filesystem.)
 
 ## Quickstart
 
@@ -342,6 +342,20 @@ that ran an older katamari's `ktmr skill install`, from before `AGENTS.md`/
 installing is always idempotent. Set `[skill] offer_install = false` in
 config (see below) to turn the offer off entirely; `ktmr skill install`
 keeps working as an explicit command regardless.
+
+`ktmr skill install --user` installs the skill once for every repository
+instead: just `~/.agents/skills/katamari-review` and the
+`~/.claude/skills/katamari-review` symlink to it, under your home directory
+rather than a repo — no `AGENTS.md`/`CLAUDE.md`, since a home directory has
+no single project for either to point at. It works from outside any git
+repo (there's no repo root to find), is idempotent the same way the
+per-repo command is, and refreshes stale content the same way too. A repo
+whose `$HOME` already carries the skill this way is never offered the
+first-comment prompt above, since it already has what the prompt would
+install. Running a plain `ktmr skill install` inside a particular repo
+still works on top of this and remains the repo-shared default — the two
+scopes don't conflict, since the per-repo skill/`.claude` symlink and the
+`--user` one live at different paths.
 
 `ktmr open <file>` opens a single file read-only, with the same
 highlighting/hover/go-to-definition as the diff view — useful for reading

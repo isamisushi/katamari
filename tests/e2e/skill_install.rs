@@ -118,6 +118,28 @@ fn run_skill_install_cli(repo_root: &Path) -> Output {
         .expect("failed to spawn ktmr skill install")
 }
 
+/// As [`preinstall_skill`], but named for the `--user` tests below, whose
+/// argument stands in for `$HOME` rather than a repo root — the on-disk
+/// layout `install_skill_files` produces is identical either way (see its
+/// docs), so this is deliberately just a differently-named alias, kept
+/// separate for readability at each call site.
+fn preinstall_user_skill(home: &Path) {
+    preinstall_skill(home);
+}
+
+/// Runs the real `ktmr skill install --user` CLI subcommand directly, with
+/// `home` as `$HOME` and `cwd` as the working directory — `cwd` is
+/// deliberately free to be a non-git directory in every caller below,
+/// since working from outside any repo is the point of `--user`.
+fn run_skill_install_user_cli(cwd: &Path, home: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_ktmr"))
+        .args(["skill", "install", "--user"])
+        .current_dir(cwd)
+        .env("HOME", home)
+        .output()
+        .expect("failed to spawn ktmr skill install --user")
+}
+
 #[test]
 fn saving_the_first_comment_in_an_uninstalled_repo_offers_the_full_harness_and_y_installs_it() {
     let repo = fixture::basic_repo();
@@ -385,4 +407,143 @@ fn cli_install_run_twice_is_idempotent() {
         fs::read_link(repo.path().join("CLAUDE.md")).unwrap(),
         claude_link_after_first
     );
+}
+
+// --- --user -----------------------------------------------------------
+
+#[test]
+fn cli_user_install_writes_into_home_not_cwd_and_skips_agents_claude_md() {
+    let home = tempfile::tempdir().unwrap();
+    // Deliberately not a git repo — `--user` must work from anywhere.
+    let cwd = tempfile::tempdir().unwrap();
+
+    let output = run_skill_install_user_cli(cwd.path(), home.path());
+    assert!(
+        output.status.success(),
+        "ktmr skill install --user failed outside a git repo:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("wrote"));
+    assert!(
+        stdout.contains(
+            "linked .claude/skills/katamari-review -> ../../.agents/skills/katamari-review"
+        )
+    );
+
+    // The skill landed under $HOME, in the exact shape `crate::skill`
+    // promises.
+    let agents_skill_md = home
+        .path()
+        .join(".agents")
+        .join("skills")
+        .join("katamari-review")
+        .join("SKILL.md");
+    assert_eq!(
+        fs::read_to_string(&agents_skill_md).unwrap(),
+        bundled_skill_md()
+    );
+    let claude_dest = home
+        .path()
+        .join(".claude")
+        .join("skills")
+        .join("katamari-review");
+    assert!(fs::symlink_metadata(&claude_dest).unwrap().is_symlink());
+    assert_eq!(
+        fs::read_link(&claude_dest).unwrap(),
+        Path::new("../../.agents/skills/katamari-review"),
+    );
+
+    // Nothing landed under cwd, and no AGENTS.md/CLAUDE.md anywhere — the
+    // whole point of `--user`.
+    assert!(!cwd.path().join(".agents").exists());
+    assert!(!cwd.path().join(".claude").exists());
+    assert!(!home.path().join("AGENTS.md").exists());
+    assert!(!home.path().join("CLAUDE.md").exists());
+    assert!(!cwd.path().join("AGENTS.md").exists());
+    assert!(!cwd.path().join("CLAUDE.md").exists());
+}
+
+#[test]
+fn cli_user_install_run_twice_is_idempotent() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+
+    let first = run_skill_install_user_cli(cwd.path(), home.path());
+    assert!(first.status.success());
+    let first_stdout = String::from_utf8_lossy(&first.stdout).into_owned();
+    assert!(first_stdout.contains("wrote"));
+
+    let second = run_skill_install_user_cli(cwd.path(), home.path());
+    assert!(second.status.success());
+    let second_stdout = String::from_utf8_lossy(&second.stdout).into_owned();
+    assert!(
+        second_stdout.contains("already up to date"),
+        "second run's SKILL.md line should report no change: {second_stdout}"
+    );
+    assert!(second_stdout.contains(".claude/skills/katamari-review already linked correctly"));
+}
+
+#[test]
+fn cli_user_install_without_home_fails_with_a_clear_message() {
+    let cwd = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_ktmr"))
+        .args(["skill", "install", "--user"])
+        .current_dir(cwd.path())
+        .env_remove("HOME")
+        .output()
+        .expect("failed to spawn ktmr skill install --user");
+
+    assert!(
+        !output.status.success(),
+        "must fail without $HOME:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("$HOME is not set"),
+        "expected the $HOME error message: {stderr}"
+    );
+
+    // A failed lookup must never write anything.
+    assert!(!cwd.path().join(".agents").exists());
+    assert!(!cwd.path().join(".claude").exists());
+}
+
+#[test]
+fn saving_the_first_comment_never_offers_the_prompt_when_home_already_has_the_skill() {
+    // A repo with nothing installed of its own, but a `$HOME` that already
+    // has the skill from an earlier `ktmr skill install --user` — the
+    // prompt gate (`ui::mod`'s event loop) must treat that as "already
+    // done" and never offer a redundant per-repo copy.
+    let repo = fixture::basic_repo();
+    let user_home = tempfile::tempdir().unwrap();
+    preinstall_user_skill(user_home.path());
+
+    let mut opts = wide_spawn_options();
+    // Harness::spawn seeds its own per-test $HOME first; this later entry
+    // in extra_env overrides it, so the spawned session sees `user_home`
+    // as $HOME instead.
+    opts.extra_env
+        .push(("HOME".into(), user_home.path().as_os_str().to_owned()));
+    let h = Harness::spawn(repo.path(), opts);
+    h.wait_for_text("todo.txt");
+
+    save_a_comment(&h, "already inherited the skill from $HOME");
+    h.wait_for_text("comment: saved");
+
+    assert!(
+        !h.screen_contents()
+            .contains("install the Claude Code review skill"),
+        "a repo whose $HOME already has the skill must never be offered the per-repo prompt"
+    );
+
+    // The repo itself stays untouched — the skill lives only under
+    // $HOME, never copied into the repo just because a comment was saved.
+    assert!(!repo.path().join(".agents").exists());
+    assert!(!repo.path().join(".claude").exists());
+    assert!(!repo.path().join("AGENTS.md").exists());
+    assert!(!repo.path().join("CLAUDE.md").exists());
 }
