@@ -666,7 +666,32 @@ fn run_diff(
         };
         (text, None, true)
     };
+    // Issue #26 (and its follow-up fix): every headless path below this
+    // point — `--dump`, `--dump-units`, and the interactive `App::new`
+    // fallthrough — reorders `files` into `file_tree::canonical_file_order`
+    // *here*, once, rather than each growing its own local copy. `--dump`
+    // bypasses `App::rederive` entirely, so it needs this to keep its
+    // sidebar-shaped output agreeing with the interactive tree; that much
+    // was already true before this comment. What changed: `--dump-units`
+    // used to see `files` in raw parser order because the reorder used to
+    // be shadowed inside `if dump`'s block, scoped away from every sibling
+    // branch — the reasoning at the time was that `dump_units`'s own cache
+    // key should match its own hunk enumeration, order for order, which is
+    // true in isolation but misses the point. `groups::diff_key` hashes
+    // `enumerate_hunks(files)` in whatever order `files` is passed in (see
+    // its docs: "file order matters too"), and the interactive TUI keys
+    // its units cache off `App::full_files()`, which is canonical order
+    // from `App::canonicalize` (see that doc for why). A raw-order
+    // `--dump-units` and the canonical-order TUI computing *different*
+    // keys for the identical diff is exactly the bug: every cache lookup
+    // between the two entry points misses, silently respawning the agent
+    // CLI (up to 180s) instead of reusing a grouping that already covers
+    // the same diff. Reordering once here, before either branch, is what
+    // makes `ktmr diff --dump-units` and the TUI's `u` panel agree byte-
+    // for-byte on both the key and, downstream, the grouping itself.
     let files = parse_unified_diff(&diff_text);
+    let order = ui::file_tree::canonical_file_order(&files);
+    let files = ui::file_tree::apply_order(files, &order);
 
     if dump {
         // Comments always anchor to the working tree, regardless of which
@@ -678,15 +703,6 @@ fn run_diff(
         // diff.
         let loaded = CommentStore::new(&repo_root).load().unwrap_or_default();
         let comments = comments::build_index(&repo_root, &loaded);
-        // Issue #26: `--dump`'s headless output bypasses `App::rederive`
-        // entirely, so it needs its own copy of the same reorder that
-        // keeps the interactive TUI's diff pane and file tree agreeing —
-        // shadowed locally rather than reordering the outer `files`, since
-        // `dump_units`'s grouping just below wants the raw parser order
-        // its own cache key was built from (see `groups::diff_key`'s docs
-        // on file order affecting the key).
-        let order = ui::file_tree::canonical_file_order(&files);
-        let files = ui::file_tree::apply_order(files, &order);
         let text = match layout {
             LayoutArg::Unified => format_dump(&files, &comments),
             LayoutArg::Side => format_dump_side_by_side(&files, &comments),

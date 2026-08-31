@@ -2953,6 +2953,61 @@ mod tests {
         );
     }
 
+    /// Regression guard for the defect fixed alongside 74d6135: `main.rs`'s
+    /// `--dump-units` branch used to key `groups::cached`/`groups::generate`
+    /// off `files` in raw parser order (the reorder was shadowed inside the
+    /// sibling `if dump` block), while the interactive TUI has always keyed
+    /// its units cache off `App::full_files()` — canonical order, via
+    /// `App::canonicalize`. For a diff whose raw header order isn't already
+    /// canonical (this fixture's `old_module.rs`/`renamed_to.rs` swap
+    /// against `no_trailing_newline.rs` under canonicalization — see
+    /// `rederive_orders_files_to_match_the_sidebar_tree_not_raw_parse_order`
+    /// above for the exact ordering), that meant `ktmr diff --dump-units`
+    /// and the TUI's `u` panel computed *different* `groups::diff_key`s for
+    /// the identical diff: a permanent cross-entry-point cache miss,
+    /// respawning the agent CLI (up to 180s) every time instead of reusing
+    /// a grouping either side had already cached. This pins the two paths'
+    /// keys equal — `main.rs` now applies the same
+    /// `file_tree::canonical_file_order`/`apply_order` pair `App::canonicalize`
+    /// does, hoisted ahead of both its `--dump` and `--dump-units` branches
+    /// rather than scoped to `--dump` alone.
+    #[test]
+    fn dump_units_and_the_tui_key_the_identical_diff_the_same_way() {
+        let raw = parse_unified_diff(FIXTURE);
+        let order = file_tree::canonical_file_order(&raw);
+        // If this fixture's raw order were already canonical, the two
+        // paths would agree whether or not the fix is in place — make sure
+        // it's actually exercising the bug.
+        assert_ne!(
+            order,
+            (0..raw.len()).collect::<Vec<_>>(),
+            "fixture's raw parse order must differ from canonical order for this to be a \
+             meaningful regression guard"
+        );
+
+        // What `main.rs` now feeds `groups::cached`/`groups::generate` for
+        // `--dump-units`, post-fix: the raw parse, canonicalized the same
+        // way `App::canonicalize` does.
+        let headless_files = file_tree::apply_order(parse_unified_diff(FIXTURE), &order);
+        let headless_key =
+            crate::groups::diff_key(&crate::groups::enumerate_hunks(&headless_files));
+
+        // What the interactive TUI feeds the same functions, via
+        // `App::full_files()`.
+        let app = App::new(
+            "test-repo".to_owned(),
+            PathBuf::from("/repo"),
+            parse_unified_diff(FIXTURE),
+        );
+        let tui_key = crate::groups::diff_key(&crate::groups::enumerate_hunks(app.full_files()));
+
+        assert_eq!(
+            headless_key, tui_key,
+            "ktmr diff --dump-units and the TUI must compute the same units-cache key for the \
+             same diff"
+        );
+    }
+
     #[test]
     fn toggle_sidebar_flips_visibility() {
         let mut app = test_app();

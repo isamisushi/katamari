@@ -201,9 +201,12 @@ fn sort_siblings(nodes: &mut [Node]) {
 /// that everything downstream — `flatten`'s `RenderRow::FileHeader
 /// { file_idx }`, hunk enumeration, comment anchoring (path-based, so
 /// untouched either way) — just sees a files slice that was always in this
-/// order and needs no further changes. `main.rs`'s headless `--dump` path
-/// (which never constructs an `App` at all) applies it the same way,
-/// directly.
+/// order and needs no further changes. `main.rs`'s headless paths (`--dump`
+/// and `--dump-units`, neither of which construct an `App`) apply it the
+/// same way, directly, once, right after parsing — including for
+/// `--dump-units`'s `groups::diff_key`, which must land on the same key the
+/// interactive units cache computes from `App::full_files()`, or the two
+/// entry points miss each other's cache entries for the identical diff.
 pub fn canonical_file_order(files: &[DiffFile]) -> Vec<usize> {
     let tree = build(files);
     let mut order = Vec::with_capacity(files.len());
