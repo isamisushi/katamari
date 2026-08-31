@@ -17,8 +17,9 @@ starting. All sections are optional.
 keymap = "vim"  # or "emacs"
 
 [keys]
-# Action name (kebab-case; see the keybindings table above for what each
-# one does) -> key-sequence notation, overriding the preset above.
+# Action name (kebab-case; see the keybindings table in the Keybindings
+# chapter for what each one does) -> key-sequence notation, overriding the
+# preset above.
 # Notation: "C-x" (Ctrl), "M-x" (Alt/Meta), "Space"/"Esc"/"Enter"/"Tab"/
 # "BackTab"/"Backspace"/arrows/Home/End/PageUp/PageDown as named keys, a
 # bare character otherwise, space-separated for a multi-key sequence.
@@ -28,7 +29,8 @@ next-hunk = "C-n"
 [lsp]
 # Whether a missing language server is silently downloaded/built into
 # katamari's own prefix instead of just reporting an install hint. Default
-# true; see "Language servers" below for what each language's strategy is.
+# true; see the Language servers chapter for what each language's strategy
+# is.
 auto_install = true
 
 [lsp.logging]
@@ -44,13 +46,15 @@ max_age_days = 2
 # PATH and every project-local lookup. `<id>` is rust/typescript/python/
 # go/kotlin/java for a built-in override, or any other id of your own
 # choosing to define a custom server for a filetype katamari has no
-# built-in support for — see "Custom language servers" below.
+# built-in support for — see the Language servers chapter's "Custom
+# language servers" section.
 command = "/opt/homebrew/bin/rust-analyzer"
 args = []
 # extensions/root_markers/language_id/initialization_options — all
 # optional, all snake_case, normally only set on a *custom* id (a built-in
-# override like this `rust` entry needs none of them). See "Custom
-# language servers" below for what each does and a worked example. A whole
+# override like this `rust` entry needs none of them). See the Language
+# servers chapter's "Custom language servers" section for what each does
+# and a worked example. A whole
 # [lsp.servers.<id>] entry replaces wholesale on merge (the repo file's
 # entry for one id fully replaces the home file's entry for that same id,
 # not a field-by-field merge) — sibling ids are untouched either way. A
@@ -71,18 +75,18 @@ highlight_max_lines = 5000
 # set false to restore truncation, e.g. if you rely on it for
 # alignment-heavy code.
 wrap = true
-# Shows the key-display overlay chip described under "Keybindings" above
+# Shows the key-display overlay chip described in the Keybindings chapter
 # by default, without needing `--show-keys` on every invocation. Default
 # false.
 show_keys = false
-# Enables mouse capture (wheel scrolling — see "Mouse" under "Keybindings"
-# above). Default true; set false to leave the terminal's own
+# Enables mouse capture (wheel scrolling — see "Mouse" in the Keybindings
+# chapter). Default true; set false to leave the terminal's own
 # click-and-drag text selection working instead.
 mouse = true
 # Resting the pointer on an eligible code symbol or changed-file tree row
 # shows details after ~400ms, independently of click/wheel/right-click
-# support above — see "Mouse" under "Keybindings". Default true; only ever
-# has anything to act on while `mouse` (above) is also true.
+# support above — see "Mouse" in the Keybindings chapter. Default true;
+# only ever has anything to act on while `mouse` (above) is also true.
 mouse_hover = true
 
 [watch]
@@ -103,13 +107,13 @@ check = true
 [skill]
 # Whether saving your first comment in a repo without the full katamari
 # review harness installed (skill + AGENTS.md + CLAUDE.md) offers to
-# install it (see "Quickstart" above). Default true; false turns off the
+# install it (see the Quickstart chapter). Default true; false turns off the
 # offer entirely. `ktmr skill install` always keeps working as an explicit
 # command either way.
 offer_install = true
 
 [units]
-# Review units (see "Review units" above): which agent CLI `u` spawns to
+# Review units (see the Review units chapter): which agent CLI `u` spawns to
 # group the diff, and what model/effort it runs with. All optional — with
 # no [units] table in either config file, the first `u` that would spawn a
 # CLI opens a one-time picker that writes this section for you.

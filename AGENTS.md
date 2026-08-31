@@ -20,6 +20,19 @@ mise exec -- cargo clippy --all-targets -- -D warnings      # includes tests/
 mise exec -- cargo fmt --check
 ```
 
+`docs/` is an mdBook site (deployed to GitHub Pages by
+`.github/workflows/docs.yml` on push to main). mdBook isn't on `PATH`
+either — fetch the version pinned as `MDBOOK_VERSION` in that workflow and
+run it by absolute path:
+
+```
+curl -sL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz | tar xz -C /tmp/mdbook
+/tmp/mdbook/mdbook build docs   # should build with zero warnings
+```
+
+Bump `MDBOOK_VERSION` in `docs.yml` and the version above together when
+upgrading mdBook.
+
 ## Tests
 
 - Unit tests are colocated with the code they cover (`#[cfg(test)] mod

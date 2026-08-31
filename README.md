@@ -11,28 +11,6 @@ without leaving the terminal.
 
 **Full manual: [isamisushi.github.io/katamari](https://isamisushi.github.io/katamari/)**
 (the same content also lives in-repo under [`docs/src/`](docs/src/)).
-This page is a short landing page — install, a minimal quickstart, and
-where to read more.
-
-## Why
-
-Reviewing an AI agent's changes usually means either reading a raw `git
-diff` with no semantic information, or opening a full IDE for a change
-that's often small and mechanical. katamari sits in between: LSP is wired
-directly into the diff, so you can hover a changed identifier or jump to
-its definition without leaving it. It also assumes the underlying workflow
-is "agent edits, you review, you leave comments, the agent addresses them"
-rather than "you edit" — comments live in a plain file an agent reads
-through `ktmr comments`, and the diff refreshes live as edits land on
-disk. And since an agent's whole task usually lands as one tangled diff,
-`u` recovers a stacked-PR-like reading order — foundations first, then
-what's built on them — as a derived, read-only view, with nothing branched
-or rewritten. For repositories using [jj](https://github.com/jj-vcs/jj)
-colocated with git, katamari also keeps a timeline of jj's automatic
-working-copy snapshots, so you can step back through every version of the
-working tree an agent's session passed through, not just what's on disk
-now. See [Why](https://isamisushi.github.io/katamari/introduction.html#why)
-for the full case.
 
 ## Install
 
@@ -122,6 +100,14 @@ See the [full manual](https://isamisushi.github.io/katamari/) for
 [Reset](https://isamisushi.github.io/katamari/reset.html), and
 [jj colocated setup](https://isamisushi.github.io/katamari/jj-colocated-setup.html).
 
+## Why
+
+Reviewing an AI agent's changes usually means either reading a raw `git
+diff` with no semantic information, or opening a full IDE for a change
+that's often small and mechanical. katamari sits in between. See
+[Why](https://isamisushi.github.io/katamari/introduction.html#why) for the
+full case.
+
 ## Configuration
 
 TOML, merged from built-in defaults → `~/.config/katamari/config.toml` →
@@ -142,14 +128,7 @@ Every field, with its default and what it does, is documented in the
 
 ## Development
 
-`mise run test` runs the unit suite plus a PTY-driven integration suite
-(`tests/e2e.rs`) that drives the real compiled `ktmr` binary and asserts
-on the rendered terminal screen; `mise run e2e-tmux` is a second,
-real-terminal-emulator tier for the one thing a PTY can't check for real:
-the kitty-keyboard-protocol fallback. Both build their own throwaway git
-fixtures and point `$HOME`/`$XDG_CONFIG_HOME`/`$XDG_DATA_HOME` at a
-tempdir, so a test run never touches your real config or language-server
-installs. See the
+`mise run test` runs the unit suite plus a PTY-driven e2e suite; see the
 [Development chapter](https://isamisushi.github.io/katamari/development.html)
 for the full picture.
 

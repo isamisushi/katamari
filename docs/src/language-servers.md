@@ -120,7 +120,7 @@ rust-analyzer settings through `[lsp.servers.rust]`.
 needed:
 
 ```
-ktmr lsp doctor              # where each language's server resolves from today (no installs triggered) — see "Health check" below for the fuller report
+ktmr lsp doctor              # where each language's server resolves from today (no installs triggered) — see the Health check chapter for the fuller report
 ktmr lsp install <language>  # force an install into katamari's managed prefix (rust/typescript/python/go/kotlin/java/all)
 ktmr lsp update              # reinstall any pinned server that's fallen behind the current pin
 ```
