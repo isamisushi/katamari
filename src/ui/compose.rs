@@ -13,7 +13,6 @@
 
 use crate::keymap::{KeyChord, KeySeq};
 use crate::ui::app::CommentTarget;
-use crate::ui::scroll;
 use crate::ui::text_input::{self, EditCommand, char_byte_index, cursor_marked_line};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -347,12 +346,20 @@ pub fn handle_key(
 pub struct ComposeState {
     pub target: CommentTarget,
     buffer: ComposeBuffer,
-    /// Logical-line index of the first buffer line [`render`] draws — the
-    /// same scroll-follow role `App::scroll_offset` plays for the diff pane,
-    /// needed here because issue #29's soft-wrap means a comment can now
-    /// hold more wrapped display rows than the panel is tall. Advanced only
-    /// by [`follow_cursor`] inside `render`, never by `handle_key` itself:
-    /// scrolling is a rendering concern, not a buffer-editing one.
+    /// Index of the first *visual* (wrapped) row [`render`] draws, counted
+    /// across the buffer's whole flattened `(line, sub-row)` sequence — not
+    /// a logical-line index, which is what this field held when issue #29
+    /// first added scroll-follow. That version broke as soon as a single
+    /// logical line's own wrapped rows outgrew the panel: the cursor's
+    /// logical row never changes while you keep typing on one line (no
+    /// `Enter`), so a logical-row-granular offset had nothing to advance on
+    /// and the cursor scrolled off the bottom invisibly (see the commit
+    /// this field's doc comment now post-dates: 0d46563). Counting in
+    /// visual rows instead means "the cursor's row is on screen" and "the
+    /// cursor itself is on screen" are the same statement again, regardless
+    /// of how many display rows any one logical line wraps into. Advanced
+    /// only by [`follow_cursor`] inside `render`, never by `handle_key`
+    /// itself: scrolling is a rendering concern, not a buffer-editing one.
     scroll_offset: usize,
 }
 
@@ -473,19 +480,64 @@ fn char_range_str<'a>(line: &'a str, range: &Range<usize>) -> &'a str {
     &line[start..end]
 }
 
-/// Advances `state.scroll_offset` to keep the cursor's *logical* line on
-/// screen — [`crate::ui::scroll::clamp_scroll`] genericized over each line's
-/// wrapped row count via `line_ranges`, the same "row_height callback" shape
-/// `App::clamp_scroll` already feeds it for the diff pane's own wrapped
-/// rows. Split out from [`render`] so scroll-follow is testable without a
-/// `ratatui::Frame`. Like `App::clamp_scroll`, this only ever *pulls* the
-/// offset toward the cursor's line — never centers or otherwise second-
-/// guesses wherever a reviewer scrolled on their own.
-fn follow_cursor(state: &mut ComposeState, line_ranges: &[Vec<Range<usize>>], text_height: usize) {
-    let (cursor_row, _) = state.buffer.cursor();
-    state.scroll_offset = scroll::clamp_scroll(cursor_row, text_height, state.scroll_offset, |i| {
-        line_ranges[i].len()
-    });
+/// Total visual (wrapped) rows across every line in `line_ranges` — the
+/// upper bound [`follow_cursor`] clamps `scroll_offset` against so that
+/// deleting the tail of a long line, or widening the terminal, can never
+/// strand the offset past the end of what [`render`]'s flattened row
+/// sequence actually has left to show.
+fn total_visual_rows(line_ranges: &[Vec<Range<usize>>]) -> usize {
+    line_ranges.iter().map(Vec::len).sum()
+}
+
+/// The cursor's position within the buffer's flattened `(line, sub-row)`
+/// sequence — every wrapped row of every line before `row`, plus `sub_row`
+/// within `row` itself. This is the coordinate [`follow_cursor`] actually
+/// needs: a logical line index alone can't say whether the cursor is on
+/// screen once that line's own wrapped rows outnumber the viewport.
+fn visual_row_for(line_ranges: &[Vec<Range<usize>>], row: usize, sub_row: usize) -> usize {
+    let rows_before: usize = line_ranges[..row].iter().map(Vec::len).sum();
+    rows_before + sub_row
+}
+
+/// Advances `state.scroll_offset` to keep the cursor's *visual* row —
+/// `cursor_visual_row`, its wrapped sub-row counted across the whole
+/// buffer, not just which logical line it's on — inside a `text_height`-row
+/// window. Split out from [`render`] so scroll-follow is testable without a
+/// `ratatui::Frame`.
+///
+/// This is plain sliding-window arithmetic, not
+/// [`crate::ui::scroll::clamp_scroll`]: that function's `row_height`
+/// callback is genericized at *logical*-row granularity — it can report how
+/// tall a row is, but the offset it maintains still names a logical row to
+/// start rendering from *at that row's own sub-row 0*, never partway
+/// through one. That was exactly this defect (see 0d46563, the commit this
+/// fixes): while the cursor stays on one logical line, the line never
+/// changes, so `clamp_scroll` never had a reason to move the offset even
+/// once that single line's wrapped rows ran past `text_height`. Once the
+/// unit being scrolled has to be a mid-line window, the offset has to be a
+/// visual-row index too — patching `clamp_scroll`'s contract to allow that
+/// would just move the same logical/visual mismatch somewhere else, and
+/// `scroll.rs` stays as-is for the diff pane's own (logical-row-correct)
+/// read-only selection semantics, which still want it exactly as it is.
+///
+/// Like `App::clamp_scroll`, this only ever *pulls* the offset toward the
+/// cursor — never centers or otherwise second-guesses wherever a reviewer
+/// scrolled on their own — and the final clamp against
+/// [`total_visual_rows`] is what keeps a shrinking buffer or a widened
+/// terminal from leaving the offset stranded past the end.
+fn follow_cursor(
+    state: &mut ComposeState,
+    line_ranges: &[Vec<Range<usize>>],
+    cursor_visual_row: usize,
+    text_height: usize,
+) {
+    if cursor_visual_row < state.scroll_offset {
+        state.scroll_offset = cursor_visual_row;
+    } else if cursor_visual_row >= state.scroll_offset + text_height {
+        state.scroll_offset = cursor_visual_row + 1 - text_height;
+    }
+    let total = total_visual_rows(line_ranges);
+    state.scroll_offset = state.scroll_offset.min(total.saturating_sub(text_height));
 }
 
 /// Draws the overlay near `cursor_screen_row`, reusing
@@ -495,10 +547,15 @@ fn follow_cursor(state: &mut ComposeState, line_ranges: &[Vec<Range<usize>>], te
 ///
 /// Issue #29: long lines soft-wrap at the panel's content width (no
 /// gutter here, unlike the diff pane, so that's simply `inner.width`) and
-/// the panel scroll-follows the cursor's logical line via
-/// [`follow_cursor`]/[`ui::scroll::clamp_scroll`] — mutable access to
-/// `state` is only for that scroll bookkeeping, never the buffer text
-/// itself, which stays exactly what [`handle_key`] left it as. Cursor
+/// the panel scroll-follows the cursor's *visual* row via
+/// [`follow_cursor`] — mutable access to `state` is only for that scroll
+/// bookkeeping, never the buffer text itself, which stays exactly what
+/// [`handle_key`] left it as. Because the offset is now visual-row-granular
+/// (see [`ComposeState::scroll_offset`]'s doc comment), the row-emission
+/// loop below walks the buffer's wrapped rows as one flat `(line_idx,
+/// sub_idx)` sequence and can start mid-line — the window shown is whatever
+/// `text_height` rows begin at `state.scroll_offset` in that sequence, not
+/// always a run of whole lines from their own first wrapped row. Cursor
 /// *movement* (`ComposeBuffer::move_up`/`move_down`) deliberately stays
 /// logical-line based rather than visual-row based: jumping by wrapped
 /// display row would mean up/down sometimes lands mid-line depending on
@@ -523,27 +580,38 @@ pub fn render(
     let width = inner.width as usize;
 
     let line_ranges = wrap_lines(&state.buffer, width);
-    follow_cursor(state, &line_ranges, text_height);
-
     let (cursor_row, cursor_col) = state.buffer.cursor();
     let cursor_sub_row = wrap_row_for_col(&line_ranges[cursor_row], cursor_col);
+    let cursor_visual_row = visual_row_for(&line_ranges, cursor_row, cursor_sub_row);
+    follow_cursor(state, &line_ranges, cursor_visual_row, text_height);
 
-    let mut rows: Vec<Line> = Vec::with_capacity(text_height);
-    'lines: for (line_idx, ranges) in line_ranges.iter().enumerate().skip(state.scroll_offset) {
-        let text = &state.buffer.lines()[line_idx];
-        for (sub_idx, range) in ranges.iter().enumerate() {
-            if rows.len() >= text_height {
-                break 'lines;
-            }
+    // Flatten every line's wrapped rows into one `(line_idx, sub_idx,
+    // range)` sequence and take the `text_height`-row window starting at
+    // `scroll_offset` — a plain visual-row slice, so a window that starts
+    // partway through one line's wrapped rows renders correctly rather than
+    // (the pre-fix bug) always restarting each visible line at its own
+    // sub-row 0.
+    let mut rows: Vec<Line> = line_ranges
+        .iter()
+        .enumerate()
+        .flat_map(|(line_idx, ranges)| {
+            ranges
+                .iter()
+                .enumerate()
+                .map(move |(sub_idx, range)| (line_idx, sub_idx, range))
+        })
+        .skip(state.scroll_offset)
+        .take(text_height)
+        .map(|(line_idx, sub_idx, range)| {
+            let text = &state.buffer.lines()[line_idx];
             let sub_text = char_range_str(text, range);
-            let row = if line_idx == cursor_row && sub_idx == cursor_sub_row {
+            if line_idx == cursor_row && sub_idx == cursor_sub_row {
                 cursor_marked_line(sub_text, cursor_col - range.start)
             } else {
                 Line::from(sub_text.to_owned())
-            };
-            rows.push(row);
-        }
-    }
+            }
+        })
+        .collect();
     while rows.len() < text_height {
         rows.push(Line::default());
     }
@@ -1040,11 +1108,25 @@ mod tests {
         }
     }
 
+    /// The cursor's visual row for `state`'s current buffer, wrapped at
+    /// `width` — the same three-line computation `render` itself does
+    /// before calling `follow_cursor`, pulled out so every test below can
+    /// drive `follow_cursor` (and inspect what `render` would show) without
+    /// repeating it.
+    fn cursor_visual(state: &ComposeState, width: usize) -> (Vec<Vec<Range<usize>>>, usize, usize) {
+        let ranges = wrap_lines(&state.buffer, width);
+        let (row, col) = state.buffer.cursor();
+        let sub_row = wrap_row_for_col(&ranges[row], col);
+        let visual = visual_row_for(&ranges, row, sub_row);
+        (ranges, sub_row, visual)
+    }
+
     #[test]
     fn follow_cursor_scrolls_forward_past_a_tall_wrapped_line_and_snaps_back() {
         let mut state = ComposeState::new(dummy_target());
-        // line0: 10 chars, wraps into 2 rows at width 5. line1 and line2:
-        // one character each, 1 row apiece.
+        // line0: 10 chars, wraps into 2 visual rows at width 5 (visual rows
+        // 0,1). line1 and line2: one character each, 1 visual row apiece
+        // (visual rows 2 and 3) — 4 visual rows in the buffer altogether.
         for c in "abcdefghij".chars() {
             state.buffer.insert_char(c);
         }
@@ -1058,39 +1140,153 @@ mod tests {
         let width = 5;
         let text_height = 2;
 
-        let ranges = wrap_lines(&state.buffer, width);
-        follow_cursor(&mut state, &ranges, text_height);
+        let (ranges, _, visual) = cursor_visual(&state, width);
+        follow_cursor(&mut state, &ranges, visual, text_height);
         assert_eq!(
             state.scroll_offset, 0,
-            "line0's own 2 wrapped rows exactly fill a 2-row viewport"
+            "cursor sits on line0's own first wrapped row (visual row 0), \
+             already within a 2-row window at offset 0"
         );
 
-        state.buffer.move_down(); // cursor -> line1
-        let ranges = wrap_lines(&state.buffer, width);
-        follow_cursor(&mut state, &ranges, text_height);
+        state.buffer.move_down(); // cursor -> line1 (visual row 2)
+        let (ranges, _, visual) = cursor_visual(&state, width);
+        follow_cursor(&mut state, &ranges, visual, text_height);
         assert_eq!(
             state.scroll_offset, 1,
-            "line0 (2 rows) plus line1 (1 row) would need 3 rows, so line0 \
-             scrolls out of view to keep line1's cursor on screen"
+            "line1's visual row (2) needs a 2-row window starting at 1 to \
+             stay visible, scrolling line0's first wrapped row out of view"
         );
 
-        state.buffer.move_down(); // cursor -> line2
-        let ranges = wrap_lines(&state.buffer, width);
-        follow_cursor(&mut state, &ranges, text_height);
+        state.buffer.move_down(); // cursor -> line2 (visual row 3)
+        let (ranges, _, visual) = cursor_visual(&state, width);
+        follow_cursor(&mut state, &ranges, visual, text_height);
         assert_eq!(
-            state.scroll_offset, 1,
-            "line1+line2 already exactly fill the 2-row viewport from \
-             offset 1; no further scroll needed"
+            state.scroll_offset, 2,
+            "line2's visual row (3) needs the window to advance to [2, 4) — \
+             the pre-fix logical-line offset would have wrongly left this \
+             at 1, since line1's own logical row hadn't changed height"
         );
 
         state.buffer.move_up();
-        state.buffer.move_up(); // cursor -> line0
-        let ranges = wrap_lines(&state.buffer, width);
-        follow_cursor(&mut state, &ranges, text_height);
+        state.buffer.move_up(); // cursor -> line0 (visual row 0)
+        let (ranges, _, visual) = cursor_visual(&state, width);
+        follow_cursor(&mut state, &ranges, visual, text_height);
         assert_eq!(
             state.scroll_offset, 0,
             "cursor moved above the visible window snaps the offset \
              directly back to it"
+        );
+    }
+
+    #[test]
+    fn follow_cursor_keeps_a_single_overflowing_line_s_cursor_in_view_as_it_grows() {
+        // The exact defect this amends (0d46563): one logical line, no
+        // `Enter` ever pressed, whose own wrapped rows grow past
+        // `text_height` as characters are typed. Under the old
+        // logical-line-granular offset this never scrolled at all — the
+        // cursor's logical row (0) never changed — even once its wrapped
+        // sub-row ran off the bottom of the panel.
+        let mut state = ComposeState::new(dummy_target());
+        let width = 5;
+        let text_height = 2;
+
+        for c in "abcdefghijklmno".chars() {
+            state.buffer.insert_char(c);
+            let (ranges, sub_row, visual) = cursor_visual(&state, width);
+            follow_cursor(&mut state, &ranges, visual, text_height);
+
+            let (cursor_row, _) = state.buffer.cursor();
+            assert!(
+                visual >= state.scroll_offset && visual < state.scroll_offset + text_height,
+                "cursor visual row {visual} must stay inside the visible \
+                 window [{}, {}) after typing {:?}",
+                state.scroll_offset,
+                state.scroll_offset + text_height,
+                state.buffer.text(),
+            );
+
+            // Every row `render` would actually draw for this frame must
+            // include the cursor's own `(line, sub-row)` — not just be
+            // numerically within range of it.
+            let visible: Vec<(usize, usize)> = ranges
+                .iter()
+                .enumerate()
+                .flat_map(|(li, r)| r.iter().enumerate().map(move |(si, _)| (li, si)))
+                .skip(state.scroll_offset)
+                .take(text_height)
+                .collect();
+            assert!(
+                visible.contains(&(cursor_row, sub_row)),
+                "the cursor's own (line, sub-row) must be among the rows \
+                 render would emit; visible: {visible:?}, cursor: \
+                 ({cursor_row}, {sub_row})"
+            );
+        }
+    }
+
+    #[test]
+    fn follow_cursor_scrolls_back_up_when_the_cursor_returns_to_the_start_of_an_overflowing_line() {
+        let mut state = ComposeState::new(dummy_target());
+        let width = 5;
+        let text_height = 2;
+        let text = "abcdefghijklmno";
+
+        for c in text.chars() {
+            state.buffer.insert_char(c);
+        }
+        let (ranges, _, visual) = cursor_visual(&state, width);
+        follow_cursor(&mut state, &ranges, visual, text_height);
+        assert!(
+            state.scroll_offset > 0,
+            "typing past the panel's height must have scrolled forward"
+        );
+
+        for _ in 0..text.chars().count() {
+            state.buffer.move_left();
+        }
+        let (ranges, _, visual) = cursor_visual(&state, width);
+        assert_eq!(visual, 0, "cursor is back at the very start of the line");
+        follow_cursor(&mut state, &ranges, visual, text_height);
+        assert_eq!(
+            state.scroll_offset, 0,
+            "moving the cursor back above the visible window must scroll \
+             the offset back up to meet it"
+        );
+    }
+
+    #[test]
+    fn follow_cursor_follows_the_cursor_across_ordinary_unwrapped_lines() {
+        // One visual row per line (width is wide enough that "a" never
+        // wraps) — this must match the plain uniform-height scroll-follow
+        // behavior every other scrolling pane in this codebase already has,
+        // proving the visual-row rewrite didn't change anything for the
+        // multi-line case issue #29 already covered.
+        let mut state = ComposeState::new(dummy_target());
+        let width = 20;
+        let text_height = 3;
+
+        for n in 0..6 {
+            if n > 0 {
+                state.buffer.newline();
+            }
+            state.buffer.insert_char('a');
+        }
+        for _ in 0..5 {
+            state.buffer.move_up(); // back to line 0
+        }
+
+        let mut offsets = Vec::new();
+        for _ in 0..6 {
+            let (ranges, _, visual) = cursor_visual(&state, width);
+            follow_cursor(&mut state, &ranges, visual, text_height);
+            offsets.push(state.scroll_offset);
+            state.buffer.move_down();
+        }
+        assert_eq!(
+            offsets,
+            vec![0, 0, 0, 1, 2, 3],
+            "with one visual row per line this must match \
+             ui::scroll::clamp_scroll's own uniform-height behavior"
         );
     }
 

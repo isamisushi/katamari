@@ -231,3 +231,62 @@ fn a_long_unbroken_line_soft_wraps_on_screen_and_saves_with_no_inserted_newline(
     let status = h.wait_exit(Duration::from_secs(5));
     assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
 }
+
+/// Amends 0d46563: that commit gave the overlay wrap + scroll-follow, but
+/// fed logical-line indices into `ui::scroll::clamp_scroll` while `render`
+/// always started each visible line at its own sub-row 0. Because the
+/// cursor's logical line never changes while typing one unbroken line (no
+/// `Enter`), the offset never moved either, so once that single line's
+/// wrapped rows outgrew the panel the cursor — and every character typed
+/// after it — went permanently invisible. The 100x30 default terminal
+/// above doesn't show this until a few hundred characters in; a narrow
+/// panel makes it reproducible in a couple dozen, which is exactly what
+/// `a_long_unbroken_line_soft_wraps_on_screen_and_saves_with_no_inserted_newline`
+/// above, at 100x30, can't catch.
+#[test]
+fn a_narrow_panel_stays_visible_typing_one_line_past_its_own_height() {
+    let repo = fixture::basic_repo();
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            cols: 70,
+            rows: 12,
+            ..Default::default()
+        },
+    );
+
+    h.wait_for_text("README.md");
+    for _ in 0..3 {
+        h.send(Key::Char('j'));
+    }
+    h.send(Key::Char('c'));
+    // Not `open_compose`'s usual "C-s save" wait: at this width the
+    // compose panel's content column is only ~22 cells, too narrow for the
+    // full hint line to render unclipped. The title's "comment:" prefix
+    // fits regardless of width and is enough to know the overlay opened.
+    h.wait_for_text("comment:");
+
+    // 60 filler characters plus a marker: at a ~22-column content width
+    // that's 3 wrapped rows for one logical line, comfortably past the
+    // panel's ~2-row height — exactly the shape of the fixed defect (the
+    // pre-fix panel went blind around the 44th character here).
+    let long_line = format!("{}TAIL", "x".repeat(60));
+    for c in long_line.chars() {
+        h.send(Key::Char(c));
+    }
+    h.wait_until(Duration::from_secs(3), |screen| {
+        screen.contents().contains("TAIL")
+    });
+
+    let contents = h.screen_contents();
+    assert!(
+        contents.contains("TAIL"),
+        "the most recently typed characters must stay visible even once a \
+         single unbroken line's wrapped rows outgrow the panel; screen:\n{contents}"
+    );
+
+    h.send(Key::Esc); // discard — this test only cares about the live display
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
