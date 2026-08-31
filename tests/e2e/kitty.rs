@@ -19,6 +19,7 @@
 //! actual key bytes on the wire were parsed as `JumpBack`/`JumpForward` and
 //! dispatched, not just that the process didn't crash.
 
+use crate::support::harness::SPLASH_MARKER;
 use crate::support::screen::underlined_cells;
 use crate::support::{Harness, Key, KittyMode, SpawnOptions, fixture};
 use std::time::Duration;
@@ -225,6 +226,58 @@ fn kitty_unsupported() {
     h.wait_until(Duration::from_secs(2), |s| {
         underlined_cells(s) != before && !underlined_cells(s).is_empty()
     });
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+// ---- startup splash vs. a slow-to-answer kitty probe ----------------------
+
+/// The bug this pair of `ui::mod` functions exists to fix, reproduced for
+/// real: `enable_kitty_keyboard_protocol`'s probe is a synchronous read that
+/// crossterm only bounds at 2s, and on a terminal that never answers, `ktmr`
+/// used to sit there with nothing drawn since `init_terminal` entered the
+/// alternate screen — indistinguishable from a hang. `probe_reply_delay`
+/// (see [`SpawnOptions::probe_reply_delay`]) reproduces that stall on
+/// demand, without actually waiting out crossterm's full 2s timeout to
+/// prove it: the reply still arrives, just held back long enough (well
+/// under crossterm's own bound) for a test to observe the screen mid-wait.
+///
+/// Uses [`Harness::spawn_without_ready_wait`] rather than the ordinary
+/// `Harness::spawn`, since `spawn`'s readiness wait deliberately skips past
+/// any frame containing [`SPLASH_MARKER`] — exactly the frame this test
+/// needs to catch.
+#[test]
+fn splash_is_visible_while_the_kitty_probe_is_still_pending() {
+    let repo = fixture::basic_repo();
+    let mut h = Harness::spawn_without_ready_wait(
+        repo.path(),
+        SpawnOptions {
+            probe_reply_delay: Some(Duration::from_millis(500)),
+            ..Default::default()
+        },
+    );
+
+    // Caught well inside the 500ms the probe reply is being held back —
+    // `ktmr` is blocked inside `supports_keyboard_enhancement`'s
+    // synchronous read for that whole window, so the real diff view can't
+    // have painted yet. Confirms this is genuinely the splash standing in
+    // for a still-black screen, not the two racing onto the same frame.
+    h.wait_for_text(SPLASH_MARKER);
+    assert!(
+        !h.screen_contents().contains("README.md"),
+        "the real diff view must not have rendered yet while the kitty \
+         probe reply is still being withheld"
+    );
+
+    // Once the (delayed) reply lands, startup finishes and the splash is
+    // replaced by the real UI, same as every other test in this suite.
+    h.wait_for_text("README.md");
+    assert!(
+        !h.screen_contents().contains(SPLASH_MARKER),
+        "the splash must not linger once the real UI has painted"
+    );
 
     h.send(Key::Char('q'));
     let status = h.wait_exit(Duration::from_secs(5));

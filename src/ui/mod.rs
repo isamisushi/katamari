@@ -97,7 +97,10 @@ use lsp_types::{FileChangeType, PositionEncodingKind};
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout as RatatuiLayout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout as RatatuiLayout, Position, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 use std::collections::HashSet;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -252,10 +255,22 @@ pub fn run(
 
     let mut terminal = init_terminal()?;
 
+    // Between `init_terminal` entering the alternate screen and the event
+    // loop's first real `terminal.draw` (below, past config/keymap/LSP
+    // setup and `enable_kitty_keyboard_protocol`'s own possibly-2s probe),
+    // nothing would otherwise touch stdout — a real user hit exactly that:
+    // a terminal that doesn't answer the probe leaves them staring at a
+    // black screen with just a cursor, indistinguishable from "stuck." See
+    // `draw_startup_splash`'s docs.
+    draw_startup_splash(&mut terminal)?;
+
     // Must happen before `spawn_input_thread` below starts its own
     // blocking `event::read()` loop — see `enable_kitty_keyboard_protocol`'s
     // docs on why the two would otherwise contend for crossterm's internal
-    // event-reader lock.
+    // event-reader lock. Drawing the splash just above writes to stdout
+    // only, so it doesn't need to respect that ordering itself — it's safe
+    // on either side of this call, and goes first so the probe's up-to-2s
+    // wait never runs against a still-black screen.
     let ci_distinguishable = enable_kitty_keyboard_protocol();
 
     // Issue #20: unlike the kitty probe above, this is a plain write with
@@ -4976,6 +4991,71 @@ fn init_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
+/// The text [`draw_startup_splash`] renders. Pulled out to a constant
+/// (rather than inlined in that function) because it doubles as the marker
+/// `tests/support/harness.rs` watches for: that harness blocks
+/// `Harness::spawn` on "first non-empty frame," and the splash is now the
+/// first non-empty frame, drawn before `spawn_input_thread` even starts —
+/// so the harness must keep waiting past a frame containing this exact text
+/// rather than treating it as "ready for keys" (a key sent that early could
+/// be eaten by `enable_kitty_keyboard_protocol`'s synchronous stdin read).
+/// There's no `[lib]` target for an integration test to import this
+/// constant from, so `SPLASH_MARKER` in `harness.rs` hand-duplicates the
+/// string instead — the same by-hand sharing that file's own `PROBE_QUERY`
+/// already uses for crossterm's probe bytes. Keep the two in sync.
+const STARTUP_SPLASH_TEXT: &str = "katamari — starting…";
+
+/// Renders [`STARTUP_SPLASH_TEXT`] centered and dimmed onto `frame` — split
+/// out from [`draw_startup_splash`] the same way every other pane in this
+/// module keeps its cell-drawing logic in a plain `render(frame, ...)`
+/// function separate from whatever calls `terminal.draw` around it, so it
+/// can be exercised in a unit test against a [`ratatui::backend::TestBackend`]
+/// without a real terminal.
+fn render_startup_splash(frame: &mut Frame) {
+    let area = frame.area();
+    let dim = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+    let line = Line::from(Span::styled(STARTUP_SPLASH_TEXT, dim));
+    // Same "shrink to the text's own height, center via `Alignment` for
+    // the horizontal half" split `render_empty_state` in `diff_view.rs`
+    // uses — one line here, so `top_pad` alone does all the vertical
+    // centering.
+    let top_pad = area.height.saturating_sub(1) / 2;
+    let text_area = Rect {
+        x: area.x,
+        y: area.y + top_pad,
+        width: area.width,
+        height: area.height.min(1),
+    };
+    frame.render_widget(Paragraph::new(line).alignment(Alignment::Center), text_area);
+}
+
+/// Draws one [`render_startup_splash`] frame straight onto `terminal`.
+/// Called from `run` immediately after `init_terminal` and before
+/// `enable_kitty_keyboard_protocol`, whose crossterm-internal probe blocks
+/// on a real synchronous tty read that it only bounds at 2s — on a
+/// terminal that never answers (stock Terminal.app, some tmux setups),
+/// nothing else would touch the alternate screen `init_terminal` just
+/// entered until the event loop's first real `terminal.draw` call, well
+/// past config/keymap/LSP setup, so a user on such a terminal was staring
+/// at a black screen with just a blinking cursor for up to 2s with no way
+/// to tell "starting" from "stuck." This is cheap enough (one small
+/// paragraph, no layout beyond centering) to draw unconditionally rather
+/// than only on terminals suspected of being slow.
+///
+/// Takes no [`Keymap`]/[`config::KeymapPreset`] and renders no key hints —
+/// both depend on `ci_distinguishable`, which only exists once the very
+/// probe this function draws ahead of has returned (see `vim_preset`/
+/// `emacs_preset`'s callers in `run`), so a splash that needed either would
+/// have to wait for the probe first, defeating the point of drawing before
+/// it. Drawn once and never refreshed; the real UI takes over at the event
+/// loop's own first `terminal.draw`.
+fn draw_startup_splash(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    terminal.draw(render_startup_splash)?;
+    Ok(())
+}
+
 /// Probes for the kitty keyboard protocol and, if the terminal answers
 /// that it supports it, enables its escape-code disambiguation — the
 /// mechanism this session needs to tell a literal Tab from `Ctrl-i` apart
@@ -6098,6 +6178,78 @@ mod tests {
              screen, not after — a terminal that only honors the disable \
              sequence while still in the alternate screen would otherwise \
              leave capture stuck on; got:\n{written:?}"
+        );
+    }
+
+    // ---- startup splash ----------------------------------------------------
+
+    #[test]
+    fn startup_splash_renders_the_marker_text_centered() {
+        use ratatui::backend::TestBackend;
+
+        let width = 40;
+        let height = 10;
+        let backend = TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(render_startup_splash).unwrap();
+        let buffer = terminal.backend().buffer();
+
+        // Same "concatenate one row's cells" reader `diff_view`'s own
+        // `row_text` uses — needed here (rather than a whole-buffer
+        // substring check) to also assert *which* row and that it's
+        // horizontally centered on it, not just that the text exists
+        // somewhere on screen.
+        let row_text = |y: u16| -> String {
+            (0..width)
+                .map(|x| buffer.cell((x, y)).map_or(" ", |c| c.symbol()))
+                .collect()
+        };
+
+        let marker_row = (0..height)
+            .find(|&y| row_text(y).contains(STARTUP_SPLASH_TEXT))
+            .expect("draw_startup_splash must render its marker text somewhere on screen");
+
+        // `harness.rs`'s readiness wait treats this as "not a real frame
+        // yet" precisely because the marker is what it greps for — a
+        // regression here (wrong text, or text that never lands on screen
+        // at all) would silently break that contract without tripping any
+        // other test, since the harness would just wait past a frame it
+        // should have kept waiting past anyway. See `STARTUP_SPLASH_TEXT`'s
+        // docs on the two sides staying in sync.
+        assert_eq!(
+            marker_row,
+            (height - 1) / 2,
+            "one line of text on a height-{height} screen must land on the \
+             vertically centered row (matching render_startup_splash's own \
+             top_pad formula)"
+        );
+
+        let text = row_text(marker_row);
+        let start = text
+            .find(STARTUP_SPLASH_TEXT)
+            .expect("already confirmed present on this row");
+        let leading = text[..start].chars().filter(|c| *c != ' ').count();
+        assert_eq!(
+            leading, 0,
+            "no non-space cell should precede the marker text on its row"
+        );
+        let end = start + STARTUP_SPLASH_TEXT.chars().count();
+        let trailing_text: String = text.chars().skip(end).collect();
+        assert!(
+            trailing_text.trim().is_empty(),
+            "no non-space cell should follow the marker text on its row: {trailing_text:?}"
+        );
+
+        // Horizontal centering: the gap on the left and right of the text
+        // must be within one cell of each other (an odd leftover column
+        // rounds to one side or the other, same as `render_empty_state`'s
+        // own `Alignment::Center` everywhere else in the UI).
+        let left_gap = start as i32;
+        let right_gap = (width as usize - end) as i32;
+        assert!(
+            (left_gap - right_gap).abs() <= 1,
+            "left gap {left_gap} and right gap {right_gap} must differ by at \
+             most one column for text centered via Alignment::Center"
         );
     }
 

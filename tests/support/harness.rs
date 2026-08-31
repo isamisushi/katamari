@@ -75,6 +75,22 @@ impl KittyMode {
 /// something it displays) so the reader thread knows the instant to answer.
 const PROBE_QUERY: &[u8] = b"\x1b[?u\x1b[c";
 
+/// `ui::mod::STARTUP_SPLASH_TEXT`, hand-duplicated here the same way
+/// [`PROBE_QUERY`] above hand-duplicates crossterm's own probe bytes —
+/// there's no `[lib]` target in `Cargo.toml` for this integration test to
+/// import the real constant from, so the two copies are kept in sync by
+/// convention and a comment on each side pointing at the other, not by the
+/// compiler.
+///
+/// `ktmr` now draws a splash frame containing this text immediately after
+/// entering the alternate screen and *before* the kitty-keyboard-protocol
+/// probe (whose synchronous stdin read can eat any key a test sends too
+/// early) and before `spawn_input_thread` even starts. That splash is the
+/// first non-empty frame, so [`Harness::spawn`]'s readiness wait must keep
+/// waiting past a frame that still contains this marker rather than
+/// treating it as "ready for keys" — see its docs.
+pub(crate) const SPLASH_MARKER: &str = "katamari — starting…";
+
 /// [`Harness::spawn`]'s configuration. Defaults to a generously-sized
 /// terminal and no extra args — plain `ktmr` in a git repo defaults to `ktmr
 /// diff`, which is all this suite ever needs to spawn.
@@ -100,6 +116,16 @@ pub struct SpawnOptions {
     /// tests share one process, so mutating the test runner's own
     /// environment would race every parallel test in the suite.
     pub extra_env: Vec<(std::ffi::OsString, std::ffi::OsString)>,
+    /// Holds [`spawn_reader_thread`]'s reply to the kitty-keyboard-protocol
+    /// probe back by this long after spotting it on the wire. `None` (the
+    /// default) replies the instant the probe bytes are seen, matching
+    /// every real terminal this harness otherwise simulates. Exists only so
+    /// a test can observe the real, if brief, window where `ktmr` is
+    /// blocked inside `supports_keyboard_enhancement`'s synchronous read —
+    /// the exact window `ui::mod::draw_startup_splash` exists to paint over
+    /// — without waiting out that function's real ~2s timeout to prove it:
+    /// see `kitty::splash_is_visible_while_the_kitty_probe_is_still_pending`.
+    pub probe_reply_delay: Option<Duration>,
 }
 
 impl Default for SpawnOptions {
@@ -111,6 +137,7 @@ impl Default for SpawnOptions {
             args: Vec::new(),
             update_state_json: None,
             extra_env: Vec::new(),
+            probe_reply_delay: None,
         }
     }
 }
@@ -151,7 +178,8 @@ impl Harness {
     /// Spawns `ktmr` (via `env!("CARGO_BIN_EXE_ktmr")`) in `cwd` inside a
     /// PTY sized `opts.cols`x`opts.rows`, answers the kitty-keyboard-protocol
     /// probe as `opts.kitty_mode` dictates, and blocks until the first
-    /// rendered frame has real content on screen before returning.
+    /// rendered frame that is *not* the startup splash has real content on
+    /// screen before returning.
     ///
     /// That wait is load-bearing, not a convenience. `ktmr` answers the
     /// probe via a synchronous blocking read that runs *before* it spawns
@@ -163,6 +191,15 @@ impl Harness {
     /// test sends via [`Harness::send`] is sent only once that window has
     /// definitely closed — test bodies never have to think about the race
     /// themselves.
+    ///
+    /// The splash frame (see [`SPLASH_MARKER`]) is drawn *before* that probe
+    /// even runs, so "any non-empty frame" alone is no longer a safe
+    /// definition of ready — it would return the moment the splash lands,
+    /// which is still inside the exact window the paragraph above warns
+    /// about. Skipping any frame containing the marker closes that gap: the
+    /// wait only succeeds once the splash has been replaced by the real UI,
+    /// which happens after both the probe and `spawn_input_thread` have
+    /// already run.
     ///
     /// Also always seeds `$XDG_STATE_HOME/katamari/update-check.json` before
     /// the child starts — with `opts.update_state_json` if a test supplied
@@ -177,6 +214,27 @@ impl Harness {
     /// DNS/TLS work under `cargo test`'s default parallelism to make
     /// timing-sensitive assertions elsewhere in the suite flaky.
     pub fn spawn(cwd: &Path, opts: SpawnOptions) -> Harness {
+        let harness = Self::spawn_without_ready_wait(cwd, opts);
+        harness.wait_until(READY_TIMEOUT, |screen| {
+            let contents = screen.contents();
+            !contents.trim().is_empty() && !contents.contains(SPLASH_MARKER)
+        });
+        harness
+    }
+
+    /// Everything [`spawn`](Self::spawn) does *except* that final ready
+    /// wait — spawns the child, wires up the pty/reader thread, and returns
+    /// immediately. `spawn`'s wait is there for a reason (see its docs) and
+    /// every ordinary test must keep going through it; this exists only for
+    /// `kitty::splash_is_visible_while_the_kitty_probe_is_still_pending`,
+    /// which needs a live [`Harness`] to poll *during* the window `spawn`'s
+    /// wait deliberately skips past (the splash, before the kitty probe has
+    /// replied). `pub(crate)` rather than `pub`, and not part of
+    /// `support::mod`'s `pub use harness::{...}` re-export list — visible to
+    /// the one test file that needs it without being something an ordinary
+    /// test could reach for by accident and skip the real readiness
+    /// guarantee.
+    pub(crate) fn spawn_without_ready_wait(cwd: &Path, opts: SpawnOptions) -> Harness {
         let env_home = tempfile::Builder::new()
             .prefix("katamari-e2e-home-")
             .tempdir()
@@ -236,9 +294,10 @@ impl Harness {
             Arc::clone(&screen),
             Arc::clone(&bytes_read),
             opts.kitty_mode,
+            opts.probe_reply_delay,
         );
 
-        let harness = Harness {
+        Harness {
             pty,
             write_lock,
             screen,
@@ -248,10 +307,7 @@ impl Harness {
             child,
             reader: Some(reader),
             _env_home: env_home,
-        };
-
-        harness.wait_until(READY_TIMEOUT, |screen| !screen.contents().trim().is_empty());
-        harness
+        }
     }
 
     /// Sends one logical keypress, encoded for this harness's
@@ -382,13 +438,19 @@ fn write_locked(pty: &Pty, lock: &Mutex<()>, bytes: &[u8]) {
 /// answering it inline the moment it appears (see [`PROBE_QUERY`] and
 /// [`KittyMode::probe_reply`]) — reactively, never preemptively, so a
 /// terminal that never asked never gets an unsolicited reply sitting in its
-/// input buffer ahead of whatever a test sends next.
+/// input buffer ahead of whatever a test sends next. `probe_reply_delay`
+/// (see [`SpawnOptions::probe_reply_delay`]) sleeps this thread, right here,
+/// for that long after spotting the probe and before writing the reply —
+/// safe to do inline rather than off on some other thread, since `ktmr`'s
+/// own probe read is synchronous: it sends nothing else worth draining
+/// until this reply arrives.
 fn spawn_reader_thread(
     pty: Arc<Pty>,
     write_lock: Arc<Mutex<()>>,
     screen: Arc<Mutex<Parser<ClipboardCapture>>>,
     bytes_read: Arc<AtomicUsize>,
     kitty_mode: KittyMode,
+    probe_reply_delay: Option<Duration>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
@@ -412,6 +474,9 @@ fn spawn_reader_thread(
             if !probe_answered {
                 tail.extend_from_slice(chunk);
                 if find_subslice(&tail, PROBE_QUERY).is_some() {
+                    if let Some(delay) = probe_reply_delay {
+                        std::thread::sleep(delay);
+                    }
                     write_locked(&pty, &write_lock, kitty_mode.probe_reply());
                     probe_answered = true;
                     tail.clear();
