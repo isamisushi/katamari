@@ -149,6 +149,25 @@ pub fn moving_scope_repo() -> FixtureRepo {
     FixtureRepo { dir }
 }
 
+/// A single commit and nothing uncommitted — `ktmr diff`'s default
+/// working-tree scope with literally nothing to review, for the
+/// empty-diff-pane placeholder E2E coverage (`tests/e2e/rendering.rs`).
+/// Builds the identical shape [`moving_scope_repo`] does for its own,
+/// unrelated reason (amending `HEAD` after a harness is already spawned
+/// against it) — kept as its own function rather than reused so a future
+/// change to that test's needs can't silently change what this one
+/// exercises too.
+pub fn clean_repo() -> FixtureRepo {
+    let dir = init_repo();
+    let root = dir.path();
+
+    std::fs::write(root.join("notes.txt"), "alpha\nbeta\ngamma\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "first"]);
+
+    FixtureRepo { dir }
+}
+
 /// Whether `jj` is on `PATH` — [`python3_available`]'s jj-side counterpart,
 /// the same self-skip pattern for the same reason: `jj` is mise-managed
 /// (`mise.toml`'s `[tools]` pins a version), so it resolves in this

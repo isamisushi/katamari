@@ -1,8 +1,11 @@
-//! Two rendering guards the unit-level test suite can't provide on its own,
-//! since both depend on how `ratatui`'s cells actually land on a real
+//! Rendering guards the unit-level test suite can't provide on its own,
+//! since these depend on how `ratatui`'s cells actually land on a real
 //! terminal grid: CJK double-width rendering end-to-end
-//! (`renders_japanese_diff`), and the M9 hint-wrapping fix actually wrapping
-//! rather than truncating on a narrow terminal (`narrow_terminal_wraps_hints`).
+//! (`renders_japanese_diff`), the M9 hint-wrapping fix actually wrapping
+//! rather than truncating on a narrow terminal (`narrow_terminal_wraps_hints`),
+//! and the empty-diff placeholder actually reaching a real spawned session
+//! (`empty_diff_shows_a_placeholder_not_blank_panes`,
+//! `empty_diff_placeholder_vanishes_once_a_watched_edit_lands`).
 
 use crate::support::screen::{hint_line_count, wide_cell_contents};
 use crate::support::{Harness, Key, SpawnOptions, fixture};
@@ -81,6 +84,70 @@ fn narrow_terminal_wraps_hints() {
     assert!(
         move_line.is_some() && hunk_line.is_some() && move_line != hunk_line,
         "expected `move` and `hunk` hints on different wrapped lines, got hint lines: {hint_lines:?}"
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+/// `ktmr diff` in a repo with nothing uncommitted used to render two
+/// completely empty bordered panes — indistinguishable from a session still
+/// loading. This is that bug's real-terminal repro, guarding the fix: the
+/// diff pane must show the scope-aware placeholder text instead, and the
+/// hint line naming `o`/`q` proves the wording was read off the live
+/// keymap rather than baked in (see `diff_view::render_empty_state`'s docs).
+#[test]
+fn empty_diff_shows_a_placeholder_not_blank_panes() {
+    let repo = fixture::clean_repo();
+    let mut h = Harness::spawn(repo.path(), SpawnOptions::default());
+
+    h.wait_for_text("working tree clean");
+    let contents = h.screen_contents();
+    assert!(
+        contents.contains("nothing to review"),
+        "expected the full working-tree headline; screen:\n{contents}"
+    );
+    assert!(
+        contents.contains("opens the scope menu"),
+        "expected a hint naming the scope-menu key; screen:\n{contents}"
+    );
+    assert!(
+        contents.contains("quits"),
+        "expected a hint naming the quit key; screen:\n{contents}"
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+/// The placeholder is derived from `App::rows` on every rederive, not
+/// cached from the first empty paint — a live-refresh session that starts
+/// clean and then gains a real change must swap straight to the real diff,
+/// with no keypress, the same way `tests/e2e/watch.rs`'s already-showing-content
+/// case proves a refresh reaches the screen at all.
+#[test]
+fn empty_diff_placeholder_vanishes_once_a_watched_edit_lands() {
+    let repo = fixture::clean_repo();
+    let mut h = Harness::spawn(repo.path(), SpawnOptions::default());
+
+    h.wait_for_text("working tree clean");
+
+    const MARKER: &str = "LIVE_REFRESH_FROM_EMPTY_UNIQUE_MARKER";
+    std::fs::write(
+        repo.path().join("notes.txt"),
+        format!("alpha {MARKER}\nbeta\ngamma\n"),
+    )
+    .expect("failed to edit watched fixture file");
+
+    h.wait_until(Duration::from_secs(10), |screen| {
+        screen.contents().contains(MARKER)
+    });
+    let contents = h.screen_contents();
+    assert!(
+        !contents.contains("working tree clean"),
+        "the placeholder must be gone once a real change lands; screen:\n{contents}"
     );
 
     h.send(Key::Char('q'));

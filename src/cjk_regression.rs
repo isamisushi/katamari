@@ -613,6 +613,7 @@ mod tests {
                     &comments,
                     false,
                     &[],
+                    &Keymap::from_bindings(&vim_preset(false)),
                 );
             })
             .unwrap();
@@ -760,6 +761,7 @@ mod tests {
                     &comments,
                     false,
                     &[],
+                    &Keymap::from_bindings(&vim_preset(false)),
                 );
             })
             .unwrap();

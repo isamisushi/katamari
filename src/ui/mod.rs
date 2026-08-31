@@ -4800,6 +4800,7 @@ fn draw(
                 comments,
                 app.focus == app::MainPaneFocus::Diff,
                 &hints::diff_pane_hints(keymap, app.sidebar_visible),
+                keymap,
             );
             // Issue #22: the *content* rect (inside `render_focusable`'s own
             // border) paired with the `HitRow`s it just drew, for click

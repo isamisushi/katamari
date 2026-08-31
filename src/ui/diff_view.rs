@@ -19,6 +19,7 @@ use crate::diff::{
     side_by_side_scroll_start,
 };
 use crate::highlight::{HighlightKind, Language, LineHighlighter, Span as HlSpan};
+use crate::keymap::{Action, Keymap};
 use crate::lsp::DiagnosticsStore;
 use crate::ui::app::{App, Layout};
 use crate::ui::mouse::{HitRow, LineHit};
@@ -36,7 +37,7 @@ use crate::ui::text::{
 };
 use lsp_types::DiagnosticSeverity;
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -111,8 +112,9 @@ pub fn render(
 /// [`TimelineView`]: crate::ui::timeline_view::TimelineView
 #[allow(clippy::too_many_arguments)]
 // mirrors `render`'s own shape plus
-// the two focus/hint parameters `PaneChrome` needs; splitting this into a
-// struct would just move the same fields one level down.
+// the focus/hint/keymap parameters `PaneChrome`/[`render_empty_state`] need;
+// splitting this into a struct would just move the same fields one level
+// down.
 ///
 /// Returns one [`HitRow`] per rendered terminal row of the content pane, in
 /// the same viewport-clamped order [`render_content`] pushed the matching
@@ -132,6 +134,7 @@ pub fn render_focusable(
     comments: &CommentIndex,
     focused: bool,
     hints: &[PaneHint<'_>],
+    keymap: &Keymap,
 ) -> Vec<HitRow> {
     let block = PaneChrome::new(" diff ", area.width)
         .focused(focused)
@@ -139,6 +142,19 @@ pub fn render_focusable(
         .block();
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    // A parsed diff with zero files (the working tree is clean, a revision
+    // has no changes, …) used to fall straight through to `render_content`,
+    // which for an empty `app.rows` renders nothing at all — a bare
+    // bordered pane indistinguishable from one still loading. Only this
+    // root pane special-cases it (not the plain [`render`] [`TimelineView`]
+    // nests): the hint line below names `Action::OpenScopeMenu`, which only
+    // `View::Diff` actually intercepts (see `ui::mod::handle_action`'s
+    // `OpenScopeMenu` arm) — showing it over a historical snapshot's empty
+    // diff would name a key that does nothing there.
+    if app.rows.is_empty() {
+        render_empty_state(frame, inner, app, keymap);
+        return Vec::new();
+    }
     render_content(
         frame,
         inner,
@@ -148,6 +164,59 @@ pub fn render_focusable(
         diagnostics,
         comments,
     )
+}
+
+/// [`render_focusable`]'s placeholder for an empty `app.rows`: a short,
+/// dimmed headline plus a dimmed hint line, both centered in `inner` —
+/// unlike every other row this pane draws, this isn't gutter/line-numbered
+/// content read top-down, it's a single status message, so it earns the one
+/// spot in this file that centers rather than left-aligns. Wording is
+/// scope-aware: [`App::disk_is_new_side`] is `true` only for the plain
+/// working-tree scope (see its own docs) — every other scope (staged, a
+/// git/jj revision or range, a PR) gets the more general phrasing, since
+/// "working tree" would be actively wrong for those. The hint line's keys
+/// are read off `keymap`, not hardcoded `"o"`/`"q"` — a `[keys]` rebind or
+/// the emacs preset must still name the keys that actually work, same
+/// reasoning as [`crate::ui::hints::HintItem::for_actions`].
+fn render_empty_state(frame: &mut Frame, inner: Rect, app: &App, keymap: &Keymap) {
+    let headline = if app.disk_is_new_side {
+        "working tree clean \u{2014} nothing to review"
+    } else {
+        "no changes in this scope"
+    };
+    let dim = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::DIM);
+    let mut lines = vec![Line::from(Span::styled(headline, dim))];
+
+    let hint_parts: Vec<String> = [
+        keymap
+            .binding_for(Action::OpenScopeMenu)
+            .map(|seq| format!("{} opens the scope menu", seq.compact_notation())),
+        keymap
+            .binding_for(Action::Quit)
+            .map(|seq| format!("{} quits", seq.compact_notation())),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !hint_parts.is_empty() {
+        lines.push(Line::from(Span::styled(hint_parts.join(" \u{b7} "), dim)));
+    }
+
+    // Vertically centered by shrinking the render area to just the text's
+    // own height and shifting its top down, rather than padding the
+    // `Vec<Line>` itself with blank entries — `Paragraph`'s own
+    // `Alignment::Center` already handles the horizontal half.
+    let block_height = (lines.len() as u16).min(inner.height);
+    let top_pad = inner.height.saturating_sub(block_height) / 2;
+    let area = Rect {
+        x: inner.x,
+        y: inner.y + top_pad,
+        width: inner.width,
+        height: block_height,
+    };
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
 }
 
 fn render_content(
@@ -1211,10 +1280,19 @@ mod tests {
     use super::*;
     use crate::comments::{self, Comment, CommentIndex};
     use crate::diff::{DiffFile, DiffHunk, DiffLineKind, DiffRow, SideBySideRow, SideCell};
+    use crate::keymap::{KeySeq, vim_preset};
     use crate::lsp::DiagnosticsStore;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use std::path::{Path, PathBuf};
+
+    /// A plain vim-preset [`Keymap`] for tests that need one only because
+    /// [`render_focusable`]'s signature requires it — every binding this
+    /// file's own tests actually assert against text for (`o`/`q`) is the
+    /// same under either built-in preset, so which one is beside the point.
+    fn test_keymap() -> Keymap {
+        Keymap::from_bindings(&vim_preset(false))
+    }
 
     fn row(kind: DiffLineKind, text: &str, old: Option<u32>, new: Option<u32>) -> DiffRow {
         DiffRow {
@@ -1463,6 +1541,7 @@ mod tests {
                     &comments,
                     true,
                     &[],
+                    &test_keymap(),
                 );
             })
             .unwrap();
@@ -1495,12 +1574,186 @@ mod tests {
                     &comments,
                     false,
                     &[],
+                    &test_keymap(),
                 );
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
         let corner = buffer.cell((0, 0)).expect("top-left corner");
         assert_ne!(corner.fg, Color::Cyan);
+    }
+
+    /// As [`draw_unified`]/[`draw_side_by_side`], but through
+    /// `render_focusable` — the empty-state tests below need the real
+    /// `PaneChrome` border (rather than `render_unified`'s bare content),
+    /// since a centering assertion has to know exactly where that border
+    /// puts the content rect.
+    fn draw_focusable(app: &App, width: u16, height: u16) -> Buffer {
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let comments = CommentIndex::default();
+        let backend = TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_focusable(
+                    frame,
+                    frame.area(),
+                    app,
+                    &mut highlighter,
+                    Layout::Unified,
+                    &diagnostics,
+                    &comments,
+                    false,
+                    &[],
+                    &test_keymap(),
+                );
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// An `App` with a parsed diff of zero files — exactly what `git
+    /// diff`/`jj diff` produces for a clean working tree or a
+    /// no-op scope, and the trigger for [`render_empty_state`].
+    fn app_with_no_files() -> App {
+        App::new("repo".to_owned(), PathBuf::from("/repo"), Vec::new())
+    }
+
+    #[test]
+    fn render_focusable_shows_the_working_tree_placeholder_when_rows_are_empty() {
+        let mut app = app_with_no_files();
+        app.disk_is_new_side = true; // the plain working-tree scope
+        assert!(app.rows.is_empty(), "sanity: a fileless diff has no rows");
+
+        let buffer = draw_focusable(&app, 60, 10);
+        let text = buffer_text(&buffer);
+        assert!(
+            text.contains("working tree clean") && text.contains("nothing to review"),
+            "expected the working-tree wording, got:\n{text}"
+        );
+        assert!(
+            !text.contains("no changes in this scope"),
+            "the working-tree scope shouldn't also show the generic scope wording:\n{text}"
+        );
+    }
+
+    /// `disk_is_new_side` is `false` for every non-working-tree scope
+    /// (staged, a git/jj revision or range, a PR — see its own docs), so a
+    /// staged empty diff exercises the same "other scopes" branch this test
+    /// is really about without needing one test per scope kind.
+    #[test]
+    fn render_focusable_shows_the_generic_placeholder_for_a_non_working_tree_empty_scope() {
+        let mut app = app_with_no_files();
+        app.disk_is_new_side = false;
+        app.scope_label = Some("r: HEAD".to_owned());
+
+        let buffer = draw_focusable(&app, 60, 10);
+        let text = buffer_text(&buffer);
+        assert!(
+            text.contains("no changes in this scope"),
+            "expected the scope-generic wording, got:\n{text}"
+        );
+        assert!(
+            !text.contains("working tree clean"),
+            "a non-working-tree empty scope shouldn't claim the working tree is clean:\n{text}"
+        );
+    }
+
+    /// The empty-state hint must read `Action::OpenScopeMenu`/`Action::Quit`
+    /// off the live `Keymap`, the same way every other on-screen hint does
+    /// (see `hints::HintItem::for_actions`'s docs) — not hardcode `"o"`/`"q"`,
+    /// which would go stale under a `[keys]` rebind. Proven by rebinding
+    /// the scope-menu action to something neither built-in preset uses and
+    /// checking the rendered hint follows it.
+    #[test]
+    fn render_focusable_empty_placeholder_reads_the_live_keymap_binding() {
+        let mut app = app_with_no_files();
+        app.disk_is_new_side = true;
+
+        let mut bindings = vim_preset(false);
+        let slot = bindings
+            .iter_mut()
+            .find(|(_, a)| *a == Action::OpenScopeMenu)
+            .unwrap();
+        slot.0 = KeySeq::parse("C-o");
+        let keymap = Keymap::from_bindings(&bindings);
+
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let comments = CommentIndex::default();
+        let backend = TestBackend::new(60, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_focusable(
+                    frame,
+                    frame.area(),
+                    &app,
+                    &mut highlighter,
+                    Layout::Unified,
+                    &diagnostics,
+                    &comments,
+                    false,
+                    &[],
+                    &keymap,
+                );
+            })
+            .unwrap();
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(
+            text.contains("C-o"),
+            "expected the rebound scope-menu key in the hint, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn render_focusable_empty_placeholder_is_horizontally_centered() {
+        let mut app = app_with_no_files();
+        app.disk_is_new_side = true;
+        let (width, height) = (60, 10);
+
+        let buffer = draw_focusable(&app, width, height);
+        let row = find_row_containing(&buffer, height, width, "working tree clean");
+        // `PaneChrome`'s border owns column 0 and `width - 1` — measuring
+        // padding only inside that, the same content rect
+        // `pane::inner_rect` gives `render_focusable`'s own `block.inner`.
+        let inner = pane::inner_rect(width, Rect::new(0, 0, width, height));
+        // `.chars()`, not a byte-index slice: `row` also holds the
+        // border's multi-byte `'\u{2502}'`, so a byte offset would land
+        // mid-character rather than at column `inner.x`.
+        let content: String = row
+            .chars()
+            .skip(inner.x as usize)
+            .take(inner.width as usize)
+            .collect();
+        let left_pad = content.chars().count() - content.trim_start().chars().count();
+        let right_pad = content.chars().count() - content.trim_end().chars().count();
+        assert!(
+            left_pad.abs_diff(right_pad) <= 1,
+            "expected roughly equal left/right padding for a centered line, \
+             got {left_pad} vs {right_pad} in {content:?}"
+        );
+    }
+
+    #[test]
+    fn render_focusable_empty_placeholder_is_vertically_centered() {
+        let mut app = app_with_no_files();
+        app.disk_is_new_side = true;
+        let (width, height) = (60, 21);
+
+        let buffer = draw_focusable(&app, width, height);
+        let inner = pane::inner_rect(width, Rect::new(0, 0, width, height));
+        let headline_row = (0..height)
+            .find(|&y| row_text(&buffer, y, width).contains("working tree clean"))
+            .expect("headline row not found");
+        // Two lines of content (headline + hint) centered in a much taller
+        // pane land well clear of both the top and bottom border, not
+        // pinned to either.
+        assert!(
+            (inner.y + 2..inner.y + inner.height - 2).contains(&headline_row),
+            "expected the headline vertically centered in a {height}-row pane, landed on row {headline_row}"
+        );
     }
 
     #[test]
