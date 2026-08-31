@@ -1424,19 +1424,34 @@ fn event_loop(
                         &mut pending_pointer_hover,
                         &observer,
                     );
-                    if agent_permission.is_some() {
+                    if agent_permission.is_some() && compose.is_none() && ask_compose.is_none() {
                         // A permission request from the resident agent (see
-                        // `crate::acp::session`) always wins the keypress,
-                        // ahead of even `compose` — defensive ordering only:
-                        // sending a prompt always closes `compose` first
-                        // (the `ask_compose`/`compose` arms below), and a
-                        // second prompt is rejected outright while a turn is
-                        // running (see `AgentStore::is_turn_running`), so a
-                        // permission request can never actually arrive while
-                        // either overlay is open. Two bindings only — Enter/
-                        // `y` allows, Esc/`n` rejects — and nothing else does
-                        // anything: this must never auto-resolve, so any
-                        // other key is simply swallowed, leaving the modal up.
+                        // `crate::acp::session`) wins the keypress ahead of
+                        // everything else that isn't itself an unsaved
+                        // overlay. It's safe to assume `ask_compose` is
+                        // already closed here — sending a prompt closes it
+                        // first, and a second prompt is rejected outright
+                        // while a turn is running (see
+                        // `AgentStore::is_turn_running`), so a permission
+                        // request can't arrive while it's open. `compose` has
+                        // no such coupling, though: it's the ordinary
+                        // add-a-comment overlay, opened independently of any
+                        // agent turn, so a permission request raised by a
+                        // backgrounded ask/push can legitimately arrive while
+                        // the reviewer is mid-comment. Requiring both to be
+                        // closed (rather than just checking `agent_permission`)
+                        // is what keeps this modal from ever stealing a
+                        // `compose` keystroke — Enter for a newline, Esc to
+                        // cancel, a literal `y`/`n` typed as part of a word —
+                        // as an unintended permission answer: see
+                        // `render_permission_prompt`'s call site for the
+                        // matching render-side gate that leaves the request
+                        // queued (and the modal undrawn) until whichever
+                        // overlay is open gets dismissed on its own terms.
+                        // Two bindings only — Enter/`y` allows, Esc/`n`
+                        // rejects — and nothing else does anything: this must
+                        // never auto-resolve, so any other key is simply
+                        // swallowed, leaving the modal up.
                         match key.code {
                             KeyCode::Enter | KeyCode::Char('y') => {
                                 agent_handle.answer_permission(true);
@@ -1546,11 +1561,13 @@ fn event_loop(
                                     // away rather than leaving the reviewer
                                     // wondering whether their question was
                                     // even sent — see `ui::ask`'s module
-                                    // docs.
-                                    goto_status = Some(
-                                        "agent: a turn is already running — wait for it to finish"
-                                            .to_owned(),
-                                    );
+                                    // docs. Still just a best-effort
+                                    // pre-check, not a lock: a prompt that
+                                    // slips past it and gets rejected by the
+                                    // manager thread itself instead reaches
+                                    // this same status bar asynchronously,
+                                    // via `AcpNotice::PromptRejected` below.
+                                    goto_status = Some(acp::session::AGENT_BUSY_MSG.to_owned());
                                     ask_compose = None;
                                 } else {
                                     let prompt_text =
@@ -2487,10 +2504,38 @@ fn event_loop(
                     agent_permission = Some(PermissionPromptState { tool_title });
                 }
                 AcpNotice::SpawnFailed(e) => {
+                    // Defensive, mirroring `Closed` below: a spawn failure
+                    // shouldn't be able to arrive while a permission prompt
+                    // is up (that requires a session that already spawned
+                    // successfully), but clearing it here costs nothing and
+                    // rules out ever stranding the modal on this path too.
+                    agent_permission = None;
                     goto_status = Some(format!("agent: {e}"));
                 }
                 AcpNotice::Closed(reason) => {
+                    // The manager thread (`crate::acp::session`) already
+                    // drops its own `pending_permission` when the adapter
+                    // process dies or exits mid-request — the modal has to
+                    // be cleared here too, or it outlives the connection it
+                    // was answering for. Left set, it would keep swallowing
+                    // every key but Enter/y/Esc/n (see the key-handling gate
+                    // above), stranding the reviewer unable to scroll,
+                    // navigate, or even quit until pressing one of those,
+                    // which then resolves to a harmless but confusing
+                    // no-pending-request no-op.
+                    agent_permission = None;
                     goto_status = Some(format!("agent: connection closed ({reason})"));
+                }
+                AcpNotice::PromptRejected => {
+                    // The async counterpart to the synchronous
+                    // `is_turn_running` pre-checks in `Action::PushCommentsToAgent`
+                    // and the ask overlay's `Save` — see `AcpNotice::PromptRejected`'s
+                    // own docs for the TOCTOU window this closes. Whichever
+                    // status this overwrites was already about to be
+                    // superseded by "sent"/"pushed" from the send that
+                    // actually won the race, so there's no ordering to get
+                    // wrong here.
+                    goto_status = Some(acp::session::AGENT_BUSY_MSG.to_owned());
                 }
             },
             Err(RecvTimeoutError::Timeout) => {}
@@ -3815,10 +3860,20 @@ fn handle_action(
                 if open_count == 0 {
                     *goto_status = Some("agent: no open comments to push".to_owned());
                 } else if agent_handle.is_turn_running() {
-                    *goto_status =
-                        Some("agent: a turn is already running — wait for it to finish".to_owned());
+                    *goto_status = Some(acp::session::AGENT_BUSY_MSG.to_owned());
                 } else {
                     agent_handle.send_prompt(acp::check::DEFAULT_PROMPT.to_owned());
+                    // A status note on the success path too — previously
+                    // this arm set none at all, which meant a second `p`
+                    // press landing in the synchronous pre-check's own
+                    // TOCTOU window (see `AcpNotice::PromptRejected`'s
+                    // docs) looked identical, from the status bar, to a
+                    // successful push: nothing distinguished "sent" from
+                    // "silently dropped." Now the two report differently —
+                    // this line synchronously, the rejection asynchronously
+                    // via that notice — regardless of which one actually
+                    // happens.
+                    *goto_status = Some(format!("agent: pushed {open_count} open comment(s)"));
                     // Opens (never closes) so the push is visible right
                     // away — a one-line difference from `A`'s own toggle
                     // (see `open_agent_panel`'s docs): pressing `p` must
@@ -5191,6 +5246,12 @@ fn draw(
     ask_compose: Option<&mut ask::AskComposeState>,
     agent_permission: Option<&PermissionPromptState>,
 ) {
+    // Captured before `compose`/`ask_compose` are moved into `View::Diff`'s
+    // arm below (they're `Option<&mut _>`, not `Copy`) — see the matching
+    // key-handling gate in `event_loop` for why a pending permission request
+    // must stay queued, undrawn, rather than rendering on top of either
+    // overlay while it's the reviewer's unsaved, in-progress input.
+    let overlay_open = compose.is_some() || ask_compose.is_some();
     match view {
         View::Diff(app) => {
             let hint_items = hints::diff_view_items(keymap, hints_expanded);
@@ -5381,10 +5442,17 @@ fn draw(
     // renders last of all, for the same "must win every hit-test" reason
     // `help` does — a permission request must be answerable, and visible,
     // regardless of which view or overlay happened to be on top when it
-    // arrived. In practice the two never coincide (see `PermissionPromptState`'s
-    // own docs on why), so the ordering between them is only ever a
-    // defensive one, never actually exercised.
-    if let Some(prompt) = agent_permission {
+    // arrived. The one exception is `compose`/`ask_compose`: while either is
+    // open the request stays queued and undrawn (`overlay_open`, above)
+    // rather than covering the reviewer's own unsaved text — see the
+    // matching key-handling gate in `event_loop`, which keeps keystrokes
+    // routed to that overlay for exactly as long as this stays undrawn, so
+    // the two can never disagree about who owns the keypress. The modal
+    // appears on the very next frame after the overlay closes on its own
+    // terms (saved or cancelled).
+    if let Some(prompt) = agent_permission
+        && !overlay_open
+    {
         render_permission_prompt(frame, frame.area(), prompt);
     }
 }
@@ -5727,6 +5795,15 @@ fn install_panic_hook() {
         let _ = execute!(io::stdout(), DisableMouseCapture);
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        // Neither `LspManager::shutdown_all` nor `AgentStore::shutdown` runs
+        // on this path — both are plain post-event-loop calls in `run`,
+        // which a panic unwinds straight past — so a spawned language
+        // server or ACP adapter child would otherwise be orphaned rather
+        // than killed. See `crate::procguard`'s module docs for why even
+        // each `Transport`'s own `Drop` impl can't be relied on here either
+        // (it lives on a manager thread's stack, which a main-thread panic
+        // never unwinds).
+        crate::procguard::kill_all();
         original(info);
     }));
 }

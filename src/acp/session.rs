@@ -51,6 +51,18 @@ use std::time::Duration;
 /// less than making it `pub(crate)` just to save a line.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The one message for "a `SessionCommand::Prompt` arrived while a turn was
+/// already running," shared by every place that can report it: this
+/// module's own reject-not-queue branch below (as a transcript system
+/// line), [`AcpNotice::PromptRejected`] (so the event loop can say the same
+/// thing on the status bar when *that* branch — not the UI's own
+/// synchronous pre-check — is what actually caught it), and `ui::mod`'s two
+/// synchronous `is_turn_running` pre-checks (`Action::PushCommentsToAgent`
+/// and the ask overlay's `Save`). Kept as one constant rather than four
+/// hand-typed copies of the same string so none of these call sites can
+/// ever drift apart and describe the same rejection differently.
+pub(crate) const AGENT_BUSY_MSG: &str = "agent: a turn is already running — wait for it to finish";
+
 /// How often [`run_session`] polls its three input sources when nothing is
 /// pending — short enough that a permission answer or a new prompt reaches
 /// the agent promptly, long enough not to busy-loop the manager thread.
@@ -192,6 +204,15 @@ pub enum AcpNotice {
     PermissionRequested,
     SpawnFailed(String),
     Closed(String),
+    /// A [`SessionCommand::Prompt`] reached the manager thread's own
+    /// reject-not-queue branch (a turn was already running by the time it
+    /// dequeued the command, even though the UI's own synchronous
+    /// `is_turn_running` pre-check passed) — see that branch's docs for the
+    /// up-to-[`POLL_INTERVAL`] window this closes. Without this, a second
+    /// `p`/ask-`Save` landing in that window was dropped with only a
+    /// transcript system line to show for it — indistinguishable, from the
+    /// status bar, from the first one succeeding.
+    PromptRejected,
 }
 
 /// Shared handle the event loop holds for the session's whole lifetime —
@@ -417,10 +438,18 @@ fn run_session(
                 if prompt_rx.is_some() {
                     // A turn (or the handshake ahead of one) already has
                     // this session's undivided attention — reject rather
-                    // than queue (see the module docs' B5 reasoning).
-                    store.push_system(
-                        "agent: a turn is already running — wait for it to finish".to_owned(),
-                    );
+                    // than queue (see the module docs' B5 reasoning). Also
+                    // notifies the event loop (`AcpNotice::PromptRejected`),
+                    // not just the transcript — the UI's own synchronous
+                    // pre-check catches the common case, but this branch is
+                    // what actually runs when a second prompt slips in
+                    // during the up-to-`POLL_INTERVAL` window between that
+                    // check and this thread dequeuing the command (e.g. two
+                    // `p` presses from keyboard auto-repeat), and that
+                    // rejection needs to be just as visible as the
+                    // synchronous one.
+                    store.push_system(AGENT_BUSY_MSG.to_owned());
+                    let _ = notice_tx.send(AcpNotice::PromptRejected);
                 } else {
                     if client.is_none() {
                         store.set_state(TurnState::Spawning);

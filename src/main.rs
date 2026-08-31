@@ -9,6 +9,7 @@ mod groups;
 mod highlight;
 mod keymap;
 mod lsp;
+mod procguard;
 mod skill;
 mod ui;
 mod update;

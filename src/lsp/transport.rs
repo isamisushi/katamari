@@ -189,7 +189,12 @@ impl Shared {
 /// [`crate::lsp::client::Client`] one level up.
 pub struct Transport {
     shared: Arc<Shared>,
-    child: Mutex<Child>,
+    // `Arc`, not a bare `Mutex<Child>`, so `crate::procguard` can hold a
+    // `Weak` reference alongside this one — see that module's docs for why
+    // the panic hook needs an independent way to reach and kill this same
+    // child when this `Transport`'s own `Drop`-time `kill()` never gets a
+    // chance to run.
+    child: Arc<Mutex<Child>>,
     events_rx: Mutex<Option<Receiver<LspEvent>>>,
     reader_handle: Mutex<Option<JoinHandle<()>>>,
     stderr_handle: Mutex<Option<JoinHandle<()>>>,
@@ -247,9 +252,15 @@ impl Transport {
         let stderr_log = Arc::new(Mutex::new(String::new()));
         let stderr_handle = spawn_stderr_thread(stderr, Arc::clone(&stderr_log), stderr_sink);
 
+        let child = Arc::new(Mutex::new(child));
+        // See the `child` field's own doc comment and `crate::procguard`'s
+        // module docs: this is the panic-path safety net, not part of the
+        // normal request/response flow above.
+        crate::procguard::register(&child);
+
         Ok(Self {
             shared,
-            child: Mutex::new(child),
+            child,
             events_rx: Mutex::new(Some(events_rx)),
             reader_handle: Mutex::new(Some(reader_handle)),
             stderr_handle: Mutex::new(Some(stderr_handle)),

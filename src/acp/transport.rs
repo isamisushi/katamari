@@ -145,7 +145,12 @@ impl Shared {
 /// `Transport` per agent process.
 pub struct Transport {
     shared: Arc<Shared>,
-    child: Mutex<Child>,
+    // `Arc`, not a bare `Mutex<Child>`, so `crate::procguard` can hold a
+    // `Weak` reference alongside this one — see that module's docs for why
+    // the panic hook needs an independent way to reach and kill this same
+    // child when this `Transport`'s own `Drop`-time `kill()` never gets a
+    // chance to run.
+    child: Arc<Mutex<Child>>,
     events_rx: Mutex<Option<Receiver<AcpEvent>>>,
     stderr_log: Arc<Mutex<String>>,
 }
@@ -179,9 +184,15 @@ impl Transport {
         let stderr_log = Arc::new(Mutex::new(String::new()));
         spawn_stderr_thread(stderr, Arc::clone(&stderr_log));
 
+        let child = Arc::new(Mutex::new(child));
+        // See the `child` field's own doc comment and `crate::procguard`'s
+        // module docs: this is the panic-path safety net, not part of the
+        // normal request/response flow above.
+        crate::procguard::register(&child);
+
         Ok(Self {
             shared,
-            child: Mutex::new(child),
+            child,
             events_rx: Mutex::new(Some(events_rx)),
             stderr_log,
         })

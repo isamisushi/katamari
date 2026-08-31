@@ -68,12 +68,19 @@ pub enum AskContextError {
 /// Resolves `selected` (or, for a bare cursor row, a one-element slice) back
 /// to real diff content and formats it into a question's context block.
 /// `title` is derived from the first resolved line's path plus the min/max
-/// of whichever of `old_line`/`new_line` each resolved line carries —
-/// [`crate::comments::location_label`]'s own formatting, for the same
-/// `path:line`/`path:start-end` look the compose overlay's own title has,
-/// without actually depending on [`crate::ui::app::CommentTarget`] (this
-/// selection may include deletions/discontinuities a `CommentTarget` could
-/// never represent).
+/// of whichever of `old_line`/`new_line` each *same-path* resolved line
+/// carries — [`crate::comments::location_label`]'s own formatting, for the
+/// same `path:line`/`path:start-end` look the compose overlay's own title
+/// has, without actually depending on [`crate::ui::app::CommentTarget`]
+/// (this selection may include deletions/discontinuities a `CommentTarget`
+/// could never represent). Unlike `CommentTarget`, this selection can
+/// legitimately span more than one file (see the module docs on why
+/// `AskAgent`'s eligibility is looser) — restricting the min/max scan to
+/// `first`'s own path, rather than every resolved line regardless of file,
+/// is what keeps a range like "A.rs:10-12 and B.rs:100-105" from rendering
+/// as the nonsensical "A.rs:10-105"; a selection that actually does span
+/// multiple files gets a distinct "N files" title instead, since no single
+/// `path:range` could honestly describe it.
 pub fn build_ask_context(
     rows: &[RenderRow],
     files: &[DiffFile],
@@ -84,13 +91,23 @@ pub fn build_ask_context(
         return Err(AskContextError::Empty);
     };
     let path = first.path.to_owned();
-    let numbers: Vec<u32> = lines
+    let file_count = lines
         .iter()
-        .filter_map(|line| line.new_line.or(line.old_line))
-        .collect();
-    let title = match (numbers.iter().min(), numbers.iter().max()) {
-        (Some(&start), Some(&end)) => crate::comments::location_label(&path, start, end),
-        _ => path,
+        .map(|line| line.path)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let title = if file_count > 1 {
+        format!("{file_count} files")
+    } else {
+        let numbers: Vec<u32> = lines
+            .iter()
+            .filter(|line| line.path == path)
+            .filter_map(|line| line.new_line.or(line.old_line))
+            .collect();
+        match (numbers.iter().min(), numbers.iter().max()) {
+            (Some(&start), Some(&end)) => crate::comments::location_label(&path, start, end),
+            _ => path,
+        }
     };
 
     match clipboard::format_diff_selection(lines, ASK_CONTEXT_MAX_BYTES) {
@@ -253,6 +270,35 @@ mod tests {
             ctx.title,
             crate::comments::location_label("src/lib.rs", 10, 11)
         );
+    }
+
+    #[test]
+    fn build_ask_context_title_reports_file_count_for_a_multi_file_selection() {
+        // Regression: `numbers` used to be collected across every resolved
+        // line regardless of path, while `path` stayed pinned to the
+        // first file — for a selection spanning A.rs:10-12 and
+        // B.rs:100-105 that produced the nonsensical "A.rs:10-105" (a
+        // contiguous 96-line range that doesn't exist). A distinct
+        // "N files" title is the honest thing to show instead.
+        let files = vec![
+            file(
+                "A.rs",
+                vec![
+                    diff_row(DiffLineKind::Context, "a1", Some(10), Some(10)),
+                    diff_row(DiffLineKind::Context, "a2", Some(12), Some(12)),
+                ],
+            ),
+            file(
+                "B.rs",
+                vec![diff_row(DiffLineKind::Context, "b1", Some(100), Some(100))],
+            ),
+        ];
+        let rows = flatten(&files);
+        let selected: Vec<usize> = (0..rows.len())
+            .filter(|&i| matches!(rows[i], RenderRow::Line { .. }))
+            .collect();
+        let ctx = build_ask_context(&rows, &files, &selected).unwrap();
+        assert_eq!(ctx.title, "2 files");
     }
 
     #[test]
