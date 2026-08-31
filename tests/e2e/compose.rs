@@ -127,3 +127,57 @@ fn alt_backspace_deletes_the_previous_word_under_kitty_mode() {
     let status = h.wait_exit(Duration::from_secs(5));
     assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
 }
+
+/// Issue #27: `[keys.compose] save` moves the overlay's save key off its
+/// `C-s` default — through a real repo-level config file, the real binary's
+/// own config-loading path, not `ComposeKeymap::resolve` called in-process
+/// (already covered by `src/ui/compose.rs`'s own unit tests). Proves three
+/// things a unit test can't: the hint line renders the *configured*
+/// binding, the old hardcoded `C-s` genuinely stops saving once `save`
+/// moves elsewhere, and the new binding actually saves.
+#[test]
+fn keys_compose_save_rebind_via_config_changes_the_hint_and_the_save_key() {
+    let repo = fixture::basic_repo();
+    std::fs::create_dir_all(repo.path().join(".katamari")).unwrap();
+    std::fs::write(
+        repo.path().join(".katamari").join("config.toml"),
+        "[keys.compose]\nsave = \"C-x\"\n",
+    )
+    .unwrap();
+
+    let mut h = Harness::spawn(repo.path(), SpawnOptions::default());
+    h.wait_for_text("README.md");
+    for _ in 0..3 {
+        h.send(Key::Char('j'));
+    }
+    h.send(Key::Char('c'));
+    // The hint reflects the resolved keymap, not a hardcoded string — `Esc`
+    // (cancel's untouched default) stays put alongside the rebound `save`.
+    h.wait_for_text("C-x save · Esc cancel");
+
+    for c in "looks good".chars() {
+        h.send(Key::Char(c));
+    }
+    h.wait_for_text("looks good");
+
+    // The old default no longer saves: `C-s` is Control-modified, so it's
+    // swallowed by `text_input::recognize` rather than inserted either —
+    // the overlay just stays open with the typed text untouched.
+    h.send(Key::CtrlS);
+    let after_ctrl_s = h.screen_contents();
+    assert!(
+        !after_ctrl_s.contains("comment: saved"),
+        "C-s must no longer save once [keys.compose] moves save to C-x; screen:\n{after_ctrl_s}"
+    );
+    assert!(
+        after_ctrl_s.contains("looks good"),
+        "the overlay must still be open with the typed text intact; screen:\n{after_ctrl_s}"
+    );
+
+    h.send(Key::CtrlX);
+    h.wait_for_text("comment: saved");
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}

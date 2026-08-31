@@ -11,6 +11,7 @@
 //! movement) is testable without a terminal, matching every other pure state
 //! transition in this codebase.
 
+use crate::keymap::{KeyChord, KeySeq};
 use crate::ui::app::CommentTarget;
 use crate::ui::text_input::{self, EditCommand, char_byte_index, cursor_marked_line};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -19,6 +20,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use std::collections::HashMap;
 
 /// A cursor-addressable multi-line text buffer, indexed by `char` (not byte
 /// or grapheme) offsets within each line — simple enough for a short review
@@ -168,34 +170,144 @@ impl ComposeBuffer {
     }
 }
 
+/// The compose overlay's own two special keys, resolved once at startup
+/// from `[keys.compose]` (issue #27) layered onto the `C-s`/`Esc` defaults.
+/// Deliberately not `crate::keymap::Action`/`Keymap` entries the way every
+/// other rebindable key in this app is: [`handle_key`]'s own docs explain
+/// why compose bypasses the trie entirely (it needs literal characters,
+/// including IME input, not the action vocabulary), and that reasoning
+/// applies just as much to *how* save/cancel get rebound as to how the rest
+/// of a keystroke is handled — a `KeyChord` compared directly against
+/// [`KeyChord::from`] one raw event is all this overlay's single-event
+/// dispatch can ever use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComposeKeymap {
+    save: KeyChord,
+    cancel: KeyChord,
+}
+
+impl Default for ComposeKeymap {
+    fn default() -> Self {
+        Self {
+            save: KeyChord::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            cancel: KeyChord::new(KeyCode::Esc, KeyModifiers::NONE),
+        }
+    }
+}
+
+impl ComposeKeymap {
+    /// Applies `[keys.compose]`'s `save`/`cancel` entries onto
+    /// [`Self::default`], failing on the first invalid one with a
+    /// `"[keys.compose] <name> = <notation>: <why>"` message —
+    /// [`crate::config::apply_key_overrides`]'s own error shape for the
+    /// main `[keys]` table, so a bad entry in either table reads the same
+    /// way in the startup error `ui::run` surfaces.
+    ///
+    /// This is deliberately *stricter* than that table: `Keymap::binding_for`'s
+    /// docs (see its `binding_for_never_reports_an_entry_the_trie_resolves_to_a_different_action`
+    /// test) walk through how a `[keys]` override is allowed to silently
+    /// shadow another action's key, because the worst that does is leave
+    /// that other action unbound and unmentioned in its own hint — a cost a
+    /// reviewer discovers by reading `?`. A shadowed compose key is a
+    /// different order of problem: it can make an ordinary typed character
+    /// stop reaching the buffer at all (a bare-char binding — see the
+    /// `Continue` outcome this function refuses before it ever ships), or
+    /// make `Save`/`Cancel` indistinguishable (a `save == cancel`
+    /// collision) — both silent at config-parse time and discovered only
+    /// when a reviewer's comment doesn't save, or a letter they typed never
+    /// showed up. So this validates and refuses outright instead of
+    /// deferring to the same laxness — don't "fix" this divergence to match
+    /// `[keys]`'s behavior; it's deliberate.
+    pub fn resolve(overrides: &HashMap<String, String>) -> Result<Self, String> {
+        let mut keymap = Self::default();
+        for (name, notation) in overrides {
+            if name != "save" && name != "cancel" {
+                return Err(format!(
+                    "[keys.compose]: unrecognized key `{name}` (expected `save` or `cancel`)"
+                ));
+            }
+            let seq = KeySeq::try_parse(notation)
+                .map_err(|e| format!("[keys.compose] {name} = {notation:?}: {e}"))?;
+            let chord = seq.as_single_chord().ok_or_else(|| {
+                format!(
+                    "[keys.compose] {name} = {notation:?}: must be a single key, not a sequence"
+                )
+            })?;
+            // A bare, unmodified character (`KeyChord::as_plain_char` —
+            // includes `Space`, whose *notation* is a named key but whose
+            // underlying chord is exactly as bare as any other unmodified
+            // letter) would make that character untypeable — `Save`/
+            // `Cancel` are checked ahead of the insert fallback in
+            // `handle_key`, so it would never reach `ComposeBuffer` again.
+            if let Some(c) = chord.as_plain_char() {
+                return Err(format!(
+                    "[keys.compose] {name} = {notation:?}: binding to {c:?} would stop that \
+                     character from being typed into a comment"
+                ));
+            }
+            match name.as_str() {
+                "save" => keymap.save = chord,
+                "cancel" => keymap.cancel = chord,
+                _ => unreachable!("checked above"),
+            }
+        }
+        if keymap.save == keymap.cancel {
+            return Err(format!(
+                "[keys.compose]: save and cancel must not be the same key (both {})",
+                keymap.save_notation()
+            ));
+        }
+        Ok(keymap)
+    }
+
+    fn save_notation(self) -> String {
+        KeySeq::from_chords(vec![self.save]).compact_notation()
+    }
+
+    fn cancel_notation(self) -> String {
+        KeySeq::from_chords(vec![self.cancel]).compact_notation()
+    }
+}
+
 /// What [`handle_key`] decided one key press should do to the overlay as a
 /// whole, beyond editing the buffer itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComposeOutcome {
     /// The buffer changed (or the key was a no-op); the overlay stays open.
     Continue,
-    /// `C-s`: the caller should persist the buffer's text as a comment and
-    /// close the overlay.
+    /// `keys.save` (`C-s` by default): the caller should persist the
+    /// buffer's text as a comment and close the overlay.
     Save,
-    /// `Esc`: discard the buffer and close the overlay.
+    /// `keys.cancel` (`Esc` by default): discard the buffer and close the
+    /// overlay.
     Cancel,
 }
 
 /// Applies one raw terminal key event to `buffer`, bypassing
-/// [`crate::keymap`] entirely — the compose overlay needs literal characters
-/// (including IME-composed Japanese input, which crossterm delivers as
-/// ordinary per-character `KeyCode::Char` events once the IME commits them),
-/// not the action vocabulary every other view's input goes through. This is
-/// why `ui::mod`'s event loop checks for an open overlay *before* feeding a
-/// key to the keymap resolver at all: routing plain prose through the vim
-/// keymap first would fire `Action::Quit` on a stray `q` instead of typing
-/// one.
-pub fn handle_key(buffer: &mut ComposeBuffer, key: KeyEvent) -> ComposeOutcome {
+/// [`crate::keymap`]'s `Action`/`Keymap` trie entirely — the compose
+/// overlay needs literal characters (including IME-composed Japanese input,
+/// which crossterm delivers as ordinary per-character `KeyCode::Char`
+/// events once the IME commits them), not the action vocabulary every other
+/// view's input goes through. This is why `ui::mod`'s event loop checks for
+/// an open overlay *before* feeding a key to the keymap resolver at all:
+/// routing plain prose through the vim keymap first would fire
+/// `Action::Quit` on a stray `q` instead of typing one. `keys` (issue #27)
+/// is the one piece of `crate::keymap` this still leans on — a bare
+/// [`KeyChord`] comparison, not the trie, since there's only ever one raw
+/// event to match against at a time.
+pub fn handle_key(
+    buffer: &mut ComposeBuffer,
+    key: KeyEvent,
+    keys: &ComposeKeymap,
+) -> ComposeOutcome {
+    let chord = KeyChord::from(key);
+    if chord == keys.cancel {
+        return ComposeOutcome::Cancel;
+    }
+    if chord == keys.save {
+        return ComposeOutcome::Save;
+    }
     match key.code {
-        KeyCode::Esc => return ComposeOutcome::Cancel,
-        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            return ComposeOutcome::Save;
-        }
         KeyCode::Enter => {
             buffer.newline();
             return ComposeOutcome::Continue;
@@ -251,13 +363,30 @@ impl ComposeState {
     }
 }
 
-const HINT: &str = "Enter newline · C-s save · Esc cancel";
+/// The overlay's bottom-row hint, built from `keys`' live bindings rather
+/// than a hardcoded string — the same "read the resolved keymap, don't
+/// restate it" rule `ui::hints`/`ui::help` follow for every other action's
+/// hint, now that `[keys.compose]` (issue #27) can move save/cancel off
+/// their `C-s`/`Esc` defaults.
+fn hint_text(keys: &ComposeKeymap) -> String {
+    format!(
+        "Enter newline · {} save · {} cancel",
+        keys.save_notation(),
+        keys.cancel_notation()
+    )
+}
 
 /// Draws the overlay near `cursor_screen_row`, reusing
 /// [`crate::ui::hover_popup`]'s positioning idea (below the cursor when
 /// there's room, above it otherwise) so the two floating panels this
 /// codebase has feel like one family rather than two independent designs.
-pub fn render(frame: &mut Frame, area: Rect, cursor_screen_row: u16, state: &ComposeState) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    cursor_screen_row: u16,
+    state: &ComposeState,
+    keys: &ComposeKeymap,
+) {
     let rect = popup_rect(area, cursor_screen_row);
     frame.render_widget(Clear, rect);
 
@@ -286,7 +415,7 @@ pub fn render(frame: &mut Frame, area: Rect, cursor_screen_row: u16, state: &Com
         lines.push(Line::default());
     }
     lines.push(Line::from(Span::styled(
-        HINT,
+        hint_text(keys),
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -406,11 +535,18 @@ mod tests {
         assert!(!buffer.is_blank());
     }
 
+    /// Every `handle_key` test that doesn't care about `[keys.compose]`
+    /// itself uses the built-in `C-s`/`Esc` defaults, same as before this
+    /// overlay had a configurable keymap at all.
+    fn default_keys() -> ComposeKeymap {
+        ComposeKeymap::default()
+    }
+
     #[test]
     fn handle_key_esc_cancels() {
         let mut buffer = ComposeBuffer::new();
         assert_eq!(
-            handle_key(&mut buffer, key(KeyCode::Esc)),
+            handle_key(&mut buffer, key(KeyCode::Esc), &default_keys()),
             ComposeOutcome::Cancel
         );
     }
@@ -421,6 +557,7 @@ mod tests {
         let outcome = handle_key(
             &mut buffer,
             key_mod(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &default_keys(),
         );
         assert_eq!(outcome, ComposeOutcome::Save);
     }
@@ -428,7 +565,7 @@ mod tests {
     #[test]
     fn handle_key_plain_char_inserts_and_continues() {
         let mut buffer = ComposeBuffer::new();
-        let outcome = handle_key(&mut buffer, key(KeyCode::Char('x')));
+        let outcome = handle_key(&mut buffer, key(KeyCode::Char('x')), &default_keys());
         assert_eq!(outcome, ComposeOutcome::Continue);
         assert_eq!(buffer.text(), "x");
     }
@@ -436,9 +573,10 @@ mod tests {
     #[test]
     fn handle_key_enter_inserts_a_newline() {
         let mut buffer = ComposeBuffer::new();
-        handle_key(&mut buffer, key(KeyCode::Char('a')));
-        handle_key(&mut buffer, key(KeyCode::Enter));
-        handle_key(&mut buffer, key(KeyCode::Char('b')));
+        let keys = default_keys();
+        handle_key(&mut buffer, key(KeyCode::Char('a')), &keys);
+        handle_key(&mut buffer, key(KeyCode::Enter), &keys);
+        handle_key(&mut buffer, key(KeyCode::Char('b')), &keys);
         assert_eq!(buffer.text(), "a\nb");
     }
 
@@ -488,6 +626,7 @@ mod tests {
         let outcome = handle_key(
             &mut buffer,
             key_mod(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            &default_keys(),
         );
         assert_eq!(outcome, ComposeOutcome::Continue);
         assert_eq!(buffer.text(), "hello ");
@@ -499,7 +638,11 @@ mod tests {
         for c in "hello world".chars() {
             buffer.insert_char(c);
         }
-        let outcome = handle_key(&mut buffer, key_mod(KeyCode::Backspace, KeyModifiers::ALT));
+        let outcome = handle_key(
+            &mut buffer,
+            key_mod(KeyCode::Backspace, KeyModifiers::ALT),
+            &default_keys(),
+        );
         assert_eq!(outcome, ComposeOutcome::Continue);
         assert_eq!(buffer.text(), "hello ");
     }
@@ -517,6 +660,154 @@ mod tests {
             buffer.cursor(),
             (0, 1),
             "column clamps to the shorter target line"
+        );
+    }
+
+    // ---- ComposeKeymap::resolve (issue #27) ---------------------------
+
+    fn overrides(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn default_keymap_matches_the_pre_issue_27_hardcoded_bindings() {
+        let keys = ComposeKeymap::default();
+        assert_eq!(
+            keys.save,
+            KeyChord::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(keys.cancel, KeyChord::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(hint_text(&keys), "Enter newline · C-s save · Esc cancel");
+    }
+
+    #[test]
+    fn resolve_rebinds_both_save_and_cancel() {
+        let keys = ComposeKeymap::resolve(&overrides(&[("save", "C-x"), ("cancel", "C-g")]))
+            .expect("both entries are valid");
+        assert_eq!(
+            keys.save,
+            KeyChord::new(KeyCode::Char('x'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            keys.cancel,
+            KeyChord::new(KeyCode::Char('g'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(hint_text(&keys), "Enter newline · C-x save · C-g cancel");
+    }
+
+    #[test]
+    fn resolve_rebinding_only_save_leaves_cancel_at_its_default() {
+        let keys =
+            ComposeKeymap::resolve(&overrides(&[("save", "C-x")])).expect("valid single entry");
+        assert_eq!(
+            keys.save,
+            KeyChord::new(KeyCode::Char('x'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            keys.cancel,
+            ComposeKeymap::default().cancel,
+            "cancel keeps its Esc default when only save is overridden"
+        );
+    }
+
+    #[test]
+    fn resolve_rejects_an_unrecognized_key_name() {
+        let err = ComposeKeymap::resolve(&overrides(&[("quit", "C-x")]))
+            .expect_err("compose only has save/cancel");
+        assert!(err.contains("[keys.compose]"), "{err}");
+        assert!(err.contains("quit"), "{err}");
+    }
+
+    #[test]
+    fn resolve_rejects_malformed_notation() {
+        let err = ComposeKeymap::resolve(&overrides(&[("save", "C-NotAKey")]))
+            .expect_err("bad key name in notation");
+        assert!(err.contains("[keys.compose] save"), "{err}");
+    }
+
+    #[test]
+    fn resolve_rejects_a_multi_chord_sequence() {
+        let err = ComposeKeymap::resolve(&overrides(&[("save", "g g")]))
+            .expect_err("compose has no trie to resolve a sequence through");
+        assert!(err.contains("single key"), "{err}");
+    }
+
+    #[test]
+    fn resolve_rejects_a_bare_unmodified_character() {
+        // Binding save to a plain "x" would make that letter untypeable —
+        // save/cancel are checked before the insert fallback in
+        // `handle_key`.
+        let err = ComposeKeymap::resolve(&overrides(&[("save", "x")]))
+            .expect_err("a bare character must never be accepted");
+        assert!(err.contains("untypeable") || err.contains("typed"), "{err}");
+    }
+
+    #[test]
+    fn resolve_rejects_a_named_key_that_also_types_a_character() {
+        // "Space" is exactly as untypeable-making as a literal " " would
+        // be — same bug, spelled differently.
+        let err = ComposeKeymap::resolve(&overrides(&[("cancel", "Space")]))
+            .expect_err("Space is a plain typable character under another name");
+        assert!(err.contains("cancel"), "{err}");
+    }
+
+    #[test]
+    fn resolve_rejects_save_and_cancel_bound_to_the_same_key() {
+        let err = ComposeKeymap::resolve(&overrides(&[("save", "C-x"), ("cancel", "C-x")]))
+            .expect_err("save and cancel must stay distinguishable");
+        assert!(err.contains("save and cancel"), "{err}");
+    }
+
+    #[test]
+    fn resolve_with_no_overrides_returns_the_defaults() {
+        let keys = ComposeKeymap::resolve(&HashMap::new()).expect("empty overrides are valid");
+        assert_eq!(keys, ComposeKeymap::default());
+    }
+
+    #[test]
+    fn handle_key_honors_a_rebound_save_and_stops_honoring_the_old_default() {
+        let keys = ComposeKeymap::resolve(&overrides(&[("save", "C-x")])).unwrap();
+        let mut buffer = ComposeBuffer::new();
+
+        // The new binding saves...
+        assert_eq!(
+            handle_key(
+                &mut buffer,
+                key_mod(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                &keys
+            ),
+            ComposeOutcome::Save
+        );
+        // ...and the old hardcoded `C-s` no longer does (nor does it insert
+        // a literal control character — `text_input::recognize` swallows
+        // any other control-modified char, same as it always has).
+        let outcome = handle_key(
+            &mut buffer,
+            key_mod(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            &keys,
+        );
+        assert_eq!(outcome, ComposeOutcome::Continue);
+        assert_eq!(
+            buffer.text(),
+            "",
+            "C-s must not have inserted anything either"
+        );
+    }
+
+    #[test]
+    fn handle_key_still_inserts_a_plain_character_that_collides_with_neither_binding() {
+        let keys =
+            ComposeKeymap::resolve(&overrides(&[("save", "C-x"), ("cancel", "C-g")])).unwrap();
+        let mut buffer = ComposeBuffer::new();
+        let outcome = handle_key(&mut buffer, key(KeyCode::Char('s')), &keys);
+        assert_eq!(outcome, ComposeOutcome::Continue);
+        assert_eq!(
+            buffer.text(),
+            "s",
+            "plain 's' must still type a letter once save has moved off C-s"
         );
     }
 }

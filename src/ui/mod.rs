@@ -64,7 +64,7 @@ use crate::lsp::{
 };
 use crate::lsp::{ObservationStore, ServerIdentity};
 use crate::skill;
-use crate::ui::compose::{ComposeOutcome, ComposeState};
+use crate::ui::compose::{ComposeKeymap, ComposeOutcome, ComposeState};
 use crate::ui::context_menu::{ContextMenuState, MenuCommand, MenuTarget};
 use crate::ui::help::{HelpOutcome, HelpState};
 use crate::ui::log_view::LogView;
@@ -272,6 +272,14 @@ pub fn run(
     let bindings = config::apply_key_overrides(preset, &config.key_overrides)
         .map_err(|e| anyhow::anyhow!("config: {e}"))?;
     let keymap = Keymap::from_bindings(&bindings);
+    // Issue #27: the compose overlay's own save/cancel keys, resolved once
+    // here alongside the main keymap — same fail-fast-at-startup treatment
+    // as `apply_key_overrides` just above, since a bad `[keys.compose]`
+    // entry is just as much a startup-blocking config error as a bad
+    // `[keys]` one (see `ComposeKeymap::resolve`'s docs for why it's
+    // actually stricter).
+    let compose_keymap = ComposeKeymap::resolve(&config.compose_key_overrides)
+        .map_err(|e| anyhow::anyhow!("config: {e}"))?;
     let mut resolver = keymap.resolver();
     let mut highlighter = LineHighlighter::new();
 
@@ -347,6 +355,7 @@ pub fn run(
         stack,
         &mut resolver,
         &keymap,
+        &compose_keymap,
         &mut highlighter,
         &app_rx,
         &lsp_manager,
@@ -713,6 +722,7 @@ fn event_loop(
     stack: &mut ViewStack,
     resolver: &mut Resolver<'_>,
     keymap: &Keymap,
+    compose_keymap: &ComposeKeymap,
     highlighter: &mut LineHighlighter,
     app_rx: &Receiver<AppEvent>,
     lsp_manager: &LspManager,
@@ -1257,6 +1267,7 @@ fn event_loop(
                 &key_display,
                 hints_expanded,
                 &mut geometry,
+                compose_keymap,
             )
         })?;
 
@@ -1289,7 +1300,7 @@ fn event_loop(
                         // way — see `key_display`'s module docs on why it never
                         // echoes typed characters.
                         key_display.record_typing(Instant::now());
-                        match compose::handle_key(state.buffer_mut(), key) {
+                        match compose::handle_key(state.buffer_mut(), key, compose_keymap) {
                             ComposeOutcome::Continue => {}
                             ComposeOutcome::Cancel => compose = None,
                             ComposeOutcome::Save => {
@@ -4743,6 +4754,7 @@ fn draw(
     key_display: &key_display::KeyDisplayState,
     hints_expanded: bool,
     geometry: &mut mouse::FrameGeometry,
+    compose_keymap: &ComposeKeymap,
 ) {
     match view {
         View::Diff(app) => {
@@ -4837,7 +4849,7 @@ fn draw(
             if let Some(state) = compose
                 && let Some(row) = view.cursor_screen_row()
             {
-                compose::render(frame, diff_area, row, state);
+                compose::render(frame, diff_area, row, state, compose_keymap);
                 geometry.record(diff_area, mouse::ScrollTarget::ComposeModal);
             }
             if let Some(state) = scope_menu {

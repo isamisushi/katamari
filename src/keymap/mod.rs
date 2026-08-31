@@ -287,6 +287,27 @@ impl KeyChord {
         }
     }
 
+    /// The character this chord would insert into a text field via
+    /// `ui::text_input::recognize`, if nothing intercepted it first —
+    /// `Some(c)` only for a completely unmodified `Char` chord, `None` for
+    /// anything carrying `CONTROL`/`ALT` or a genuinely non-`Char` key
+    /// (`Esc`, an arrow, ...), since only a bare `Char` ever reaches
+    /// `recognize`'s `Insert` arm. Deliberately includes `Space`: its
+    /// notation renders as the multi-character name `"Space"` (see
+    /// [`Self::notation`]), but the underlying chord is `Char(' ')` with no
+    /// modifiers, exactly as bare as any other unmodified letter — the data
+    /// model has no separate "named" representation for it. What
+    /// `ui::compose::ComposeKeymap::resolve` uses to refuse a
+    /// `[keys.compose]` binding that would make an ordinary character
+    /// untypeable once save/cancel are checked ahead of the insert
+    /// fallback.
+    pub(crate) fn as_plain_char(self) -> Option<char> {
+        match self.code {
+            KeyCode::Char(c) if self.modifiers.is_empty() => Some(c),
+            _ => None,
+        }
+    }
+
     /// Parses one whitespace-delimited token of key-sequence notation:
     /// `C-d` for Ctrl-d, `M-x` for Alt/Meta-x (the emacs preset's prefix
     /// keys — see [`emacs_preset`]), `]` or `g` for a plain char, or a named
@@ -430,6 +451,23 @@ impl KeySeq {
     /// uses, instead of inventing a second notation for "keys as typed."
     pub(crate) fn from_chords(chords: Vec<KeyChord>) -> Self {
         Self(chords)
+    }
+
+    /// `Some` only when this sequence is exactly one chord long — what
+    /// `ui::compose::ComposeKeymap::resolve` needs to reject a
+    /// `[keys.compose]` entry that names a multi-key sequence (`g g`). The
+    /// compose overlay dispatches on one raw [`crossterm::event::KeyEvent`]
+    /// at a time (see `ComposeKeymap`'s own docs on why it bypasses this
+    /// module's trie/`Resolver` entirely), so a save/cancel binding longer
+    /// than one chord could never be reached no matter how the overlay's
+    /// dispatch were written — this is checked at config-resolve time so
+    /// that's a clear startup error, not a binding that silently never
+    /// fires.
+    pub fn as_single_chord(&self) -> Option<KeyChord> {
+        match self.0.as_slice() {
+            [chord] => Some(*chord),
+            _ => None,
+        }
     }
 }
 
@@ -1641,5 +1679,34 @@ mod tests {
         assert_eq!(seq.compact_notation(), "C-i");
         let ctrl_i = ctrl('i');
         assert_eq!(seq.0, vec![ctrl_i]);
+    }
+
+    #[test]
+    fn as_single_chord_is_some_only_for_exactly_one_chord() {
+        assert_eq!(KeySeq::parse("C-s").as_single_chord(), Some(ctrl('s')));
+        assert_eq!(KeySeq::parse("g g").as_single_chord(), None);
+        assert_eq!(KeySeq::try_parse("").unwrap().as_single_chord(), None);
+    }
+
+    #[test]
+    fn as_plain_char_is_some_only_for_a_fully_unmodified_char_chord() {
+        assert_eq!(chord('x').as_plain_char(), Some('x'));
+        // "Space" notation-parses to the same bare `Char(' ')` a literal
+        // space token would — no separate "named key" representation, so
+        // this must be caught too, not just a literal single-char token.
+        assert_eq!(
+            KeySeq::parse("Space")
+                .as_single_chord()
+                .unwrap()
+                .as_plain_char(),
+            Some(' ')
+        );
+        assert_eq!(ctrl('s').as_plain_char(), None, "C-s carries a modifier");
+        assert_eq!(alt('x').as_plain_char(), None, "M-x carries a modifier");
+        assert_eq!(
+            KeyChord::new(KeyCode::Esc, KeyModifiers::NONE).as_plain_char(),
+            None,
+            "Esc is never a Char chord at all"
+        );
     }
 }

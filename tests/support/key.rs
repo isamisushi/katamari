@@ -40,9 +40,18 @@ pub enum Key {
     /// can't tell `Ctrl-i` from a plain Tab apart. See [`Key::AltLeft`]'s
     /// docs for the encoding.
     AltRight,
-    /// `Ctrl-s` — the comment-compose overlay's `ComposeOutcome::Save`,
+    /// `Ctrl-s` — the comment-compose overlay's default `ComposeOutcome::Save`,
     /// unambiguous in both modes (`0x13`).
     CtrlS,
+    /// `Ctrl-x` — issue #27's `tests/e2e/config.rs` uses this as a
+    /// `[keys.compose] save` rebind target, distinct from `Ctrl-s` so a
+    /// test can prove the *old* default stopped working once the config
+    /// moves `save` here. Same "control bit strips the high bits of the
+    /// ASCII letter" convention as every other bare `CtrlX` variant in this
+    /// enum (`'x'` is `0x78`; `0x78 & 0x1f == 0x18`), and unambiguous in
+    /// both kitty modes for the same reason `Key::CtrlS`/`Key::CtrlW` are:
+    /// nothing else on the wire ever produces `0x18`.
+    CtrlX,
     /// `Ctrl-w` — issue #28's `EditCommand::DeletePreviousWord`, unambiguous
     /// in both modes (`0x17`, same "control bit strips the high bits of the
     /// ASCII letter" convention as [`Key::CtrlO`]/[`Key::CtrlT`]'s own
@@ -128,6 +137,7 @@ impl Key {
             Key::AltLeft => b"\x1b[1;3D".to_vec(),
             Key::AltRight => b"\x1b[1;3C".to_vec(),
             Key::CtrlS => vec![0x13],
+            Key::CtrlX => vec![0x18],
             Key::CtrlW => vec![0x17],
             Key::AltBackspace => match mode {
                 KittyMode::Supported => b"\x1b[127;3u".to_vec(),

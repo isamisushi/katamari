@@ -107,6 +107,18 @@ pub struct Config {
     /// notation (see [`KeySeq::try_parse`]), applied over the selected
     /// preset by [`apply_key_overrides`].
     pub key_overrides: HashMap<String, String>,
+    /// `[keys.compose]`: `"save"`/`"cancel"` to key-sequence notation for
+    /// the comment-compose overlay (issue #27), resolved by
+    /// [`crate::ui::compose::ComposeKeymap::resolve`] in `ui::run` the same
+    /// way `key_overrides` is applied via [`apply_key_overrides`] just
+    /// above it. A separate map rather than two more `[keys]` entries: the
+    /// overlay's save/cancel aren't `keymap::Action`s at all (see
+    /// `ComposeKeymap`'s own docs) and `RawFile.keys` is a flat
+    /// `HashMap<String, String>` with no room for a nested table — see
+    /// [`extract_compose_key_overrides`] for how `[keys.compose]` gets
+    /// pulled out of the raw TOML table before that flat shape ever tries
+    /// to deserialize it.
+    pub compose_key_overrides: HashMap<String, String>,
     /// `[lsp.servers.<id>]`, keyed either by the same lowercase language
     /// name [`crate::lsp::adapter::Language::lsp_id`] reports (`"rust"`,
     /// `"typescript"`, `"python"`, `"go"`, `"kotlin"`, `"java"`) to override
@@ -259,6 +271,7 @@ impl Default for Config {
         Self {
             keymap: KeymapPreset::Vim,
             key_overrides: HashMap::new(),
+            compose_key_overrides: HashMap::new(),
             lsp_servers: HashMap::new(),
             auto_install: true,
             lsp_logging: LoggingConfig::default(),
@@ -298,6 +311,14 @@ impl Default for Config {
 pub(crate) struct RawFile {
     keymap: Option<String>,
     keys: Option<HashMap<String, String>>,
+    /// `[keys.compose]`, populated by hand in [`parse_with_warnings`] —
+    /// never by `serde` (see `#[serde(skip)]` below): a nested table under
+    /// `[keys]` has no shape `keys`'s own flat `HashMap<String, String>`
+    /// could deserialize, so it's pulled out of the raw `toml::Table`
+    /// *before* this struct's derive ever runs — see
+    /// [`extract_compose_key_overrides`].
+    #[serde(skip)]
+    compose_keys: Option<HashMap<String, String>>,
     lsp: Option<RawLsp>,
     ui: Option<RawUi>,
     watch: Option<RawWatch>,
@@ -415,6 +436,14 @@ fn merge_raw(base: &mut RawFile, overlay: RawFile) {
         base.keys
             .get_or_insert_with(HashMap::new)
             .extend(overlay_keys);
+    }
+    if let Some(overlay_compose_keys) = overlay.compose_keys {
+        // Per-key, not whole-map: a repo file that only rebinds `save`
+        // must not erase a `cancel` set by the home file (or vice versa) —
+        // the same field-level precedence `keys` above gets.
+        base.compose_keys
+            .get_or_insert_with(HashMap::new)
+            .extend(overlay_compose_keys);
     }
     if let Some(overlay_lsp) = overlay.lsp {
         let base_lsp = base.lsp.get_or_insert_with(RawLsp::default);
@@ -569,16 +598,23 @@ pub(crate) fn parse_with_warnings(path: &Path, text: &str) -> (RawFile, Vec<Stri
     // `toml::Value: FromStr` parses a single value *literal* (e.g. `"42"`),
     // not a whole document — `toml::Table` is the document-level parser
     // (a TOML file's top level is always a table of key/value pairs).
-    let table: toml::Table = match text.parse() {
+    let mut table: toml::Table = match text.parse() {
         Ok(t) => t,
         Err(e) => {
             warnings.push(format!("{}: {e}", path.display()));
             return (RawFile::default(), warnings);
         }
     };
+    // Must happen before the flat `try_into()` below — see
+    // `extract_compose_key_overrides`'s own docs for why `[keys.compose]`
+    // can't survive that conversion in place.
+    let compose_keys = extract_compose_key_overrides(path, &mut table, &mut warnings);
     warn_unknown_keys(path, &table, &mut warnings);
-    match table.try_into() {
-        Ok(raw) => (raw, warnings),
+    match table.try_into::<RawFile>() {
+        Ok(mut raw) => {
+            raw.compose_keys = compose_keys;
+            (raw, warnings)
+        }
         Err(e) => {
             warnings.push(format!("{}: {e}", path.display()));
             (RawFile::default(), warnings)
@@ -586,13 +622,58 @@ pub(crate) fn parse_with_warnings(path: &Path, text: &str) -> (RawFile, Vec<Stri
     }
 }
 
+/// Pulls `[keys.compose]` out of the raw TOML table and returns it as its
+/// own map, removing it from `table["keys"]` in place — `RawFile.keys` is
+/// a flat `HashMap<String, String>` (see its own docs), so a nested table
+/// left in place under `[keys]` would fail that shape's deserialization
+/// and take the *entire* file down with it via [`parse_with_warnings`]'s
+/// existing wrong-shaped-field degrade, silently losing every other
+/// setting the file had too. Only ever touches an actual `[keys.compose]`
+/// *table* — a flat `compose = "..."` entry directly under `[keys]` (a
+/// nonsensical action name, but syntactically legal) is left alone so it
+/// still reaches [`apply_key_overrides`]'s own "unrecognized action name"
+/// error instead of silently vanishing here.
+///
+/// Returns `None` when there's no `[keys]` table at all, or no `compose`
+/// sub-table within it — [`merge_raw`] and [`finalize`] both treat that
+/// the same as "this file didn't mention compose bindings," same as every
+/// other optional section in this format.
+fn extract_compose_key_overrides(
+    path: &Path,
+    table: &mut toml::Table,
+    warnings: &mut Vec<String>,
+) -> Option<HashMap<String, String>> {
+    let keys = table.get_mut("keys")?.as_table_mut()?;
+    if !keys.get("compose").is_some_and(toml::Value::is_table) {
+        return None;
+    }
+    let compose_table = keys.remove("compose")?;
+    let compose_table = compose_table.as_table()?; // just checked above
+
+    let mut overrides = HashMap::new();
+    for (name, value) in compose_table {
+        match value.as_str() {
+            Some(s) => {
+                overrides.insert(name.clone(), s.to_owned());
+            }
+            None => warnings.push(format!(
+                "{}: keys.compose.{name} must be a string",
+                path.display()
+            )),
+        }
+    }
+    Some(overrides)
+}
+
 /// Collects one `<path>: unknown config key '<dotted path>'` message per key
 /// this module has never heard of, at every level this config format has
 /// fixed keys for, into `warnings` rather than printing directly — see
-/// [`parse_with_warnings`]'s docs for why. `[keys]` is deliberately
-/// excluded: its keys are action names, i.e. data this module validates at
-/// [`apply_key_overrides`] time (against the live `Action` enum, with a
-/// clear per-entry error), not schema to check here.
+/// [`parse_with_warnings`]'s docs for why. `[keys]` (including its nested
+/// `[keys.compose]`) is deliberately excluded: both are actions/bindings
+/// this module validates elsewhere with a clear per-entry error —
+/// `[keys]` at [`apply_key_overrides`] time against the live `Action`
+/// enum, `[keys.compose]` at `crate::ui::compose::ComposeKeymap::resolve`
+/// time — not schema to check here.
 fn warn_unknown_keys(path: &Path, table: &toml::Table, warnings: &mut Vec<String>) {
     warn_extra(path, "", table, TOP_LEVEL_KEYS, warnings);
     if let Some(lsp) = table.get("lsp").and_then(toml::Value::as_table) {
@@ -696,6 +777,7 @@ fn finalize(raw: RawFile) -> Config {
     Config {
         keymap,
         key_overrides: raw.keys.unwrap_or_default(),
+        compose_key_overrides: raw.compose_keys.unwrap_or_default(),
         lsp_servers: lsp.servers,
         auto_install: lsp.auto_install.unwrap_or(true),
         lsp_logging: LoggingConfig {
@@ -1087,6 +1169,132 @@ mod tests {
         let keys = base.keys.unwrap();
         assert_eq!(keys.get("quit").map(String::as_str), Some("q"));
         assert_eq!(keys.get("hover").map(String::as_str), Some("K"));
+    }
+
+    // ---- [keys.compose] (issue #27) ------------------------------------
+
+    #[test]
+    fn keys_compose_section_parses_into_compose_key_overrides() {
+        let repo = fixture_repo();
+        write_repo_config(&repo, "[keys.compose]\nsave = \"C-x\"\ncancel = \"C-g\"\n");
+        let config = load_merged(&repo);
+        assert_eq!(
+            config.compose_key_overrides,
+            HashMap::from([
+                ("save".to_owned(), "C-x".to_owned()),
+                ("cancel".to_owned(), "C-g".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
+    fn keys_compose_rebinding_only_save_leaves_cancel_unmentioned() {
+        let repo = fixture_repo();
+        write_repo_config(&repo, "[keys.compose]\nsave = \"C-x\"\n");
+        let config = load_merged(&repo);
+        assert_eq!(
+            config.compose_key_overrides,
+            HashMap::from([("save".to_owned(), "C-x".to_owned())]),
+            "an unmentioned `cancel` must stay absent, not defaulted here — \
+             `ComposeKeymap::resolve` is what applies the Esc default"
+        );
+    }
+
+    #[test]
+    fn keys_compose_coexists_with_flat_keys_entries_in_the_same_file() {
+        let repo = fixture_repo();
+        write_repo_config(
+            &repo,
+            "[keys]\nquit = \"Q\"\n\n[keys.compose]\nsave = \"C-x\"\n",
+        );
+        let config = load_merged(&repo);
+        assert_eq!(
+            config.key_overrides.get("quit").map(String::as_str),
+            Some("Q"),
+            "extracting [keys.compose] must not disturb [keys]'s own flat entries"
+        );
+        assert_eq!(
+            config.compose_key_overrides.get("save").map(String::as_str),
+            Some("C-x")
+        );
+    }
+
+    #[test]
+    fn keys_compose_maps_merge_per_key_so_a_repo_override_of_save_keeps_a_home_cancel() {
+        let mut base = RawFile {
+            compose_keys: Some(HashMap::from([("cancel".to_owned(), "C-g".to_owned())])),
+            ..RawFile::default()
+        };
+        let overlay = RawFile {
+            compose_keys: Some(HashMap::from([("save".to_owned(), "C-x".to_owned())])),
+            ..RawFile::default()
+        };
+        merge_raw(&mut base, overlay);
+        let compose_keys = base.compose_keys.unwrap();
+        assert_eq!(compose_keys.get("save").map(String::as_str), Some("C-x"));
+        assert_eq!(compose_keys.get("cancel").map(String::as_str), Some("C-g"));
+    }
+
+    #[test]
+    fn keys_compose_non_string_value_is_reported_and_dropped_without_losing_the_rest_of_the_file() {
+        let path = PathBuf::from("/fake/config.toml");
+        let (raw, warnings) =
+            parse_with_warnings(&path, "[keys.compose]\nsave = 5\n[ui]\ntab_width = 6\n");
+        assert!(
+            warnings.iter().any(|w| w.contains("keys.compose.save")),
+            "warnings: {warnings:?}"
+        );
+        assert!(
+            raw.compose_keys.is_none_or(|m| !m.contains_key("save")),
+            "a wrong-shaped compose value must not silently become a binding"
+        );
+        assert_eq!(
+            raw.ui.unwrap().tab_width,
+            Some(6),
+            "the rest of the file must still parse — only the offending \
+             [keys.compose] entry is affected, unlike a wrong-shaped flat field"
+        );
+    }
+
+    #[test]
+    fn keys_compose_as_a_flat_keys_entry_is_left_for_apply_key_overrides_to_reject() {
+        // `compose` isn't a real action name, but a *string* `[keys]
+        // compose = "..."` entry is syntactically a normal flat override —
+        // extraction only ever touches an actual `[keys.compose]` table,
+        // so this reaches `apply_key_overrides`'s own unrecognized-action
+        // error instead of vanishing here.
+        let repo = fixture_repo();
+        write_repo_config(&repo, "[keys]\ncompose = \"C-x\"\n");
+        let config = load_merged(&repo);
+        assert_eq!(
+            config.key_overrides.get("compose").map(String::as_str),
+            Some("C-x")
+        );
+        assert!(config.compose_key_overrides.is_empty());
+    }
+
+    #[test]
+    fn full_pipeline_resolves_a_valid_keys_compose_section_end_to_end() {
+        let repo = fixture_repo();
+        write_repo_config(&repo, "[keys.compose]\nsave = \"C-x\"\ncancel = \"C-g\"\n");
+        let config = load_merged(&repo);
+        let keymap = crate::ui::compose::ComposeKeymap::resolve(&config.compose_key_overrides)
+            .expect("a valid [keys.compose] section must resolve");
+        assert_ne!(keymap, crate::ui::compose::ComposeKeymap::default());
+    }
+
+    #[test]
+    fn full_pipeline_surfaces_an_invalid_keys_compose_binding_as_a_resolve_error() {
+        let repo = fixture_repo();
+        // A bare, unmodified character would make that letter untypeable —
+        // one of `ComposeKeymap::resolve`'s own rejections, exercised here
+        // through the real config-file round trip rather than a
+        // hand-built `HashMap`.
+        write_repo_config(&repo, "[keys.compose]\nsave = \"x\"\n");
+        let config = load_merged(&repo);
+        let err = crate::ui::compose::ComposeKeymap::resolve(&config.compose_key_overrides)
+            .expect_err("a bare-character binding must be rejected");
+        assert!(err.contains("[keys.compose]"), "{err}");
     }
 
     #[test]
