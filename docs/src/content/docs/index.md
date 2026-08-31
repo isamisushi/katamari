@@ -5,7 +5,7 @@ template: splash
 hero:
   tagline: Terminal diff review with language intelligence — hover, go-to-definition, and live diagnostics inside git diff, review comments an AI agent can read back and address, and semantic review units without creating a single branch.
   image:
-    html: '<img src="/katamari/demo.gif" alt="katamari demo: reviewing a diff in the terminal, with hover and go-to-definition" style="max-width: min(44rem, 100%); height: auto; border-radius: 0.5rem;" />'
+    html: '<video autoplay loop muted playsinline poster="/katamari/demo-poster.png" width="1370" height="760" style="max-width: min(44rem, 100%); height: auto; border-radius: 0.5rem;" aria-label="katamari demo: reviewing a diff in the terminal, with hover and go-to-definition"><source src="/katamari/demo.webm" type="video/webm" /><source src="/katamari/demo.mp4" type="video/mp4" /></video>'
   actions:
     - text: Get started
       link: /katamari/installation/
