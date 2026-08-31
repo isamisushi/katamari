@@ -1,0 +1,17 @@
+[book]
+title = "katamari"
+authors = ["isamisushi"]
+language = "en"
+src = "src"
+description = "A terminal diff-review tool with LSP inside the diff, semantic review units, and an agent-readable comment round-trip."
+
+[build]
+build-dir = "book"
+
+[output.html]
+git-repository-url = "https://github.com/isamisushi/katamari"
+git-repository-icon = "fa-github"
+edit-url-template = "https://github.com/isamisushi/katamari/edit/main/docs/src/{path}"
+site-url = "/katamari/"
+default-theme = "light"
+preferred-dark-theme = "navy"

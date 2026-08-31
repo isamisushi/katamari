@@ -1,0 +1,61 @@
+# Builds docs/ (an mdBook site) and deploys it to GitHub Pages at
+# https://isamisushi.github.io/katamari/. Pages is configured for
+# build_type=workflow, so this workflow is the only thing that publishes
+# it — there's no separate "deploy from branch" step to keep in sync.
+name: Deploy docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one Pages deployment at a time; let an in-flight run finish rather
+# than racing it, since cancelling mid-upload can leave Pages serving a
+# half-published book.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+env:
+  # Keep this in sync with whatever version was last used to verify the
+  # book builds locally (see AGENTS.md) — pinned so a new mdBook release
+  # can't silently change the rendered output between local checks and CI.
+  MDBOOK_VERSION: "0.4.40"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mdBook
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSfL \
+            "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar xz
+          echo "$PWD" >> "$GITHUB_PATH"
+
+      - name: Build book
+        run: mdbook build docs
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
