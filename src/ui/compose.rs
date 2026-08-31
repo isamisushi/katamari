@@ -13,6 +13,7 @@
 
 use crate::keymap::{KeyChord, KeySeq};
 use crate::ui::app::CommentTarget;
+use crate::ui::scroll;
 use crate::ui::text_input::{self, EditCommand, char_byte_index, cursor_marked_line};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -21,6 +22,8 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use std::collections::HashMap;
+use std::ops::Range;
+use unicode_width::UnicodeWidthChar;
 
 /// A cursor-addressable multi-line text buffer, indexed by `char` (not byte
 /// or grapheme) offsets within each line — simple enough for a short review
@@ -344,6 +347,13 @@ pub fn handle_key(
 pub struct ComposeState {
     pub target: CommentTarget,
     buffer: ComposeBuffer,
+    /// Logical-line index of the first buffer line [`render`] draws — the
+    /// same scroll-follow role `App::scroll_offset` plays for the diff pane,
+    /// needed here because issue #29's soft-wrap means a comment can now
+    /// hold more wrapped display rows than the panel is tall. Advanced only
+    /// by [`follow_cursor`] inside `render`, never by `handle_key` itself:
+    /// scrolling is a rendering concern, not a buffer-editing one.
+    scroll_offset: usize,
 }
 
 impl ComposeState {
@@ -351,6 +361,7 @@ impl ComposeState {
         Self {
             target,
             buffer: ComposeBuffer::new(),
+            scroll_offset: 0,
         }
     }
 
@@ -376,15 +387,128 @@ fn hint_text(keys: &ComposeKeymap) -> String {
     )
 }
 
+/// Hard-wraps one logical line's `char`s into however many display-row
+/// ranges of at most `width` display columns each are needed to show every
+/// character — this overlay's own analogue of
+/// [`crate::ui::text::wrap_spans_to_width`], but `char`-indexed rather than
+/// grapheme-indexed to match [`ComposeBuffer`]'s own cursor model exactly
+/// (see its doc comment for why retrofitting grapheme machinery here would
+/// be wrong), and *hard*-wrapped rather than word-wrapped: a comment being
+/// edited must never silently grow a word-break the reviewer didn't type,
+/// which is also why [`crate::ui::text::wrap_text`] (word-based and lossy)
+/// isn't reused here either.
+///
+/// `width == 0` degenerately returns the whole line as one unwrapped range,
+/// matching `wrap_spans_to_width`'s same zero-width convention, rather than
+/// looping forever trying to fit characters into no space at all. An empty
+/// line yields one empty range so it still renders as a row — same
+/// "always at least one row" guarantee. A single character wider than
+/// `width` on its own (an extremely narrow panel, or a wide CJK character)
+/// is placed on its own row and allowed to overflow rather than dropped.
+// A one-`Range`-element `Vec` (the whole-line, no-wrap fallback below) is
+// exactly what clippy's `single_range_in_vec_init` exists to flag as a
+// likely `vec![elem; n]` typo — except `Range<usize>` isn't `Copy`, so that
+// typo's `vec![start..end]` reading can't even compile as the repeat form
+// here. A genuine single-range `Vec` either way.
+#[allow(clippy::single_range_in_vec_init)]
+fn wrap_line_ranges(chars: &[char], width: usize) -> Vec<Range<usize>> {
+    if width == 0 || chars.is_empty() {
+        return vec![0..chars.len()];
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    let mut col = 0usize;
+    for (i, &c) in chars.iter().enumerate() {
+        let w = c.width().unwrap_or(0);
+        if col > 0 && col + w > width {
+            ranges.push(start..i);
+            start = i;
+            col = 0;
+        }
+        col += w;
+    }
+    ranges.push(start..chars.len());
+    ranges
+}
+
+/// [`wrap_line_ranges`] applied to every line of `buffer` — the per-line
+/// wrap this overlay needs both for scroll-follow's row-height callback
+/// (`follow_cursor`) and for [`render`]'s own row layout, computed once per
+/// frame rather than twice so the two never see a different wrap of the
+/// same buffer.
+fn wrap_lines(buffer: &ComposeBuffer, width: usize) -> Vec<Vec<Range<usize>>> {
+    buffer
+        .lines()
+        .iter()
+        .map(|line| {
+            let chars: Vec<char> = line.chars().collect();
+            wrap_line_ranges(&chars, width)
+        })
+        .collect()
+}
+
+/// Which of a wrapped line's `ranges` a cursor at `char`-column `col` sits
+/// on. `col == chars.len()` (the end-of-line convention
+/// [`cursor_marked_line`] already handles) falls in none of the half-open
+/// ranges by construction, so it — along with a cursor landing exactly on a
+/// wrap boundary, which *is* contained by the row it wraps onto rather than
+/// the row it wrapped from — resolves to the last row, matching how a
+/// cursor at the true end of a wrapped line reads on screen: right after
+/// the last character actually shown.
+fn wrap_row_for_col(ranges: &[Range<usize>], col: usize) -> usize {
+    ranges
+        .iter()
+        .position(|r| r.contains(&col))
+        .unwrap_or(ranges.len() - 1)
+}
+
+/// Slices `line` to the `char`-index `range`, going through
+/// [`char_byte_index`] at both ends rather than assuming ASCII byte offsets
+/// — the one piece of arithmetic that has to stay correct for
+/// [`ComposeBuffer`]'s char-indexed model to survive being cut into wrapped
+/// display rows at all.
+fn char_range_str<'a>(line: &'a str, range: &Range<usize>) -> &'a str {
+    let start = char_byte_index(line, range.start);
+    let end = char_byte_index(line, range.end);
+    &line[start..end]
+}
+
+/// Advances `state.scroll_offset` to keep the cursor's *logical* line on
+/// screen — [`crate::ui::scroll::clamp_scroll`] genericized over each line's
+/// wrapped row count via `line_ranges`, the same "row_height callback" shape
+/// `App::clamp_scroll` already feeds it for the diff pane's own wrapped
+/// rows. Split out from [`render`] so scroll-follow is testable without a
+/// `ratatui::Frame`. Like `App::clamp_scroll`, this only ever *pulls* the
+/// offset toward the cursor's line — never centers or otherwise second-
+/// guesses wherever a reviewer scrolled on their own.
+fn follow_cursor(state: &mut ComposeState, line_ranges: &[Vec<Range<usize>>], text_height: usize) {
+    let (cursor_row, _) = state.buffer.cursor();
+    state.scroll_offset = scroll::clamp_scroll(cursor_row, text_height, state.scroll_offset, |i| {
+        line_ranges[i].len()
+    });
+}
+
 /// Draws the overlay near `cursor_screen_row`, reusing
 /// [`crate::ui::hover_popup`]'s positioning idea (below the cursor when
 /// there's room, above it otherwise) so the two floating panels this
 /// codebase has feel like one family rather than two independent designs.
+///
+/// Issue #29: long lines soft-wrap at the panel's content width (no
+/// gutter here, unlike the diff pane, so that's simply `inner.width`) and
+/// the panel scroll-follows the cursor's logical line via
+/// [`follow_cursor`]/[`ui::scroll::clamp_scroll`] — mutable access to
+/// `state` is only for that scroll bookkeeping, never the buffer text
+/// itself, which stays exactly what [`handle_key`] left it as. Cursor
+/// *movement* (`ComposeBuffer::move_up`/`move_down`) deliberately stays
+/// logical-line based rather than visual-row based: jumping by wrapped
+/// display row would mean up/down sometimes lands mid-line depending on
+/// where earlier lines happened to wrap, a surprise this overlay's small,
+/// prose-shaped buffers don't need to take on.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     cursor_screen_row: u16,
-    state: &ComposeState,
+    state: &mut ComposeState,
     keys: &ComposeKeymap,
 ) {
     let rect = popup_rect(area, cursor_screen_row);
@@ -396,30 +520,39 @@ pub fn render(
     frame.render_widget(block, rect);
 
     let text_height = inner.height.saturating_sub(1) as usize; // last row is the hint
+    let width = inner.width as usize;
+
+    let line_ranges = wrap_lines(&state.buffer, width);
+    follow_cursor(state, &line_ranges, text_height);
+
     let (cursor_row, cursor_col) = state.buffer.cursor();
-    let mut lines: Vec<Line> = state
-        .buffer
-        .lines()
-        .iter()
-        .enumerate()
-        .take(text_height)
-        .map(|(idx, text)| {
-            if idx == cursor_row {
-                cursor_marked_line(text, cursor_col)
-            } else {
-                Line::from(text.clone())
+    let cursor_sub_row = wrap_row_for_col(&line_ranges[cursor_row], cursor_col);
+
+    let mut rows: Vec<Line> = Vec::with_capacity(text_height);
+    'lines: for (line_idx, ranges) in line_ranges.iter().enumerate().skip(state.scroll_offset) {
+        let text = &state.buffer.lines()[line_idx];
+        for (sub_idx, range) in ranges.iter().enumerate() {
+            if rows.len() >= text_height {
+                break 'lines;
             }
-        })
-        .collect();
-    while lines.len() < text_height {
-        lines.push(Line::default());
+            let sub_text = char_range_str(text, range);
+            let row = if line_idx == cursor_row && sub_idx == cursor_sub_row {
+                cursor_marked_line(sub_text, cursor_col - range.start)
+            } else {
+                Line::from(sub_text.to_owned())
+            };
+            rows.push(row);
+        }
     }
-    lines.push(Line::from(Span::styled(
+    while rows.len() < text_height {
+        rows.push(Line::default());
+    }
+    rows.push(Line::from(Span::styled(
         hint_text(keys),
         Style::default().fg(Color::DarkGray),
     )));
 
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(rows), inner);
 }
 
 /// As `hover_popup::popup_rect`: roughly 60% wide, 40% tall, anchored just
@@ -808,6 +941,228 @@ mod tests {
             buffer.text(),
             "s",
             "plain 's' must still type a letter once save has moved off C-s"
+        );
+    }
+
+    // ---- wrap_line_ranges (issue #29) ----------------------------------
+
+    fn chars_of(s: &str) -> Vec<char> {
+        s.chars().collect()
+    }
+
+    #[test]
+    fn wrap_line_ranges_breaks_mid_word_at_the_width() {
+        let chars = chars_of("abcdef");
+        assert_eq!(wrap_line_ranges(&chars, 5), vec![0..5, 5..6]);
+    }
+
+    #[test]
+    fn wrap_line_ranges_a_line_exactly_the_width_stays_on_one_row() {
+        let chars = chars_of("abcde");
+        assert_eq!(
+            wrap_line_ranges(&chars, 5),
+            vec![0..5],
+            "a line that fits exactly must not gain a spurious empty second row"
+        );
+    }
+
+    #[test]
+    fn wrap_line_ranges_an_empty_line_yields_one_empty_range() {
+        assert_eq!(
+            wrap_line_ranges(&[], 5),
+            vec![0..0],
+            "an empty line still needs a row to sit on"
+        );
+    }
+
+    #[test]
+    fn wrap_line_ranges_wide_characters_count_two_columns_each() {
+        // Three CJK characters at width 2 each: two fit exactly in a
+        // width-4 row, the third wraps rather than a character ever
+        // splitting in half (impossible anyway at char granularity, but the
+        // column accounting must still land on a character boundary here).
+        let chars = chars_of("日本語");
+        assert_eq!(wrap_line_ranges(&chars, 4), vec![0..2, 2..3]);
+    }
+
+    #[test]
+    fn wrap_line_ranges_zero_width_degrades_to_one_unwrapped_row() {
+        let chars = chars_of("abcdef");
+        assert_eq!(
+            wrap_line_ranges(&chars, 0),
+            vec![0..6],
+            "matches wrap_spans_to_width's own zero-width convention rather \
+             than looping forever"
+        );
+    }
+
+    // ---- wrap_row_for_col / char_range_str (issue #29) --------------------
+
+    #[test]
+    fn wrap_row_for_col_finds_the_row_the_column_falls_within() {
+        let ranges = vec![0..5, 5..6];
+        assert_eq!(wrap_row_for_col(&ranges, 2), 0, "mid the first row");
+        assert_eq!(
+            wrap_row_for_col(&ranges, 5),
+            1,
+            "the wrap boundary itself belongs to the row it wraps onto, not \
+             the row it wrapped from"
+        );
+        assert_eq!(
+            wrap_row_for_col(&ranges, 6),
+            1,
+            "cursor past the last character (end-of-line) lands on the last row"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::single_range_in_vec_init)]
+    fn wrap_row_for_col_on_a_single_row_line_always_answers_that_row() {
+        let ranges = vec![0..5];
+        assert_eq!(wrap_row_for_col(&ranges, 0), 0);
+        assert_eq!(wrap_row_for_col(&ranges, 5), 0, "end-of-line convention");
+    }
+
+    #[test]
+    fn char_range_str_slices_by_char_index_not_byte_index() {
+        // "日本語" is 3 chars but 9 bytes — a byte-indexed slice at 2..3
+        // would panic (not a char boundary) or cut a character in half.
+        assert_eq!(char_range_str("日本語", &(0..2)), "日本");
+        assert_eq!(char_range_str("日本語", &(2..3)), "語");
+    }
+
+    // ---- follow_cursor / scroll-follow (issue #29) -------------------------
+
+    fn dummy_target() -> CommentTarget {
+        CommentTarget::Single {
+            file: "a.rs".to_owned(),
+            line: 1,
+        }
+    }
+
+    #[test]
+    fn follow_cursor_scrolls_forward_past_a_tall_wrapped_line_and_snaps_back() {
+        let mut state = ComposeState::new(dummy_target());
+        // line0: 10 chars, wraps into 2 rows at width 5. line1 and line2:
+        // one character each, 1 row apiece.
+        for c in "abcdefghij".chars() {
+            state.buffer.insert_char(c);
+        }
+        state.buffer.newline();
+        state.buffer.insert_char('k');
+        state.buffer.newline();
+        state.buffer.insert_char('l');
+        state.buffer.move_up();
+        state.buffer.move_up(); // cursor back on line0
+
+        let width = 5;
+        let text_height = 2;
+
+        let ranges = wrap_lines(&state.buffer, width);
+        follow_cursor(&mut state, &ranges, text_height);
+        assert_eq!(
+            state.scroll_offset, 0,
+            "line0's own 2 wrapped rows exactly fill a 2-row viewport"
+        );
+
+        state.buffer.move_down(); // cursor -> line1
+        let ranges = wrap_lines(&state.buffer, width);
+        follow_cursor(&mut state, &ranges, text_height);
+        assert_eq!(
+            state.scroll_offset, 1,
+            "line0 (2 rows) plus line1 (1 row) would need 3 rows, so line0 \
+             scrolls out of view to keep line1's cursor on screen"
+        );
+
+        state.buffer.move_down(); // cursor -> line2
+        let ranges = wrap_lines(&state.buffer, width);
+        follow_cursor(&mut state, &ranges, text_height);
+        assert_eq!(
+            state.scroll_offset, 1,
+            "line1+line2 already exactly fill the 2-row viewport from \
+             offset 1; no further scroll needed"
+        );
+
+        state.buffer.move_up();
+        state.buffer.move_up(); // cursor -> line0
+        let ranges = wrap_lines(&state.buffer, width);
+        follow_cursor(&mut state, &ranges, text_height);
+        assert_eq!(
+            state.scroll_offset, 0,
+            "cursor moved above the visible window snaps the offset \
+             directly back to it"
+        );
+    }
+
+    // ---- render (real ratatui buffer) --------------------------------------
+
+    #[test]
+    fn render_soft_wraps_a_long_line_so_its_tail_is_visible_not_clipped() {
+        use ratatui::backend::TestBackend;
+        use ratatui::style::Modifier;
+
+        let mut state = ComposeState::new(dummy_target());
+        let text = format!("{}TAIL", "x".repeat(22));
+        for c in text.chars() {
+            state.buffer.insert_char(c);
+        }
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 40,
+            height: 20,
+        };
+        let rect = popup_rect(area, 0);
+        // `Block::default().borders(Borders::ALL)` insets by exactly one
+        // cell on every side — the same inset `render` itself computes via
+        // `block.inner(rect)`.
+        let inner = Rect {
+            x: rect.x + 1,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(2),
+            height: rect.height.saturating_sub(2),
+        };
+        assert_eq!(
+            inner.width, 22,
+            "fixture assumes a 22-column content width so the 22 filler \
+             characters exactly fill the first wrapped row"
+        );
+
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, area, 0, &mut state, &ComposeKeymap::default());
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let second_row: String = (0..inner.width)
+            .map(|x| {
+                buffer
+                    .cell((inner.x + x, inner.y + 1))
+                    .map_or(" ", |c| c.symbol())
+            })
+            .collect();
+        assert!(
+            second_row.starts_with("TAIL"),
+            "the wrapped second row must start with the tail text a \
+             clipped, unwrapped Paragraph would have dropped entirely; \
+             row: {second_row:?}"
+        );
+
+        let cursor_cell = buffer.cell((inner.x + 4, inner.y + 1)).unwrap();
+        assert!(
+            cursor_cell.modifier.contains(Modifier::REVERSED),
+            "the cursor (at end-of-line, right after TAIL) must render on \
+             the wrapped second row, not vanish with the row it used to \
+             belong to before wrapping"
+        );
+
+        assert_eq!(
+            state.scroll_offset, 0,
+            "a single wrapped line that fits within text_height needs no scrolling"
         );
     }
 }

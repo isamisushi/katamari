@@ -181,3 +181,53 @@ fn keys_compose_save_rebind_via_config_changes_the_hint_and_the_save_key() {
     let status = h.wait_exit(Duration::from_secs(5));
     assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
 }
+
+/// Issue #29: a long unbroken line soft-wraps across display rows instead
+/// of clipping at the panel edge — `ui::compose`'s own unit tests already
+/// cover `render`'s wrap/scroll-follow math in isolation via a bare
+/// `TestBackend`; this is the proof it survives a real terminal round-trip
+/// (real key events, real cursor tracking) and, the actual point of a
+/// *soft* wrap, that what gets saved is still the one line the reviewer
+/// typed with no `\n` quietly inserted into it.
+#[test]
+fn a_long_unbroken_line_soft_wraps_on_screen_and_saves_with_no_inserted_newline() {
+    let repo = fixture::basic_repo();
+    let mut h = Harness::spawn(repo.path(), SpawnOptions::default());
+    open_compose(&h);
+
+    // At the harness's default 100x30 terminal the compose panel's content
+    // width is well under 80 columns — 80 filler characters plus a marker
+    // guarantees at least one wrap, landing "TAILEND" on a continuation row
+    // an unwrapped `Paragraph` (pre-issue-#29 behavior) would have clipped
+    // before ever reaching.
+    let long_line = format!("{}TAILEND", "x".repeat(80));
+    for c in long_line.chars() {
+        h.send(Key::Char(c));
+    }
+    h.wait_until(Duration::from_secs(3), |screen| {
+        screen.contents().contains("TAILEND")
+    });
+
+    let contents = h.screen_contents();
+    assert!(
+        contents.contains("TAILEND"),
+        "the wrapped continuation row must surface the line's tail; screen:\n{contents}"
+    );
+
+    h.send(Key::CtrlS);
+    h.wait_for_text("comment: saved");
+
+    let raw = std::fs::read_to_string(repo.path().join(".katamari").join("comments.jsonl"))
+        .expect("comments.jsonl must exist after a save");
+    let record: serde_json::Value =
+        serde_json::from_str(raw.trim()).expect("comments.jsonl holds one JSON object per line");
+    assert_eq!(
+        record["body"], long_line,
+        "the saved body must be exactly the typed line — soft-wrap is \
+         display-only and must never insert a real newline"
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
