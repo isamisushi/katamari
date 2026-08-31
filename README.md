@@ -1,11 +1,12 @@
 # katamari
 
-A terminal diff-review tool. `ktmr diff` shows a `git diff` with syntax
-highlighting, hover/go-to-definition/find-references/diagnostics from real
-language servers, and inline review comments an AI coding agent can read
-back and address — and `u` regroups a big tangled diff into ordered,
-stacked-PR-like review units, without creating a single branch. All of it
-without leaving the terminal.
+**The only terminal diff viewer with a language server inside it.** `ktmr
+diff` shows a `git diff` with hover/go-to-definition/find-references/live
+diagnostics from real language servers, a resident coding-agent session
+you can ask about any selection, review comments it reads back and
+resolves, and `u` to regroup a tangled diff into ordered, stacked-PR-like
+review units — without creating a single branch. All of it without
+leaving the terminal.
 
 ![demo](docs/demo.gif)
 
@@ -54,8 +55,9 @@ ktmr diff --pr 123     # a GitHub pull request, via your logged-in `gh`
 
 Inside the diff: `j`/`k` move, `K` hovers the identifier under the cursor,
 `gd` goes to its definition, `/` searches, `c` then `C-s` leaves a review
-comment on the current line (or a `V` visual range), `u` groups the diff
-into ordered review units. `o` opens a popup to switch scope mid-session
+comment on the current line (or a `V` visual range), `a` asks a resident
+agent session about the line or selection, `u` groups the diff into
+ordered review units. `o` opens a popup to switch scope mid-session
 (working tree, staged, a revision, another PR) without restarting; `?`
 opens a filterable list of every live binding.
 
@@ -79,20 +81,28 @@ and the scope-menu popup (`o`) for switching mid-session.
 
 ## Features
 
-- **Semantic review units** (`u`) — the diff's hunks grouped into ordered,
-  stacked-PR-like units, through the `claude`/`codex` CLI you already
-  have, derived and read-only
 - **LSP inside the diff** — hover, go-to-definition, find-references, and
   live diagnostics on changed lines (Rust / TypeScript / Python / Go /
   Kotlin / Java, plus any language via `[lsp.servers.<id>]`)
-- **Live refresh** — working-tree diffs update as an agent's edits land on
-  disk, no restart
-- **jj support** — colocated jj revsets, and a snapshot timeline through
-  every save of an agent's session
+- **Ask the agent** (`a`/`A`/`p`) — question a resident coding-agent session
+  about any selection, watch it work in a streaming panel, and push every
+  open comment to it in one message, with every edit gated on your own
+  `y`/`n`
+- **Durable, resolvable comments** — leave one on a line or a `V` range; it
+  lands in a plain, git-trackable `.katamari/comments.jsonl` an agent
+  lists, addresses, and resolves via `ktmr comments`, picked up live with
+  no restart
+- **Semantic review units** (`u`) — turn a tangled diff into a stack you
+  can actually read, without touching a branch: hunks grouped into
+  ordered, stacked-PR-like units through the `claude`/`codex` CLI you
+  already have, derived and read-only
+- **git and jj, equally** — colocated jj revsets and a snapshot timeline
+  through every save of an agent's session, the same LSP/comments/units
+  feature set either way
 - **GitHub PR review** — `ktmr diff --pr 123` opens a pull request's diff
   through your own `gh`, no checkout
-- **Ask the agent** (`a`/`A`/`p`) — question a resident coding-agent session
-  about any selection, with every edit gated on your own `y`/`n`
+- **Live refresh** — working-tree diffs update as an agent's edits land on
+  disk, no restart
 - **Your keybindings** — vim (default) and emacs presets, every action
   remappable
 

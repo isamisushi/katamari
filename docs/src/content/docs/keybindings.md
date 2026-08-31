@@ -154,6 +154,12 @@ is underneath.
 
 ## Ask the agent
 
+Rather than shelling out to an agent CLI fresh for each question,
+katamari spawns one coding-agent session per review and keeps it alive
+for as long as `ktmr diff` runs — one persistent, protocol-owned process
+instead of a one-shot hand-off, so context carries from question to
+question rather than resetting each time.
+
 `a` opens a small compose box (reusing the comment overlay's own text
 editor) anchored to the cursor's row or a visual selection (`V`), and sends
 your typed question — together with the selected diff content (path,

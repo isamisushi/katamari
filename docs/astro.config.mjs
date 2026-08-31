@@ -29,6 +29,7 @@ export default defineConfig({
         { label: "Health check", slug: "health-check" },
         { label: "Reset", slug: "reset" },
         { label: "jj colocated setup", slug: "jj-colocated-setup" },
+        { label: "Compared to other tools", slug: "compared-to-other-tools" },
         { label: "Development", slug: "development" },
       ],
     }),

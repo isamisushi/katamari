@@ -1,9 +1,9 @@
 ---
 title: katamari
-description: A terminal diff-review tool with LSP inside the diff, semantic review units, and an agent-readable comment round-trip.
+description: A terminal diff-review tool with LSP inside the diff, a persistent agent you can ask, durable resolvable comments, and read-only review units.
 template: splash
 hero:
-  tagline: Terminal diff review with language intelligence — hover, go-to-definition, and live diagnostics inside git diff, review comments an AI agent can read back and address, and semantic review units without creating a single branch.
+  tagline: The only terminal diff viewer with a language server inside it. Ask a resident coding-agent session about any selection, leave comments it resolves, and turn a tangled diff into a stack you can actually read — all without creating a single branch.
   image:
     html: '<video autoplay loop muted playsinline poster="/katamari/demo-poster.png" width="1370" height="760" style="max-width: min(44rem, 100%); height: auto; border-radius: 0.5rem;" aria-label="katamari demo: reviewing a diff in the terminal, with hover and go-to-definition"><source src="/katamari/demo.webm" type="video/webm" /><source src="/katamari/demo.mp4" type="video/mp4" /></video>'
   actions:
@@ -16,33 +16,43 @@ hero:
       variant: minimal
 ---
 
-A terminal diff-review tool. `ktmr diff` shows a `git diff` with syntax
-highlighting, hover/go-to-definition/find-references/diagnostics from real
-language servers, and inline review comments an AI coding agent can read
-back and address — and `u` regroups a big tangled diff into ordered,
-stacked-PR-like review units, without creating a single branch. All of it
-without leaving the terminal.
+**The only terminal diff viewer with a language server inside it.** `ktmr
+diff` shows a `git diff` with hover/go-to-definition/find-references/live
+diagnostics from real language servers, a resident coding-agent session
+you can ask about any selection, review comments it reads back and
+resolves, and `u` to regroup a tangled diff into ordered, stacked-PR-like
+review units — without creating a single branch. All of it without
+leaving the terminal.
 
-- **Semantic review units** — `u` groups the diff's hunks into ordered,
-  stacked-PR-like units (the refactor first, then the feature built on it,
-  tests with the code they cover), each reviewable as its own scoped
-  diff — derived and read-only, through the `claude`/`codex` CLI you
-  already have, no branches created, nothing written outside `.katamari/`
-  (see [Review units](/katamari/review-units/))
 - **LSP inside the diff** — hover, go-to-definition, find-references, and
   live diagnostics on changed lines (Rust / TypeScript / Python / Go /
   Kotlin / Java; servers auto-install on first use; `[lsp.servers.<id>]`
   wires up a custom server for any other filetype)
-- **Live refresh** — working-tree diffs refresh as an agent's edits land on
-  disk by default; pass `--no-watch` for a static session
+- **Ask the agent** (`a`/`A`/`p`) — question a resident coding-agent
+  session (Claude, via [ACP](https://agentclientprotocol.com)) about any
+  selection, watch it work in a streaming transcript panel, and push every
+  open comment to it in one message — every edit it wants to make waits on
+  your own `y`/`n` (see [Ask the agent](/katamari/keybindings/#ask-the-agent))
+- **Durable, resolvable comments** — leave one in the TUI, on one line or a
+  `V` visual range; it lands in a plain, git-trackable
+  `.katamari/comments.jsonl` an agent lists, addresses, and resolves via
+  `ktmr comments`, picked up live with no restart
+- **Semantic review units** — turn a tangled diff into a stack you can
+  actually read, without touching a branch: `u` groups the diff's hunks
+  into ordered, stacked-PR-like units (the refactor first, then the
+  feature built on it, tests with the code they cover), each reviewable as
+  its own scoped diff — derived and read-only, through the `claude`/`codex`
+  CLI you already have, no branches created, nothing written outside
+  `.katamari/` (see [Review units](/katamari/review-units/))
+- **git and jj, equally first-class** — colocated jj revsets, and a
+  snapshot timeline through every save of an agent's session — the same
+  LSP, comments, and review-units feature set either way
 - **Any scope of change** — working tree, staged, one commit, a range, a jj
   change or revset, or a GitHub pull request by number (`--pr`, through
   your own `gh`); browse and pick from `ktmr log`, or switch mid-session
   with a popup (`o`)
-- **jj snapshot timeline** — step through every save of an agent's session,
-  not just the final state
-- **Comment round-trip** — leave comments in the TUI, on one line or a `V`
-  visual range, and an agent reads and resolves them via `ktmr comments`
+- **Live refresh** — working-tree diffs refresh as an agent's edits land on
+  disk by default; pass `--no-watch` for a static session
 - **Mouse, when you want it** — wheel scrolls the pane under the pointer,
   clicks drive the file tree and run go-to-definition, right-click opens a
   context menu, resting the pointer hovers — all optional, keyboard-first
@@ -58,34 +68,58 @@ without leaving the terminal.
 
 ## Why
 
-Reviewing an AI agent's changes usually means either reading a raw `git
-diff` with no semantic information (what does this symbol actually
-resolve to? does this introduce a type error?), or opening a full IDE for
-a change that's often small and mechanical. katamari sits in between: it's
-a diff viewer with LSP wired directly into it, so you can hover a changed
-identifier or jump to its definition without leaving the diff, and see
-compiler/type-checker diagnostics on the changed lines themselves.
+Agents now write more code, faster, than review capacity can absorb.
+Confidence that AI-generated code is actually correct runs low
+industry-wide, yet the volume of AI-assisted pull requests keeps
+climbing — the bottleneck has moved from writing the code to deciding
+whether to trust and merge it. Agent-authored diffs also tend to land
+large and oddly ordered, nothing like a human's incrementally-committed
+history: a refactor, the feature it enabled, the tests, and a lockfile
+bump interleaved across files in alphabetical order. That's precisely the
+"unreadable as one blob" problem the stacked-PR world exists to solve —
+except that fix means materializing real branches and PRs before anyone's
+read the change, a team-level commitment most solo reviewers and small
+teams don't want for a diff that was never going to live as separate PRs
+anyway.
 
-It also assumes the underlying workflow is "agent edits, you review, you
-leave comments, the agent addresses them" rather than "you edit." Review
-comments are stored as a plain file (`.katamari/comments.jsonl`) an agent
-reads and updates through `ktmr comments`, and the working-tree diff refreshes
-live as the agent's edits land on disk — no restart, no re-running a command
-by hand. Pass `ktmr diff --no-watch` when you want a static working-tree
-snapshot instead.
+A wave of terminal-native review tools converged independently on the
+same shape recently: local, vim-keyed, comment-then-hand-to-agent —
+real evidence that a lightweight, no-SaaS review loop that lives where the
+agent CLI already lives is something people actually want. What stayed
+missing was the thing a reviewer needs to trust a diff enough to comment
+on it with authority: the ability to actually navigate the code the way an
+editor lets you — jump to a definition, see who else calls this, see the
+type — without leaving the diff to open a second window. The gap between
+"a nice terminal diff pager" and "an editor's worth of understanding"
+stayed wide open the whole time.
 
-That workflow has a second problem besides missing semantics: an agent
-tends to land its whole task as one tangled diff, with no commit structure
-worth reading — the refactor, the feature it enabled, the tests, and a
-lockfile bump interleaved across files in alphabetical order. The
-established fix, stacked PRs, buys back readability by materializing real
-branches and PRs before anyone has read the change. katamari's
-[review units](/katamari/review-units/) recover the same "read it in dependency
-order, one concern at a time" property as a derived, read-only view over
-the diff you already have — grouped through your own `claude`/`codex` CLI,
-with nothing created and nothing rewritten.
+katamari treats a language server exactly the way it treats a coding
+agent: something it spawns, owns the lifecycle of, and can health-check
+(`ktmr doctor`), rather than something shelled out to once and forgotten.
+That's the same manager pattern underneath both the LSP subsystem and the
+[agent session](/katamari/keybindings/#ask-the-agent) `a`/`A`/`p` talk to,
+which is why review gets editor-grade navigation instead of pager-grade
+text, and why asking the agent about a selection means one persistent,
+protocol-owned session for the whole review rather than a fresh process
+per question. The comment store is a plain, git-trackable file with real
+status semantics — `.katamari/comments.jsonl`, resolved and reopened
+through `ktmr comments` — because a review can span days and multiple
+agent invocations, and a comment that isn't durably resolvable isn't
+trustworthy enough to walk away from. And [review
+units](/katamari/review-units/) are strictly read-only and derived, cached
+by content hash, because the whole point is a *better reading order* for a
+diff that already exists — never risking the actual git history to get
+there.
 
-For repositories using [jj](https://github.com/jj-vcs/jj) colocated with
-git, katamari also keeps a timeline of jj's automatic working-copy
-snapshots, so you can step back through every version of the working tree
-an agent's session passed through, not just the version currently on disk.
+Put together, that's a single static binary you can drop into any repo
+with zero infrastructure: no server, no token, no SaaS bill, no branch
+surgery. For repositories using [jj](https://github.com/jj-vcs/jj)
+colocated with git, the same binary also keeps a timeline of jj's
+automatic working-copy snapshots, so you can step back through every
+version of the working tree an agent's session passed through, not just
+the version currently on disk.
+
+See [Compared to other tools](/katamari/compared-to-other-tools/) for how
+this stacks up against diff pagers, git TUIs, other terminal review tools,
+cloud AI reviewers, and stacked-PR platforms — including where katamari is
+the wrong tool for the job.

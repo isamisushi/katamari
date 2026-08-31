@@ -3,6 +3,9 @@ title: Review units
 description: How `u` groups a tangled diff into ordered, stacked-PR-like review units through your own agent CLI.
 ---
 
+Turn a tangled diff into a stack you can actually read — without touching
+a branch.
+
 A one-shot agent session tends to land as one big tangled diff: a
 refactor, the feature it enabled, its tests, and a lockfile bump,
 interleaved across files in alphabetical order. Stacked-PR tooling solves
