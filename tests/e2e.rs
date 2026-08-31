@@ -71,6 +71,8 @@ mod update_check;
 mod visual;
 #[path = "e2e/watch.rs"]
 mod watch;
+#[path = "e2e/watch_filtering.rs"]
+mod watch_filtering;
 #[path = "e2e/wrap.rs"]
 mod wrap;
 #[path = "e2e/yank.rs"]

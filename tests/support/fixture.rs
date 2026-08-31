@@ -168,6 +168,94 @@ pub fn clean_repo() -> FixtureRepo {
     FixtureRepo { dir }
 }
 
+/// Shaped for `tests/e2e/watch_filtering.rs`: exercises the filtered
+/// registration walk's two pruning rules — a gitignored directory and a
+/// fake nested checkout — alongside one ordinary tracked file a test can
+/// edit to prove live refresh still works at all, in the same session a
+/// negative assertion about the other two relies on (see
+/// `tests/e2e/moving_scope.rs`'s docs on why a positive proof and a
+/// negative assertion belong in one sequenced session rather than two
+/// independent tests).
+///
+/// Both `ignored/` and `agent-worktree/` are built as they'd appear
+/// *before* a session ever spawns — the initial registration walk (not
+/// dynamic re-registration) is what must prune them, since only that walk
+/// runs deep enough to ever reach directories that already existed at
+/// startup.
+///
+/// Both are also gitignored, `agent-worktree/` included — the realistic
+/// shape a real `.claude/worktree/*` setup would already need regardless
+/// of live refresh (an un-gitignored nested checkout would flood *every*
+/// `git status`/`ktmr diff` with its entire untracked tree as "new files,"
+/// watch feature or not), and the only shape an E2E assertion phrased as
+/// "this content never renders" can prove *deterministically* end to end:
+/// `handle_watch_refresh` re-derives the *whole* working-tree diff on
+/// every trigger, from whatever reason, so an un-gitignored nested
+/// checkout's current content would still surface the moment *any*
+/// unrelated refresh happens to run — which says nothing about whether
+/// the nested checkout's own change was what woke that refresh up
+/// (`walk_admits`'s actual job), only about git's own untracked-file
+/// listing. That distinction is what the unit tests
+/// (`walk_admits_skips_a_nested_checkout_with_a_dot_git_file`/
+/// `_directory`) exist to isolate, gitignore-free, at the function level;
+/// this fixture's job is only the realistic end-to-end shape.
+pub fn watch_filtering_repo() -> FixtureRepo {
+    let dir = init_repo();
+    let root = dir.path();
+
+    std::fs::write(root.join("tracked.txt"), "alpha\nbeta\ngamma\n").unwrap();
+    std::fs::write(root.join(".gitignore"), "ignored/\nagent-worktree/\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "initial commit"]);
+
+    // An uncommitted edit, already part of the diff at spawn time — the
+    // same shape `basic_repo`'s `README.md` edit has: something the test
+    // can `wait_for_text` on immediately (an unedited `tracked.txt` would
+    // have no diff at all yet, and so wouldn't appear on screen to wait
+    // for), and an already-visible line to overwrite with a marker later
+    // rather than appending below into a collapsed unchanged-context gap.
+    std::fs::write(root.join("tracked.txt"), "alpha, updated\nbeta\ngamma\n").unwrap();
+
+    std::fs::create_dir_all(root.join("ignored")).unwrap();
+    std::fs::write(root.join("ignored").join("output.txt"), "junk\n").unwrap();
+
+    let worktree = root.join("agent-worktree");
+    std::fs::create_dir_all(worktree.join("src")).unwrap();
+    std::fs::write(worktree.join(".git"), "gitdir: /nowhere/in/particular\n").unwrap();
+    // `.txt`, not a real source extension — this module's own docs on why
+    // every fixture avoids one (no `Language::detect` match means no LSP
+    // warm-up/spawn) apply just as much to a file inside a directory this
+    // test expects to never even be watched.
+    std::fs::write(worktree.join("src").join("main.txt"), "placeholder\n").unwrap();
+
+    FixtureRepo { dir }
+}
+
+/// A minimal repo with one un-gitignored nested checkout
+/// (`worktree/.git`, a plain file — the shape a real linked worktree's
+/// always is), for `ktmr watch-check`-driven coverage of
+/// `watch::walk_admits`'s nested-checkout rule specifically, isolated from
+/// gitignore-based exclusion the way [`watch_filtering_repo`]'s own
+/// (gitignored) nested checkout can't be at the TUI level — see that
+/// function's docs on why an un-gitignored nested checkout's content can
+/// leak into a *full* working-tree diff regardless of which path
+/// triggered it, and why `watch-check` (which never runs `git diff` at
+/// all, only reports what `watch::spawn` itself detected) is the level
+/// that can actually prove this rule deterministically end to end.
+/// Nothing here needs to be tracked or committed at all — `watch-check`
+/// has no diff concept, only raw filesystem events.
+pub fn nested_checkout_repo() -> FixtureRepo {
+    let dir = init_repo();
+    let root = dir.path();
+
+    let worktree = root.join("worktree");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join(".git"), "gitdir: /nowhere/in/particular\n").unwrap();
+    std::fs::write(worktree.join("placeholder.txt"), "placeholder\n").unwrap();
+
+    FixtureRepo { dir }
+}
+
 /// Whether `jj` is on `PATH` — [`python3_available`]'s jj-side counterpart,
 /// the same self-skip pattern for the same reason: `jj` is mise-managed
 /// (`mise.toml`'s `[tools]` pins a version), so it resolves in this

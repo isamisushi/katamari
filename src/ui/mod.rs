@@ -441,10 +441,16 @@ pub fn run(
 
 /// Starts watching the root diff's repository and wires its events onto
 /// `app_tx`, marking the root [`App`] as being in watch mode along the way.
-/// Returns a status-bar note if the watcher itself failed to start (e.g.
-/// the platform's file-watching backend couldn't be initialized) — a live
-/// session that silently isn't watching would be a much worse failure mode
-/// than one that says so up front.
+/// Returns a status-bar note only when watch mode isn't available for the
+/// current view at all (see below) — `watch::spawn`'s own setup (which
+/// used to be able to fail synchronously right here, e.g. the platform's
+/// file-watching backend refusing to initialize) now runs entirely on its
+/// own thread and reports a failure asynchronously instead, as
+/// [`WatchSignal::Failed`] over the same channel [`spawn_watch_forwarder`]
+/// relays — see the event loop's `AppEvent::Watch(WatchSignal::Failed(_))`
+/// arm for the async equivalent of what this function's `Err` arm used to
+/// do synchronously (the status-bar note, and flipping `watch_mode` back
+/// off).
 fn start_watch(stack: &mut ViewStack, app_tx: Sender<AppEvent>, quiet: Duration) -> Option<String> {
     let View::Diff(app) = stack.root_mut() else {
         // `main.rs` only ever offers live refresh alongside the plain diff
@@ -455,13 +461,9 @@ fn start_watch(stack: &mut ViewStack, app_tx: Sender<AppEvent>, quiet: Duration)
     };
     app.watch_mode = true;
     let (watch_tx, watch_rx) = mpsc::channel::<WatchSignal>();
-    match watch::spawn(app.repo_root.clone(), watch_tx, quiet) {
-        Ok(()) => {
-            spawn_watch_forwarder(watch_rx, app_tx);
-            None
-        }
-        Err(e) => Some(format!("watch: failed to start: {e}")),
-    }
+    watch::spawn(app.repo_root.clone(), watch_tx, quiet);
+    spawn_watch_forwarder(watch_rx, app_tx);
+    None
 }
 
 /// Loads the root diff's comment log (empty if there isn't one yet or the
@@ -2171,6 +2173,24 @@ fn event_loop(
                 if !watch_paused {
                     watch_status = Some(WatchStatus::new("watch: pending\u{2026}".to_owned()));
                 }
+            }
+            Ok(AppEvent::Watch(WatchSignal::Failed(e))) => {
+                // Async setup (see `watch::spawn`'s docs) failed after the
+                // fact — this session was never actually watching, so the
+                // status bar's "⦿ watch" indicator would otherwise lie;
+                // flip it off the same way a synchronous failure used to
+                // make `start_watch` never turn it on in the first place.
+                // `watch_active`/`watch_paused` are deliberately left
+                // alone: they already don't gate on whether the underlying
+                // watcher truly started (see `watch_active`'s own
+                // construction from `pre_refresh_hook.is_some()`), a
+                // pre-existing characteristic this change doesn't touch —
+                // only `watch_mode`, the status-bar display flag, is this
+                // arm's job to correct.
+                if let View::Diff(app) = stack.root_mut() {
+                    app.watch_mode = false;
+                }
+                watch_status = Some(WatchStatus::new(format!("watch: failed to start: {e}")));
             }
             Ok(AppEvent::Watch(WatchSignal::Flushed(batch))) => {
                 // Only meaningful when the currently-open prompt (if any)
@@ -4396,14 +4416,32 @@ fn handle_watch_refresh(
 
     sync_lsp_after_refresh(app, lsp_manager, &batch.changes);
 
-    *watch_status = Some(WatchStatus::new(
-        if overlay_closed {
-            "closed: file changed"
-        } else {
-            "updated"
-        }
-        .to_owned(),
-    ));
+    // `batch.changes.is_empty()` is otherwise impossible here — `run`'s own
+    // debounce flush never sends a `Flushed` with nothing in it (see
+    // `WatchSession::run`) — so it's a reliable, exclusive tag for the one
+    // signal that isn't that: `watch::spawn`'s guaranteed post-registration
+    // catch-up (see its docs). That one exists purely as silent correctness
+    // insurance against an async-setup-window race that essentially never
+    // actually happens; flashing "updated" every single session regardless
+    // — including the overwhelming majority where this re-diff came back
+    // byte-identical (`overlay_closed` stays `false` exactly then, since a
+    // truly unchanged `files` list can't fail to preserve the cursor's row)
+    // — would be pure status-bar noise, and did in fact make sessions that
+    // legitimately touch nothing flicker a note observable in e2e screen
+    // comparisons. A batch that *did* carry a real race (vanishingly rare:
+    // a write landing in the microsecond-scale gap before registration
+    // lands) still applies fully above — files, overlays, LSP sync, all
+    // updated — just without this specific note calling attention to it.
+    if !batch.changes.is_empty() || overlay_closed {
+        *watch_status = Some(WatchStatus::new(
+            if overlay_closed {
+                "closed: file changed"
+            } else {
+                "updated"
+            }
+            .to_owned(),
+        ));
+    }
 }
 
 /// Issue #8: applies one `AppEvent::RevisionChanged` tick — sibling of

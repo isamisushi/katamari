@@ -1138,13 +1138,21 @@ fn run_lsp_check(
 /// batch as one line (change kind and path, one entry per change, sorted
 /// for deterministic output a test script can diff against), and exits
 /// once `flushes` have arrived or `timeout_secs` have passed without them.
+///
+/// `watch::spawn`'s own setup now runs on its own thread rather than
+/// blocking this function's caller (see that function's docs), so a setup
+/// failure arrives as [`watch::WatchSignal::Failed`] over `rx` instead of a
+/// synchronous `Result` here — still a hard error for this tool, just
+/// delivered asynchronously. The guaranteed empty-`changes` catch-up flush
+/// `spawn` sends right after registration completes (same docs) is real
+/// but isn't a *change* this tool is waiting to observe, so it's reported
+/// distinctly and doesn't count toward `flushes`.
 fn run_watch_check(dir: PathBuf, flushes: usize, timeout_secs: u64) -> Result<()> {
     let repo_root = dir.canonicalize().unwrap_or(dir);
     println!("watching: {}", repo_root.display());
 
     let (tx, rx) = std::sync::mpsc::channel();
-    watch::spawn(repo_root, tx, watch::DEBOUNCE_QUIET)
-        .map_err(|e| anyhow::anyhow!("failed to start watcher: {e}"))?;
+    watch::spawn(repo_root, tx, watch::DEBOUNCE_QUIET);
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut seen = 0usize;
@@ -1157,6 +1165,12 @@ fn run_watch_check(dir: PathBuf, flushes: usize, timeout_secs: u64) -> Result<()
         }
         match rx.recv_timeout(remaining) {
             Ok(watch::WatchSignal::Pending) => println!("[pending]"),
+            Ok(watch::WatchSignal::Failed(e)) => {
+                bail!("watch-check: setup failed: {e}");
+            }
+            Ok(watch::WatchSignal::Flushed(batch)) if batch.changes.is_empty() => {
+                println!("[startup catch-up]");
+            }
             Ok(watch::WatchSignal::Flushed(batch)) => {
                 seen += 1;
                 let mut lines: Vec<String> = batch
