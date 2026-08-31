@@ -1,7 +1,10 @@
-# Keybindings
+---
+title: Keybindings
+description: Every keybinding in the vim and emacs presets, plus mouse support and diff search.
+---
 
 Vim bindings are the default; set `keymap = "emacs"` in config (see
-[Configuration](./configuration.md)) for the emacs column. `q` quits katamari from anywhere — a pushed
+[Configuration](/katamari/configuration/)) for the emacs column. `q` quits katamari from anywhere — a pushed
 `FileView`/timeline/log/inspector included, never "back" to whatever's
 underneath. `Esc` is the generic "get me out of this": it dismisses the
 nearest open overlay (a popup, the hover card, the references panel), and
@@ -128,7 +131,7 @@ same as pressing `V` again.
 
 `?` from any view opens a floating help window listing every command,
 grouped, with its actual key next to it — the bindings shown are live
-(preset plus any `[keys]` override, see [Configuration](./configuration.md)),
+(preset plus any `[keys]` override, see [Configuration](/katamari/configuration/)),
 never a hardcoded reference the
 table above could drift out of sync with. `j`/`k`/arrows/`C-n`/`C-p` (and
 `PageDown`/`PageUp`/`C-d`/`C-u`, and `gg`/`G` for top/bottom) scroll; `/`
@@ -160,12 +163,12 @@ one uppercase letter makes it case-sensitive. Match granularity is
 per-occurrence — a row with three hits is three `n` stops — across every
 file in the diff, in file → hunk → line order. Only visible content is
 searched: a fold row's hidden, unchanged context (git's own omitted context
-between hunks — see `zo`/`zc` in [Quickstart](./quickstart.md)) isn't
+between hunks — see `zo`/`zc` in [Quickstart](/katamari/quickstart/)) isn't
 matched until you unfold it, at which point a confirmed search's matches
 recompute automatically over the newly revealed rows.
 
 Any binding can be overridden per action; see `[keys]` in
-[Configuration](./configuration.md).
+[Configuration](/katamari/configuration/).
 
 Pass `--show-keys` to `diff`/`open`/`log`/`timeline` (or set `[ui]
 show_keys = true` to leave it on by default) to show a small overlay chip
@@ -177,4 +180,3 @@ being pressed. A multi-key sequence builds up as you type it (`g` then
 ~1.5s of inactivity, and while typing into the comment-compose or
 revision-input overlays it shows a generic `[typing…]` placeholder instead
 of echoing your text.
-

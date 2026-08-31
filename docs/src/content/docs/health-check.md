@@ -1,4 +1,7 @@
-# Health check
+---
+title: Health check
+description: "`ktmr doctor`'s checkhealth-style report for diagnosing VCS, config, and LSP issues."
+---
 
 `ktmr doctor` is a checkhealth-style report for when something isn't working
 and you can't tell whether it's katamari, the language server, or just a slow
@@ -23,11 +26,11 @@ Five sections, always in this order:
   every parse/unknown-key warning a normal session would otherwise only
   print to stderr.
 - **lsp (resolution)** — the same static, offline information `ktmr lsp
-  doctor` prints (see [Language servers](./language-servers.md)), folded in
+  doctor` prints (see [Language servers](/katamari/language-servers/)), folded in
   as checks: where each of the six built-in languages' server resolves
   from today, plus every `[lsp.servers.<id>]` custom entry.
 - **agents** — which agent CLIs (`claude`, `codex`) are on `PATH` for
-  [review units](./review-units.md)' grouping and, when more than one is,
+  [review units](/katamari/review-units/)' grouping and, when more than one is,
   which one `u` would actually spawn — resolved through the same `[units]`
   preference the TUI uses, so the report can't drift from what `u` does.
   None found is a warning, not an error: grouping is optional, and
@@ -54,4 +57,3 @@ building a release binary and running it against a throwaway multi-language
 monorepo in an isolated sandbox, so a release is only cut once LSP
 auto-install has actually been proven end to end, not just unit-tested. See
 `AGENTS.md`'s "Release check" section for usage.
-

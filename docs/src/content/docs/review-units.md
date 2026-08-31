@@ -1,4 +1,7 @@
-# Review units
+---
+title: Review units
+description: How `u` groups a tangled diff into ordered, stacked-PR-like review units through your own agent CLI.
+---
 
 A one-shot agent session tends to land as one big tangled diff: a
 refactor, the feature it enabled, its tests, and a lockfile bump,
@@ -75,7 +78,6 @@ which CLI, which model, which reasoning effort. The choice is appended as
 a `[units]` block to `~/.config/katamari/config.toml` (append-only —
 anything hand-written in the file is preserved) and never asked again;
 `Esc` abandons it without saving or spawning anything. See `[units]` under
-[Configuration](./configuration.md) for the keys and their exact CLI-flag
-mapping, and `ktmr reset --units-config` ([Reset](./reset.md)) to remove
+[Configuration](/katamari/configuration/) for the keys and their exact CLI-flag
+mapping, and `ktmr reset --units-config` ([Reset](/katamari/reset/)) to remove
 the block and get the picker back.
-

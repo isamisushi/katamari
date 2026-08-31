@@ -1,4 +1,7 @@
-# Installation
+---
+title: Installation
+description: Every way to install katamari — Homebrew, the install script, prebuilt binaries, mise, from source, and Windows via WSL.
+---
 
 Every method installs two identical binaries, `katamari` and `ktmr` (the
 short name is what the rest of this document uses). There are no distro
@@ -81,4 +84,3 @@ it inside [WSL](https://learn.microsoft.com/windows/wsl/) and follow the
 Linux instructions there. (A native `cargo install` may compile, but parts
 of the tool — `ktmr skill install`'s symlinks (`--user` included), LSP
 auto-install's executable-bit handling — assume a Unix filesystem.)
-

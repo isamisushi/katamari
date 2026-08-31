@@ -38,7 +38,7 @@ mise use -g "ubi:isamisushi/katamari[exe=ktmr]"
 
 Prebuilt binaries (with a per-target archive table), building from source,
 and running under Windows/WSL are all covered in the
-[Installation chapter](https://isamisushi.github.io/katamari/installation.html).
+[Installation chapter](https://isamisushi.github.io/katamari/installation/).
 
 ## Quickstart
 
@@ -70,7 +70,7 @@ repository as a small, tool-agnostic skill an agent picks up automatically
 your home directory instead). katamari also offers to install it the first
 time you save a comment in a repo that doesn't have it yet.
 
-The full [Quickstart chapter](https://isamisushi.github.io/katamari/quickstart.html)
+The full [Quickstart chapter](https://isamisushi.github.io/katamari/quickstart/)
 covers every scope `ktmr diff` opens (staged, a commit, a range, a jj
 revset, `--pr <number>`), `ktmr log`, the LSP Inspector, fold expansion,
 and the scope-menu popup (`o`) for switching mid-session.
@@ -93,19 +93,19 @@ and the scope-menu popup (`o`) for switching mid-session.
   remappable
 
 See the [full manual](https://isamisushi.github.io/katamari/) for
-[Review units](https://isamisushi.github.io/katamari/review-units.html),
-[Keybindings](https://isamisushi.github.io/katamari/keybindings.html),
-[Language servers](https://isamisushi.github.io/katamari/language-servers.html),
-[Health check](https://isamisushi.github.io/katamari/health-check.html),
-[Reset](https://isamisushi.github.io/katamari/reset.html), and
-[jj colocated setup](https://isamisushi.github.io/katamari/jj-colocated-setup.html).
+[Review units](https://isamisushi.github.io/katamari/review-units/),
+[Keybindings](https://isamisushi.github.io/katamari/keybindings/),
+[Language servers](https://isamisushi.github.io/katamari/language-servers/),
+[Health check](https://isamisushi.github.io/katamari/health-check/),
+[Reset](https://isamisushi.github.io/katamari/reset/), and
+[jj colocated setup](https://isamisushi.github.io/katamari/jj-colocated-setup/).
 
 ## Why
 
 Reviewing an AI agent's changes usually means either reading a raw `git
 diff` with no semantic information, or opening a full IDE for a change
 that's often small and mechanical. katamari sits in between. See
-[Why](https://isamisushi.github.io/katamari/introduction.html#why) for the
+[Why](https://isamisushi.github.io/katamari/#why) for the
 full case.
 
 ## Configuration
@@ -124,12 +124,12 @@ agent = "claude"         # which CLI `u` spawns to group the diff
 ```
 
 Every field, with its default and what it does, is documented in the
-[Configuration chapter](https://isamisushi.github.io/katamari/configuration.html).
+[Configuration chapter](https://isamisushi.github.io/katamari/configuration/).
 
 ## Development
 
 `mise run test` runs the unit suite plus a PTY-driven e2e suite; see the
-[Development chapter](https://isamisushi.github.io/katamari/development.html)
+[Development chapter](https://isamisushi.github.io/katamari/development/)
 for the full picture.
 
 ## License

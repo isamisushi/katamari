@@ -20,18 +20,19 @@ mise exec -- cargo clippy --all-targets -- -D warnings      # includes tests/
 mise exec -- cargo fmt --check
 ```
 
-`docs/` is an mdBook site (deployed to GitHub Pages by
-`.github/workflows/docs.yml` on push to main). mdBook isn't on `PATH`
-either — fetch the version pinned as `MDBOOK_VERSION` in that workflow and
-run it by absolute path:
+`docs/` is an Astro Starlight site (deployed to GitHub Pages by
+`.github/workflows/docs.yml` on push to main). It needs Node 22 — install
+one via `mise use -g node@22` if `node` isn't already on `PATH` — then
+build from inside `docs/`:
 
 ```
-curl -sL https://github.com/rust-lang/mdBook/releases/download/v0.4.40/mdbook-v0.4.40-x86_64-unknown-linux-gnu.tar.gz | tar xz -C /tmp/mdbook
-/tmp/mdbook/mdbook build docs   # should build with zero warnings
+cd docs
+npm ci             # installs from the committed package-lock.json; never `npm install` in CI or here
+npm run build      # should build with zero errors; output goes to docs/dist
 ```
 
-Bump `MDBOOK_VERSION` in `docs.yml` and the version above together when
-upgrading mdBook.
+`docs/dist`, `docs/node_modules`, and `docs/.astro` are all generated and
+gitignored — never commit them.
 
 ## Tests
 

@@ -1,4 +1,7 @@
-# Language servers
+---
+title: Language servers
+description: Which language server katamari auto-installs per language, and how to configure a custom one.
+---
 
 katamari spawns servers lazily, the first time a file of that language is
 opened, and looks for each one in this order: config override →
@@ -57,7 +60,7 @@ Managed installs live under `~/.local/share/katamari/servers/`
 subdirectory per server — never touched by anything but katamari, and safe
 to delete entirely (everything reinstalls on demand).
 
-`[lsp.servers.<id>]` in config (see [Configuration](./configuration.md))
+`[lsp.servers.<id>]` in config (see [Configuration](/katamari/configuration/))
 overrides any of these with an explicit command, taking priority over
 every lookup including auto-install.
 To disable auto-install and just get the old "here's the install command"
@@ -124,4 +127,3 @@ ktmr lsp doctor              # where each language's server resolves from today 
 ktmr lsp install <language>  # force an install into katamari's managed prefix (rust/typescript/python/go/kotlin/java/all)
 ktmr lsp update              # reinstall any pinned server that's fallen behind the current pin
 ```
-

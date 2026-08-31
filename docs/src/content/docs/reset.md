@@ -1,4 +1,7 @@
-# Reset
+---
+title: Reset
+description: "`ktmr reset` returns katamari to a fresh-install state, selectively."
+---
 
 `ktmr reset` returns katamari to a fresh-install state, selectively — and
 with no flags it removes nothing at all: it prints an inventory of every
@@ -23,4 +26,3 @@ run, a `.katamari/` directory left holding only its own generated
 `.gitignore` is tidied away entirely — and outside a git repository, the
 repo-scoped targets are skipped while the user-level ones (servers, state
 dir, home config) still work.
-

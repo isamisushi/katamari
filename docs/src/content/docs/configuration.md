@@ -1,4 +1,7 @@
-# Configuration
+---
+title: Configuration
+description: The full TOML configuration reference, merged from built-in defaults, home config, and repo config.
+---
 
 TOML, merged in this order (later wins per field, not per file — setting
 one field in the repo file doesn't reset the rest of a section back to
@@ -133,4 +136,3 @@ claude_effort = "high"
 # codex_model = "gpt-5-codex"
 # codex_effort = "medium"
 ```
-

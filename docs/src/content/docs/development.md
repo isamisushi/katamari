@@ -1,4 +1,7 @@
-# Development
+---
+title: Development
+description: Running katamari's unit, PTY-driven e2e, and tmux e2e test suites.
+---
 
 `mise run test` runs the unit suite plus `tests/e2e.rs`, an integration
 suite that drives the real compiled `ktmr` binary through a PTY (via

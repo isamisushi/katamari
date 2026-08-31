@@ -1,4 +1,7 @@
-# Quickstart
+---
+title: Quickstart
+description: Open a diff, review with LSP-backed hover and go-to-definition, leave comments, and switch scope without restarting.
+---
 
 Run inside any git repository:
 
@@ -18,7 +21,7 @@ re-resolves live, so amending the commit it points at (`git commit
 --amend`, `jj describe`/`squash`) updates the open diff in place, cursor
 and scroll preserved. A diff opened by commit hash never changes.
 
-In a colocated jj repository (see [jj colocated setup](./jj-colocated-setup.md)),
+In a colocated jj repository (see [jj colocated setup](/katamari/jj-colocated-setup/)),
 `ktmr diff` also takes jj revsets, matching `jj diff`'s own flags so jj
 muscle memory transfers directly:
 
@@ -93,7 +96,7 @@ copy that complete record once, so a partial wrapped-row selection never
 truncates or duplicates a log message. Oversized selections are refused with
 an in-inspector status message. `q`/`I` close it. Language
 servers spawn lazily, the first time something asks, and auto-install
-themselves if missing — see [Language servers](./language-servers.md) if a
+themselves if missing — see [Language servers](/katamari/language-servers/) if a
 feature reports a server as unavailable.
 
 Each TUI session also writes one combined, privacy-filtered journal under
@@ -178,7 +181,7 @@ either way — but a repo that only has *some* of the three pieces (e.g. one
 that ran an older katamari's `ktmr skill install`, from before `AGENTS.md`/
 `CLAUDE.md` were part of the harness) is still offered the rest once, since
 installing is always idempotent. Set `[skill] offer_install = false` in
-config (see [Configuration](./configuration.md)) to turn the offer off
+config (see [Configuration](/katamari/configuration/)) to turn the offer off
 entirely; `ktmr skill install` keeps working as an explicit command
 regardless.
 
@@ -201,7 +204,7 @@ highlighting/hover/go-to-definition as the diff view — useful for reading
 code a diff jumped you into without leaving katamari.
 
 If the repository has a colocated jj repo (see
-[jj colocated setup](./jj-colocated-setup.md)), `t` from `ktmr diff` opens the
+[jj colocated setup](/katamari/jj-colocated-setup/)), `t` from `ktmr diff` opens the
 snapshot timeline, or jump there directly with `ktmr timeline`.
 
 `o` from `ktmr diff` opens the scope-picker popup — switch what a live
@@ -235,4 +238,3 @@ refresh loop (the watcher itself keeps running) until you swap back;
 Finally, `u` groups the current diff into ordered review units — katamari's
 stacked-PR-like reading order — and `Enter` on one scopes the whole session
 to it. That's the next section.
-

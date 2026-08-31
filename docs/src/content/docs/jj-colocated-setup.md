@@ -1,4 +1,7 @@
-# jj colocated setup
+---
+title: jj colocated setup
+description: Colocate jj with an existing git repository so katamari's timeline can read its snapshots.
+---
 
 katamari's timeline reads jj's own automatic working-copy snapshots — no
 katamari-specific setup beyond jj itself being colocated with the existing
@@ -20,4 +23,3 @@ diff -r`/`--from`/`--to` and `ktmr log`'s jj-backed history need this same
 colocated setup; `ktmr log` still works without it (falling back to plain
 `git log`), just without jj's revsets or the working copy as a browsable
 entry.
-

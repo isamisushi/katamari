@@ -1,4 +1,20 @@
-# Introduction
+---
+title: katamari
+description: A terminal diff-review tool with LSP inside the diff, semantic review units, and an agent-readable comment round-trip.
+template: splash
+hero:
+  tagline: Terminal diff review with language intelligence — hover, go-to-definition, and live diagnostics inside git diff, review comments an AI agent can read back and address, and semantic review units without creating a single branch.
+  image:
+    html: '<img src="/katamari/demo.gif" alt="katamari demo: reviewing a diff in the terminal, with hover and go-to-definition" />'
+  actions:
+    - text: Get started
+      link: /katamari/installation/
+      icon: right-arrow
+    - text: GitHub
+      link: https://github.com/isamisushi/katamari
+      icon: external
+      variant: minimal
+---
 
 A terminal diff-review tool. `ktmr diff` shows a `git diff` with syntax
 highlighting, hover/go-to-definition/find-references/diagnostics from real
@@ -7,14 +23,12 @@ back and address — and `u` regroups a big tangled diff into ordered,
 stacked-PR-like review units, without creating a single branch. All of it
 without leaving the terminal.
 
-![demo](assets/demo.gif)
-
 - **Semantic review units** — `u` groups the diff's hunks into ordered,
   stacked-PR-like units (the refactor first, then the feature built on it,
   tests with the code they cover), each reviewable as its own scoped
   diff — derived and read-only, through the `claude`/`codex` CLI you
   already have, no branches created, nothing written outside `.katamari/`
-  (see [Review units](./review-units.md))
+  (see [Review units](/katamari/review-units/))
 - **LSP inside the diff** — hover, go-to-definition, find-references, and
   live diagnostics on changed lines (Rust / TypeScript / Python / Go /
   Kotlin / Java; servers auto-install on first use; `[lsp.servers.<id>]`
@@ -66,7 +80,7 @@ worth reading — the refactor, the feature it enabled, the tests, and a
 lockfile bump interleaved across files in alphabetical order. The
 established fix, stacked PRs, buys back readability by materializing real
 branches and PRs before anyone has read the change. katamari's
-[review units](./review-units.md) recover the same "read it in dependency
+[review units](/katamari/review-units/) recover the same "read it in dependency
 order, one concern at a time" property as a derived, read-only view over
 the diff you already have — grouped through your own `claude`/`codex` CLI,
 with nothing created and nothing rewritten.
@@ -75,4 +89,3 @@ For repositories using [jj](https://github.com/jj-vcs/jj) colocated with
 git, katamari also keeps a timeline of jj's automatic working-copy
 snapshots, so you can step back through every version of the working tree
 an agent's session passed through, not just the version currently on disk.
-
