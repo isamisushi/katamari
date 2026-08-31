@@ -12,10 +12,11 @@
 //! transition in this codebase.
 
 use crate::ui::app::CommentTarget;
+use crate::ui::text_input::{self, EditCommand, char_byte_index, cursor_marked_line};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
@@ -67,12 +68,48 @@ impl ComposeBuffer {
             let end = char_byte_index(line, self.col);
             line.replace_range(start..end, "");
             self.col -= 1;
-        } else if self.row > 0 {
-            let current = self.lines.remove(self.row);
-            self.row -= 1;
-            self.col = self.lines[self.row].chars().count();
-            self.lines[self.row].push_str(&current);
+        } else {
+            self.merge_into_previous_line();
         }
+    }
+
+    /// `C-w`/`M-Backspace`: deletes the word behind the cursor via
+    /// [`text_input::word_start_before`] — readline's unix-word-rubout
+    /// semantics, same as [`crate::ui::text_input::LineInput::delete_previous_word`]
+    /// but scoped to the current line. At the start of a line past the
+    /// first, there's no "word" to delete across the boundary, only a line
+    /// to join — [`Self::merge_into_previous_line`], exactly
+    /// [`Self::backspace`]'s own row-merge branch, not a no-op the way
+    /// stopping at col 0 mid-buffer would be.
+    pub fn delete_previous_word(&mut self) {
+        if self.col > 0 {
+            let chars: Vec<char> = self.lines[self.row].chars().collect();
+            let start = text_input::word_start_before(&chars, self.col);
+            let line = &mut self.lines[self.row];
+            let start_byte = char_byte_index(line, start);
+            let end_byte = char_byte_index(line, self.col);
+            line.replace_range(start_byte..end_byte, "");
+            self.col = start;
+        } else {
+            self.merge_into_previous_line();
+        }
+    }
+
+    /// Removes the current line and appends its text to the end of the
+    /// previous one, cursor landing at the join point — the shared tail of
+    /// [`Self::backspace`] and [`Self::delete_previous_word`] when both hit
+    /// column 0 past the first line. A no-op on the first line (`self.row
+    /// == 0`): there's no previous line to merge into, so both callers'
+    /// `self.col > 0` guard is what actually decides whether this runs, not
+    /// a check in here.
+    fn merge_into_previous_line(&mut self) {
+        if self.row == 0 {
+            return;
+        }
+        let current = self.lines.remove(self.row);
+        self.row -= 1;
+        self.col = self.lines[self.row].chars().count();
+        self.lines[self.row].push_str(&current);
     }
 
     pub fn move_left(&mut self) {
@@ -131,79 +168,6 @@ impl ComposeBuffer {
     }
 }
 
-/// `pub(super)`: [`crate::ui::scope_menu`]'s single-line revision input
-/// reuses this exact char-index-to-byte-index conversion rather than
-/// re-deriving it — see [`ComposeBuffer`]'s docs on why char indexing
-/// (never byte indexing) is the right coordinate space for a text buffer a
-/// user is actively typing into.
-pub(super) fn char_byte_index(s: &str, char_idx: usize) -> usize {
-    s.char_indices()
-        .nth(char_idx)
-        .map_or(s.len(), |(byte_idx, _)| byte_idx)
-}
-
-/// A single-line, `char`-indexed text-editing buffer: insert/backspace/
-/// move-left/move-right over one line of free-form text, cursor addressed
-/// by `char` index (never byte — see [`char_byte_index`]'s own docs on why
-/// that matters for anything beyond ASCII). The shared shape behind
-/// [`crate::ui::scope_menu::RevisionInput`] and
-/// [`crate::ui::search::SearchInput`] — both are just `pub type` aliases
-/// for this — since neither prompt needs anything more specific to its own
-/// domain than "a user is typing one line of text." Lives here, alongside
-/// [`char_byte_index`] (every method below leans on it) rather than in
-/// either alias's own module: before this was extracted, the two aliases'
-/// modules each carried a byte-for-byte identical copy of this same struct
-/// and its five methods, with nothing tying the copies together to catch
-/// them drifting apart on a future fix (a boundary bug, a new Home/End key)
-/// applied to one and not the other. Not [`ComposeBuffer`] itself: that
-/// type is multi-line, with `Enter` meaning "insert a newline" — exactly
-/// wrong for a field where `Enter` means "submit this one line" and there's
-/// no second line to navigate to.
-#[derive(Debug, Default)]
-pub(crate) struct LineInput {
-    text: String,
-    /// `char` index into `text` — not a byte offset.
-    cursor: usize,
-}
-
-impl LineInput {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-
-    pub fn cursor(&self) -> usize {
-        self.cursor
-    }
-
-    pub fn insert_char(&mut self, c: char) {
-        let byte_idx = char_byte_index(&self.text, self.cursor);
-        self.text.insert(byte_idx, c);
-        self.cursor += 1;
-    }
-
-    pub fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let start = char_byte_index(&self.text, self.cursor - 1);
-        let end = char_byte_index(&self.text, self.cursor);
-        self.text.replace_range(start..end, "");
-        self.cursor -= 1;
-    }
-
-    pub fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    pub fn move_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.text.chars().count());
-    }
-}
-
 /// What [`handle_key`] decided one key press should do to the overlay as a
 /// whole, beyond editing the buffer itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,41 +192,38 @@ pub enum ComposeOutcome {
 /// one.
 pub fn handle_key(buffer: &mut ComposeBuffer, key: KeyEvent) -> ComposeOutcome {
     match key.code {
-        KeyCode::Esc => ComposeOutcome::Cancel,
-        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => ComposeOutcome::Save,
+        KeyCode::Esc => return ComposeOutcome::Cancel,
+        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            return ComposeOutcome::Save;
+        }
         KeyCode::Enter => {
             buffer.newline();
-            ComposeOutcome::Continue
-        }
-        KeyCode::Backspace => {
-            buffer.backspace();
-            ComposeOutcome::Continue
-        }
-        KeyCode::Left => {
-            buffer.move_left();
-            ComposeOutcome::Continue
-        }
-        KeyCode::Right => {
-            buffer.move_right();
-            ComposeOutcome::Continue
+            return ComposeOutcome::Continue;
         }
         KeyCode::Up => {
             buffer.move_up();
-            ComposeOutcome::Continue
+            return ComposeOutcome::Continue;
         }
         KeyCode::Down => {
             buffer.move_down();
-            ComposeOutcome::Continue
+            return ComposeOutcome::Continue;
         }
-        // Any other control/alt-modified char is left alone rather than
-        // inserted literally — a stray `C-a`/`C-e` etc. typed out of habit
-        // shouldn't drop a control character into the comment body.
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            buffer.insert_char(c);
-            ComposeOutcome::Continue
-        }
-        _ => ComposeOutcome::Continue,
+        _ => {}
     }
+    // Everything else — insert/backspace/word-delete/left/right — is the
+    // shared editing core every raw-key-bypass text field in this codebase
+    // dispatches through; see `text_input::recognize`'s own docs for why an
+    // unrecognized key (a stray `C-a`/`C-e` etc.) is swallowed rather than
+    // inserted literally.
+    match text_input::recognize(&key) {
+        Some(EditCommand::Insert(c)) => buffer.insert_char(c),
+        Some(EditCommand::Backspace) => buffer.backspace(),
+        Some(EditCommand::DeletePreviousWord) => buffer.delete_previous_word(),
+        Some(EditCommand::MoveLeft) => buffer.move_left(),
+        Some(EditCommand::MoveRight) => buffer.move_right(),
+        None => {}
+    }
+    ComposeOutcome::Continue
 }
 
 /// State for one open compose overlay: what it was opened to comment on —
@@ -330,34 +291,6 @@ pub fn render(frame: &mut Frame, area: Rect, cursor_screen_row: u16, state: &Com
     )));
 
     frame.render_widget(Paragraph::new(lines), inner);
-}
-
-/// Renders one line of the buffer with its `char`-column cursor position
-/// underlined, so the compose overlay shows where typing will land the same
-/// way a real cursor would — `ratatui::Frame` has no text-input widget of
-/// its own to delegate this to. `pub(super)` rather than private:
-/// [`crate::ui::scope_menu`]'s one-line revision input reuses this exact
-/// rendering rather than re-deriving the same cursor math for a second kind
-/// of text field.
-pub(super) fn cursor_marked_line(text: &str, cursor_col: usize) -> Line<'static> {
-    let chars: Vec<char> = text.chars().collect();
-    let before: String = chars[..cursor_col.min(chars.len())].iter().collect();
-    let at = chars.get(cursor_col).copied();
-    let after: String = if cursor_col < chars.len() {
-        chars[cursor_col + 1..].iter().collect()
-    } else {
-        String::new()
-    };
-
-    let mut spans = vec![Span::raw(before)];
-    spans.push(Span::styled(
-        at.map_or_else(|| " ".to_owned(), String::from),
-        Style::default().add_modifier(Modifier::REVERSED),
-    ));
-    if !after.is_empty() {
-        spans.push(Span::raw(after));
-    }
-    Line::from(spans)
 }
 
 /// As `hover_popup::popup_rect`: roughly 60% wide, 40% tall, anchored just
@@ -507,6 +440,68 @@ mod tests {
         handle_key(&mut buffer, key(KeyCode::Enter));
         handle_key(&mut buffer, key(KeyCode::Char('b')));
         assert_eq!(buffer.text(), "a\nb");
+    }
+
+    #[test]
+    fn delete_previous_word_removes_the_word_behind_the_cursor_mid_line() {
+        let mut buffer = ComposeBuffer::new();
+        for c in "hello world".chars() {
+            buffer.insert_char(c);
+        }
+        buffer.delete_previous_word();
+        assert_eq!(buffer.text(), "hello ");
+        assert_eq!(buffer.cursor(), (0, 6));
+    }
+
+    #[test]
+    fn delete_previous_word_skips_trailing_whitespace_before_the_word() {
+        let mut buffer = ComposeBuffer::new();
+        for c in "hello world   ".chars() {
+            buffer.insert_char(c);
+        }
+        buffer.delete_previous_word();
+        assert_eq!(buffer.text(), "hello ");
+    }
+
+    #[test]
+    fn delete_previous_word_at_a_line_start_merges_into_the_previous_line() {
+        let mut buffer = ComposeBuffer::new();
+        buffer.insert_char('a');
+        buffer.newline();
+        buffer.insert_char('b');
+        buffer.move_left(); // cursor at col 0 of the second line
+        buffer.delete_previous_word();
+        assert_eq!(
+            buffer.text(),
+            "ab",
+            "at col 0 past the first line this is a line-join, not a no-op"
+        );
+        assert_eq!(buffer.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn handle_key_ctrl_w_deletes_the_previous_word() {
+        let mut buffer = ComposeBuffer::new();
+        for c in "hello world".chars() {
+            buffer.insert_char(c);
+        }
+        let outcome = handle_key(
+            &mut buffer,
+            key_mod(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(outcome, ComposeOutcome::Continue);
+        assert_eq!(buffer.text(), "hello ");
+    }
+
+    #[test]
+    fn handle_key_alt_backspace_deletes_the_previous_word() {
+        let mut buffer = ComposeBuffer::new();
+        for c in "hello world".chars() {
+            buffer.insert_char(c);
+        }
+        let outcome = handle_key(&mut buffer, key_mod(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(outcome, ComposeOutcome::Continue);
+        assert_eq!(buffer.text(), "hello ");
     }
 
     #[test]

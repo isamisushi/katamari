@@ -5,8 +5,8 @@
 //! silently truncate on a narrow terminal.
 
 use crate::ui::app::{App, Layout};
-use crate::ui::compose;
 use crate::ui::hints::{self, HintItem};
+use crate::ui::text_input;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -34,7 +34,7 @@ use ratatui::widgets::Paragraph;
 /// the echo mid-typing (see `ui::mod`'s event loop, where `hover_state`'s
 /// `status_hint()` outranks `goto_status`/`lsp_status`/`watch_status` in
 /// the chain that produces `status_note`), and a bare `&str` has no way to
-/// carry a cursor position for [`compose::cursor_marked_line`] to mark.
+/// carry a cursor position for [`text_input::cursor_marked_line`] to mark.
 /// Threaded straight from `ui::mod`'s live `search_prompt: Option<SearchPromptState>`
 /// every frame while the prompt is open, unlike `status_note`'s note-typed
 /// siblings, which are one-shot until something else replaces them.
@@ -129,12 +129,12 @@ pub fn render(
 
     if let Some((text, cursor)) = search_prompt {
         // Absolute priority over `status_note` — see this function's docs.
-        // `compose::cursor_marked_line` already returns styled spans (the
-        // char under the cursor reverse-video'd), so these are appended
-        // directly rather than wrapped in one more `Span::styled` the way
-        // `status_note`'s plain text is.
+        // `text_input::cursor_marked_line` already returns styled spans
+        // (the char under the cursor reverse-video'd), so these are
+        // appended directly rather than wrapped in one more `Span::styled`
+        // the way `status_note`'s plain text is.
         spans.push(Span::raw("\u{b7} /"));
-        spans.extend(compose::cursor_marked_line(text, cursor).spans);
+        spans.extend(text_input::cursor_marked_line(text, cursor).spans);
         spans.push(Span::raw(" "));
     } else if let Some(note) = status_note {
         spans.push(Span::styled(

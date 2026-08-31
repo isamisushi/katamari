@@ -30,9 +30,9 @@
 //! loop for exactly where that bypass arm sits and why.
 
 use crate::keymap::{Action, Keymap, action_name};
-use crate::ui::compose::{char_byte_index, cursor_marked_line};
 use crate::ui::mouse::{FrameGeometry, ScrollTarget};
 use crate::ui::text::display_width;
+use crate::ui::text_input::{self, EditCommand, LineInput, cursor_marked_line};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -314,10 +314,10 @@ pub enum HelpMode {
     Filter,
 }
 
-/// The help popup's state: which mode is active, the filter text (`char`-
-/// indexed together with `cursor`, the same convention
+/// The help popup's state: which mode is active, the filter text (a
+/// [`LineInput`] — the same char-indexed buffer
 /// [`crate::ui::compose::ComposeBuffer`]/[`crate::ui::scope_menu::RevisionInput`]
-/// use and for the same reason — never splitting a UTF-8 sequence
+/// use and for the same reason: never splitting a UTF-8 sequence
 /// mid-character), and the scroll offset into the current (filtered) row
 /// list.
 ///
@@ -329,9 +329,7 @@ pub enum HelpMode {
 /// one-shot search-and-close.
 pub struct HelpState {
     mode: HelpMode,
-    filter: String,
-    /// `char` index into `filter` — not a byte offset.
-    cursor: usize,
+    filter: LineInput,
     scroll: usize,
     /// Set by a lone `g` in `Browse` mode, cleared by anything else
     /// (including a second, non-chord `g` press's own completion) — the
@@ -346,8 +344,7 @@ impl HelpState {
     pub fn new() -> Self {
         Self {
             mode: HelpMode::Browse,
-            filter: String::new(),
-            cursor: 0,
+            filter: LineInput::new(),
             scroll: 0,
             pending_g: false,
         }
@@ -358,11 +355,11 @@ impl HelpState {
     }
 
     pub fn filter_text(&self) -> &str {
-        &self.filter
+        self.filter.text()
     }
 
     pub fn cursor(&self) -> usize {
-        self.cursor
+        self.filter.cursor()
     }
 
     pub fn scroll(&self) -> usize {
@@ -375,7 +372,7 @@ impl HelpState {
     /// retype from scratch).
     pub fn enter_filter(&mut self) {
         self.mode = HelpMode::Filter;
-        self.cursor = self.filter.chars().count();
+        self.filter.move_to_end();
     }
 
     /// `Enter` from `Filter` mode: back to `Browse`, filter text untouched.
@@ -390,16 +387,13 @@ impl HelpState {
     /// has no notion of "closed," only `Some`/`None` in the caller's
     /// `Option<HelpState>`).
     pub fn exit_filter_clear(&mut self) {
-        self.filter.clear();
-        self.cursor = 0;
+        self.filter = LineInput::new();
         self.scroll = 0;
         self.mode = HelpMode::Browse;
     }
 
     pub fn insert_char(&mut self, c: char) {
-        let byte_idx = char_byte_index(&self.filter, self.cursor);
-        self.filter.insert(byte_idx, c);
-        self.cursor += 1;
+        self.filter.insert_char(c);
         // A live filter is pointless if the view stays scrolled to
         // wherever `Browse` mode last left it — every keystroke narrows
         // (or widens) the row set, so each one starts back at the top of
@@ -408,22 +402,25 @@ impl HelpState {
     }
 
     pub fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let start = char_byte_index(&self.filter, self.cursor - 1);
-        let end = char_byte_index(&self.filter, self.cursor);
-        self.filter.replace_range(start..end, "");
-        self.cursor -= 1;
+        self.filter.backspace();
+        self.scroll = 0;
+    }
+
+    /// `C-w`/`M-Backspace`: as [`Self::backspace`], but a whole word at
+    /// once — same scroll reset, for the same reason (a narrower or wider
+    /// filter needs to be viewed from its own top, not wherever `Browse`
+    /// mode happened to leave the scroll position).
+    pub fn delete_previous_word(&mut self) {
+        self.filter.delete_previous_word();
         self.scroll = 0;
     }
 
     pub fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        self.filter.move_left();
     }
 
     pub fn move_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.filter.chars().count());
+        self.filter.move_right();
     }
 
     /// `total_rows`/`viewport` (the popup's current row count and visible
@@ -577,36 +574,33 @@ pub fn handle_key(
                 _ => HelpOutcome::Continue,
             }
         }
-        HelpMode::Filter => match key.code {
-            KeyCode::Esc => {
-                state.exit_filter_clear();
-                HelpOutcome::Continue
+        HelpMode::Filter => {
+            match key.code {
+                KeyCode::Esc => {
+                    state.exit_filter_clear();
+                    return HelpOutcome::Continue;
+                }
+                KeyCode::Enter => {
+                    state.exit_filter_keep();
+                    return HelpOutcome::Continue;
+                }
+                _ => {}
             }
-            KeyCode::Enter => {
-                state.exit_filter_keep();
-                HelpOutcome::Continue
+            // Insert/backspace/word-delete/left/right go through the
+            // shared editing core every raw-key-bypass text field uses —
+            // see `text_input::recognize`'s own docs for why an
+            // unrecognized key (a stray `C-a`/`C-e` etc.) is swallowed
+            // rather than inserted literally.
+            match text_input::recognize(&key) {
+                Some(EditCommand::Insert(c)) => state.insert_char(c),
+                Some(EditCommand::Backspace) => state.backspace(),
+                Some(EditCommand::DeletePreviousWord) => state.delete_previous_word(),
+                Some(EditCommand::MoveLeft) => state.move_left(),
+                Some(EditCommand::MoveRight) => state.move_right(),
+                None => {}
             }
-            KeyCode::Backspace => {
-                state.backspace();
-                HelpOutcome::Continue
-            }
-            KeyCode::Left => {
-                state.move_left();
-                HelpOutcome::Continue
-            }
-            KeyCode::Right => {
-                state.move_right();
-                HelpOutcome::Continue
-            }
-            // As `compose::handle_key`/`handle_revision_key`: a stray
-            // control-modified char (habitual `C-a`/`C-e` etc.) is left
-            // alone rather than inserted literally.
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                state.insert_char(c);
-                HelpOutcome::Continue
-            }
-            _ => HelpOutcome::Continue,
-        },
+            HelpOutcome::Continue
+        }
     }
 }
 
@@ -1087,6 +1081,25 @@ mod tests {
             HelpOutcome::Continue
         );
         assert_eq!(state.filter_text(), "");
+    }
+
+    #[test]
+    fn ctrl_w_deletes_the_previous_word_from_the_filter() {
+        let mut state = HelpState::new();
+        state.enter_filter();
+        for c in "goto def".chars() {
+            state.insert_char(c);
+        }
+        assert_eq!(
+            handle_key(
+                &mut state,
+                key_mod(KeyCode::Char('w'), KeyModifiers::CONTROL),
+                10,
+                5
+            ),
+            HelpOutcome::Continue
+        );
+        assert_eq!(state.filter_text(), "goto ");
     }
 
     // ---- scroll clamping -------------------------------------------------

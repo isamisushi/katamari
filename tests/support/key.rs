@@ -43,6 +43,23 @@ pub enum Key {
     /// `Ctrl-s` — the comment-compose overlay's `ComposeOutcome::Save`,
     /// unambiguous in both modes (`0x13`).
     CtrlS,
+    /// `Ctrl-w` — issue #28's `EditCommand::DeletePreviousWord`, unambiguous
+    /// in both modes (`0x17`, same "control bit strips the high bits of the
+    /// ASCII letter" convention as [`Key::CtrlO`]/[`Key::CtrlT`]'s own
+    /// `0x0f`/`0x14`, and — like both of those — no mode-specific encoding
+    /// to pick between, since nothing else on the wire ever produces
+    /// `0x17`).
+    CtrlW,
+    /// `Alt-Backspace` — issue #28's other spelling of
+    /// `EditCommand::DeletePreviousWord`. Legacy: the same "meta sends
+    /// escape" convention [`Key::AltChar`]'s docs describe, a bare `ESC`
+    /// immediately followed by Backspace's own `0x7f` DEL byte — crossterm's
+    /// legacy parser recurses on the tail exactly as it does for
+    /// `AltChar`, arriving at `KeyCode::Backspace` with `KeyModifiers::ALT`
+    /// OR'd in. Kitty: the CSI-u form with Backspace's key code (`127`,
+    /// the same DEL codepoint) and the alt modifier (`3` = `1 + 2`, as
+    /// `AltChar`'s own docs derive).
+    AltBackspace,
     /// A literal Tab / `Action::FocusNextPane` (issue #13 split pane focus
     /// out of the pre-#13 `Action::NextSymbol` Tab used to mean). Encodes
     /// to the same `0x09` byte as legacy `Ctrl-i` in
@@ -111,6 +128,11 @@ impl Key {
             Key::AltLeft => b"\x1b[1;3D".to_vec(),
             Key::AltRight => b"\x1b[1;3C".to_vec(),
             Key::CtrlS => vec![0x13],
+            Key::CtrlW => vec![0x17],
+            Key::AltBackspace => match mode {
+                KittyMode::Supported => b"\x1b[127;3u".to_vec(),
+                KittyMode::Unsupported => vec![0x1b, 0x7f],
+            },
             Key::Tab => vec![0x09],
             Key::BackTab => match mode {
                 KittyMode::Supported => b"\x1b[9;2u".to_vec(),

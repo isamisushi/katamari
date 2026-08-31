@@ -39,6 +39,7 @@ pub mod sidebar;
 pub mod status_bar;
 pub mod symbols;
 pub mod text;
+pub(crate) mod text_input;
 pub mod timeline_view;
 pub mod units_panel;
 pub mod units_setup;

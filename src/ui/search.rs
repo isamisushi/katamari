@@ -23,9 +23,9 @@
 //!
 //! [`SearchPromptState`]/[`SearchInput`]/[`handle_prompt_key`] are the `/`
 //! prompt's own raw-key-bypass overlay. `SearchInput` is a
-//! [`crate::ui::compose::LineInput`] type alias, the same shared buffer
+//! [`crate::ui::text_input::LineInput`] type alias, the same shared buffer
 //! [`crate::ui::scope_menu::RevisionInput`] aliases too — see that type's
-//! docs for why the buffer itself lives in `compose` rather than being
+//! docs for why the buffer itself lives in `text_input` rather than being
 //! redefined here; only [`handle_prompt_key`]'s key dispatch (Esc cancels
 //! rather than "back to the menu list", Enter confirms rather than
 //! submits) is specific to this module.
@@ -33,7 +33,8 @@
 use crate::diff::{DiffFile, RenderRow};
 use crate::ui::navigation::JumpEntry;
 use crate::ui::refresh::Anchor;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::ui::text_input::{self, EditCommand};
+use crossterm::event::{KeyCode, KeyEvent};
 
 /// One substring occurrence: `row_idx` is the flat index into
 /// [`crate::ui::app::App::rows`] (only ever [`RenderRow::Line`] rows are
@@ -256,16 +257,16 @@ pub fn step(current: usize, len: usize, forward: bool) -> Option<(usize, bool)> 
     })
 }
 
-/// The `/` prompt's single-line text buffer — [`crate::ui::compose::LineInput`]
+/// The `/` prompt's single-line text buffer — [`crate::ui::text_input::LineInput`]
 /// under its own name here rather than a redefinition: a search query's
-/// buffer shape (char-indexed insert/backspace/move-left/move-right) has
-/// nothing to do with search *semantics*, it's the exact same "one line of
-/// free-form text" problem [`crate::ui::scope_menu::RevisionInput`] already
-/// solves, so both alias the one shared type instead of each maintaining
-/// their own copy of the same ~40 lines. See `LineInput`'s own docs for the
-/// buffer itself; only this module's [`handle_prompt_key`] dispatch is
-/// specific to a search prompt.
-pub type SearchInput = crate::ui::compose::LineInput;
+/// buffer shape (char-indexed insert/backspace/word-delete/move-left/
+/// move-right) has nothing to do with search *semantics*, it's the exact
+/// same "one line of free-form text" problem
+/// [`crate::ui::scope_menu::RevisionInput`] already solves, so both alias
+/// the one shared type instead of each maintaining their own copy. See
+/// `LineInput`'s own docs for the buffer itself; only this module's
+/// [`handle_prompt_key`] dispatch is specific to a search prompt.
+pub type SearchInput = crate::ui::text_input::LineInput;
 
 /// What [`handle_prompt_key`] decided one key press should do, beyond
 /// editing the buffer itself — the single-line sibling of
@@ -293,29 +294,23 @@ pub enum SearchPromptOutcome {
 /// routed through the keymap resolver first.
 pub fn handle_prompt_key(input: &mut SearchInput, key: KeyEvent) -> SearchPromptOutcome {
     match key.code {
-        KeyCode::Esc => SearchPromptOutcome::Cancel,
-        KeyCode::Enter => SearchPromptOutcome::Confirm,
-        KeyCode::Backspace => {
-            input.backspace();
-            SearchPromptOutcome::Continue
-        }
-        KeyCode::Left => {
-            input.move_left();
-            SearchPromptOutcome::Continue
-        }
-        KeyCode::Right => {
-            input.move_right();
-            SearchPromptOutcome::Continue
-        }
-        // As `compose::handle_key`/`handle_revision_key`: a stray
-        // control/alt-modified char (habitual `C-a`/`C-e` etc.) is left
-        // alone rather than inserted literally.
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            input.insert_char(c);
-            SearchPromptOutcome::Continue
-        }
-        _ => SearchPromptOutcome::Continue,
+        KeyCode::Esc => return SearchPromptOutcome::Cancel,
+        KeyCode::Enter => return SearchPromptOutcome::Confirm,
+        _ => {}
     }
+    // Insert/backspace/word-delete/left/right go through the shared
+    // editing core every raw-key-bypass text field uses — see
+    // `text_input::recognize`'s own docs for why an unrecognized key (a
+    // stray `C-a`/`C-e` etc.) is swallowed rather than inserted literally.
+    match text_input::recognize(&key) {
+        Some(EditCommand::Insert(c)) => input.insert_char(c),
+        Some(EditCommand::Backspace) => input.backspace(),
+        Some(EditCommand::DeletePreviousWord) => input.delete_previous_word(),
+        Some(EditCommand::MoveLeft) => input.move_left(),
+        Some(EditCommand::MoveRight) => input.move_right(),
+        None => {}
+    }
+    SearchPromptOutcome::Continue
 }
 
 /// The `/` prompt's live state while it's open: the raw-bypass overlay's
@@ -349,7 +344,7 @@ pub struct SearchPromptState {
 mod tests {
     use super::*;
     use crate::diff::{DiffHunk, DiffLineKind, DiffRow, flatten};
-    use crossterm::event::{KeyEventKind, KeyEventState};
+    use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
 
     fn line(text: &str, new_line: u32) -> DiffRow {
         DiffRow {
@@ -714,5 +709,19 @@ mod tests {
         );
         assert_eq!(outcome, SearchPromptOutcome::Continue);
         assert_eq!(input.text(), "");
+    }
+
+    #[test]
+    fn handle_key_ctrl_w_deletes_the_previous_word() {
+        let mut input = SearchInput::new();
+        for c in "fn main".chars() {
+            input.insert_char(c);
+        }
+        let outcome = handle_prompt_key(
+            &mut input,
+            key_mod(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(outcome, SearchPromptOutcome::Continue);
+        assert_eq!(input.text(), "fn ");
     }
 }

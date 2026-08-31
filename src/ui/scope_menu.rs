@@ -8,7 +8,7 @@
 //!   matching every other view/overlay's pattern in this codebase of
 //!   keeping the state transitions testable without a real terminal.
 //! - [`RevisionInput`]/[`handle_revision_key`]: the one-line text field
-//!   "Revision…" opens, reusing [`crate::ui::compose`]'s char-indexed
+//!   "Revision…" opens, reusing [`crate::ui::text_input`]'s char-indexed
 //!   buffer conventions (see [`RevisionInput`]'s docs) since it's the same
 //!   kind of "a user is typing text" state, just single-line and
 //!   submit-on-Enter rather than newline-on-Enter.
@@ -19,8 +19,8 @@
 //! same split [`crate::ui::log_view::LogView`] draws between its own list
 //! and `ui::mod::handle_action`'s `Action::Confirm` handling for it.
 
-use crate::ui::compose::cursor_marked_line;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::ui::text_input::{self, EditCommand, cursor_marked_line};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -127,16 +127,16 @@ impl ScopeMenuList {
 }
 
 /// A single-line text buffer for the "Revision…" entry's free-form input —
-/// [`crate::ui::compose::LineInput`] under its own name here rather than a
-/// redefinition: see that type's docs for why the buffer itself (char, not
-/// byte, indexed — safe against ever splitting a UTF-8 sequence
-/// mid-character) lives in `compose` and is shared with
+/// [`crate::ui::text_input::LineInput`] under its own name here rather than
+/// a redefinition: see that type's docs for why the buffer itself (char,
+/// not byte, indexed — safe against ever splitting a UTF-8 sequence
+/// mid-character) lives in `text_input` and is shared with
 /// [`crate::ui::search::SearchInput`] rather than each prompt keeping its
 /// own copy. Deliberately not [`crate::ui::compose::ComposeBuffer`]: that
 /// type is multi-line, with `Enter` meaning "insert a newline" — exactly
 /// wrong for a field where `Enter` means "submit this one line" (see
 /// [`handle_revision_key`]) and there is no second line to navigate to.
-pub type RevisionInput = crate::ui::compose::LineInput;
+pub type RevisionInput = crate::ui::text_input::LineInput;
 
 /// What [`handle_revision_key`] decided one key press should do, beyond
 /// editing the buffer itself — the single-line sibling of
@@ -162,29 +162,23 @@ pub enum RevisionInputOutcome {
 /// [`crate::keymap::Action`]s if routed through the keymap resolver first.
 pub fn handle_revision_key(input: &mut RevisionInput, key: KeyEvent) -> RevisionInputOutcome {
     match key.code {
-        KeyCode::Esc => RevisionInputOutcome::Back,
-        KeyCode::Enter => RevisionInputOutcome::Submit(input.text().to_owned()),
-        KeyCode::Backspace => {
-            input.backspace();
-            RevisionInputOutcome::Continue
-        }
-        KeyCode::Left => {
-            input.move_left();
-            RevisionInputOutcome::Continue
-        }
-        KeyCode::Right => {
-            input.move_right();
-            RevisionInputOutcome::Continue
-        }
-        // As `compose::handle_key`: a stray control/alt-modified char
-        // (habitual `C-a`/`C-e` etc.) is left alone rather than inserted
-        // literally.
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            input.insert_char(c);
-            RevisionInputOutcome::Continue
-        }
-        _ => RevisionInputOutcome::Continue,
+        KeyCode::Esc => return RevisionInputOutcome::Back,
+        KeyCode::Enter => return RevisionInputOutcome::Submit(input.text().to_owned()),
+        _ => {}
     }
+    // Insert/backspace/word-delete/left/right go through the shared
+    // editing core every raw-key-bypass text field uses — see
+    // `text_input::recognize`'s own docs for why an unrecognized key (a
+    // stray `C-a`/`C-e` etc.) is swallowed rather than inserted literally.
+    match text_input::recognize(&key) {
+        Some(EditCommand::Insert(c)) => input.insert_char(c),
+        Some(EditCommand::Backspace) => input.backspace(),
+        Some(EditCommand::DeletePreviousWord) => input.delete_previous_word(),
+        Some(EditCommand::MoveLeft) => input.move_left(),
+        Some(EditCommand::MoveRight) => input.move_right(),
+        None => {}
+    }
+    RevisionInputOutcome::Continue
 }
 
 /// What the scope-menu popup is currently showing: the entry list, or (once
@@ -356,7 +350,7 @@ fn render_pr_input(frame: &mut Frame, area: Rect, input: &RevisionInput) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyEventKind, KeyEventState};
+    use crossterm::event::{KeyEventKind, KeyEventState, KeyModifiers};
 
     // ---- available_entries / ScopeMenuList --------------------------------
 
@@ -537,5 +531,21 @@ mod tests {
         );
         assert_eq!(outcome, RevisionInputOutcome::Continue);
         assert_eq!(input.text(), "");
+    }
+
+    #[test]
+    fn handle_key_ctrl_w_deletes_the_previous_word() {
+        let mut input = RevisionInput::new();
+        // A revset has no internal whitespace, so word-rubout's boundary is
+        // the space this string does have — everything after it goes.
+        for c in "main..feature widget".chars() {
+            input.insert_char(c);
+        }
+        let outcome = handle_revision_key(
+            &mut input,
+            key_mod(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(outcome, RevisionInputOutcome::Continue);
+        assert_eq!(input.text(), "main..feature ");
     }
 }
