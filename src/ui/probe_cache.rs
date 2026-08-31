@@ -35,12 +35,32 @@
 //!
 //! **Staleness.** There is no expiry and no revalidation — a verdict, once
 //! cached for a fingerprint, is trusted forever. The one way this can go
-//! stale is a user switching to a *different* terminal emulator that happens
-//! to reuse an already-cached fingerprint (e.g. two VTE-family terminals, or
-//! upgrading an emulator that changes `TERM_PROGRAM_VERSION` in a way that
-//! doesn't affect kitty support) — a real but narrow case, and `ktmr reset
-//! --cache` (which removes this file along with every other disposable
-//! cache) is the escape hatch when it matters.
+//! stale outside a multiplexer (see below) is a user switching to a
+//! *different* terminal emulator that happens to reuse an already-cached
+//! fingerprint (e.g. two VTE-family terminals, or upgrading an emulator that
+//! changes `TERM_PROGRAM_VERSION` in a way that doesn't affect kitty
+//! support) — a real but narrow case, and `ktmr reset --cache` (which
+//! removes this file along with every other disposable cache) is the escape
+//! hatch when it matters.
+//!
+//! **Multiplexers.** tmux (>=3.2, unconditionally) and GNU screen overwrite
+//! `TERM`/`TERM_PROGRAM`/`TERM_PROGRAM_VERSION` to their own identity —
+//! `TERM_PROGRAM=tmux`, `TERM` set to whatever `default-terminal` is
+//! configured — regardless of which outer terminal emulator actually hosts
+//! the session and regardless of whether *that* emulator's passthrough
+//! supports the kitty keyboard protocol. Left unhandled, this is not the
+//! narrow case above: it collapses *every* outer emulator behind one tmux
+//! (or screen) session/version onto one fingerprint, so a user who runs
+//! `ktmr` in tmux from a kitty-capable terminal and later from a
+//! non-capable one (or the reverse) gets served the first terminal's
+//! verdict for the second, silently — and `ktmr doctor`'s own cache check
+//! (`doctor::kitty_probe_check`) can't catch it either, since it reads the
+//! identical fingerprint from inside the same wrongly-collapsed session. So
+//! [`multiplexed_from_env`] gates the cache out entirely — a session with
+//! `$TMUX` or `$STY` set never looks up or records a verdict, always
+//! re-probing instead — trading the (bounded, ≤2s, one-time-per-launch) cost
+//! of a real probe for never trusting or writing a signal that's already
+//! lost the identity it would need to key on.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -85,6 +105,27 @@ pub(crate) fn fingerprint_from_env() -> String {
 
 fn env_var(name: &str) -> String {
     std::env::var(name).unwrap_or_default()
+}
+
+/// [`multiplexed`] applied to this process's real environment — see the
+/// module docs' **Multiplexers** section. `run` and `doctor::kitty_probe_check`
+/// both call this before touching the cache at all: a `true` result means
+/// [`fingerprint_from_env`] still returns *some* string (fingerprints are
+/// unconditional — the value is still worth showing in a doctor report), but
+/// neither [`look_up`] nor [`record`] should ever be called against it.
+pub(crate) fn multiplexed_from_env() -> bool {
+    multiplexed(&env_var("TMUX"), &env_var("STY"))
+}
+
+/// True when either value is non-empty — the pure half of
+/// [`multiplexed_from_env`], kept separate the same way [`fingerprint`] is
+/// kept separate from [`fingerprint_from_env`], so a test can exercise the
+/// decision against fabricated values without touching this process's real
+/// environment. `TMUX` is tmux's own per-session marker (set for every
+/// process it spawns, unrelated to its rewritten `TERM`/`TERM_PROGRAM`
+/// pair); `STY` is GNU screen's equivalent.
+fn multiplexed(tmux: &str, sty: &str) -> bool {
+    !tmux.is_empty() || !sty.is_empty()
 }
 
 /// Builds the cache key from the three env values that identify a terminal
@@ -195,6 +236,35 @@ mod tests {
         let gnome_terminal = fingerprint("xterm-256color", "", "");
         let some_other_vte_terminal = fingerprint("xterm-256color", "", "");
         assert_eq!(gnome_terminal, some_other_vte_terminal);
+    }
+
+    // --- multiplexer detection ------------------------------------------------
+
+    #[test]
+    fn neither_tmux_nor_sty_set_is_not_multiplexed() {
+        assert!(!multiplexed("", ""));
+    }
+
+    #[test]
+    fn a_nonempty_tmux_value_is_multiplexed() {
+        // Real tmux sets `$TMUX` to a socket-path/pid/window triple, but any
+        // non-empty value means "spawned inside a tmux session" — the
+        // fingerprint-collapsing behavior this guards against doesn't
+        // depend on which triple it is.
+        assert!(multiplexed("/tmp/tmux-1000/default,1234,0", ""));
+    }
+
+    #[test]
+    fn a_nonempty_sty_value_is_multiplexed() {
+        assert!(multiplexed("", "1234.pts-0.host"));
+    }
+
+    #[test]
+    fn both_set_is_still_multiplexed() {
+        assert!(multiplexed(
+            "/tmp/tmux-1000/default,1234,0",
+            "1234.pts-0.host"
+        ));
     }
 
     // --- cache read/write round trip ----------------------------------------

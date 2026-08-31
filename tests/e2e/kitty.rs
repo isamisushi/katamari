@@ -371,13 +371,7 @@ fn a_second_launch_writes_then_reuses_the_kitty_probe_cache() {
             ..Default::default()
         },
     );
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed < long_delay / 2,
-        "a cache-hit launch must skip the probe entirely rather than \
-         merely outrace a withheld reply; ready in {elapsed:?} against a \
-         {long_delay:?} withheld reply"
-    );
+    let cache_hit_elapsed = start.elapsed();
     assert!(
         h.screen_contents().contains("README.md"),
         "the real diff view, not just any non-splash frame, must have \
@@ -389,6 +383,139 @@ fn a_second_launch_writes_then_reuses_the_kitty_probe_cache() {
     assert!(
         status.success(),
         "second launch should exit 0, got {status:?}"
+    );
+
+    // Proof this is a genuine skip, not a hardcoded wall-clock budget on a
+    // real fork/exec plus full startup: a third launch against a *fresh*
+    // cache (a fresh `state_home`, deliberately not reused from above), with
+    // the exact same withheld-reply delay, measures how long a real
+    // cache-*miss* launch takes under this run's own scheduling/contention —
+    // the number `cache_hit_elapsed` must clear. Comparing the two against
+    // each other rather than against a fixed threshold means this assertion
+    // tracks relative speedup on whatever machine happens to run it, instead
+    // of a millisecond figure tuned to this one.
+    let baseline_start = Instant::now();
+    let mut baseline = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            probe_reply_delay: Some(long_delay),
+            ..Default::default()
+        },
+    );
+    let baseline_elapsed = baseline_start.elapsed();
+    baseline.send(Key::Char('q'));
+    let baseline_status = baseline.wait_exit(Duration::from_secs(5));
+    assert!(
+        baseline_status.success(),
+        "baseline (fresh-cache) launch should exit 0, got {baseline_status:?}"
+    );
+
+    assert!(
+        cache_hit_elapsed < baseline_elapsed / 2,
+        "a cache-hit launch must skip the probe entirely rather than \
+         merely outrace a withheld reply; cache-hit ready in \
+         {cache_hit_elapsed:?}, a fresh-cache baseline against the same \
+         {long_delay:?} withheld reply took {baseline_elapsed:?}"
+    );
+}
+
+// ---- kitty probe cache: bypassed entirely inside a multiplexer -----------
+
+/// The fix for the fingerprint-collapse bug: inside tmux/screen,
+/// `TERM`/`TERM_PROGRAM`/`TERM_PROGRAM_VERSION` no longer identify the outer
+/// terminal (tmux overwrites all three to its own identity regardless of
+/// which emulator hosts the session — see `ui::probe_cache`'s module docs'
+/// **Multiplexers** section), so two different outer terminals — one
+/// kitty-capable, one not — would otherwise collapse onto one fingerprint
+/// and silently share a verdict that belongs to whichever one happened to
+/// probe first. Proven two ways against the same warm cache this test
+/// itself seeds: a launch with `$TMUX` set never *records* a verdict at all
+/// (so the cache file a plain-terminal launch would have produced here
+/// simply doesn't exist), and a launch with `$TMUX` set never *trusts* one
+/// either — reusing the exact same-fingerprint warm-cache setup
+/// `a_second_launch_writes_then_reuses_the_kitty_probe_cache` above proves
+/// *does* get skipped outside a multiplexer, and showing it does not get
+/// skipped here.
+#[test]
+fn tmux_sessions_bypass_the_kitty_probe_cache() {
+    let repo = fixture::basic_repo();
+    let state_home = tempfile::tempdir().expect("tempdir for a shared $XDG_STATE_HOME");
+    let cache_path = state_home.path().join("katamari").join("kitty-probe.json");
+    // A real tmux `$TMUX` value's shape (socket path, pid, window); only
+    // "non-empty" matters to `probe_cache::multiplexed_from_env`, but a
+    // realistic value keeps this test honest about what it's simulating.
+    let tmux_env = vec![(
+        std::ffi::OsString::from("TMUX"),
+        std::ffi::OsString::from("/tmp/tmux-1000/default,12345,0"),
+    )];
+
+    // First launch, `$TMUX` set: the real probe still answers (this
+    // harness's default `KittyMode::Supported`), but `enable_kitty_keyboard_
+    // protocol` must not persist that answer — see this test's own docs.
+    {
+        let mut h = Harness::spawn(
+            repo.path(),
+            SpawnOptions {
+                state_home: Some(state_home.path().to_path_buf()),
+                extra_env: tmux_env.clone(),
+                ..Default::default()
+            },
+        );
+        h.send(Key::Char('q'));
+        let status = h.wait_exit(Duration::from_secs(5));
+        assert!(
+            status.success(),
+            "first (tmux) launch should exit 0, got {status:?}"
+        );
+    }
+    assert!(
+        !cache_path.exists(),
+        "a multiplexed launch must never write the kitty probe cache \
+         (fingerprint has no terminal identity left to key on): found {}",
+        cache_path.display()
+    );
+
+    // Second launch, same state home and same `$TMUX` value — if a verdict
+    // *had* been written above (or if `enable_kitty_keyboard_protocol`
+    // wrongly trusted the fingerprint despite never seeing a write), this
+    // launch could skip the probe. It must not: the withheld reply below
+    // must actually be waited on, proven the same relative way the
+    // cache-hit test above proves the opposite — this launch must take
+    // meaningfully *longer* than a cache-hit would, not shorter.
+    let long_delay = Duration::from_secs(4);
+    let start = Instant::now();
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            state_home: Some(state_home.path().to_path_buf()),
+            extra_env: tmux_env,
+            probe_reply_delay: Some(long_delay),
+            ..Default::default()
+        },
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= long_delay / 2,
+        "a multiplexed launch must always re-probe rather than ever trust a \
+         cached verdict; ready in {elapsed:?} despite a {long_delay:?} \
+         withheld reply"
+    );
+    assert!(
+        h.screen_contents().contains("README.md"),
+        "the real diff view must still render once the withheld reply lands"
+    );
+    assert!(
+        !cache_path.exists(),
+        "the second multiplexed launch must not have written the cache \
+         either: found {}",
+        cache_path.display()
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(
+        status.success(),
+        "second (tmux) launch should exit 0, got {status:?}"
     );
 }
 

@@ -526,9 +526,29 @@ fn config_section(effective_root: &Path) -> Section {
 /// (either verdict) is `ok` — the next launch in this terminal skips the
 /// real probe either way; a miss is `warn`, since it means the *next*
 /// launch, not this `doctor` run, will pay crossterm's up-to-2s wait.
+///
+/// Checked first, ahead of the lookup: inside a terminal multiplexer
+/// (`$TMUX`/`$STY` set), `fingerprint` no longer identifies the outer
+/// terminal in front of the user (see `probe_cache`'s module docs'
+/// **Multiplexers** section) — `run` never looks the cache up there either,
+/// so reporting a `hit`/`miss` off this same fingerprint would tell this
+/// user a terminal-specific answer that doesn't actually apply to their
+/// terminal. This is `warn`, same as a miss, but for a different (and
+/// permanent, not one-launch) reason: every launch in this session pays the
+/// real probe, by design, not just the next one.
 fn kitty_probe_check() -> Check {
     let fingerprint = probe_cache::fingerprint_from_env();
     let label = "kitty keyboard probe cache";
+    if probe_cache::multiplexed_from_env() {
+        return Check::warn(
+            label,
+            format!(
+                "disabled inside a terminal multiplexer ({fingerprint}) — tmux/screen \
+                 overwrite the env vars this cache keys on, so every launch here re-probes \
+                 rather than trust a verdict that might belong to a different outer terminal"
+            ),
+        );
+    }
     match probe_cache::look_up(&probe_cache::cache_file_path(), &fingerprint) {
         Some(true) => Check::ok(
             label,

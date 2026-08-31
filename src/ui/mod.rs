@@ -264,9 +264,19 @@ pub fn run(
     // `probe_cache`'s module docs for the fingerprint and staleness
     // reasoning, and `render_startup_splash`'s docs for what it does with
     // `cached_kitty_support.is_none()` below.
+    //
+    // `probe_cache_usable` gates both the lookup here and the recording
+    // inside `enable_kitty_keyboard_protocol` below — see `probe_cache`'s
+    // module docs' **Multiplexers** section: inside tmux/screen,
+    // `probe_fingerprint` is still computed (a doctor report can still show
+    // it) but never trusted or written, since the multiplexer has already
+    // overwritten the very env vars it's built from.
     let probe_cache_path = probe_cache::cache_file_path();
     let probe_fingerprint = probe_cache::fingerprint_from_env();
-    let cached_kitty_support = probe_cache::look_up(&probe_cache_path, &probe_fingerprint);
+    let probe_cache_usable = !probe_cache::multiplexed_from_env();
+    let cached_kitty_support = probe_cache_usable
+        .then(|| probe_cache::look_up(&probe_cache_path, &probe_fingerprint))
+        .flatten();
 
     // Between `init_terminal` entering the alternate screen and the event
     // loop's first real `terminal.draw` (below, past config/keymap/LSP
@@ -284,8 +294,12 @@ pub fn run(
     // only, so it doesn't need to respect that ordering itself — it's safe
     // on either side of this call, and goes first so the probe's up-to-2s
     // wait (on a cache miss) never runs against a still-black screen.
-    let ci_distinguishable =
-        enable_kitty_keyboard_protocol(cached_kitty_support, &probe_cache_path, &probe_fingerprint);
+    let ci_distinguishable = enable_kitty_keyboard_protocol(
+        cached_kitty_support,
+        &probe_cache_path,
+        &probe_fingerprint,
+        probe_cache_usable,
+    );
 
     // Issue #20: unlike the kitty probe above, this is a plain write with
     // no reply to race against `spawn_input_thread`'s reader — the ordering
@@ -5130,9 +5144,17 @@ fn draw_startup_splash(
 /// before, so there is nothing left to ask. `Some(false)` returns `false`
 /// immediately, same reasoning in the other direction. Only `None` (no
 /// cached verdict yet — a first launch in this terminal, or one since
-/// `ktmr reset --cache`) runs the real probe below, and — regardless of
-/// which way it answers — records that answer via `probe_cache::record`
-/// before this terminal is ever asked again.
+/// `ktmr reset --cache`, or *every* launch inside a multiplexer, since `run`
+/// never looks one up there) runs the real probe below.
+///
+/// `record_verdict` is `run`'s `probe_cache_usable`
+/// (`!probe_cache::multiplexed_from_env()`) — when true, the real probe's
+/// answer is recorded via `probe_cache::record` before this terminal is
+/// ever asked again; when false (inside tmux/screen), the answer is used
+/// for this session but never written, since `fingerprint` has already lost
+/// the identity a later session under a *different* outer terminal would
+/// need it to carry — see [`probe_cache`]'s module docs' **Multiplexers**
+/// section.
 ///
 /// Must run after [`enable_raw_mode`] (crossterm's probe blocks on a real
 /// synchronous read from the tty — it doesn't work otherwise) and before
@@ -5156,15 +5178,20 @@ fn enable_kitty_keyboard_protocol(
     cached: Option<bool>,
     cache_path: &Path,
     fingerprint: &str,
+    record_verdict: bool,
 ) -> bool {
     if let Some(supported) = cached {
         return supported && push_kitty_enhancement_flags();
     }
     let Ok(true) = supports_keyboard_enhancement() else {
-        probe_cache::record(cache_path, fingerprint, false);
+        if record_verdict {
+            probe_cache::record(cache_path, fingerprint, false);
+        }
         return false;
     };
-    probe_cache::record(cache_path, fingerprint, true);
+    if record_verdict {
+        probe_cache::record(cache_path, fingerprint, true);
+    }
     push_kitty_enhancement_flags()
 }
 

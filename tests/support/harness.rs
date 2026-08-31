@@ -295,7 +295,18 @@ impl Harness {
             .env("HOME", env_home.path())
             .env("XDG_CONFIG_HOME", env_home.path().join("config"))
             .env("XDG_DATA_HOME", env_home.path().join("data"))
-            .env("XDG_STATE_HOME", state_home);
+            .env("XDG_STATE_HOME", state_home)
+            // `ui::probe_cache::multiplexed_from_env` treats either of these
+            // as "inside a terminal multiplexer" and bypasses the kitty
+            // probe cache entirely — a real difference this suite must not
+            // pick up by accident from whatever shell `cargo test` itself
+            // happens to be running under (e.g. a contributor's own tmux
+            // session). Removed unconditionally so every test in this file
+            // sees the same plain-terminal fingerprint regardless of the
+            // ambient environment; `kitty::tmux_sessions_bypass_the_kitty_probe_cache`
+            // opts back in explicitly via `extra_env` below.
+            .env_remove("TMUX")
+            .env_remove("STY");
         for (key, value) in &opts.extra_env {
             command = command.env(key, value);
         }
