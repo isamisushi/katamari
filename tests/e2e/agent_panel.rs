@@ -426,6 +426,132 @@ fn follow_up_while_a_turn_is_running_is_rejected_and_names_the_cancel_key() {
 }
 
 #[test]
+fn cancel_auto_declines_a_permission_that_straggles_in_after_an_immediate_follow_up_is_attempted() {
+    // Regression test for the misattribution bug: a cancelled turn's own
+    // `session/request_permission` arriving *after* the reviewer has
+    // already attempted a follow-up prompt must never be answered as if it
+    // belonged to that follow-up (see `fake_acp_agent.py`'s
+    // `STRAGGLING_PERMISSION` docs for exactly the ordering this proves —
+    // cancel ack, then an immediate follow-up attempt, then the straggler,
+    // then finally the abandoned turn's own response). The follow-up itself
+    // must still go through afterward — held (queued), not dropped, while
+    // the old turn's own response was still outstanding.
+    if !fixture::python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let repo = fixture::basic_repo();
+    let (opts, _home) = agent_spawn_options();
+    let mut h = Harness::spawn(repo.path(), opts);
+
+    open_ask(&h);
+    type_text(&h, "STRAGGLING_PERMISSION");
+    h.send(Key::CtrlS);
+    h.send(Key::Char('A'));
+    h.wait_for_text("thinking slowly");
+
+    h.send(Key::CtrlG);
+    h.wait_for_text("you: cancelled the turn");
+    h.wait_for_text("idle");
+
+    // Attempt a follow-up right away, before the straggler (or the
+    // abandoned turn's own delayed response) has arrived — this is the
+    // exact window the misattribution bug needed: `turn_abandoned` used to
+    // clear the instant this was merely *requested*, not once the old
+    // turn's own response actually landed. The fake agent holds its final
+    // response open for a beat (see its own docs) specifically so this
+    // attempt reliably lands inside that window rather than winning a race
+    // against local IPC latency.
+    h.send(Key::Esc);
+    h.send(Key::Char('a'));
+    h.wait_for_text("C-s save");
+    type_text(&h, "an immediate follow-up");
+    h.send(Key::CtrlS);
+    h.send(Key::Char('A'));
+
+    // The straggler must be auto-declined, not resurrected as a live
+    // permission modal a stray `y` from the reviewer (now mid follow-up)
+    // could grant.
+    h.wait_for_text("auto-declined permission");
+    assert!(
+        !h.screen_contents().contains("agent permission"),
+        "the straggling permission request must never render as a live modal"
+    );
+    assert!(
+        !repo.path().join("acp-straggler-marker.txt").exists(),
+        "the cancelled turn's straggling tool call must never be granted"
+    );
+
+    // The queued follow-up must only actually dispatch once the old turn's
+    // own response has landed — proving this isn't just "eventually every
+    // message shows up somewhere," check the auto-decline is strictly
+    // before the follow-up's own line in the transcript.
+    h.wait_for_text("an immediate follow-up");
+    let screen = h.screen_contents();
+    let declined_at = screen
+        .find("auto-declined permission")
+        .expect("already waited for this text");
+    let follow_up_at = screen
+        .find("an immediate follow-up")
+        .expect("already waited for this text");
+    assert!(
+        declined_at < follow_up_at,
+        "the straggler's auto-decline must be visible before the queued follow-up dispatches, got:\n{screen}"
+    );
+
+    // And the queued follow-up must complete as an entirely normal turn —
+    // held, not silently dropped, by the draining window it landed in.
+    h.wait_for_text("agent permission");
+    h.send(Key::Char('y'));
+    h.wait_until(Duration::from_secs(10), |screen| {
+        screen.contents().contains("turn finished (end_turn)")
+    });
+    assert!(
+        repo.path().join("acp-marker-2.txt").is_file(),
+        "the queued follow-up must complete normally once the drain resolved"
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
+fn cancel_key_during_a_slow_handshake_takes_effect_immediately_not_after_it_finishes() {
+    // Regression test: `TurnState::Spawning`'s "C-g cancel" footer hint
+    // used to be inert — a cancel queued while the manager thread was
+    // blocked inside `spawn_and_handshake`'s own synchronous
+    // `recv_timeout` just sat unprocessed until that step finished or timed
+    // out on its own. `wait_for_text`'s default 3s budget (`DEFAULT_WAIT`,
+    // far under the artificial handshake delay below) is the actual proof
+    // here: if C-g were still inert, this would time out and panic rather
+    // than ever reach "idle".
+    if !fixture::python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let repo = fixture::basic_repo();
+    let (mut opts, _home) = agent_spawn_options();
+    opts.extra_env
+        .push(("KATAMARI_FAKE_ACP_HANDSHAKE_DELAY_SECS".into(), "10".into()));
+    let mut h = Harness::spawn(repo.path(), opts);
+
+    open_ask(&h);
+    type_text(&h, "hello");
+    h.send(Key::CtrlS);
+    h.send(Key::Char('A'));
+    h.wait_for_text("spawning adapter");
+
+    h.send(Key::CtrlG);
+    h.wait_for_text("you: cancelled the turn");
+    h.wait_for_text("idle");
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
 fn push_comments_to_agent_with_nothing_open_reports_a_status_and_sends_nothing() {
     if !fixture::python3_available() {
         eprintln!("skipping: python3 not on PATH");

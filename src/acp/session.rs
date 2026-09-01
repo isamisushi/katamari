@@ -42,7 +42,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Same generous bound `check::run`'s own handshake steps use — the npx
 /// fallback downloads the adapter package on first use, slow once, cached
@@ -50,6 +50,16 @@ use std::time::Duration;
 /// and private to that module, and duplicating one `Duration` literal costs
 /// less than making it `pub(crate)` just to save a line.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long [`run_session`] waits for a cancelled turn's own
+/// `session/prompt` response to actually land before giving up on it and
+/// letting a fresh prompt through anyway — see `draining_rx`'s own docs
+/// for what this guards. Must be comfortably longer than the real
+/// adapter's documented ~30s force-cancel backstop (see
+/// [`SessionCommand::CancelTurn`]'s docs), or a well-behaved adapter's own
+/// timeout would routinely lose the race against this one and never get
+/// the chance to answer.
+const CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// The one message for "a `SessionCommand::Prompt` arrived while a turn was
 /// already running," shared by every place that can report it: this
@@ -195,11 +205,15 @@ enum SessionCommand {
     /// this can't be waited on). See [`run_session`]'s own handling for the
     /// full sequence: any pending permission is answered as a reject first,
     /// [`TurnState`] returns to `Idle` immediately regardless of whether the
-    /// adapter ever actually stops, and every `session/update` between now
-    /// and the next prompt actually starting is swallowed rather than risk
-    /// it reading as this transcript's own continuation (ACP v1 has no
+    /// adapter ever actually stops, and every `session/update`/
+    /// `session/request_permission` between now and the abandoned turn's
+    /// own `session/prompt` response actually landing is swallowed rather
+    /// than risk it reading as a fresh turn's own traffic (ACP v1 has no
     /// turn/request id on `session/update` to correlate against otherwise —
-    /// see the module docs).
+    /// see the module docs). A [`SessionCommand::Prompt`] arriving during
+    /// that window is rejected, not queued or dispatched early — see
+    /// `draining_rx`'s own docs in [`run_session`] for why a fresh prompt
+    /// can't safely go out until the old one is confirmed settled.
     CancelTurn,
     /// Carries a rendezvous `Sender` so [`AgentStore::shutdown`] can wait
     /// (briefly) for the transport to actually die before the process
@@ -361,12 +375,12 @@ impl AgentStore {
     /// an adapter process spawned mid-session doesn't outlive `ktmr`'s own
     /// exit (the same guarantee [`super::transport::Transport::kill`]'s own
     /// docs describe), short enough that quitting never visibly hangs. A
-    /// manager thread stuck deep inside a slow handshake (spawn already
-    /// under way, past 3s) can outlive this wait — a bounded risk accepted
-    /// here the same way `check::run`'s own handshake has no external
-    /// cancellation either; process exit reaps the thread regardless, the
-    /// only cost is a possibly-orphaned adapter process in that one rare
-    /// race.
+    /// `Shutdown` queued mid-handshake is now picked up within
+    /// [`POLL_INTERVAL`] rather than only once the in-flight handshake step
+    /// finishes on its own (see [`wait_handshake_step`]'s docs), so the
+    /// window this wait can actually be outrun in is small; process exit
+    /// reaps the thread regardless if it somehow still is, the only cost
+    /// then being a possibly-orphaned adapter process in that rarer race.
     pub fn shutdown(&self) {
         let (ack_tx, ack_rx) = mpsc::channel();
         if self
@@ -456,9 +470,40 @@ fn run_session(
     // Client-side stand-in for turn identity — ACP v1's `session/update`
     // carries no turn/request id to correlate against (see the module
     // docs), so this is what lets a cancelled turn's late-arriving updates
-    // be told apart from the next turn's own. Set by `SessionCommand::CancelTurn`,
-    // cleared the moment a fresh prompt actually starts.
+    // be told apart from the next turn's own. Set by `SessionCommand::CancelTurn`;
+    // cleared only once `draining_rx` (below) confirms the abandoned turn's
+    // own `session/prompt` has actually resolved, or `CANCEL_DRAIN_TIMEOUT`
+    // gives up on waiting for that — never merely because a fresh prompt
+    // was *requested*, which used to be the bug: a straggling permission
+    // request from turn A could arrive after a follow-up `Prompt` for turn
+    // B had already cleared this, and would then be misread as turn B's
+    // own request instead of auto-declined.
     let mut turn_abandoned = false;
+    // The cancelled turn's own `prompt_rx`, kept rather than dropped —
+    // "draining" until its `session/prompt` response actually lands (or
+    // `CANCEL_DRAIN_TIMEOUT` elapses waiting for it). A fresh
+    // `SessionCommand::Prompt` is never dispatched while this is `Some`:
+    // dispatching one early would mean two `session/prompt` calls in flight
+    // on the same session at once, which ACP v1 does not allow (see
+    // `AcpClient::prompt`'s own doc comment), and would also force
+    // `turn_abandoned` to clear before this thread can tell whether the old
+    // turn is truly done raising `session/request_permission`.
+    let mut draining_rx: Option<Receiver<Result<serde_json::Value, super::transport::AcpError>>> =
+        None;
+    let mut draining_since: Option<Instant> = None;
+    // A prompt requested while `draining_rx` is still `Some` — held here
+    // rather than rejected outright, and dispatched automatically the
+    // moment draining resolves (see the poll below). Without this, "ask a
+    // follow-up right after C-g" would be a straight race between however
+    // long the *adapter* takes to actually confirm the cancel and however
+    // long the *reviewer* takes to type the next question — fine on a fast
+    // local fake agent, but a real one (or a loaded CI box) can lose that
+    // race, rejecting a follow-up the reviewer has every reason to expect
+    // "just works" the way the panel's own footer already promises. Holds
+    // at most one: a second `Prompt` arriving while this is already `Some`
+    // is rejected, the same reject-not-queue-more-than-one reasoning the
+    // ordinary busy check applies (see the module docs' B5).
+    let mut pending_after_drain: Option<String> = None;
 
     loop {
         match command_rx.try_recv() {
@@ -470,47 +515,51 @@ fn run_session(
                 return;
             }
             Ok(SessionCommand::Prompt(text)) => {
-                if prompt_rx.is_some() {
-                    // A turn (or the handshake ahead of one) already has
-                    // this session's undivided attention — reject rather
-                    // than queue (see the module docs' B5 reasoning). Also
-                    // notifies the event loop (`AcpNotice::PromptRejected`),
-                    // not just the transcript — the UI's own synchronous
-                    // pre-check catches the common case, but this branch is
-                    // what actually runs when a second prompt slips in
-                    // during the up-to-`POLL_INTERVAL` window between that
-                    // check and this thread dequeuing the command (e.g. two
-                    // `p` presses from keyboard auto-repeat), and that
-                    // rejection needs to be just as visible as the
-                    // synchronous one.
+                if prompt_rx.is_some() || pending_after_drain.is_some() {
+                    // A turn is genuinely running, or a previous cancel is
+                    // already holding one queued follow-up in
+                    // `pending_after_drain` — either way this session's
+                    // undivided attention is already spoken for, and a
+                    // second prompt is rejected rather than queued (see the
+                    // module docs' B5 reasoning: holding *two* would risk
+                    // dispatching one against context the reviewer has since
+                    // scrolled away from). Also notifies the event loop
+                    // (`AcpNotice::PromptRejected`), not just the transcript
+                    // — the UI's own synchronous pre-check catches the
+                    // common case, but this branch is what actually runs
+                    // when a second prompt slips in during the
+                    // up-to-`POLL_INTERVAL` window between that check and
+                    // this thread dequeuing the command (e.g. two `p`
+                    // presses from keyboard auto-repeat).
                     store.push_system(AGENT_BUSY_MSG.to_owned());
                     let _ = notice_tx.send(AcpNotice::PromptRejected);
-                } else {
-                    if client.is_none() {
-                        store.set_state(TurnState::Spawning);
-                        match spawn_and_handshake(adapter_override.as_deref(), &repo_root) {
-                            Ok((c, ev, sess, description)) => {
-                                store.set_adapter_description(description);
-                                client = Some(c);
-                                events = Some(ev);
-                                session_id = Some(sess);
-                            }
-                            Err(e) => {
-                                store.push_system(format!("agent: {e}"));
-                                store.set_state(TurnState::Idle);
-                                let _ = notice_tx.send(AcpNotice::SpawnFailed(e));
-                            }
-                        }
-                    }
-                    if let (Some(c), Some(sess)) = (&client, &session_id) {
-                        store.push_system(format!("you: {text}"));
-                        store.set_state(TurnState::Running);
-                        prompt_rx = Some(c.prompt(sess, &text));
-                        // A fresh turn genuinely starting — any abandonment
-                        // from a previous cancel no longer applies (see
-                        // `turn_abandoned`'s own docs).
-                        turn_abandoned = false;
-                    }
+                } else if draining_rx.is_some() {
+                    // A just-cancelled turn is still draining its own
+                    // `session/prompt` response (see that field's docs) —
+                    // held rather than dispatched or rejected: dispatching
+                    // now would mean two `session/prompt` calls in flight at
+                    // once (ACP v1 forbids this) and would risk a straggling
+                    // `session/request_permission` from the old turn being
+                    // misattributed to this one; rejecting would turn "ask a
+                    // follow-up right after C-g" into a race against however
+                    // long the adapter takes to confirm the cancel. The poll
+                    // below dispatches this the moment draining resolves.
+                    pending_after_drain = Some(text);
+                } else if let Some(ack) = dispatch_prompt(
+                    text,
+                    adapter_override.as_deref(),
+                    &repo_root,
+                    &command_rx,
+                    &store,
+                    &notice_tx,
+                    &mut client,
+                    &mut events,
+                    &mut session_id,
+                    &mut prompt_rx,
+                    &mut turn_abandoned,
+                ) {
+                    let _ = ack.send(());
+                    return;
                 }
             }
             Ok(SessionCommand::CancelTurn) => {
@@ -558,15 +607,21 @@ fn run_session(
                         let _ = c.cancel(sess);
                     }
                     store.set_state(TurnState::Idle);
-                    // Drop the pending `session/prompt` receiver rather
-                    // than wait on it — safe (the transport's own `tx.send`
-                    // on the other end just becomes a no-op once this end
-                    // is gone; the pending slot itself is still cleaned up
-                    // normally by `dispatch_inbound` whenever the late
-                    // reply does arrive). This is what lets a fresh
-                    // `SessionCommand::Prompt` past the `prompt_rx.is_some()`
-                    // busy check on the very next loop iteration.
-                    prompt_rx = None;
+                    // Move the pending `session/prompt` receiver into
+                    // `draining_rx` rather than dropping it — a fresh
+                    // `SessionCommand::Prompt` must not go out (and
+                    // `turn_abandoned` must not clear) until this turn's own
+                    // response actually lands, or `CANCEL_DRAIN_TIMEOUT`
+                    // gives up on waiting for it (see both fields' own
+                    // docs). Dropping it here, as this used to, let a
+                    // follow-up prompt dispatch the instant the *next*
+                    // `SessionCommand::Prompt` was merely requested — with
+                    // nothing to stop this turn's own late
+                    // `session/request_permission` from then being
+                    // misattributed to that follow-up and answered as if it
+                    // were its own.
+                    draining_rx = prompt_rx.take();
+                    draining_since = Some(Instant::now());
                     turn_abandoned = true;
                     let _ = notice_tx.send(AcpNotice::TurnFinished {
                         stop_reason: "cancelled".to_owned(),
@@ -610,6 +665,79 @@ fn run_session(
             Err(TryRecvError::Disconnected) => return, // every AgentHandle dropped
         }
 
+        // Polled every pass, independent of whether a command actually
+        // arrived this iteration — a cancelled turn's adapter can (and, per
+        // the real one's own async `canUseTool` path, sometimes does) keep
+        // talking well after `session/cancel` went out, so this has to keep
+        // checking on its own rather than only in response to something
+        // else waking the loop. See `draining_rx`'s own docs for why this
+        // gates both the busy-check above and `turn_abandoned` below.
+        let mut just_drained = false;
+        if let Some(rx) = &draining_rx {
+            match rx.try_recv() {
+                Ok(_) | Err(TryRecvError::Disconnected) => {
+                    // The abandoned turn's own `session/prompt` response
+                    // landed (or its channel died, e.g. the adapter process
+                    // exited without ever answering) — either way, nothing
+                    // more can arrive that plausibly belongs to that turn,
+                    // so it's now safe to stop swallowing `session/update`
+                    // and auto-declining `session/request_permission`, and
+                    // to let a fresh prompt actually go out.
+                    draining_rx = None;
+                    draining_since = None;
+                    turn_abandoned = false;
+                    just_drained = true;
+                }
+                Err(TryRecvError::Empty) => {
+                    if draining_since.is_some_and(|since| since.elapsed() >= CANCEL_DRAIN_TIMEOUT) {
+                        // The adapter never confirmed the cancel at all
+                        // (a hand-rolled `--adapter` that ignores
+                        // `session/cancel` entirely, say) — give up waiting
+                        // rather than lock the session out of new prompts
+                        // forever. Any stragglers this adapter still sends
+                        // after this point are no longer distinguishable
+                        // from a fresh turn's own traffic, which is exactly
+                        // the risk `AGENT_BUSY_MSG`'s TOCTOU precedent
+                        // elsewhere in this module already accepts for
+                        // narrower windows — this is the same trade-off,
+                        // just bounded at `CANCEL_DRAIN_TIMEOUT` instead of
+                        // `POLL_INTERVAL`.
+                        store.push_system(
+                            "agent: cancelled turn never confirmed — allowing new prompts anyway"
+                                .to_owned(),
+                        );
+                        draining_rx = None;
+                        draining_since = None;
+                        turn_abandoned = false;
+                        just_drained = true;
+                    }
+                }
+            }
+        }
+        // A follow-up asked while draining was still in progress (see
+        // `pending_after_drain`'s own docs) — now that draining just
+        // resolved, dispatch it exactly the way a fresh `Prompt` command
+        // would have, had it arrived this late instead of during the drain.
+        if just_drained
+            && let Some(text) = pending_after_drain.take()
+            && let Some(ack) = dispatch_prompt(
+                text,
+                adapter_override.as_deref(),
+                &repo_root,
+                &command_rx,
+                &store,
+                &notice_tx,
+                &mut client,
+                &mut events,
+                &mut session_id,
+                &mut prompt_rx,
+                &mut turn_abandoned,
+            )
+        {
+            let _ = ack.send(());
+            return;
+        }
+
         if let Some(rx) = &prompt_rx
             && let Ok(result) = rx.try_recv()
         {
@@ -640,10 +768,11 @@ fn run_session(
         match ev_rx.recv_timeout(POLL_INTERVAL) {
             Ok(AcpEvent::Notification { method, params }) => {
                 // `turn_abandoned` swallows every update between a cancel
-                // and the next prompt actually starting — see that flag's
-                // own docs on why the transcript can't otherwise tell a
-                // just-cancelled turn's stragglers from a fresh turn's own
-                // stream.
+                // and the abandoned turn's own `session/prompt` response
+                // actually landing (see `draining_rx`'s docs on why that,
+                // not merely "a new prompt was requested," is what clears
+                // it) — the transcript can't otherwise tell a just-cancelled
+                // turn's stragglers from a fresh turn's own stream.
                 if method == "session/update"
                     && let Some(line) = describe_update(&params)
                     && !turn_abandoned
@@ -700,8 +829,23 @@ fn run_session(
                 events = None;
                 session_id = None;
                 prompt_rx = None;
+                draining_rx = None;
+                draining_since = None;
                 pending_permission = None;
                 turn_abandoned = false;
+                // A queued follow-up (see `pending_after_drain`'s docs) has
+                // nothing left to wait on — the connection it was waiting
+                // to reuse just closed. Dropped, not re-dispatched: unlike
+                // the ordinary self-heal (the *next* prompt re-spawns from
+                // scratch), silently firing off a respawn from inside this
+                // event handler on the reviewer's behalf, for a question
+                // they typed before the connection died, risks surprising
+                // them with a turn they never re-confirmed asking for.
+                if pending_after_drain.take().is_some() {
+                    store.push_system(
+                        "agent: queued follow-up dropped — connection closed".to_owned(),
+                    );
+                }
                 let _ = notice_tx.send(AcpNotice::Closed(reason_text));
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -714,65 +858,280 @@ fn run_session(
                 events = None;
                 session_id = None;
                 prompt_rx = None;
+                draining_rx = None;
+                draining_since = None;
                 pending_permission = None;
                 turn_abandoned = false;
+                pending_after_drain = None;
             }
         }
     }
+}
+
+/// What [`spawn_and_handshake`] resolved to. Not a plain `Result` — once
+/// the handshake became interruptible (see that function's own docs on
+/// why), "the adapter answered" and "the adapter failed to" needed two more
+/// siblings: a `SessionCommand::CancelTurn`/`Shutdown` arriving mid-flight
+/// is neither of those, and each needs different handling from the caller
+/// than a `Failed` handshake does (no `SpawnFailed` notice, no error line
+/// phrased as if the adapter were at fault).
+enum SpawnOutcome {
+    Ready(AcpClient, Receiver<AcpEvent>, String, String),
+    Failed(String),
+    /// A [`SessionCommand::CancelTurn`] arrived before the handshake
+    /// finished — the half-spawned adapter process has already been killed
+    /// by the time this is returned.
+    Cancelled,
+    /// A [`SessionCommand::Shutdown`] arrived before the handshake
+    /// finished — same treatment, plus the ack channel the caller must
+    /// still signal before returning from [`run_session`] itself.
+    ShuttingDown(Sender<()>),
+}
+
+/// One handshake step's outcome — what [`wait_handshake_step`] resolves a
+/// single `initialize`/`session/new`/`session/set_mode` wait into.
+enum StepOutcome<T> {
+    Ready(T),
+    TimedOut,
+    Cancelled,
+    ShuttingDown(Sender<()>),
+}
+
+/// Waits for one handshake response while staying receptive to
+/// `command_rx` — polling both on [`POLL_INTERVAL`], the same idiom
+/// [`run_session`]'s own main loop uses for its three input sources,
+/// rather than a single blocking `recv_timeout(HANDSHAKE_TIMEOUT)` with no
+/// way to interrupt it at all. That used to mean a C-g pressed while
+/// `TurnState::Spawning` just sat in `command_rx`, unprocessed, until the
+/// in-flight handshake step finished or timed out on its own — up to
+/// `HANDSHAKE_TIMEOUT` (3× worst case) despite the panel's footer
+/// advertising an immediate cancel the whole time.
+///
+/// Only `CancelTurn`/`Shutdown` are actioned here — `Prompt`/
+/// `AnswerPermission` can't legitimately arrive this early (the UI's own
+/// `is_turn_running` pre-check blocks a second `Prompt` while `Spawning`
+/// counts as active, and there's no pending permission to answer before a
+/// session even exists yet) and are silently dropped if they somehow do —
+/// defense in depth for a path that shouldn't be reachable, not a real one.
+fn wait_handshake_step<T>(
+    rx: &Receiver<T>,
+    command_rx: &Receiver<SessionCommand>,
+    deadline: Instant,
+) -> StepOutcome<T> {
+    loop {
+        match rx.recv_timeout(POLL_INTERVAL) {
+            Ok(v) => return StepOutcome::Ready(v),
+            Err(RecvTimeoutError::Disconnected) => return StepOutcome::TimedOut,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        match command_rx.try_recv() {
+            Ok(SessionCommand::CancelTurn) => return StepOutcome::Cancelled,
+            Ok(SessionCommand::Shutdown(ack)) => return StepOutcome::ShuttingDown(ack),
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            return StepOutcome::TimedOut;
+        }
+    }
+}
+
+/// Spawns the adapter if needed and sends one prompt turn — the shared
+/// tail end of both a fresh [`SessionCommand::Prompt`] dispatching right
+/// away and a prompt that was held in `pending_after_drain` while a
+/// previous cancelled turn's own response was still outstanding, once that
+/// resolves (see that field's own docs in [`run_session`]). Takes every
+/// piece of state it might touch by `&mut` reference rather than a bundled
+/// struct — `run_session`'s own locals, not fields of one shared type, so
+/// there's nothing to bundle them into without adding a type that exists
+/// for this one call site.
+///
+/// Returns `Some` only when a [`SessionCommand::Shutdown`] interrupted the
+/// spawn (see [`wait_handshake_step`]'s docs on why that can now happen
+/// mid-handshake at all) — the caller must ack it and return from
+/// `run_session` itself, exactly like the top-level `Shutdown` handling
+/// does; every other outcome (sent, spawn failed, spawn cancelled) is
+/// already fully handled internally and needs nothing further from the
+/// caller.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_prompt(
+    text: String,
+    adapter_override: Option<&str>,
+    repo_root: &Path,
+    command_rx: &Receiver<SessionCommand>,
+    store: &AgentHandle,
+    notice_tx: &Sender<AcpNotice>,
+    client: &mut Option<AcpClient>,
+    events: &mut Option<Receiver<AcpEvent>>,
+    session_id: &mut Option<String>,
+    prompt_rx: &mut Option<Receiver<Result<serde_json::Value, super::transport::AcpError>>>,
+    turn_abandoned: &mut bool,
+) -> Option<Sender<()>> {
+    if client.is_none() {
+        store.set_state(TurnState::Spawning);
+        match spawn_and_handshake(adapter_override, repo_root, command_rx) {
+            SpawnOutcome::Ready(c, ev, sess, description) => {
+                store.set_adapter_description(description);
+                *client = Some(c);
+                *events = Some(ev);
+                *session_id = Some(sess);
+            }
+            SpawnOutcome::Failed(e) => {
+                store.push_system(format!("agent: {e}"));
+                store.set_state(TurnState::Idle);
+                let _ = notice_tx.send(AcpNotice::SpawnFailed(e));
+                return None;
+            }
+            SpawnOutcome::Cancelled => {
+                // C-g landed while still `Spawning` — the half-connected
+                // adapter has already been killed by `spawn_and_handshake`
+                // itself; this prompt was never sent anywhere, so there's
+                // nothing to drain (`draining_rx` only applies once a real
+                // `session/prompt` went out) and nothing further to queue —
+                // any text held in `pending_after_drain` for *this* call
+                // is simply dropped, same as a fresh `Prompt` cancelled
+                // mid-spawn always has been.
+                store.push_system("you: cancelled the turn".to_owned());
+                store
+                    .push_system("agent: spawn cancelled before the handshake finished".to_owned());
+                store.set_state(TurnState::Idle);
+                let _ = notice_tx.send(AcpNotice::TurnFinished {
+                    stop_reason: "cancelled".to_owned(),
+                });
+                return None;
+            }
+            SpawnOutcome::ShuttingDown(ack) => return Some(ack),
+        }
+    }
+    if let (Some(c), Some(sess)) = (client.as_ref(), session_id.as_ref()) {
+        store.push_system(format!("you: {text}"));
+        store.set_state(TurnState::Running);
+        *prompt_rx = Some(c.prompt(sess, &text));
+        // Defensive, not load-bearing: every caller of this function only
+        // reaches here once `draining_rx` is already `None` (the busy/hold
+        // checks above route anything else to `pending_after_drain` or a
+        // rejection instead), which is what actually clears
+        // `turn_abandoned` — see that flag's own docs. This just keeps a
+        // freshly-spawned or never-cancelled session's first turn starting
+        // from `false` too.
+        *turn_abandoned = false;
+    }
+    None
 }
 
 /// The lazy first-use handshake: resolve the adapter, spawn it,
 /// `initialize`, `session/new`, and opt into `acceptEdits` mode when it's
 /// on offer — the same steps `check::run` takes (39-104 as of this
 /// writing), minus that function's `println!` trace and its final prompt
-/// send, which belong to the caller here instead.
+/// send, which belong to the caller here instead. Cancellable at every
+/// step via `command_rx` — see [`wait_handshake_step`]'s docs.
 fn spawn_and_handshake(
     adapter_override: Option<&str>,
     repo_root: &Path,
-) -> Result<(AcpClient, Receiver<AcpEvent>, String, String), String> {
-    let resolution = super::adapter::resolve(adapter_override)?;
+    command_rx: &Receiver<SessionCommand>,
+) -> SpawnOutcome {
+    let resolution = match super::adapter::resolve(adapter_override) {
+        Ok(r) => r,
+        Err(e) => return SpawnOutcome::Failed(e),
+    };
 
-    let client = AcpClient::spawn(resolution.command)
-        .map_err(|e| format!("failed to spawn adapter: {e}"))?;
+    let client = match AcpClient::spawn(resolution.command) {
+        Ok(c) => c,
+        Err(e) => return SpawnOutcome::Failed(format!("failed to spawn adapter: {e}")),
+    };
     let events = client
         .transport()
         .take_events()
         .expect("first and only take_events");
 
-    let init = client
-        .initialize()
-        .recv_timeout(HANDSHAKE_TIMEOUT)
-        .map_err(|_| handshake_failure(&client, "initialize produced no response"))?
-        .map_err(|e| handshake_failure(&client, &e.to_string()))?;
+    let init_rx = client.initialize();
+    let init = match wait_handshake_step(&init_rx, command_rx, Instant::now() + HANDSHAKE_TIMEOUT) {
+        StepOutcome::Ready(Ok(v)) => v,
+        StepOutcome::Ready(Err(e)) => {
+            return SpawnOutcome::Failed(handshake_failure(&client, &e.to_string()));
+        }
+        StepOutcome::TimedOut => {
+            return SpawnOutcome::Failed(handshake_failure(
+                &client,
+                "initialize produced no response",
+            ));
+        }
+        StepOutcome::Cancelled => {
+            client.transport().kill();
+            return SpawnOutcome::Cancelled;
+        }
+        StepOutcome::ShuttingDown(ack) => {
+            client.transport().kill();
+            return SpawnOutcome::ShuttingDown(ack);
+        }
+    };
     match init.get("protocolVersion").and_then(|v| v.as_i64()) {
         Some(v) if v == PROTOCOL_VERSION => {}
         Some(v) => {
-            return Err(format!(
+            return SpawnOutcome::Failed(format!(
                 "agent answered protocol v{v}; this client speaks v{PROTOCOL_VERSION}"
             ));
         }
-        None => return Err(format!("initialize result had no protocolVersion: {init}")),
+        None => {
+            return SpawnOutcome::Failed(format!(
+                "initialize result had no protocolVersion: {init}"
+            ));
+        }
     }
 
     let cwd_str = repo_root.to_string_lossy().into_owned();
-    let new_session = client
-        .new_session(&cwd_str)
-        .recv_timeout(HANDSHAKE_TIMEOUT)
-        .map_err(|_| handshake_failure(&client, "session/new produced no response"))?
-        .map_err(|e| handshake_failure(&client, &e.to_string()))?;
-    let session = parse_new_session(&new_session)
-        .ok_or_else(|| format!("session/new result had no sessionId: {new_session}"))?;
+    let session_rx = client.new_session(&cwd_str);
+    let new_session =
+        match wait_handshake_step(&session_rx, command_rx, Instant::now() + HANDSHAKE_TIMEOUT) {
+            StepOutcome::Ready(Ok(v)) => v,
+            StepOutcome::Ready(Err(e)) => {
+                return SpawnOutcome::Failed(handshake_failure(&client, &e.to_string()));
+            }
+            StepOutcome::TimedOut => {
+                return SpawnOutcome::Failed(handshake_failure(
+                    &client,
+                    "session/new produced no response",
+                ));
+            }
+            StepOutcome::Cancelled => {
+                client.transport().kill();
+                return SpawnOutcome::Cancelled;
+            }
+            StepOutcome::ShuttingDown(ack) => {
+                client.transport().kill();
+                return SpawnOutcome::ShuttingDown(ack);
+            }
+        };
+    let session = match parse_new_session(&new_session) {
+        Some(s) => s,
+        None => {
+            return SpawnOutcome::Failed(format!(
+                "session/new result had no sessionId: {new_session}"
+            ));
+        }
+    };
 
     if session.available_modes.iter().any(|m| m == "acceptEdits") {
-        // Best-effort: a refusal still leaves the turn usable (every edit
-        // just asks permission instead), so this doesn't fail the whole
-        // handshake — mirrors `check::run`'s own treatment.
-        let _ = client
-            .set_mode(&session.session_id, "acceptEdits")
-            .recv_timeout(HANDSHAKE_TIMEOUT);
+        let mode_rx = client.set_mode(&session.session_id, "acceptEdits");
+        // Best-effort (see the original docs): a plain timeout or an error
+        // result here doesn't fail the whole handshake, mirrors
+        // `check::run`'s own treatment — every edit just asks permission
+        // instead. `Cancelled`/`ShuttingDown` are the exception: there's no
+        // point finishing a handshake for a turn that's already being torn
+        // down.
+        match wait_handshake_step(&mode_rx, command_rx, Instant::now() + HANDSHAKE_TIMEOUT) {
+            StepOutcome::Cancelled => {
+                client.transport().kill();
+                return SpawnOutcome::Cancelled;
+            }
+            StepOutcome::ShuttingDown(ack) => {
+                client.transport().kill();
+                return SpawnOutcome::ShuttingDown(ack);
+            }
+            StepOutcome::Ready(_) | StepOutcome::TimedOut => {}
+        }
     }
 
-    Ok((client, events, session.session_id, resolution.description))
+    SpawnOutcome::Ready(client, events, session.session_id, resolution.description)
 }
 
 fn handshake_failure(client: &AcpClient, what: &str) -> String {

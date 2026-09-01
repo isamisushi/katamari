@@ -44,12 +44,31 @@ delay — until the client actually sends `session/cancel`, so
 `agent_panel.rs`'s cancel tests can prove a turn was genuinely in flight
 (not finished before the cancel keypress landed) without racing a fixed
 sleep against test timing.
+
+A second such substring, `STRAGGLING_PERMISSION`, models the real, async
+adapter's own failure mode a plain synchronous fake otherwise can't: a
+`canUseTool` call the SDK had already committed to *before* the interrupt
+propagated, so a fresh `session/request_permission` for a second, distinct
+tool call arrives strictly after `session/cancel` was received and strictly
+before the turn's own `session/prompt` response is finally sent — proving
+the client's turn-abandonment gate survives a follow-up prompt attempted
+in that gap, not just a straggler landing immediately after the cancel.
+
+A third knob, the `KATAMARI_FAKE_ACP_HANDSHAKE_DELAY_SECS` environment
+variable, sleeps that many seconds before answering `initialize` — for
+`agent_panel.rs`'s own test that C-g actually cuts short a slow handshake
+rather than sitting inert until it finishes on its own.
 """
 
 import json
+import os
 import sys
+import time
 
 _turn = 0
+_handshake_delay_secs = float(
+    os.environ.get("KATAMARI_FAKE_ACP_HANDSHAKE_DELAY_SECS") or "0"
+)
 
 
 def send(obj):
@@ -112,6 +131,75 @@ def handle_prompt(msg):
                 return
             if note.get("method") == "session/cancel":
                 break
+        send(
+            {"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "cancelled"}}
+        )
+        return
+
+    if "STRAGGLING_PERMISSION" in prompt_text:
+        # See the module docs: stream a chunk, wait for `session/cancel`
+        # (same block-and-match as `SLOW_CANCELLABLE` above), then — instead
+        # of resolving the turn right away — raise one *more*
+        # `session/request_permission` for a different tool call before
+        # finally sending the turn's own response. A client that clears its
+        # abandonment tracking merely because a follow-up prompt was
+        # *attempted* (rather than because this turn's own response
+        # actually arrived) would misread this straggler as belonging to
+        # that follow-up.
+        send_update(
+            session_id,
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "thinking slowly"},
+            },
+        )
+        while True:
+            note = read_message()
+            if note is None:
+                return
+            if note.get("method") == "session/cancel":
+                break
+        straggler_id = f"tc-straggler-{turn}"
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": 2000 + turn,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": session_id,
+                    "toolCall": {
+                        "toolCallId": straggler_id,
+                        "title": "Edit straggler.txt",
+                    },
+                    "options": [
+                        {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "reject", "name": "Reject", "kind": "reject_once"},
+                    ],
+                },
+            }
+        )
+        straggler_reply = read_message()
+        straggler_outcome = (straggler_reply or {}).get("result", {}).get(
+            "outcome", {}
+        )
+        straggler_granted = (
+            straggler_outcome.get("outcome") == "selected"
+            and straggler_outcome.get("optionId") == "allow"
+        )
+        if straggler_granted:
+            # Only ever written if the client mis-answered the straggler as
+            # a grant — the assertion this whole branch exists for is that
+            # this file must never appear.
+            with open("acp-straggler-marker.txt", "w") as f:
+                f.write("the cancelled turn's straggling tool call was granted\n")
+        # Held open a beat before finally resolving the turn's own
+        # `session/prompt` — long enough that a test can drive a whole
+        # keystroke-by-keystroke follow-up attempt (open the overlay, type,
+        # C-s) and still land it while the client's own `draining_rx` for
+        # *this* turn is still pending, proving the client's own hold-until-
+        # drained gate — not just timing luck — is what keeps the queued
+        # follow-up from dispatching until this response lands.
+        time.sleep(1.5)
         send(
             {"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "cancelled"}}
         )
@@ -202,6 +290,8 @@ def main():
         method = msg.get("method")
         msg_id = msg.get("id")
         if method == "initialize":
+            if _handshake_delay_secs > 0:
+                time.sleep(_handshake_delay_secs)
             send(
                 {
                     "jsonrpc": "2.0",
