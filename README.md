@@ -89,13 +89,17 @@ and the scope-menu popup (`o`) for switching mid-session.
   working tree or `HEAD` — read-only on a fixed commit, `--staged`, a jj
   range, or `--pr`
 - **Ask the agent** (`a`/`A`/`p`) — question a resident coding-agent session
-  about any selection, watch it work in a streaming panel, and push every
-  open comment to it in one message, with every edit gated on your own
-  `y`/`n`
+  about any selection, ask follow-ups in the same session, push every open
+  comment in one message, `C-g` cancels an in-flight turn safely, and
+  every edit stays gated on your own `y`/`n`
 - **Durable, resolvable comments** — leave one on a line or a `V` range; it
   lands in a plain, git-trackable `.katamari/comments.jsonl` an agent
   lists, addresses, and resolves via `ktmr comments`, picked up live with
   no restart
+- **Reviewed-hunk state** (`r`/`R`) — mark a hunk reviewed and it
+  collapses, content-addressed so the mark survives a rebase or reorder:
+  remember what you've reviewed — only what the agent rewrote comes back,
+  kept in `.katamari/reviewed.jsonl`
 - **Semantic review units** (`u`) — turn a tangled diff into a stack you
   can actually read, without touching a branch: hunks grouped into
   ordered, stacked-PR-like units through the `claude`/`codex` CLI you
@@ -103,8 +107,9 @@ and the scope-menu popup (`o`) for switching mid-session.
 - **git and jj, equally** — colocated jj revsets and a snapshot timeline
   through every save of an agent's session, the same LSP/comments/units
   feature set either way
-- **GitHub PR review** — `ktmr diff --pr 123` opens a pull request's diff
-  through your own `gh`, no checkout
+- **Any scope, PR and branch included** — `--pr 123` opens a GitHub pull
+  request through your own `gh`, no checkout; `--branch`/`B` reviews the
+  current branch against its auto-detected base, no network, live-followed
 - **Live refresh** — working-tree diffs update as an agent's edits land on
   disk, no restart
 - **Your keybindings** — vim (default) and emacs presets, every action

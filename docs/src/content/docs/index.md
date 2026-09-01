@@ -3,7 +3,7 @@ title: katamari
 description: A terminal diff-review tool with LSP inside the diff, a persistent agent you can ask, durable resolvable comments, and read-only review units.
 template: splash
 hero:
-  tagline: '<a href="/katamari/compared-to-other-tools/">The only terminal diff viewer with a language server inside it.</a> Ask a resident coding-agent session about any selection, leave comments it resolves, and turn a tangled diff into a stack you can actually read — all without creating a single branch.'
+  tagline: '<a href="/katamari/compared-to-other-tools/">The only terminal diff viewer with a language server inside it.</a> Ask a resident coding-agent session about any selection, leave comments it resolves, remember what you''ve already reviewed, and turn a tangled diff into a stack you can actually read — all without creating a single branch.'
   image:
     html: '<video autoplay loop muted playsinline poster="/katamari/demo-poster.png" width="1370" height="760" style="max-width: min(44rem, 100%); height: auto; border-radius: 0.5rem;" aria-label="katamari demo: reviewing a diff in the terminal, with hover and go-to-definition"><source src="/katamari/demo.webm" type="video/webm" /><source src="/katamari/demo.mp4" type="video/mp4" /></video>'
   actions:
@@ -33,13 +33,22 @@ leaving the terminal.
   range, or `--pr`
 - **Ask the agent** (`a`/`A`/`p`) — question a resident coding-agent
   session (Claude, via [ACP](https://agentclientprotocol.com)) about any
-  selection, watch it work in a streaming transcript panel, and push every
-  open comment to it in one message — every edit it wants to make waits on
-  your own `y`/`n` (see [Ask the agent](/katamari/keybindings/#ask-the-agent))
+  selection, watch it work in a streaming transcript panel, ask follow-ups
+  in the same session with no re-selecting, and push every open comment to
+  it in one message; `C-g` cancels an in-flight turn safely from anywhere,
+  and every edit it wants to make still waits on your own `y`/`n` (see
+  [Ask the agent](/katamari/keybindings/#ask-the-agent))
 - **Durable, resolvable comments** — leave one in the TUI, on one line or a
   `V` visual range; it lands in a plain, git-trackable
   `.katamari/comments.jsonl` an agent lists, addresses, and resolves via
   `ktmr comments`, picked up live with no restart
+- **Reviewed-hunk state** (`r`/`R`) — mark the hunk under the cursor
+  reviewed and it collapses to a one-line marker; the mark is
+  content-addressed, keyed on the hunk's own changed lines rather than its
+  position, so it survives a rebase or reorder and only the hunk an agent
+  actually rewrites resurfaces unreviewed — persisted in
+  `.katamari/reviewed.jsonl`, explicit-keypress-only, never inferred from
+  scroll (see [Quickstart](/katamari/quickstart/))
 - **Semantic review units** — turn a tangled diff into a stack you can
   actually read, without touching a branch: `u` groups the diff's hunks
   into ordered, stacked-PR-like units (the refactor first, then the
@@ -51,9 +60,10 @@ leaving the terminal.
   snapshot timeline through every save of an agent's session — the same
   LSP, comments, and review-units feature set either way
 - **Any scope of change** — working tree, staged, one commit, a range, a jj
-  change or revset, or a GitHub pull request by number (`--pr`, through
-  your own `gh`); browse and pick from `ktmr log`, or switch mid-session
-  with a popup (`o`)
+  change or revset, a GitHub pull request by number (`--pr`, through your
+  own `gh`), or the current branch against its automatically detected base
+  (`--branch`/`B`, no network, live-followed as either side moves);
+  browse and pick from `ktmr log`, or switch mid-session with a popup (`o`)
 - **Live refresh** — working-tree diffs refresh as an agent's edits land on
   disk by default; pass `--no-watch` for a static session
 - **Mouse, when you want it** — wheel scrolls the pane under the pointer,
@@ -71,19 +81,21 @@ leaving the terminal.
 
 ## Why
 
-Agents now write more code, faster, than review capacity can absorb.
-Confidence that AI-generated code is actually correct runs low
-industry-wide, yet the volume of AI-assisted pull requests keeps
-climbing — the bottleneck has moved from writing the code to deciding
-whether to trust and merge it. Agent-authored diffs also tend to land
-large and oddly ordered, nothing like a human's incrementally-committed
-history: a refactor, the feature it enabled, the tests, and a lockfile
-bump interleaved across files in alphabetical order. That's precisely the
-"unreadable as one blob" problem the stacked-PR world exists to solve —
-except that fix means materializing real branches and PRs before anyone's
-read the change, a team-level commitment most solo reviewers and small
-teams don't want for a diff that was never going to live as separate PRs
-anyway.
+Agents now write more code, faster, than review capacity can absorb, and
+the strain shows up as a verification bottleneck: the scarce resource
+isn't writing the change anymore, it's deciding whether to trust and merge
+it. Confidence that AI-generated code is actually correct runs low
+industry-wide, yet the volume of AI-assisted pull requests keeps climbing
+regardless — leaving rubber-stamping as the path of least resistance for
+anyone whose review time hasn't scaled to match. Agent-authored diffs also
+tend to land large and oddly ordered, nothing like a human's
+incrementally-committed history: a refactor, the feature it enabled, the
+tests, and a lockfile bump interleaved across files in alphabetical order.
+That's precisely the "unreadable as one blob" problem the stacked-PR world
+exists to solve — except that fix means materializing real branches and
+PRs before anyone's read the change, a team-level commitment most solo
+reviewers and small teams don't want for a diff that was never going to
+live as separate PRs anyway.
 
 A wave of terminal-native review tools converged independently on the
 same shape recently: local, vim-keyed, comment-then-hand-to-agent —

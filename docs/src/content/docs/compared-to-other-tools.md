@@ -3,13 +3,13 @@ title: Compared to other tools
 description: An honest, dated comparison against diff pagers, git TUIs, terminal review peers, cloud AI reviewers, and stacked-PR platforms — and where katamari is the wrong tool.
 ---
 
-A factual snapshot as of August 2026. Terminal review tools in particular
+A factual snapshot as of September 2026. Terminal review tools in particular
 are moving fast; if you're reading this much later, re-verify the specific
 claims below rather than trusting them at face value.
 
 ## Where katamari is ahead
 
-Three things, as far as this survey found, no other tool in any of these
+Four things, as far as this survey found, no other tool in any of these
 categories does at the same time:
 
 |  | Diff pagers (delta, difftastic) | git TUIs (lazygit, gitui) | Terminal review peers (lumen, revdiff, tuicr, Hunk) | Cloud AI reviewers (CodeRabbit, Copilot code review) | Stacked-PR platforms (Graphite, GitHub Stacked PRs) | **katamari** |
@@ -17,6 +17,7 @@ categories does at the same time:
 | **LSP inside the diff** — hover, go-to-definition, find-references, live diagnostics on changed lines | No | No (delta's own pager coloring only) | No | No | No | **Yes** — 6 languages plus custom servers, auto-install, `ktmr doctor` |
 | **LLM review units** — read-only regrouping of an existing diff into an ordered, stacked-PR-like reading order | No | No | Partial — lumen's "stacked" mode is raw commit order, not a model-computed grouping | No | N/A — real branch/commit surgery at authoring time, not a read-only regroup of a diff that already exists | **Yes** — read-only, cached by content hash, whole-diff coverage guaranteed |
 | **Protocol-owned persistent agent session** — one agent process spawned and held for the whole review, streaming output, every edit human-gated | N/A | N/A | One-shot CLI invocation or pipe per hand-off, not a held session (closest: Hunk's skill can inspect a live session to reload/apply comments, but that's not a conversational session the reviewer directly drives) | N/A — the reviewer *is* the hosted model, not a session you converse with | N/A | **Yes** — an [ACP](https://agentclientprotocol.com) session spawned once and kept alive for as long as `ktmr diff` runs |
+| **Reviewed-hunk state** — remembering what you've already reviewed, in a way that survives the diff changing under you | No | No | Partial — a 2026 wave of local seen-state trackers (e.g. seendiff) picked up the idea, but the ones surveyed here mark on scroll rather than an explicit action | No — nothing to remember across sessions when the review is one hosted pass | Partial — GitHub's own file-level "Viewed" checkbox (unchanged since 2019, clears on a force-push); Gerrit patchsets and Reviewable do real interdiff, but both are platform/SaaS-bound | **Yes** — hunk-granular, content-addressed, explicit-keypress-only, local |
 
 **LSP inside the diff** is a subsystem, not a feature flag: spawn/lifecycle
 management, per-language capability negotiation, an auto-install pipeline,
@@ -43,6 +44,22 @@ one-shot invocation: a shell-escape into an agent prompt, a stdout pipe on
 quit, a browser-storage export. None hold a live, protocol-driven
 conversation with human-gated permissions the way katamari's [Ask the
 agent](/katamari/keybindings/#ask-the-agent) does.
+
+**Reviewed-hunk state** is the newest of the four, and the closest
+comparisons are still moving. GitHub's own "Viewed" checkbox has been
+file-granular since 2019 and still clears on a force-push — precisely the
+case an agent's iterating session hits on every rewrite. Gerrit patchsets
+and Reviewable both do real interdiff between revisions, but neither
+exists outside its own platform. A 2026 wave of local, terminal-native
+tools — seendiff among them — picked up seen-state tracking for git diffs
+directly, which is real convergence worth naming; the ones surveyed here
+mark a line seen as you scroll past it, though, which risks marking
+something you scrolled by without reading. katamari's marks are
+hunk-granular and keyed on the hunk's own content, so a rebase or reorder
+doesn't lose them and an agent's rewrite of one hunk resurfaces only that
+hunk — and they're set by an explicit `r`/`R`/`m` keypress only, never
+inferred from scroll position, in a local `.katamari/reviewed.jsonl` with
+no forge account involved.
 
 Where katamari is *behind*: peers like lumen and tuicr can write real
 comments and reviews back to a forge (tuicr to four platforms, via their
