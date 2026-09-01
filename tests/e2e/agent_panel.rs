@@ -220,6 +220,212 @@ fn push_comments_to_agent_sends_the_default_prompt_and_opens_the_panel() {
 }
 
 #[test]
+fn cancel_key_with_nothing_running_is_a_harmless_no_op() {
+    if !fixture::python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let repo = fixture::basic_repo();
+    let (opts, _home) = agent_spawn_options();
+    let mut h = Harness::spawn(repo.path(), opts);
+    h.wait_for_text("README.md");
+
+    h.send(Key::CtrlG);
+    h.wait_for_text("nothing to cancel");
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
+fn cancel_key_stops_a_running_turn_and_a_fresh_ask_works_immediately() {
+    if !fixture::python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let repo = fixture::basic_repo();
+    let (opts, _home) = agent_spawn_options();
+    let mut h = Harness::spawn(repo.path(), opts);
+
+    open_ask(&h);
+    type_text(&h, "SLOW_CANCELLABLE");
+    h.send(Key::CtrlS);
+
+    // Open the panel and prove the turn is genuinely in flight (no
+    // permission asked on this path — the fake agent's `SLOW_CANCELLABLE`
+    // branch streams a chunk and then just blocks) before cancelling it.
+    h.send(Key::Char('A'));
+    h.wait_for_text("thinking slowly");
+
+    h.send(Key::CtrlG);
+    h.wait_for_text("you: cancelled the turn");
+    h.wait_for_text("idle");
+
+    // The session — same adapter process, same session id — must still
+    // work right after cancelling: a genuinely fresh, diff-anchored ask
+    // isn't blocked by anything left over from the abandoned turn.
+    h.send(Key::Esc); // close the panel, back to the diff
+    h.send(Key::Char('a')); // same row `open_ask` already put the cursor on
+    h.wait_for_text("C-s save");
+    type_text(&h, "a fresh question");
+    h.send(Key::CtrlS);
+    h.wait_for_text("agent permission");
+    h.send(Key::Char('y'));
+    h.send(Key::Char('A'));
+    h.wait_until(Duration::from_secs(10), |screen| {
+        screen.contents().contains("turn finished (end_turn)")
+    });
+    assert!(
+        repo.path().join("acp-marker-2.txt").is_file(),
+        "the fresh turn must complete normally right after a cancel"
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
+fn cancel_key_declines_a_pending_permission_and_the_session_still_works() {
+    if !fixture::python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let repo = fixture::basic_repo();
+    let (opts, _home) = agent_spawn_options();
+    let mut h = Harness::spawn(repo.path(), opts);
+
+    open_ask(&h);
+    type_text(&h, "explain this line");
+    h.send(Key::CtrlS);
+    h.wait_for_text("agent permission");
+
+    // Cancel, not y/n — must decline the pending request and stop the
+    // whole turn in one gesture, unlike n/Esc which only decline that one
+    // tool call.
+    h.send(Key::CtrlG);
+    h.wait_until(Duration::from_secs(5), |screen| {
+        !screen.contents().contains("agent permission")
+    });
+
+    h.send(Key::Char('A'));
+    h.wait_for_text("you: cancelled the turn");
+    h.wait_for_text("permission declined");
+    assert!(
+        !repo.path().join("acp-marker-1.txt").exists(),
+        "a cancelled turn must never let the pending edit land"
+    );
+
+    // Self-heals: a second, ordinary turn works normally afterward.
+    h.send(Key::Esc); // close the panel, back to the diff
+    h.send(Key::Char('a'));
+    h.wait_for_text("C-s save");
+    type_text(&h, "one more time");
+    h.send(Key::CtrlS);
+    h.wait_for_text("agent permission");
+    h.send(Key::Char('y'));
+    h.send(Key::Char('A'));
+    h.wait_until(Duration::from_secs(10), |screen| {
+        screen.contents().contains("turn finished (end_turn)")
+    });
+    assert!(
+        repo.path().join("acp-marker-2.txt").is_file(),
+        "the second turn must complete normally after the first was cancelled"
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
+fn follow_up_from_the_panel_sends_the_next_prompt_into_the_same_session() {
+    if !fixture::python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let repo = fixture::basic_repo();
+    let (opts, _home) = agent_spawn_options();
+    let mut h = Harness::spawn(repo.path(), opts);
+
+    // First turn, anchored to a diff row — proves the fixture, then leaves
+    // the panel open for the follow-up below.
+    open_ask(&h);
+    type_text(&h, "what changed here?");
+    h.send(Key::CtrlS);
+    h.wait_for_text("agent permission");
+    h.send(Key::Char('y'));
+    h.send(Key::Char('A'));
+    h.wait_until(Duration::from_secs(10), |screen| {
+        screen.contents().contains("turn finished (end_turn)")
+    });
+    assert!(repo.path().join("acp-marker-1.txt").is_file());
+
+    // `a` from inside the still-open panel: a context-less follow-up, no
+    // diff row/selection to re-anchor to — the session already has the
+    // transcript so far.
+    h.send(Key::Char('a'));
+    h.wait_for_text("C-s save");
+    h.wait_for_text("ask: follow-up");
+    type_text(&h, "and what about performance?");
+    h.send(Key::CtrlS);
+    h.wait_for_text("you: and what about performance?");
+    h.wait_for_text("agent permission");
+    h.send(Key::Char('y'));
+    // Both turns end in `end_turn` — the first one's own "turn finished"
+    // line is still on screen, so a plain `contains` would trivially match
+    // it instantly rather than actually waiting for this second turn's
+    // completion. Waiting for the *second* occurrence is what proves this
+    // wait is really about the follow-up turn.
+    h.wait_until(Duration::from_secs(10), |screen| {
+        screen
+            .contents()
+            .matches("turn finished (end_turn)")
+            .count()
+            >= 2
+    });
+    assert!(
+        repo.path().join("acp-marker-2.txt").is_file(),
+        "the follow-up turn must complete normally in the same session"
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
+fn follow_up_while_a_turn_is_running_is_rejected_and_names_the_cancel_key() {
+    if !fixture::python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let repo = fixture::basic_repo();
+    let (opts, _home) = agent_spawn_options();
+    let mut h = Harness::spawn(repo.path(), opts);
+
+    open_ask(&h);
+    type_text(&h, "SLOW_CANCELLABLE");
+    h.send(Key::CtrlS);
+    h.send(Key::Char('A'));
+    h.wait_for_text("thinking slowly");
+
+    h.send(Key::Char('a'));
+    h.wait_for_text("C-g");
+    assert!(
+        !h.screen_contents().contains("C-s save"),
+        "the follow-up overlay must never have opened while a turn is running"
+    );
+
+    // Clean shutdown even with a turn still in flight: quitting must not
+    // wait on the wedged fake agent (see `AgentStore::shutdown`'s docs).
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(Duration::from_secs(5));
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
+#[test]
 fn push_comments_to_agent_with_nothing_open_reports_a_status_and_sends_nothing() {
     if !fixture::python3_available() {
         eprintln!("skipping: python3 not on PATH");

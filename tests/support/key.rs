@@ -52,6 +52,13 @@ pub enum Key {
     /// both kitty modes for the same reason `Key::CtrlS`/`Key::CtrlW` are:
     /// nothing else on the wire ever produces `0x18`.
     CtrlX,
+    /// `Ctrl-g` — `Action::CancelAgentTurn`, borrowed verbatim from emacs's
+    /// own `keyboard-quit` (see that action's own docs). Same "control bit
+    /// strips the high bits of the ASCII letter" convention as
+    /// [`Key::CtrlO`]/[`Key::CtrlT`]/[`Key::CtrlW`] (`'g'` is `0x67`;
+    /// `0x67 & 0x1f == 0x07`), unambiguous in both kitty modes for the same
+    /// reason those are: nothing else on the wire ever produces `0x07`.
+    CtrlG,
     /// `Ctrl-w` — issue #28's `EditCommand::DeletePreviousWord`, unambiguous
     /// in both modes (`0x17`, same "control bit strips the high bits of the
     /// ASCII letter" convention as [`Key::CtrlO`]/[`Key::CtrlT`]'s own
@@ -134,6 +141,7 @@ impl Key {
             },
             Key::CtrlT => vec![0x14],
             Key::CtrlO => vec![0x0f],
+            Key::CtrlG => vec![0x07],
             Key::AltLeft => b"\x1b[1;3D".to_vec(),
             Key::AltRight => b"\x1b[1;3C".to_vec(),
             Key::CtrlS => vec![0x13],

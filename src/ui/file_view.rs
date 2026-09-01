@@ -330,6 +330,7 @@ impl FileView {
             // `crate::acp::session`.
             | Action::ToggleAgentPanel
             | Action::PushCommentsToAgent
+            | Action::CancelAgentTurn
             | Action::AddComment
             | Action::ToggleComments
             | Action::ExpandFold

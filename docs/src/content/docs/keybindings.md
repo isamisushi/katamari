@@ -61,6 +61,7 @@ table below never has to live in your head.
 | Ask the agent about this line/selection | `a` | `a` |
 | Toggle agent transcript panel | `A` | `A` |
 | Push open comments to the agent | `p` | `p` |
+| Cancel the agent's turn | `C-g` | `C-g` |
 | Quit | `q` | `q` |
 
 \* Jump-forward matches neovim: it's `C-i` in terminals that implement the
@@ -182,6 +183,14 @@ queuing a second question. Set the adapter command with `[agent] adapter`
 in your **global** `~/.config/katamari/config.toml` only — see
 [Configuration](/katamari/configuration/) for why a repo-local
 `.katamari/config.toml` can never choose it.
+
+From inside the open panel, `a` sends a follow-up with no diff context
+re-attached — the session already has it, so there's nothing to select
+first. `C-g` cancels the turn currently in flight, from anywhere,
+including from the permission modal itself, where it answers the pending
+request as a decline and then stops the whole turn — unlike `n`/`Esc`
+there, which only decline that one tool call and leave the turn running
+afterward.
 
 ## Search
 

@@ -1452,6 +1452,18 @@ fn event_loop(
                         // rejects — and nothing else does anything: this must
                         // never auto-resolve, so any other key is simply
                         // swallowed, leaving the modal up.
+                        // A third, hardcoded arm for the same reason y/n/
+                        // Enter/Esc above are hardcoded rather than routed
+                        // through the keymap resolver: `C-g` cancels the
+                        // *whole turn* (not just this one tool call) even
+                        // while stuck on this exact modal — without it
+                        // there was no way to escape a permission prompt
+                        // without either granting it or declining just this
+                        // one tool call and leaving the turn running
+                        // afterward. Not rebindable, matching y/n's own
+                        // precedent — see `Action::CancelAgentTurn`'s docs
+                        // on the resulting (accepted) inconsistency with the
+                        // keymap-resolved binding everywhere else.
                         match key.code {
                             KeyCode::Enter | KeyCode::Char('y') => {
                                 agent_handle.answer_permission(true);
@@ -1459,6 +1471,10 @@ fn event_loop(
                             }
                             KeyCode::Esc | KeyCode::Char('n') => {
                                 agent_handle.answer_permission(false);
+                                agent_permission = None;
+                            }
+                            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                agent_handle.cancel_turn();
                                 agent_permission = None;
                             }
                             _ => {}
@@ -1570,8 +1586,11 @@ fn event_loop(
                                     goto_status = Some(acp::session::AGENT_BUSY_MSG.to_owned());
                                     ask_compose = None;
                                 } else {
-                                    let prompt_text =
-                                        ask::build_prompt(state.context(), &state.buffer().text());
+                                    let question = state.buffer().text();
+                                    let prompt_text = match state.context() {
+                                        Some(ctx) => ask::build_prompt(ctx, &question),
+                                        None => ask::build_follow_up_prompt(&question),
+                                    };
                                     agent_handle.send_prompt(prompt_text);
                                     ask_compose = None;
                                     // Only cleared on an actual send (not on
@@ -2483,6 +2502,16 @@ fn event_loop(
             }
             Ok(AppEvent::Acp(notice)) => match notice {
                 AcpNotice::TurnFinished { stop_reason } => {
+                    // Provably a no-op in every pre-existing case (a turn
+                    // can never finish while a permission is pending — it's
+                    // *waiting* on it — and the y/n paths already clear
+                    // this synchronously the instant they fire), but a
+                    // cancel-while-a-permission-is-pending resolves
+                    // `pending_permission` on the manager thread without
+                    // ever going through those paths — this is what clears
+                    // the separate UI-local modal state so it doesn't
+                    // strand a stale, un-answerable-again prompt on screen.
+                    agent_permission = None;
                     // No extra note needed when the panel is already open —
                     // it shows the finished state inline on its own next
                     // redraw (it pulls from `AgentStore`, never pushed to),
@@ -3815,7 +3844,7 @@ fn handle_action(
                 *goto_status = Some("yank: only available in the diff view".to_owned());
             }
         },
-        // Resident-agent trio (see `crate::acp::session`) — `AskAgent`'s
+        // Resident-agent actions (see `crate::acp::session`) — `AskAgent`'s
         // eligibility deliberately mirrors `YankSelection`'s own looser
         // rule (any selection, or the bare cursor row, on any diff
         // including a read-only one) rather than `AddComment`'s stricter
@@ -3839,11 +3868,22 @@ fn handle_action(
                     }
                 }
             }
-            View::File(_)
-            | View::Timeline(_)
-            | View::Log(_)
-            | View::LspInspector(_)
-            | View::Agent(_) => {
+            View::Agent(_) => {
+                // A context-less follow-up (see `ask::AskComposeState::new_follow_up`'s
+                // docs) — the session already has the transcript so far, so
+                // there's no diff selection to attach. Rejected (not
+                // queued) while a turn is already running, same
+                // synchronous-pre-check reasoning as the `Save` handler's
+                // own `is_turn_running` check below — this just reports it
+                // before the overlay even opens instead of after.
+                if agent_handle.is_turn_running() {
+                    *goto_status =
+                        Some("ask: a turn is running — press C-g to cancel it first".to_owned());
+                } else {
+                    *ask_compose = Some(ask::AskComposeState::new_follow_up());
+                }
+            }
+            View::File(_) | View::Timeline(_) | View::Log(_) | View::LspInspector(_) => {
                 *goto_status = Some("ask: only available in the diff view".to_owned());
             }
         },
@@ -3884,6 +3924,19 @@ fn handle_action(
             }
             None => *goto_status = Some("agent: no comments repo for this session".to_owned()),
         },
+        // View-agnostic like `ToggleAgentPanel`/`PushCommentsToAgent` above
+        // — no `stack.top()` matching needed. The success path deliberately
+        // sets no `goto_status`: `AcpNotice::TurnFinished { stop_reason:
+        // "cancelled" }` (see `crate::acp::session`) already drives the
+        // existing "agent: turn finished (...)" status line below, for
+        // free, the moment the manager thread actually processes this.
+        Action::CancelAgentTurn => {
+            if agent_handle.is_turn_running() {
+                agent_handle.cancel_turn();
+            } else {
+                *goto_status = Some(acp::session::AGENT_NOTHING_TO_CANCEL_MSG.to_owned());
+            }
+        }
         // Opens the prompt (see `search::SearchPromptState`'s docs); the
         // origin `Anchor` is captured *here*, from the cursor/scroll `/`
         // was actually pressed at, rather than inside `App` itself — `App`
@@ -5422,6 +5475,19 @@ fn draw(
         }
         View::Agent(panel) => {
             panel.render(frame, frame.area(), geometry);
+            // A follow-up opened from this view (`ask::AskComposeState::new_follow_up`
+            // — see `Action::AskAgent`'s `View::Agent` arm) has no diff
+            // cursor to anchor near the way `View::Diff`'s own ask overlay
+            // does above, so this picks a fixed anchor row instead of
+            // skipping the render entirely — the actual rendering bug this
+            // fixes: without it, every keystroke still reached
+            // `ComposeBuffer` (the raw-key bypass in the event loop is
+            // already view-agnostic), just invisibly.
+            if let Some(state) = ask_compose {
+                let area = frame.area();
+                ask::render(frame, area, area.height / 3, state, compose_keymap);
+                geometry.record(area, mouse::ScrollTarget::ComposeModal);
+            }
         }
     }
 

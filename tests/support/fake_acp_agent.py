@@ -35,6 +35,15 @@ Unlike `fake_lsp_server.py` there are no timing knobs: the ACP client has
 no readiness gate to race, so the fixture only needs protocol shape, not
 controllable delays. An unrecognized request gets an empty result rather
 than being left to hang, for the same reason the LSP fake does it.
+
+One exception to "no timing knobs": a prompt containing the literal
+substring `SLOW_CANCELLABLE` (checked as a substring, not an exact match,
+since `ui::ask::build_prompt` wraps the reviewer's own text in a diff-block
+template) streams one chunk and then blocks — indefinitely, not on a
+delay — until the client actually sends `session/cancel`, so
+`agent_panel.rs`'s cancel tests can prove a turn was genuinely in flight
+(not finished before the cancel keypress landed) without racing a fixed
+sleep against test timing.
 """
 
 import json
@@ -80,6 +89,33 @@ def handle_prompt(msg):
         prompt_text = msg["params"]["prompt"][0]["text"]
     except (KeyError, IndexError, TypeError):
         pass
+
+    if "SLOW_CANCELLABLE" in prompt_text:
+        # `agent_panel.rs`'s cancel tests: stream one chunk, then block
+        # until the client sends a real `session/cancel` notification —
+        # exactly what the real adapter's own `cancel()` waits on
+        # `interrupt()` for (see the module docs) — rather than racing a
+        # fixed delay against however long the test takes to press the
+        # cancel key. A strict block-and-match on `session/cancel` alone is
+        # enough: the one test that drives this path sends exactly that,
+        # nothing else, while this call is blocked.
+        send_update(
+            session_id,
+            {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "thinking slowly"},
+            },
+        )
+        while True:
+            note = read_message()
+            if note is None:
+                return
+            if note.get("method") == "session/cancel":
+                break
+        send(
+            {"jsonrpc": "2.0", "id": msg["id"], "result": {"stopReason": "cancelled"}}
+        )
+        return
 
     send_update(
         session_id,

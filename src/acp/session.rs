@@ -63,6 +63,16 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
 /// ever drift apart and describe the same rejection differently.
 pub(crate) const AGENT_BUSY_MSG: &str = "agent: a turn is already running — wait for it to finish";
 
+/// The one message for "there's no turn to cancel," shared by the UI's own
+/// synchronous [`AgentStore::is_turn_running`] pre-check (in
+/// `Action::CancelAgentTurn`'s `handle_action` arm) *and* the manager
+/// thread's own defense-in-depth branch in [`SessionCommand::CancelTurn`]'s
+/// handling — same TOCTOU reasoning [`AGENT_BUSY_MSG`]'s own docs spell out
+/// for `Prompt`: a turn can finish on its own (or the connection can close)
+/// in the window between the UI's pre-check and this command actually
+/// dequeuing.
+pub(crate) const AGENT_NOTHING_TO_CANCEL_MSG: &str = "agent: nothing to cancel";
+
 /// How often [`run_session`] polls its three input sources when nothing is
 /// pending — short enough that a permission answer or a new prompt reaches
 /// the agent promptly, long enough not to busy-loop the manager thread.
@@ -176,13 +186,21 @@ fn append_transcript_line(inner: &mut Inner, line: TranscriptLine) {
 /// run, decided before its loop starts). `AnswerPermission` carries no
 /// id/params: the session thread already holds the one pending request
 /// locally (see [`run_session`]'s own `pending_permission`), so the UI only
-/// ever has to say yes or no. There is deliberately no `CancelTurn` variant
-/// yet — wiring `AcpClient::cancel` to a keypress is a natural next
-/// increment, explicitly scoped out of this pass to keep the surface area
-/// (and this enum's reachable-variant set) bounded.
+/// ever has to say yes or no.
 enum SessionCommand {
     Prompt(String),
     AnswerPermission(bool),
+    /// Abandons the in-flight turn client-side and best-effort notifies the
+    /// adapter (`session/cancel` — see [`AcpClient::cancel`]'s docs on why
+    /// this can't be waited on). See [`run_session`]'s own handling for the
+    /// full sequence: any pending permission is answered as a reject first,
+    /// [`TurnState`] returns to `Idle` immediately regardless of whether the
+    /// adapter ever actually stops, and every `session/update` between now
+    /// and the next prompt actually starting is swallowed rather than risk
+    /// it reading as this transcript's own continuation (ACP v1 has no
+    /// turn/request id on `session/update` to correlate against otherwise —
+    /// see the module docs).
+    CancelTurn,
     /// Carries a rendezvous `Sender` so [`AgentStore::shutdown`] can wait
     /// (briefly) for the transport to actually die before the process
     /// exits — see that method's docs.
@@ -327,6 +345,17 @@ impl AgentStore {
             .send(SessionCommand::AnswerPermission(allow));
     }
 
+    /// Cancels whatever turn is currently in flight (fire-and-forget,
+    /// mirroring [`Self::send_prompt`]/[`Self::answer_permission`]'s own
+    /// shape) — see [`SessionCommand::CancelTurn`]'s docs for the full
+    /// sequence this triggers on the manager thread. Callers should still
+    /// prefer checking [`Self::is_turn_running`] first so the UI can report
+    /// "nothing to cancel" synchronously; see [`AGENT_NOTHING_TO_CANCEL_MSG`]'s
+    /// own docs on the TOCTOU window this doesn't fully close.
+    pub fn cancel_turn(&self) {
+        let _ = self.command_tx.send(SessionCommand::CancelTurn);
+    }
+
     /// Kills the adapter (if one was ever spawned) and stops the manager
     /// thread. Waits briefly for that to actually happen — long enough that
     /// an adapter process spawned mid-session doesn't outlive `ktmr`'s own
@@ -424,6 +453,12 @@ fn run_session(
     // only needs to know *that* one is pending and its tool title, which
     // `TurnState::AwaitingPermission` already carries.
     let mut pending_permission: Option<(serde_json::Value, serde_json::Value)> = None;
+    // Client-side stand-in for turn identity — ACP v1's `session/update`
+    // carries no turn/request id to correlate against (see the module
+    // docs), so this is what lets a cancelled turn's late-arriving updates
+    // be told apart from the next turn's own. Set by `SessionCommand::CancelTurn`,
+    // cleared the moment a fresh prompt actually starts.
+    let mut turn_abandoned = false;
 
     loop {
         match command_rx.try_recv() {
@@ -471,7 +506,71 @@ fn run_session(
                         store.push_system(format!("you: {text}"));
                         store.set_state(TurnState::Running);
                         prompt_rx = Some(c.prompt(sess, &text));
+                        // A fresh turn genuinely starting — any abandonment
+                        // from a previous cancel no longer applies (see
+                        // `turn_abandoned`'s own docs).
+                        turn_abandoned = false;
                     }
+                }
+            }
+            Ok(SessionCommand::CancelTurn) => {
+                if prompt_rx.is_none() {
+                    // Nothing running — defense in depth for the TOCTOU
+                    // window between the UI's own `is_turn_running`
+                    // pre-check and this command being dequeued (same
+                    // reasoning as the `Prompt` reject-not-queue branch
+                    // above).
+                    store.push_system(AGENT_NOTHING_TO_CANCEL_MSG.to_owned());
+                } else {
+                    store.push_system("you: cancelled the turn".to_owned());
+                    // Answer any pending permission as part of the cancel —
+                    // never leave it dangling for a stale `AnswerPermission`
+                    // to find later. Declined, not silently dropped: an
+                    // unanswered `session/request_permission` stalls the
+                    // adapter's turn forever.
+                    if let Some((id, params)) = pending_permission.take()
+                        && let Some(c) = &client
+                    {
+                        let option_id = choose_reject_option(&params);
+                        let _ = c
+                            .transport()
+                            .respond(id, permission_outcome(option_id.as_deref()));
+                        let tool_title = params
+                            .get("toolCall")
+                            .and_then(|t| t.get("title"))
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("(tool)");
+                        store.push_system(format!(
+                            "agent: permission declined — {tool_title} (turn cancelled)"
+                        ));
+                    }
+                    // `session/cancel` (see `AcpClient::cancel`'s docs) —
+                    // best-effort. The real adapter honors this by
+                    // interrupting the SDK query and eventually resolving
+                    // the pending `session/prompt` with `stopReason:
+                    // "cancelled"`, but that can lag up to its own 30s
+                    // force-cancel backstop (or never arrive at all, for a
+                    // hand-rolled `--adapter`). Rather than block this
+                    // thread on either, this is fire-and-forget — the turn
+                    // is abandoned client-side below regardless of whether
+                    // the adapter ever actually stops.
+                    if let (Some(c), Some(sess)) = (&client, &session_id) {
+                        let _ = c.cancel(sess);
+                    }
+                    store.set_state(TurnState::Idle);
+                    // Drop the pending `session/prompt` receiver rather
+                    // than wait on it — safe (the transport's own `tx.send`
+                    // on the other end just becomes a no-op once this end
+                    // is gone; the pending slot itself is still cleaned up
+                    // normally by `dispatch_inbound` whenever the late
+                    // reply does arrive). This is what lets a fresh
+                    // `SessionCommand::Prompt` past the `prompt_rx.is_some()`
+                    // busy check on the very next loop iteration.
+                    prompt_rx = None;
+                    turn_abandoned = true;
+                    let _ = notice_tx.send(AcpNotice::TurnFinished {
+                        stop_reason: "cancelled".to_owned(),
+                    });
                 }
             }
             Ok(SessionCommand::AnswerPermission(allow)) => {
@@ -540,14 +639,41 @@ fn run_session(
         };
         match ev_rx.recv_timeout(POLL_INTERVAL) {
             Ok(AcpEvent::Notification { method, params }) => {
+                // `turn_abandoned` swallows every update between a cancel
+                // and the next prompt actually starting — see that flag's
+                // own docs on why the transcript can't otherwise tell a
+                // just-cancelled turn's stragglers from a fresh turn's own
+                // stream.
                 if method == "session/update"
                     && let Some(line) = describe_update(&params)
+                    && !turn_abandoned
                 {
                     store.push_agent(line);
                 }
             }
             Ok(AcpEvent::Request { id, method, params }) => {
-                if method == "session/request_permission" {
+                if method == "session/request_permission" && turn_abandoned {
+                    // The adapter dispatched one more tool call before it
+                    // actually honored the interrupt — auto-decline rather
+                    // than resurrect a permission prompt for a turn the
+                    // reviewer already cancelled. Never sets `AwaitingPermission`/
+                    // `pending_permission`/`PermissionRequested`: none of
+                    // those exist for a turn nobody is waiting on anymore.
+                    if let Some(c) = &client {
+                        let option_id = choose_reject_option(&params);
+                        let _ = c
+                            .transport()
+                            .respond(id, permission_outcome(option_id.as_deref()));
+                    }
+                    let tool_title = params
+                        .get("toolCall")
+                        .and_then(|t| t.get("title"))
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("(tool)");
+                    store.push_system(format!(
+                        "agent: auto-declined permission — {tool_title} (turn already cancelled)"
+                    ));
+                } else if method == "session/request_permission" {
                     let tool_title = params
                         .get("toolCall")
                         .and_then(|t| t.get("title"))
@@ -575,6 +701,7 @@ fn run_session(
                 session_id = None;
                 prompt_rx = None;
                 pending_permission = None;
+                turn_abandoned = false;
                 let _ = notice_tx.send(AcpNotice::Closed(reason_text));
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -588,6 +715,7 @@ fn run_session(
                 session_id = None;
                 prompt_rx = None;
                 pending_permission = None;
+                turn_abandoned = false;
             }
         }
     }
@@ -746,6 +874,52 @@ mod tests {
         assert!(store.is_turn_running());
         store.set_state(TurnState::Idle);
         assert!(!store.is_turn_running());
+    }
+
+    #[test]
+    fn is_turn_running_goes_false_after_a_cancel_like_transition_from_any_active_state() {
+        // Mirrors what `SessionCommand::CancelTurn`'s handling does to
+        // `TurnState` regardless of which active state it interrupts —
+        // `Running` (the common case) and `AwaitingPermission` (cancelling
+        // from the permission modal, which the manager thread's cancel arm
+        // resolves as a reject before this same `Idle` transition).
+        let store = test_store();
+        store.set_state(TurnState::Running);
+        assert!(store.is_turn_running());
+        store.set_state(TurnState::Idle);
+        assert!(!store.is_turn_running());
+
+        store.set_state(TurnState::AwaitingPermission {
+            tool_title: "Edit foo.rs".to_owned(),
+        });
+        assert!(store.is_turn_running());
+        store.set_state(TurnState::Idle);
+        assert!(
+            !store.is_turn_running(),
+            "cancelling while a permission is pending must still leave the session idle"
+        );
+    }
+
+    #[test]
+    fn cancel_turn_sends_a_command_without_panicking_even_with_no_manager_thread() {
+        // Fire-and-forget, mirroring `send_prompt`/`answer_permission`'s
+        // own untested-beyond-this-shape precedent — the real command
+        // handling only runs on a live `run_session` manager thread, which
+        // this module has no in-process test harness for (see
+        // `tests/e2e/agent_panel.rs`'s cancel tests for that coverage).
+        // This just pins that the fire-and-forget send itself can never
+        // panic, even against a `test_store()`'s abandoned receiver.
+        let store = test_store();
+        store.cancel_turn();
+    }
+
+    #[test]
+    fn agent_nothing_to_cancel_msg_is_distinct_from_agent_busy_msg() {
+        // The two rejection messages this module reports for `Prompt`
+        // (busy) vs. `CancelTurn` (nothing to cancel) must never read as
+        // the same status line — see both constants' own docs.
+        assert_ne!(AGENT_NOTHING_TO_CANCEL_MSG, AGENT_BUSY_MSG);
+        assert!(!AGENT_NOTHING_TO_CANCEL_MSG.is_empty());
     }
 
     #[test]

@@ -133,6 +133,18 @@ pub fn build_prompt(context: &AskContext, question: &str) -> String {
     )
 }
 
+/// The follow-up counterpart to [`build_prompt`], for a question asked from
+/// inside [`crate::ui::view::View::Agent`] rather than anchored to a diff
+/// row/selection (see [`AskComposeState::new_follow_up`]) — no diff block to
+/// wrap it in, since the resident session already has the whole transcript
+/// so far; wrapping it in the same "Reviewing this diff selection:" framing
+/// `build_prompt` uses would be actively misleading here. A pass-through
+/// rather than an inline `state.buffer().text()` call at the one call site
+/// so the two prompt shapes stay symmetric and independently testable.
+pub fn build_follow_up_prompt(question: &str) -> String {
+    question.to_owned()
+}
+
 /// State for one open "ask the agent" overlay — a sibling of
 /// [`crate::ui::compose::ComposeState`], not a generalization of it:
 /// `ComposeState` carries a [`crate::ui::app::CommentTarget`] this overlay
@@ -142,8 +154,15 @@ pub fn build_prompt(context: &AskContext, question: &str) -> String {
 /// Reuses [`ComposeBuffer`] and (via [`render`]) [`render_editor`]
 /// wholesale, so the actual typing/wrap/scroll-follow behavior is
 /// byte-for-byte identical to the comment overlay's.
+///
+/// `context` is `None` for a follow-up opened from
+/// [`crate::ui::view::View::Agent`] ([`Self::new_follow_up`]) — there's no
+/// diff row/selection to anchor a panel-opened question to, and the
+/// resident session already has the transcript so far, so
+/// [`build_follow_up_prompt`] sends the typed text with no context block at
+/// all rather than inventing a placeholder one.
 pub struct AskComposeState {
-    context: AskContext,
+    context: Option<AskContext>,
     buffer: ComposeBuffer,
     scroll_offset: usize,
 }
@@ -151,7 +170,18 @@ pub struct AskComposeState {
 impl AskComposeState {
     pub fn new(context: AskContext) -> Self {
         Self {
-            context,
+            context: Some(context),
+            buffer: ComposeBuffer::new(),
+            scroll_offset: 0,
+        }
+    }
+
+    /// A context-less follow-up, opened from [`crate::ui::view::View::Agent`]
+    /// (`Action::AskAgent` pressed with the panel on top) — see the struct
+    /// docs on why `context` is `None` here.
+    pub fn new_follow_up() -> Self {
+        Self {
+            context: None,
             buffer: ComposeBuffer::new(),
             scroll_offset: 0,
         }
@@ -165,15 +195,18 @@ impl AskComposeState {
         &self.buffer
     }
 
-    pub fn context(&self) -> &AskContext {
-        &self.context
+    pub fn context(&self) -> Option<&AskContext> {
+        self.context.as_ref()
     }
 }
 
 /// Draws the overlay via the shared [`render_editor`] body, with a
 /// `" ask: <location> "` title in place of the comment overlay's own
 /// `" comment: <location> "` — see [`crate::ui::compose::render`]'s docs
-/// for why the title is the one thing that differs between the two.
+/// for why the title is the one thing that differs between the two. A
+/// context-less follow-up ([`AskComposeState::new_follow_up`]) titles itself
+/// `" ask: follow-up "` instead, since there's no `AskContext::title` to
+/// show.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -181,7 +214,10 @@ pub fn render(
     state: &mut AskComposeState,
     keys: &ComposeKeymap,
 ) {
-    let title = format!(" ask: {} ", state.context.title);
+    let title = match &state.context {
+        Some(ctx) => format!(" ask: {} ", ctx.title),
+        None => " ask: follow-up ".to_owned(),
+    };
     render_editor(
         frame,
         area,
@@ -325,6 +361,20 @@ mod tests {
                 }
             ),
         }
+    }
+
+    #[test]
+    fn new_follow_up_has_no_context() {
+        let state = AskComposeState::new_follow_up();
+        assert!(state.context().is_none());
+    }
+
+    #[test]
+    fn build_follow_up_prompt_passes_the_question_through_unwrapped() {
+        assert_eq!(
+            build_follow_up_prompt("what's the status of the refactor?"),
+            "what's the status of the refactor?"
+        );
     }
 
     #[test]

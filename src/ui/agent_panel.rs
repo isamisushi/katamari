@@ -184,9 +184,21 @@ impl AgentPanelView {
             .collect();
         frame.render_widget(Paragraph::new(rows), inner);
 
+        // Static, not keymap-derived (see the struct docs) — mirrors
+        // `AGENT_BUSY_MSG`'s own precedent of a hardcoded key mention. The
+        // hint alternates on `self.state.is_active()`: cancel is only ever
+        // useful while a turn's actually running, and a follow-up ask would
+        // only get rejected while one is (see `Action::AskAgent`'s
+        // `View::Agent` arm), so showing both regardless of state would be
+        // half-misleading either way.
         let footer = format!(
-            "{} · j/k scroll · gg/G top/bottom · Esc/A close",
-            self.state.status_text()
+            "{} · j/k scroll · gg/G top/bottom · {} · Esc/A close",
+            self.state.status_text(),
+            if self.state.is_active() {
+                "C-g cancel"
+            } else {
+                "a follow-up"
+            }
         );
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(

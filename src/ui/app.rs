@@ -1733,7 +1733,8 @@ impl App {
             // doesn't own.
             | Action::AskAgent
             | Action::ToggleAgentPanel
-            | Action::PushCommentsToAgent => {}
+            | Action::PushCommentsToAgent
+            | Action::CancelAgentTurn => {}
             // `ui::mod` intercepts this before it reaches here too, same
             // bucket as `ToggleTimeline`/`ToggleLogView`/`OpenScopeMenu`
             // above — opening `ui::help`'s popup needs the live `Keymap` to

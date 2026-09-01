@@ -280,7 +280,11 @@ pub enum Action {
     /// one-shot question has none of a saved comment's need to survive
     /// being re-anchored later. A no-op outside
     /// [`crate::ui::view::View::Diff`], or when there's nothing selectable
-    /// under the cursor.
+    /// under the cursor. From [`crate::ui::view::View::Agent`] this instead
+    /// opens the same overlay in a context-less follow-up mode (no diff
+    /// selection to attach — the session already has it), rejected with a
+    /// status naming [`Action::CancelAgentTurn`]'s key while a turn is
+    /// already running rather than queued.
     AskAgent,
     /// Opens or closes the live agent transcript panel — like
     /// `ToggleLspInspector`, reachable from any view, and the underlying
@@ -299,6 +303,23 @@ pub enum Action {
     /// state — reachable from any view once a session has one, mirroring
     /// `ToggleAgentPanel`'s own universality.
     PushCommentsToAgent,
+    /// Cancels the resident agent's in-flight turn (see
+    /// [`crate::acp::session::AgentStore::cancel_turn`]) — bound to `C-g` in
+    /// both presets, borrowed verbatim from emacs's own `keyboard-quit`
+    /// (vim has no analogue of its own, so this follows the same
+    /// no-strong-identity-in-either-editor rule `AskAgent`/`ToggleAgentPanel`/
+    /// `PushCommentsToAgent` already state for `a`/`A`/`p`, just in the
+    /// other direction: emacs's convention wins outright rather than
+    /// falling back to vim's). Deliberately *not* `Esc`/[`Action::Cancel`]:
+    /// closing the agent panel and cancelling its running turn are
+    /// different intents, and closing must never silently aim at (or stop)
+    /// a turn that's still running in the background. Reachable from any
+    /// view (like `ToggleAgentPanel`/`PushCommentsToAgent`), including while
+    /// the permission modal itself is up (`ui::mod`'s raw-key interception
+    /// for that modal handles `C-g` directly, independent of this `Action`
+    /// — see that match arm's docs); a harmless no-op when no turn is
+    /// running.
+    CancelAgentTurn,
 }
 
 /// One key press, normalized for matching: the SHIFT modifier is dropped
@@ -735,6 +756,7 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("a", Action::AskAgent),
         ("A", Action::ToggleAgentPanel),
         ("p", Action::PushCommentsToAgent),
+        ("C-g", Action::CancelAgentTurn),
         ("q", Action::Quit),
         ("?", Action::OpenHelp),
     ]);
@@ -860,6 +882,12 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("a", Action::AskAgent),
         ("A", Action::ToggleAgentPanel),
         ("p", Action::PushCommentsToAgent),
+        // Unlike `a`/`A`/`p` just above, this one *does* have a strong
+        // emacs identity of its own — `C-g` is `keyboard-quit` verbatim,
+        // borrowed here for the same "abandon what's in flight" meaning
+        // (see `Action::CancelAgentTurn`'s own docs) rather than reused
+        // from vim, which has no analogous key at all.
+        ("C-g", Action::CancelAgentTurn),
         ("q", Action::Quit),
         // Same vim-keys-for-things-with-no-emacs-identity rule as `q`/`b`/
         // `s` above: `?` is unbound and not a prefix of anything else in
@@ -938,6 +966,7 @@ pub fn action_name(action: Action) -> &'static str {
         Action::AskAgent => "ask-agent",
         Action::ToggleAgentPanel => "toggle-agent-panel",
         Action::PushCommentsToAgent => "push-comments-to-agent",
+        Action::CancelAgentTurn => "cancel-agent-turn",
     }
 }
 
@@ -995,6 +1024,7 @@ pub fn action_by_name(name: &str) -> Option<Action> {
         "ask-agent" => Action::AskAgent,
         "toggle-agent-panel" => Action::ToggleAgentPanel,
         "push-comments-to-agent" => Action::PushCommentsToAgent,
+        "cancel-agent-turn" => Action::CancelAgentTurn,
         _ => return None,
     })
 }
@@ -1411,6 +1441,7 @@ mod tests {
             Action::AskAgent,
             Action::ToggleAgentPanel,
             Action::PushCommentsToAgent,
+            Action::CancelAgentTurn,
         ];
         for action in all {
             let name = action_name(action);
@@ -1591,7 +1622,7 @@ mod tests {
     /// `open_help_binds_to_plain_question_mark_in_both_presets` test.
     #[test]
     fn every_vim_and_emacs_binding_covers_every_action_exactly_once() {
-        const ACTION_COUNT: usize = 48;
+        const ACTION_COUNT: usize = 49;
         for ci_distinguishable in [false, true] {
             for preset in [
                 vim_preset(ci_distinguishable),
