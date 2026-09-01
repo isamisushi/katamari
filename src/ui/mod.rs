@@ -68,6 +68,7 @@ use crate::lsp::{
     ServerEvent, parse_publish_diagnostics, progress_status_text,
 };
 use crate::lsp::{ObservationStore, ServerIdentity};
+use crate::reviewed::store::ReviewedStore;
 use crate::skill;
 use crate::ui::compose::{ComposeKeymap, ComposeOutcome, ComposeState};
 use crate::ui::context_menu::{ContextMenuState, MenuCommand, MenuTarget};
@@ -401,6 +402,11 @@ pub fn run(
     // mode either.
     let revision_watch_status = start_revision_watch(stack.top(), app_tx.clone());
 
+    // A root diff's reviewed-hunk marks are seeded the same unconditional
+    // way, right before comments loads — see `start_reviewed`'s own docs
+    // on why this mutates `App` directly instead of returning state.
+    let reviewed_startup_status = start_reviewed(stack);
+
     // M6: a root diff's comments are loaded and watched unconditionally —
     // unlike the working-tree watcher above, this has nothing to do with
     // whether root live refresh is enabled. See
@@ -412,6 +418,7 @@ pub fn run(
     // capped warm-up is, so it only shows when nothing more actionable
     // claimed this session's one startup status slot.
     let startup_status = startup_status
+        .or(reviewed_startup_status)
         .or(comments_startup_status)
         .or(revision_watch_status)
         .or(available_update.as_ref().map(update::status_bar_notice));
@@ -534,6 +541,35 @@ fn spawn_comments_forwarder(rx: Receiver<()>, tx: Sender<AppEvent>) {
             }
         }
     });
+}
+
+/// Loads the root diff's reviewed-hunk log and seeds `App` with it —
+/// unconditionally, for every session with a [`View::Diff`] root, the same
+/// scoping [`start_comments`] uses and for the same reason (a reviewed
+/// mark, like a comment, has nothing to do with whether root live refresh
+/// is enabled). Unlike `start_comments`, this mutates `App` directly (via
+/// [`crate::ui::app::App::set_reviewed`]) rather than handing loaded state
+/// back to the caller — a comment never changes `App::rows`' shape, but a
+/// reviewed mark does (the collapse pass), so `App` has to know about it
+/// up front. No live watcher: unlike comments, nothing outside this same
+/// process ever writes `reviewed.jsonl` (marking is TUI-only, see
+/// `crate::reviewed`'s module docs), so there's no concurrent writer to
+/// watch for. Returns a status-bar note only on an I/O error reading the
+/// log — the same "don't silently not-load" principle `start_watch`/
+/// `start_comments` already follow.
+fn start_reviewed(stack: &mut ViewStack) -> Option<String> {
+    let View::Diff(app) = stack.root_mut() else {
+        return None;
+    };
+    match ReviewedStore::new(&app.repo_root).load() {
+        Ok(entries) => {
+            app.set_reviewed(entries.into_iter().map(|e| e.hunk_id).collect());
+            None
+        }
+        Err(e) => Some(format!(
+            "reviewed: failed to load .katamari/reviewed.jsonl: {e}"
+        )),
+    }
 }
 
 /// Issue #8: starts the ref-watcher behind a moving historical scope's live
@@ -2818,6 +2854,26 @@ fn try_expand_fold(
     Ok(app.expand_gap(file_idx, gap_idx, &lines))
 }
 
+/// Shared tail of `Action::MarkFileReviewed`/`Action::MarkVisibleReviewed`:
+/// persists every newly marked `(id, path)` pair through one
+/// `ReviewedStore::append_marks` call and reports the count, or "nothing
+/// new to mark" when `newly` is empty (the pure `App` method already
+/// verified there was nothing left to do, so this never even opens the
+/// store in that case).
+fn report_bulk_mark(app: &App, newly: &[(String, String)]) -> String {
+    if newly.is_empty() {
+        return "reviewed: nothing new to mark".to_owned();
+    }
+    match ReviewedStore::new(&app.repo_root).append_marks(newly) {
+        Ok(()) => format!(
+            "reviewed: marked {} hunk{}",
+            newly.len(),
+            if newly.len() == 1 { "" } else { "s" }
+        ),
+        Err(e) => format!("reviewed: failed to save: {e}"),
+    }
+}
+
 /// The shared "not ready" half of `Action::Hover`/`GotoDefinition`/
 /// `FindReferences` (issue #11): classifies the server backing `query`'s
 /// target via [`classify_action_readiness`] and, for anything but `Ready`,
@@ -3193,6 +3249,13 @@ fn files_focus_blocked_message(action: Action) -> Option<&'static str> {
         Action::NextDiagnostic | Action::PrevDiagnostic => "diagnostic: focus the diff pane first",
         Action::ToggleVisualLine => "visual: focus the diff pane first",
         Action::YankSelection => "yank: focus the diff pane first",
+        // `ToggleShowReviewed` deliberately does NOT join this list — like
+        // `ToggleComments`, it's a view-wide toggle with no cursor
+        // dependency, so it works from either pane's focus.
+        Action::MarkHunkReviewed
+        | Action::ToggleHunkReviewed
+        | Action::MarkFileReviewed
+        | Action::MarkVisibleReviewed => "reviewed: focus the diff pane first",
         _ => return None,
     })
 }
@@ -3834,6 +3897,14 @@ fn handle_action(
                         Err(e) => Some(e),
                     };
                 }
+                // Reveals one reviewed hunk's content without unmarking it
+                // — pure, no disk read (unlike the `Gap` arm above), so no
+                // `try_expand_fold`-style fallible wrapper is needed; this
+                // branch can't fail.
+                Some(RenderRow::ReviewedHunk { .. }) => {
+                    app.expand_reviewed_hunk_at_cursor();
+                    *goto_status = None;
+                }
                 _ => *goto_status = Some("fold: nothing to expand here".to_owned()),
             },
             View::File(_)
@@ -3858,6 +3929,96 @@ fn handle_action(
                 *goto_status = Some("fold: only available in the diff view".to_owned());
             }
         },
+        // `r`: mark the cursor's hunk reviewed, persist it, advance to the
+        // next unreviewed one — mirrors `AddComment`'s shape exactly (a
+        // pure `App` method for the state transition, this arm only for
+        // the store I/O and the status-bar note neither `App::update` nor
+        // the method's own return type can carry).
+        Action::MarkHunkReviewed => match stack.top_mut() {
+            View::Diff(app) => match app.mark_current_hunk_reviewed() {
+                app::MarkOutcome::Marked { id, path } => {
+                    if let Err(e) = ReviewedStore::new(&app.repo_root).append_mark(&id, &path) {
+                        *goto_status = Some(format!("reviewed: failed to save: {e}"));
+                    } else {
+                        *goto_status = None;
+                    }
+                }
+                app::MarkOutcome::AlreadyReviewed => {
+                    *goto_status = Some("reviewed: already marked".to_owned());
+                }
+                app::MarkOutcome::NothingHere => {
+                    *goto_status = Some("reviewed: nothing to mark here".to_owned());
+                }
+            },
+            View::File(_)
+            | View::Timeline(_)
+            | View::Log(_)
+            | View::LspInspector(_)
+            | View::Agent(_) => {
+                *goto_status = Some("reviewed: only available in the diff view".to_owned());
+            }
+        },
+        // `R`: flip the cursor's hunk between reviewed and not.
+        Action::ToggleHunkReviewed => match stack.top_mut() {
+            View::Diff(app) => match app.toggle_current_hunk_reviewed() {
+                app::ToggleOutcome::Marked { id, path } => {
+                    *goto_status = match ReviewedStore::new(&app.repo_root).append_mark(&id, &path)
+                    {
+                        Ok(()) => Some("reviewed: marked".to_owned()),
+                        Err(e) => Some(format!("reviewed: failed to save: {e}")),
+                    };
+                }
+                app::ToggleOutcome::Unmarked { id } => {
+                    *goto_status = match ReviewedStore::new(&app.repo_root).append_unmark(&id) {
+                        Ok(()) => Some("reviewed: unmarked".to_owned()),
+                        Err(e) => Some(format!("reviewed: failed to save: {e}")),
+                    };
+                }
+                app::ToggleOutcome::NothingHere => {
+                    *goto_status = Some("reviewed: nothing to toggle here".to_owned());
+                }
+            },
+            View::File(_)
+            | View::Timeline(_)
+            | View::Log(_)
+            | View::LspInspector(_)
+            | View::Agent(_) => {
+                *goto_status = Some("reviewed: only available in the diff view".to_owned());
+            }
+        },
+        // `m f` / `m a`: bulk-mark, one `append_marks` store call each
+        // (never N separate opens — see `ReviewedStore::append_marks`'s
+        // own docs).
+        Action::MarkFileReviewed => match stack.top_mut() {
+            View::Diff(app) => {
+                let newly = app.mark_file_reviewed();
+                *goto_status = Some(report_bulk_mark(app, &newly));
+            }
+            View::File(_)
+            | View::Timeline(_)
+            | View::Log(_)
+            | View::LspInspector(_)
+            | View::Agent(_) => {
+                *goto_status = Some("reviewed: only available in the diff view".to_owned());
+            }
+        },
+        Action::MarkVisibleReviewed => match stack.top_mut() {
+            View::Diff(app) => {
+                let newly = app.mark_visible_reviewed();
+                *goto_status = Some(report_bulk_mark(app, &newly));
+            }
+            View::File(_)
+            | View::Timeline(_)
+            | View::Log(_)
+            | View::LspInspector(_)
+            | View::Agent(_) => {
+                *goto_status = Some("reviewed: only available in the diff view".to_owned());
+            }
+        },
+        // `z R` needs no arm here at all — it's a pure state flip
+        // `App::update` already handles directly (mirroring
+        // `ToggleComments`), so it falls through the `other =>` wildcard
+        // at the bottom of this match straight into that real arm.
         // Issue #16: `V`. `App::toggle_visual` is the real, pure state
         // transition (see its docs) — this arm exists only to turn its
         // three-way `VisualToggleOutcome` into the status-bar note

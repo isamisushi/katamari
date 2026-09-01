@@ -147,7 +147,8 @@ fn row_file_idx(row: RenderRow) -> usize {
         | RenderRow::BinaryNotice { file_idx }
         | RenderRow::HunkHeader { file_idx, .. }
         | RenderRow::Line { file_idx, .. }
-        | RenderRow::Gap { file_idx, .. } => file_idx,
+        | RenderRow::Gap { file_idx, .. }
+        | RenderRow::ReviewedHunk { file_idx, .. } => file_idx,
     }
 }
 
@@ -175,6 +176,17 @@ fn row_line_and_text(files: &[DiffFile], row: RenderRow) -> (Option<u32>, Option
                 .nth(gap_idx);
             match gap {
                 Some(gap) => (Some(gap.new_start), Some("")),
+                None => (None, None),
+            }
+        }
+        // As the `Gap` arm above: a collapsed reviewed-hunk marker has a
+        // real new-side starting line even though it renders no line text
+        // of its own — reporting it here lets a refresh whose cursor sat on
+        // the marker degrade to "nearest line" instead of "jump to the file
+        // header."
+        RenderRow::ReviewedHunk { file_idx, hunk_idx } => {
+            match files.get(file_idx).and_then(|f| f.hunks.get(hunk_idx)) {
+                Some(hunk) => (Some(hunk.new_start), Some("")),
                 None => (None, None),
             }
         }
@@ -389,6 +401,40 @@ mod tests {
         assert!(
             restored.overlay_survives,
             "unchanged content at the same line must survive"
+        );
+    }
+
+    /// A cursor sitting on a collapsed `RenderRow::ReviewedHunk` marker
+    /// (never produced by `flatten` itself — this simulates what
+    /// `App::rederive`'s collapse pass leaves behind) must still capture a
+    /// real `new_line` from the hunk's own `new_start`, so a refresh lands
+    /// on the nearest surviving line rather than falling all the way back
+    /// to the file header the way a `(None, None)` anchor would.
+    #[test]
+    fn capture_anchor_on_a_reviewed_hunk_marker_degrades_to_its_hunks_new_start_line() {
+        let before = vec![context_file("a.rs", &["one", "two", "three"])];
+        let before_rows = vec![
+            RenderRow::FileHeader { file_idx: 0 },
+            RenderRow::ReviewedHunk {
+                file_idx: 0,
+                hunk_idx: 0,
+            },
+        ];
+        let anchor = capture_anchor(&before, &before_rows, 1, 1);
+
+        // "two" edited; "one" (new_line 1, matching the hunk's new_start)
+        // is untouched.
+        let after = vec![context_file("a.rs", &["one", "TWO EDITED", "three"])];
+        let after_rows = flatten(&after);
+        let restored = restore_anchor(&after, &after_rows, &anchor);
+
+        let RenderRow::Line { row_idx, .. } = after_rows[restored.row_index] else {
+            panic!("expected a Line row");
+        };
+        assert_eq!(
+            after[0].hunks[0].rows[row_idx].new_line,
+            Some(1),
+            "lands on the hunk's own new_start line, not the file header"
         );
     }
 

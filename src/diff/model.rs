@@ -493,6 +493,20 @@ pub enum RenderRow {
         file_idx: usize,
         gap_idx: usize,
     },
+    /// Stands in for a whole hunk the reviewer has marked reviewed (`r`),
+    /// the same way `Gap` stands in for a run of unchanged lines git
+    /// omitted — see [`collapse_reviewed_hunks`]. Deliberately carries no
+    /// line-count field of its own: the renderer reads
+    /// `files[file_idx].hunks[hunk_idx].rows.len()` directly, one field
+    /// access, matching this module's "structural, not cached" rule for
+    /// [`Gap`] itself. Cursor-addressable like `Gap` (`z o` expands the
+    /// hunk it stands on back to its ordinary `HunkHeader`+`Line` rows), but
+    /// never a `Line` — hover/comments/diagnostics stay invisible to it
+    /// until an expand replaces it with real rows again.
+    ReviewedHunk {
+        file_idx: usize,
+        hunk_idx: usize,
+    },
 }
 
 /// Flattens parsed files into the sequence the UI renders and scrolls
@@ -540,6 +554,45 @@ pub fn flatten(files: &[DiffFile]) -> Vec<RenderRow> {
         }
     }
     rows
+}
+
+/// Collapses every hunk whose `(file_idx, hunk_idx)` is in `reviewed` down
+/// to one [`RenderRow::ReviewedHunk`] row, replacing the run of rows
+/// [`flatten`] produced for it (its `HunkHeader` plus every `Line`
+/// belonging to that hunk — always contiguous, since `flatten`'s own hunk
+/// loop emits them that way). A pure `Vec<RenderRow>` transform: it needs no
+/// `&[DiffFile]`, since every row already carries the indices a caller can
+/// resolve content from later. [`RenderRow::Gap`] rows are untouched —
+/// they sit *between* hunks positionally, never inside one, so collapsing a
+/// neighboring hunk can never disturb one. An empty `reviewed` set is a
+/// no-op that returns `rows` unchanged.
+pub fn collapse_reviewed_hunks(
+    rows: Vec<RenderRow>,
+    reviewed: &std::collections::HashSet<(usize, usize)>,
+) -> Vec<RenderRow> {
+    if reviewed.is_empty() {
+        return rows;
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    let mut rows = rows.into_iter().peekable();
+    while let Some(row) = rows.next() {
+        match row {
+            RenderRow::HunkHeader { file_idx, hunk_idx }
+                if reviewed.contains(&(file_idx, hunk_idx)) =>
+            {
+                while matches!(
+                    rows.peek(),
+                    Some(RenderRow::Line { file_idx: f, hunk_idx: h, .. })
+                        if *f == file_idx && *h == hunk_idx
+                ) {
+                    rows.next();
+                }
+                out.push(RenderRow::ReviewedHunk { file_idx, hunk_idx });
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Where one [`Gap`] sits relative to a file's hunks — which hunk(s), if
@@ -963,6 +1016,7 @@ pub fn side_by_side_scroll_start(rows: &[SideBySideRow], flat_scroll_offset: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     const MULTI_FILE_FIXTURE: &str = include_str!("fixtures/multi_file.diff");
     const JAPANESE_FIXTURE: &str = include_str!("fixtures/japanese.diff");
@@ -1823,6 +1877,89 @@ index 1111111..2222222 100644\n\
             rows[gap_positions[1]],
             RenderRow::Gap { gap_idx: 1, .. }
         ));
+    }
+
+    // -- Reviewed-hunk collapsing --------------------------------------
+
+    #[test]
+    fn collapse_reviewed_hunks_replaces_one_hunks_rows_with_one_marker_row() {
+        let file = file_with_hunks(vec![hunk(1, 3, 1, 3), hunk(10, 3, 10, 3)]);
+        let rows = flatten(std::slice::from_ref(&file));
+        let reviewed: HashSet<(usize, usize)> = [(0, 0)].into_iter().collect();
+        let collapsed = collapse_reviewed_hunks(rows, &reviewed);
+
+        // FileHeader, ReviewedHunk(0,0), Gap, HunkHeader(0,1), 3 lines,
+        // Gap(trailing) — hunk 0's HunkHeader + 3 Lines became one row.
+        assert!(matches!(
+            collapsed[1],
+            RenderRow::ReviewedHunk {
+                file_idx: 0,
+                hunk_idx: 0
+            }
+        ));
+        assert!(
+            !collapsed
+                .iter()
+                .any(|r| matches!(r, RenderRow::HunkHeader { hunk_idx: 0, .. })),
+            "the reviewed hunk's own header must be gone"
+        );
+        assert!(
+            collapsed
+                .iter()
+                .any(|r| matches!(r, RenderRow::HunkHeader { hunk_idx: 1, .. })),
+            "the other, unreviewed hunk's header must survive"
+        );
+    }
+
+    #[test]
+    fn collapse_reviewed_hunks_leaves_a_neighboring_gap_row_untouched() {
+        let file = file_with_hunks(vec![hunk(1, 3, 1, 3), hunk(10, 3, 10, 3)]);
+        let rows = flatten(std::slice::from_ref(&file));
+        let gaps_before = rows
+            .iter()
+            .filter(|r| matches!(r, RenderRow::Gap { .. }))
+            .count();
+        let reviewed: HashSet<(usize, usize)> = [(0, 0)].into_iter().collect();
+        let collapsed = collapse_reviewed_hunks(rows, &reviewed);
+        let gaps_after = collapsed
+            .iter()
+            .filter(|r| matches!(r, RenderRow::Gap { .. }))
+            .count();
+        assert_eq!(gaps_before, gaps_after, "gap rows must survive untouched");
+    }
+
+    #[test]
+    fn collapse_reviewed_hunks_collapses_every_hunk_in_a_file_leaving_the_header() {
+        let file = file_with_hunks(vec![hunk(1, 3, 1, 3), hunk(10, 3, 10, 3)]);
+        let rows = flatten(std::slice::from_ref(&file));
+        let reviewed: HashSet<(usize, usize)> = [(0, 0), (0, 1)].into_iter().collect();
+        let collapsed = collapse_reviewed_hunks(rows, &reviewed);
+
+        assert!(matches!(
+            collapsed[0],
+            RenderRow::FileHeader { file_idx: 0 }
+        ));
+        assert!(
+            !collapsed
+                .iter()
+                .any(|r| matches!(r, RenderRow::HunkHeader { .. })
+                    || matches!(r, RenderRow::Line { .. })),
+            "no hunk header or line row should remain"
+        );
+        let marker_count = collapsed
+            .iter()
+            .filter(|r| matches!(r, RenderRow::ReviewedHunk { .. }))
+            .count();
+        assert_eq!(marker_count, 2);
+    }
+
+    #[test]
+    fn collapse_reviewed_hunks_with_an_empty_set_is_a_no_op() {
+        let file = file_with_hunks(vec![hunk(1, 3, 1, 3), hunk(10, 3, 10, 3)]);
+        let rows = flatten(std::slice::from_ref(&file));
+        let before = rows.clone();
+        let collapsed = collapse_reviewed_hunks(rows, &HashSet::new());
+        assert_eq!(before, collapsed);
     }
 
     // -- Status badges (issue #15) -----------------------------------------

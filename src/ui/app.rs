@@ -4,8 +4,9 @@
 //! testable without a real terminal.
 
 use crate::diff::{
-    ColumnMap, DiffFile, DiffLineKind, Gap, RenderRow, SideBySideRow, context_rows_for_gap,
-    file_gaps, flatten, flatten_side_by_side, gap_boundary_matches, lsp_target, splice_gap,
+    ColumnMap, DiffFile, DiffLineKind, Gap, RenderRow, SideBySideRow, collapse_reviewed_hunks,
+    context_rows_for_gap, file_gaps, flatten, flatten_side_by_side, gap_boundary_matches,
+    lsp_target, splice_gap,
 };
 use crate::keymap::Action;
 use crate::lsp::DiagnosticsStore;
@@ -75,6 +76,36 @@ pub enum VisualToggleOutcome {
     /// The cursor isn't on a [`RenderRow::Line`] — nothing here to start a
     /// selection from.
     NotSelectable,
+}
+
+/// [`App::mark_current_hunk_reviewed`]'s three-way result — `ui::mod`'s
+/// `Action::MarkHunkReviewed` arm turns each into a persistence call and/or
+/// a status-bar note.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkOutcome {
+    /// Newly marked — `id`/`path` for the caller to persist via
+    /// [`crate::reviewed::store::ReviewedStore::append_mark`].
+    Marked { id: String, path: String },
+    /// The cursor's hunk was already reviewed — nothing changed.
+    AlreadyReviewed,
+    /// The cursor isn't on a hunk at all (a file header, binary notice, or
+    /// gap row).
+    NothingHere,
+}
+
+/// [`App::toggle_current_hunk_reviewed`]'s three-way result — the same
+/// "caller needs to tell the outcomes apart to report/persist correctly"
+/// shape [`MarkOutcome`]/[`ExpandOutcome`] already use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToggleOutcome {
+    /// Newly marked — persist via
+    /// [`crate::reviewed::store::ReviewedStore::append_mark`].
+    Marked { id: String, path: String },
+    /// Newly unmarked — persist via
+    /// [`crate::reviewed::store::ReviewedStore::append_unmark`].
+    Unmarked { id: String },
+    /// The cursor isn't on a hunk at all.
+    NothingHere,
 }
 
 /// What `Action::AddComment` ("c") would create a review comment about —
@@ -322,6 +353,22 @@ pub struct App {
     /// or a fold toggle stay a single, always-consistent recomputation
     /// rather than an ad hoc patch to whatever was already on screen.
     pristine_files: Vec<DiffFile>,
+    /// Whether `pristine_files` currently holds a source [`Self::rederive`]
+    /// hasn't consumed yet — `true` immediately after [`Self::new`],
+    /// [`Self::apply_refresh`], or [`Self::apply_scope_swap`] assigns
+    /// `pristine_files` directly (even when the freshly assigned diff is
+    /// genuinely empty — an empty scope is still a *real* answer, not
+    /// "nothing new to report"), `false` from the moment `rederive`'s own
+    /// no-derived-state branch consumes it. What makes that branch safe to
+    /// call more than once in a row with nothing new to source (every
+    /// reviewed-hunk method — `mark_current_hunk_reviewed`,
+    /// `toggle_current_hunk_reviewed`, `expand_reviewed_hunk_at_cursor`,
+    /// `Action::ToggleShowReviewed` — calls bare `rederive()` without ever
+    /// touching `pristine_files`, since a mark/unmark never changes
+    /// `files`' own content): without this flag, a second such call would
+    /// find `pristine_files` already emptied by the first and wipe `files`
+    /// to nothing, mistaking "nothing new" for "the diff is now empty."
+    pristine_is_fresh: bool,
     pub files: Vec<DiffFile>,
     pub rows: Vec<RenderRow>,
     /// Del/add-run pairing of `rows` for the side-by-side layout, computed
@@ -463,6 +510,43 @@ pub struct App {
     /// from the state they're supposed to be derived from, so the only
     /// doors in are [`Self::set_unit_filter`]/[`Self::clear_unit_filter`].
     unit_filter: Option<UnitFilter>,
+    /// Hunk ids the reviewer has explicitly marked reviewed — pure
+    /// content-addressed identity (`crate::groups::HunkMeta::id`, reused
+    /// as-is; see `crate::reviewed`'s module docs for why). Loaded once
+    /// from disk via [`Self::set_reviewed`] right after construction
+    /// (never inside [`Self::new`] itself, so the many existing `App::new`
+    /// test call sites are unaffected), then mutated only through `App`'s
+    /// own mark/unmark/toggle methods — the same "private state, narrow
+    /// doors" discipline `expanded_folds`/`unit_filter` already follow.
+    /// Marking is deliberately *not* gated on `interactive`/
+    /// `disk_is_new_side` the way `z o` is — those gate reading live disk,
+    /// which marking never does (just hashing in-memory hunk content), so
+    /// a mark works identically on a working-tree, revision, or `--pr`
+    /// diff, and (since the id carries no notion of which diff produced
+    /// it) the same mark is visible across all of them for the same
+    /// repository — by design, not a bug.
+    reviewed: HashSet<String>,
+    /// Hunk ids (always a subset of `reviewed`) the reviewer has `z o`'d
+    /// open to peek at without unmarking. Keyed by content id rather than
+    /// `(file_idx, hunk_idx)` for the same reason `unit_filter`'s ids are:
+    /// it must keep meaning the same hunk across a [`Self::rederive`].
+    expanded_reviewed: HashSet<String>,
+    /// The global "show every reviewed hunk expanded" override (`z R`).
+    /// While `true`, [`Self::rederive`] skips the reviewed-collapse pass
+    /// entirely, which means there is no [`RenderRow::ReviewedHunk`] row
+    /// left to land on — a per-hunk `z o`/`z c` naturally has nothing to
+    /// act on while this is set, with no special-casing needed anywhere
+    /// else.
+    show_reviewed: bool,
+    /// `(reviewed, total)` hunk counts per entry of `self.files`, recomputed
+    /// alongside `rows`/`gap_cache` on every [`Self::rederive`] from the
+    /// same [`crate::groups::enumerate_hunks`] pass the collapse step
+    /// already pays for — the sidebar's per-file "n/m✓" suffix reads this
+    /// as a plain index lookup at render time instead of re-walking a
+    /// file's hunks once per visible row, every frame. `pub` because
+    /// [`crate::ui::sidebar::render`] reads it directly, the same way it
+    /// already reads `files`.
+    pub reviewed_by_file: Vec<(usize, usize)>,
     /// Files whose trailing gap `z o` has probed and found genuinely empty
     /// (the working tree has no more lines past the last hunk) — fed into
     /// [`Self::rederive`] as an effective `known_eof` override so the same
@@ -595,6 +679,7 @@ impl App {
             repo_root,
             view_token: NEXT_VIEW_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             pristine_files: Self::canonicalize(files),
+            pristine_is_fresh: true,
             files: Vec::new(),
             rows: Vec::new(),
             side_by_side_rows: Vec::new(),
@@ -617,6 +702,10 @@ impl App {
             units_prompt_needed: false,
             expanded_folds: HashMap::new(),
             unit_filter: None,
+            reviewed: HashSet::new(),
+            expanded_reviewed: HashSet::new(),
+            show_reviewed: false,
+            reviewed_by_file: Vec::new(),
             trailing_probed_empty: HashSet::new(),
             visual_anchor: None,
             viewport_height: 1,
@@ -756,10 +845,57 @@ impl App {
                 }
             }
             files
-        } else {
+        } else if self.pristine_is_fresh {
+            // A caller (`Self::new`/`apply_refresh`/`apply_scope_swap`)
+            // just handed us a real source, even if it happens to be
+            // empty — that's a genuine "the scope now has zero files"
+            // answer, not "nothing new to report," so it's consumed
+            // exactly as before.
+            self.pristine_is_fresh = false;
             std::mem::take(&mut self.pristine_files)
+        } else if !self.pristine_files.is_empty() {
+            // No fresh assignment since the last consume, but a *previous*
+            // has-derived-state pass resynced `pristine_files` from
+            // `self.files` (its own resync line, just above) and never
+            // emptied it again — e.g. the fold just collapsed here was the
+            // last one, so `has_derived_state` is false for *this* call
+            // but the true, unspliced content is sitting right here.
+            std::mem::take(&mut self.pristine_files)
+        } else {
+            // Nothing fresh, and no stale-but-valid resync either: a bare
+            // `rederive()` call (a reviewed-hunk mark/unmark/peek, or
+            // `Action::ToggleShowReviewed`) that never touched `files`'
+            // own content at all — `self.files` from the previous
+            // derivation is already exactly correct, so this is a no-op
+            // move rather than a fresh clone.
+            std::mem::take(&mut self.files)
         };
         self.rows = flatten(&self.files);
+        // One `enumerate_hunks` pass over the derived `files` feeds both
+        // the reviewed-collapse step below and `reviewed_by_file` — shared
+        // rather than computed twice, the same "reuse the one call, don't
+        // hash twice" reasoning `apply_unit_filter`'s own pass above
+        // already follows.
+        let hunk_meta = crate::groups::enumerate_hunks(&self.files);
+        let mut reviewed_by_file = vec![(0usize, 0usize); self.files.len()];
+        for meta in &hunk_meta {
+            reviewed_by_file[meta.file_idx].1 += 1;
+            if self.reviewed.contains(&meta.id) {
+                reviewed_by_file[meta.file_idx].0 += 1;
+            }
+        }
+        self.reviewed_by_file = reviewed_by_file;
+        if !self.show_reviewed {
+            let reviewed_positions: HashSet<(usize, usize)> = hunk_meta
+                .into_iter()
+                .filter(|meta| {
+                    self.reviewed.contains(&meta.id) && !self.expanded_reviewed.contains(&meta.id)
+                })
+                .map(|meta| (meta.file_idx, meta.hunk_idx))
+                .collect();
+            self.rows =
+                collapse_reviewed_hunks(std::mem::take(&mut self.rows), &reviewed_positions);
+        }
         self.side_by_side_rows = flatten_side_by_side(&self.files);
         self.gap_cache = self.files.iter().map(file_gaps).collect();
         // Issue #15: the files-pane tree is derived from `files` the same
@@ -1293,6 +1429,7 @@ impl App {
 
         self.prune_stale_folds(&files);
         self.pristine_files = Self::canonicalize(files);
+        self.pristine_is_fresh = true;
         self.rederive();
         self.active_symbol = 0;
 
@@ -1441,6 +1578,7 @@ impl App {
             .get(self.files_selection)
             .map(|r| r.id.clone());
         self.pristine_files = Self::canonicalize(files);
+        self.pristine_is_fresh = true;
         self.expanded_folds.clear();
         self.trailing_probed_empty.clear();
         // Same reasoning as the fold state above: a unit grouping
@@ -1524,6 +1662,220 @@ impl App {
         self.unit_filter.as_ref()
     }
 
+    // ---- Reviewed-hunk state ----------------------------------------
+
+    /// Seeds `reviewed` from disk and rederives — called exactly once, by
+    /// `ui::mod::run` right after construction, for every root
+    /// [`crate::ui::view::View::Diff`] (see that call site's own docs on
+    /// why this isn't folded into [`Self::new`] itself: it would touch
+    /// every one of the many existing `App::new` test call sites for a
+    /// concern only the real event loop needs). Resets cursor/scroll/
+    /// symbol to the top exactly the way the tail of [`Self::new`] already
+    /// does — safe here for the same reason it's safe there: nothing has
+    /// rendered a frame yet.
+    pub fn set_reviewed(&mut self, ids: HashSet<String>) {
+        self.reviewed = ids;
+        self.rederive();
+        self.cursor = 0;
+        self.scroll_offset = 0;
+        self.active_symbol = 0;
+        self.resolve_and_set_selection(None);
+    }
+
+    /// `(file_idx, hunk_idx, hunk_id)` for whichever hunk the cursor
+    /// currently sits within, resolved via one fresh
+    /// [`crate::groups::enumerate_hunks`] lookup — `None` off a
+    /// `FileHeader`/`BinaryNotice`/`Gap` row, which belong to no single
+    /// hunk. Matches on [`RenderRow::HunkHeader`], [`RenderRow::Line`], and
+    /// [`RenderRow::ReviewedHunk`] alike, so the reviewed-state actions
+    /// work identically whether the cursor sits on a hunk's header, one of
+    /// its lines, or (once collapsed) its own single marker row.
+    fn hunk_id_at_cursor(&self) -> Option<(usize, usize, String)> {
+        let (file_idx, hunk_idx) = match self.rows.get(self.cursor)? {
+            RenderRow::HunkHeader { file_idx, hunk_idx }
+            | RenderRow::Line {
+                file_idx, hunk_idx, ..
+            }
+            | RenderRow::ReviewedHunk { file_idx, hunk_idx } => (*file_idx, *hunk_idx),
+            RenderRow::FileHeader { .. }
+            | RenderRow::BinaryNotice { .. }
+            | RenderRow::Gap { .. } => {
+                return None;
+            }
+        };
+        crate::groups::enumerate_hunks(&self.files)
+            .into_iter()
+            .find(|m| m.file_idx == file_idx && m.hunk_idx == hunk_idx)
+            .map(|m| (file_idx, hunk_idx, m.id))
+    }
+
+    /// Marks the cursor's hunk reviewed and advances to the next
+    /// unreviewed one — `r`'s pure half. Advancing is free once the
+    /// marked hunk stops having a `HunkHeader` row at all: this reuses the
+    /// exact "next `HunkHeader`" predicate [`Action::NextHunk`] already
+    /// uses, so "next `HunkHeader`" and "next unreviewed hunk" are simply
+    /// the same search after a mark. No wraparound, matching every other
+    /// jump in this module — if nothing unreviewed remains ahead, the
+    /// cursor stays on the freshly collapsed marker.
+    pub fn mark_current_hunk_reviewed(&mut self) -> MarkOutcome {
+        let Some((file_idx, hunk_idx, id)) = self.hunk_id_at_cursor() else {
+            return MarkOutcome::NothingHere;
+        };
+        if self.reviewed.contains(&id) {
+            return MarkOutcome::AlreadyReviewed;
+        }
+        let path = self.files[file_idx].display_path().to_owned();
+        self.reviewed.insert(id.clone());
+        self.rederive();
+        if let Some(idx) = self.rows.iter().position(|row| {
+            matches!(row, RenderRow::ReviewedHunk { file_idx: f, hunk_idx: h }
+                if *f == file_idx && *h == hunk_idx)
+        }) {
+            self.cursor = idx;
+        }
+        self.jump_to(|row| matches!(row, RenderRow::HunkHeader { .. }));
+        self.clamp_scroll();
+        self.recompute_search();
+        MarkOutcome::Marked { id, path }
+    }
+
+    /// Flips the cursor's hunk between reviewed and not — `R`, the explicit
+    /// correction tool. Unlike [`Self::mark_current_hunk_reviewed`] the
+    /// cursor never advances (a fix-up, not a flow-forward action): it's
+    /// re-anchored to wherever the same hunk landed (its marker row if
+    /// newly collapsed, its header if newly reopened) rather than left at
+    /// a stale flat index.
+    pub fn toggle_current_hunk_reviewed(&mut self) -> ToggleOutcome {
+        let Some((file_idx, hunk_idx, id)) = self.hunk_id_at_cursor() else {
+            return ToggleOutcome::NothingHere;
+        };
+        let outcome = if self.reviewed.remove(&id) {
+            self.expanded_reviewed.remove(&id);
+            ToggleOutcome::Unmarked { id: id.clone() }
+        } else {
+            let path = self.files[file_idx].display_path().to_owned();
+            self.reviewed.insert(id.clone());
+            ToggleOutcome::Marked {
+                id: id.clone(),
+                path,
+            }
+        };
+        self.rederive();
+        if let Some(idx) = self.rows.iter().position(|row| match row {
+            RenderRow::ReviewedHunk {
+                file_idx: f,
+                hunk_idx: h,
+            }
+            | RenderRow::HunkHeader {
+                file_idx: f,
+                hunk_idx: h,
+            } => *f == file_idx && *h == hunk_idx,
+            _ => false,
+        }) {
+            self.cursor = idx;
+        }
+        self.clamp_scroll();
+        self.recompute_search();
+        outcome
+    }
+
+    /// Marks every not-yet-reviewed hunk in the cursor's current file — `m
+    /// f`. Returns the `(id, path)` pairs newly marked, for the caller to
+    /// persist in one `ReviewedStore::append_marks` call; empty (and a
+    /// total no-op, no rederive) when the file has nothing left to mark.
+    pub fn mark_file_reviewed(&mut self) -> Vec<(String, String)> {
+        let file_idx = self.diff_file();
+        let newly: Vec<(String, String)> = crate::groups::enumerate_hunks(&self.files)
+            .into_iter()
+            .filter(|m| m.file_idx == file_idx && !self.reviewed.contains(&m.id))
+            .map(|m| (m.id, m.file))
+            .collect();
+        self.apply_bulk_mark(&newly);
+        newly
+    }
+
+    /// As [`Self::mark_file_reviewed`], over every hunk currently in
+    /// `self.files` — respects an active unit filter automatically, since
+    /// it only ever reads the already-narrowed derived view, never
+    /// [`Self::full_files`].
+    pub fn mark_visible_reviewed(&mut self) -> Vec<(String, String)> {
+        let newly: Vec<(String, String)> = crate::groups::enumerate_hunks(&self.files)
+            .into_iter()
+            .filter(|m| !self.reviewed.contains(&m.id))
+            .map(|m| (m.id, m.file))
+            .collect();
+        self.apply_bulk_mark(&newly);
+        newly
+    }
+
+    /// Shared tail of [`Self::mark_file_reviewed`]/[`Self::mark_visible_reviewed`]:
+    /// inserts every newly marked id, then rederives once regardless of how
+    /// many hunks just collapsed. The cursor isn't anchor-restored to a
+    /// specific hunk the way a single mark is — a bulk mark can collapse
+    /// dozens of rows at once, so the cursor's old flat index is simply
+    /// clamped back into range, the same fallback [`Self::expand_gap`]'s
+    /// probed-empty branch uses for an equally structural, not-worth-a-
+    /// precise-target rebuild.
+    fn apply_bulk_mark(&mut self, newly: &[(String, String)]) {
+        if newly.is_empty() {
+            return;
+        }
+        for (id, _) in newly {
+            self.reviewed.insert(id.clone());
+        }
+        self.rederive();
+        self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
+        self.clamp_scroll();
+        self.recompute_search();
+    }
+
+    /// `z o` on a [`RenderRow::ReviewedHunk`] marker: reveals that one
+    /// hunk's content without unmarking it, by adding its id to
+    /// `expanded_reviewed` — [`Self::rederive`]'s collapse pass skips any
+    /// id in there even though it's still in `reviewed`. `false` off
+    /// anything but a reviewed hunk's own marker row, or one already
+    /// expanded. Needs no disk read (unlike [`Self::expand_gap`]): the
+    /// hunk's lines are already fully known from `self.files`.
+    pub fn expand_reviewed_hunk_at_cursor(&mut self) -> bool {
+        let Some(RenderRow::ReviewedHunk { file_idx, hunk_idx }) =
+            self.rows.get(self.cursor).copied()
+        else {
+            return false;
+        };
+        let Some((_, _, id)) = self.hunk_id_at_cursor() else {
+            return false;
+        };
+        if self.expanded_reviewed.contains(&id) {
+            return false;
+        }
+        self.expanded_reviewed.insert(id);
+        self.rederive();
+        if let Some(idx) = self.rows.iter().position(|row| {
+            matches!(row, RenderRow::HunkHeader { file_idx: f, hunk_idx: h }
+                if *f == file_idx && *h == hunk_idx)
+        }) {
+            self.cursor = idx;
+        }
+        self.clamp_scroll();
+        self.recompute_search();
+        true
+    }
+
+    /// `(reviewed, total)` hunk counts for the *currently derived* view —
+    /// summed from [`Self::reviewed_by_file`] rather than a fresh
+    /// `enumerate_hunks` pass, since this is read every frame by the status
+    /// bar and `reviewed_by_file` is already exactly this data, precomputed
+    /// once per [`Self::rederive`] rather than once per frame. `None` when
+    /// there are no hunks at all to report progress over (an empty diff, or
+    /// one of pure renames/binaries).
+    pub fn reviewed_progress(&self) -> Option<(usize, usize)> {
+        let (reviewed, total) = self
+            .reviewed_by_file
+            .iter()
+            .fold((0, 0), |(r, t), &(ri, ti)| (r + ri, t + ti));
+        (total > 0).then_some((reviewed, total))
+    }
+
     /// The complete diff regardless of any active [`UnitFilter`] — what
     /// grouping-related lookups must key on. While any derived state is
     /// active, `pristine_files` holds the full parse (see
@@ -1563,6 +1915,9 @@ impl App {
             // sidebar highlighting must follow the cursor onto it, not fall
             // back to file 0.
             Some(RenderRow::Gap { file_idx, .. }) => *file_idx,
+            // A collapsed reviewed-hunk marker is cursor-addressable the
+            // same way a fold row is — see `RenderRow::ReviewedHunk`'s docs.
+            Some(RenderRow::ReviewedHunk { file_idx, .. }) => *file_idx,
             None => 0,
         }
     }
@@ -1700,6 +2055,21 @@ impl App {
             }
             Action::ToggleLayout => self.layout = self.layout.toggled(),
             Action::ToggleComments => self.comments_visible = !self.comments_visible,
+            // `z R`: a pure state flip, mirroring `ToggleComments` — unlike
+            // `MarkHunkReviewed`/`ToggleHunkReviewed` this touches no store,
+            // so `App::update` handles it directly rather than `ui::mod`
+            // intercepting it. Rederiving can drastically change how many
+            // rows exist (every reviewed hunk's content appears or
+            // disappears at once), so the cursor is clamped back into
+            // range rather than anchor-restored to a specific row — the
+            // same "structural, not worth a precise target" fallback
+            // `Self::apply_bulk_mark` uses.
+            Action::ToggleShowReviewed => {
+                self.show_reviewed = !self.show_reviewed;
+                self.rederive();
+                self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
+                self.recompute_search();
+            }
             Action::NextSymbol => {
                 if self.focus == MainPaneFocus::Diff {
                     self.cycle_symbol(1);
@@ -1800,6 +2170,17 @@ impl App {
             | Action::PrevMatch
             | Action::ToggleVisualLine
             | Action::YankSelection
+            // `MarkHunkReviewed`/`ToggleHunkReviewed`/`MarkFileReviewed`/
+            // `MarkVisibleReviewed` join the same bucket as `AddComment`
+            // for the same reason: persisting a mark needs the repo root
+            // and `ReviewedStore`, neither of which `App` owns — `ui::mod`
+            // intercepts these and calls `App::mark_current_hunk_reviewed`/
+            // `toggle_current_hunk_reviewed`/`mark_file_reviewed`/
+            // `mark_visible_reviewed` directly instead.
+            | Action::MarkHunkReviewed
+            | Action::ToggleHunkReviewed
+            | Action::MarkFileReviewed
+            | Action::MarkVisibleReviewed
             | Action::Confirm => {}
             // `ui::mod` intercepts `ToggleTimeline`/`ToggleLogView`/
             // `OpenScopeMenu` before they reach here (constructing/tearing
@@ -2436,7 +2817,30 @@ impl App {
     /// since folding collapses the whole recorded range down to that one
     /// row) — not necessarily `self.cursor` itself, since the cursor can
     /// sit anywhere within an expanded range, not just its first row.
+    ///
+    /// Also `z c`'s other half, `R`eviewed-hunk collapsing: if the cursor
+    /// sits on (or inside) a hunk that's both reviewed and currently
+    /// `z o`'d open via `expanded_reviewed`, this re-collapses it back to
+    /// its `ReviewedHunk` marker instead — checked first, ahead of the
+    /// ordinary gap-fold logic below, so `z c` reads as one shared "fold
+    /// whatever's open here" binding rather than two separate ones a
+    /// reviewer would have to remember apart.
     pub fn collapse_fold_at_cursor(&mut self) -> bool {
+        if let Some((file_idx, hunk_idx, id)) = self.hunk_id_at_cursor()
+            && self.reviewed.contains(&id)
+            && self.expanded_reviewed.remove(&id)
+        {
+            self.rederive();
+            if let Some(idx) = self.rows.iter().position(|row| {
+                matches!(row, RenderRow::ReviewedHunk { file_idx: f, hunk_idx: h }
+                    if *f == file_idx && *h == hunk_idx)
+            }) {
+                self.cursor = idx;
+            }
+            self.clamp_scroll();
+            self.recompute_search();
+            return true;
+        }
         let Some(RenderRow::Line {
             file_idx,
             hunk_idx,
@@ -4398,6 +4802,455 @@ index 1111111..2222222 100644\n\
         assert!(
             !app.trailing_probed_empty.contains("f.txt"),
             "drifted boundary content must not be recorded as probed-empty"
+        );
+    }
+
+    // ---- Reviewed-hunk state (marks, collapsing, progress) --------------
+
+    /// A file with two single-line-`Add` hunks far enough apart to leave a
+    /// real Between gap — unlike `gap_fixture_file`'s all-`Context` hunks,
+    /// each hunk here has one non-context row, so its content hash actually
+    /// depends on that row's text (`enumerate_hunks` hashes only non-
+    /// context rows) rather than only its path — needed for the rewrite-
+    /// resurfaces test below, which edits that text.
+    fn reviewed_fixture_file() -> DiffFile {
+        use crate::diff::{DiffHunk, DiffLineKind, DiffRow};
+        let mk_hunk = |start: u32, text: &str| DiffHunk {
+            old_start: start,
+            old_lines: 0,
+            new_start: start,
+            new_lines: 1,
+            header: String::new(),
+            known_eof: false,
+            rows: vec![DiffRow {
+                kind: DiffLineKind::Add,
+                text: text.to_owned(),
+                old_line: None,
+                new_line: Some(start),
+            }],
+        };
+        DiffFile {
+            old_path: Some("f.txt".to_owned()),
+            new_path: Some("f.txt".to_owned()),
+            hunks: vec![mk_hunk(1, "added one"), mk_hunk(10, "added two")],
+            ..Default::default()
+        }
+    }
+
+    /// `reviewed_fixture_file` as a live `App`: rows are `[FileHeader,
+    /// HunkHeader(0,0), Line "added one", Gap(between), HunkHeader(0,1),
+    /// Line "added two", Gap(trailing)]`.
+    fn reviewed_fixture_app() -> App {
+        App::new(
+            "repo".to_owned(),
+            PathBuf::from("/repo"),
+            vec![reviewed_fixture_file()],
+        )
+    }
+
+    fn find_row(app: &App, pred: impl Fn(&RenderRow) -> bool) -> usize {
+        app.rows
+            .iter()
+            .position(pred)
+            .expect("expected row not found")
+    }
+
+    #[test]
+    fn mark_current_hunk_reviewed_collapses_it_and_advances_to_the_next_unreviewed_hunk() {
+        let mut app = reviewed_fixture_app();
+        app.cursor = find_row(&app, |r| {
+            matches!(r, RenderRow::HunkHeader { hunk_idx: 0, .. })
+        });
+
+        let outcome = app.mark_current_hunk_reviewed();
+        assert_eq!(
+            outcome,
+            MarkOutcome::Marked {
+                id: crate::groups::enumerate_hunks(std::slice::from_ref(&reviewed_fixture_file()))
+                    .into_iter()
+                    .find(|m| m.hunk_idx == 0)
+                    .unwrap()
+                    .id,
+                path: "f.txt".to_owned(),
+            }
+        );
+        assert!(
+            !app.rows
+                .iter()
+                .any(|r| matches!(r, RenderRow::HunkHeader { hunk_idx: 0, .. })),
+            "hunk 0's header is gone, replaced by its marker"
+        );
+        assert!(matches!(
+            app.rows[app.cursor],
+            RenderRow::HunkHeader {
+                file_idx: 0,
+                hunk_idx: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn mark_current_hunk_reviewed_on_the_last_hunk_does_not_wrap_around() {
+        let mut app = reviewed_fixture_app();
+        app.cursor = find_row(&app, |r| {
+            matches!(r, RenderRow::HunkHeader { hunk_idx: 1, .. })
+        });
+
+        assert!(matches!(
+            app.mark_current_hunk_reviewed(),
+            MarkOutcome::Marked { .. }
+        ));
+        assert!(
+            matches!(
+                app.rows[app.cursor],
+                RenderRow::ReviewedHunk { hunk_idx: 1, .. }
+            ),
+            "no unreviewed hunk ahead — cursor stays on the freshly collapsed marker"
+        );
+    }
+
+    #[test]
+    fn marking_an_already_reviewed_hunk_again_reports_already_reviewed() {
+        let mut app = reviewed_fixture_app();
+        app.cursor = find_row(&app, |r| {
+            matches!(r, RenderRow::HunkHeader { hunk_idx: 0, .. })
+        });
+        assert!(matches!(
+            app.mark_current_hunk_reviewed(),
+            MarkOutcome::Marked { .. }
+        ));
+        app.cursor = find_row(&app, |r| {
+            matches!(r, RenderRow::ReviewedHunk { hunk_idx: 0, .. })
+        });
+        assert_eq!(
+            app.mark_current_hunk_reviewed(),
+            MarkOutcome::AlreadyReviewed
+        );
+    }
+
+    /// Hard requirement: marking works identically on a historical/
+    /// read-only diff (a revision scope, `--pr`, `LogView`) — unlike `z o`,
+    /// which `App::disk_is_new_side` gates because it reads the live
+    /// working tree, marking only hashes in-memory hunk content and never
+    /// touches disk, so it must succeed here exactly as it does on a
+    /// working-tree diff. Mirrors the pre-existing
+    /// `visual_selection_works_the_same_on_a_non_interactive_historical_app`
+    /// test's shape for the same class of claim.
+    /// Regression: `set_reviewed` calls `rederive()` a second time (after
+    /// `App::new`'s own constructor call) with an empty `reviewed` set on
+    /// every ordinary session that has never marked anything yet — the
+    /// overwhelmingly common case. Before `pristine_is_fresh` existed,
+    /// that second bare call found `pristine_files` already emptied by the
+    /// first and silently wiped `files`/`rows` to nothing, discovered via
+    /// the E2E suite (every non-fold-related test showing an empty-diff
+    /// placeholder it had no business showing).
+    #[test]
+    fn set_reviewed_with_an_empty_set_does_not_wipe_the_diff() {
+        let app = reviewed_fixture_app();
+        let rows_before = app.rows.len();
+        let mut app = app;
+        app.set_reviewed(HashSet::new());
+        assert!(rows_before > 0, "sanity: the fixture has real content");
+        assert_eq!(
+            app.rows.len(),
+            rows_before,
+            "loading zero prior marks must not touch the diff at all"
+        );
+    }
+
+    #[test]
+    fn marking_works_the_same_on_a_non_interactive_historical_app() {
+        let mut app = reviewed_fixture_app();
+        app.interactive = false;
+        app.disk_is_new_side = false;
+        app.cursor = find_row(&app, |r| {
+            matches!(r, RenderRow::HunkHeader { hunk_idx: 0, .. })
+        });
+
+        assert!(matches!(
+            app.mark_current_hunk_reviewed(),
+            MarkOutcome::Marked { .. }
+        ));
+        assert_eq!(app.reviewed_progress(), Some((1, 2)));
+    }
+
+    #[test]
+    fn mark_current_hunk_reviewed_off_a_file_header_reports_nothing_here() {
+        let mut app = reviewed_fixture_app();
+        app.cursor = 0; // FileHeader
+        assert_eq!(app.mark_current_hunk_reviewed(), MarkOutcome::NothingHere);
+    }
+
+    #[test]
+    fn toggle_current_hunk_reviewed_marks_then_unmarks_restoring_the_original_rows() {
+        let mut app = reviewed_fixture_app();
+        let rows_before = app.rows.clone();
+        app.cursor = find_row(&app, |r| {
+            matches!(r, RenderRow::HunkHeader { hunk_idx: 0, .. })
+        });
+
+        let marked = app.toggle_current_hunk_reviewed();
+        let id = match &marked {
+            ToggleOutcome::Marked { id, path } => {
+                assert_eq!(path, "f.txt");
+                id.clone()
+            }
+            other => panic!("expected Marked, got {other:?}"),
+        };
+        assert!(matches!(
+            app.rows[app.cursor],
+            RenderRow::ReviewedHunk { hunk_idx: 0, .. }
+        ));
+
+        let unmarked = app.toggle_current_hunk_reviewed();
+        assert_eq!(unmarked, ToggleOutcome::Unmarked { id });
+        assert_eq!(
+            app.rows, rows_before,
+            "toggling back off restores the exact original row shape"
+        );
+        assert!(matches!(
+            app.rows[app.cursor],
+            RenderRow::HunkHeader { hunk_idx: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn mark_file_reviewed_marks_every_hunk_in_the_cursor_file() {
+        let mut app = reviewed_fixture_app();
+        app.cursor = find_row(&app, |r| {
+            matches!(r, RenderRow::HunkHeader { hunk_idx: 0, .. })
+        });
+
+        let pairs = app.mark_file_reviewed();
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.iter().all(|(_, path)| path == "f.txt"));
+        assert_eq!(app.reviewed_progress(), Some((2, 2)));
+        assert!(
+            !app.rows
+                .iter()
+                .any(|r| matches!(r, RenderRow::HunkHeader { .. })),
+            "every hunk in the file collapsed"
+        );
+
+        // A second call has nothing left to mark.
+        assert_eq!(app.mark_file_reviewed(), Vec::new());
+    }
+
+    #[test]
+    fn mark_visible_reviewed_respects_an_active_unit_filter() {
+        use crate::diff::{DiffHunk, DiffLineKind, DiffRow};
+        let other_file = DiffFile {
+            old_path: Some("g.txt".to_owned()),
+            new_path: Some("g.txt".to_owned()),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                known_eof: false,
+                rows: vec![DiffRow {
+                    kind: DiffLineKind::Add,
+                    text: "g line".to_owned(),
+                    old_line: None,
+                    new_line: Some(1),
+                }],
+            }],
+            ..Default::default()
+        };
+        let mut app = App::new(
+            "repo".to_owned(),
+            PathBuf::from("/repo"),
+            vec![reviewed_fixture_file(), other_file],
+        );
+
+        let metas = crate::groups::enumerate_hunks(&app.files);
+        let file0_ids: HashSet<String> = metas
+            .iter()
+            .filter(|m| m.file_idx == 0)
+            .map(|m| m.id.clone())
+            .collect();
+        let file1_id = metas.iter().find(|m| m.file_idx == 1).unwrap().id.clone();
+
+        app.set_unit_filter(UnitFilter {
+            label: "u".to_owned(),
+            description: String::new(),
+            index: 1,
+            total: 1,
+            hunk_ids: file0_ids.clone(),
+        });
+
+        let pairs = app.mark_visible_reviewed();
+        assert_eq!(
+            pairs.len(),
+            2,
+            "only the two hunks inside the active unit filter"
+        );
+        assert!(app.reviewed.is_superset(&file0_ids));
+        assert!(
+            !app.reviewed.contains(&file1_id),
+            "the other file's hunk sits outside the filter and must be untouched"
+        );
+    }
+
+    #[test]
+    fn reviewed_progress_counts_follow_the_currently_derived_view() {
+        let mut app = reviewed_fixture_app();
+        assert_eq!(app.reviewed_progress(), Some((0, 2)));
+        app.cursor = find_row(&app, |r| {
+            matches!(r, RenderRow::HunkHeader { hunk_idx: 0, .. })
+        });
+        app.mark_current_hunk_reviewed();
+        assert_eq!(app.reviewed_progress(), Some((1, 2)));
+    }
+
+    #[test]
+    fn reviewed_progress_is_none_for_a_diff_with_no_hunks() {
+        let app = App::new("repo".to_owned(), PathBuf::from("/repo"), Vec::new());
+        assert_eq!(app.reviewed_progress(), None);
+    }
+
+    #[test]
+    fn z_o_on_a_reviewed_marker_reveals_it_without_unmarking_and_z_c_recollapses_it() {
+        let mut app = reviewed_fixture_app();
+        app.cursor = find_row(&app, |r| {
+            matches!(r, RenderRow::HunkHeader { hunk_idx: 0, .. })
+        });
+        app.mark_current_hunk_reviewed();
+        app.cursor = find_row(&app, |r| {
+            matches!(r, RenderRow::ReviewedHunk { hunk_idx: 0, .. })
+        });
+
+        assert!(app.expand_reviewed_hunk_at_cursor());
+        assert!(
+            matches!(
+                app.rows[app.cursor],
+                RenderRow::HunkHeader { hunk_idx: 0, .. }
+            ),
+            "revealed back to its ordinary header+line rows"
+        );
+        assert_eq!(
+            app.reviewed_progress(),
+            Some((1, 2)),
+            "still reviewed — this is a peek, not an unmark"
+        );
+
+        assert!(app.collapse_fold_at_cursor());
+        assert!(matches!(
+            app.rows[app.cursor],
+            RenderRow::ReviewedHunk { hunk_idx: 0, .. }
+        ));
+        assert_eq!(app.reviewed_progress(), Some((1, 2)));
+    }
+
+    #[test]
+    fn toggle_show_reviewed_reveals_every_reviewed_hunk_with_no_marker_rows_left() {
+        let mut app = reviewed_fixture_app();
+        app.mark_file_reviewed();
+        assert!(
+            app.rows
+                .iter()
+                .all(|r| !matches!(r, RenderRow::HunkHeader { .. })),
+            "sanity: fully collapsed beforehand"
+        );
+
+        app.update(Action::ToggleShowReviewed);
+        assert!(
+            !app.rows
+                .iter()
+                .any(|r| matches!(r, RenderRow::ReviewedHunk { .. })),
+            "no marker rows while show_reviewed is on"
+        );
+        assert_eq!(
+            app.rows
+                .iter()
+                .filter(|r| matches!(r, RenderRow::HunkHeader { .. }))
+                .count(),
+            2
+        );
+
+        app.update(Action::ToggleShowReviewed);
+        assert!(
+            !app.rows
+                .iter()
+                .any(|r| matches!(r, RenderRow::HunkHeader { .. })),
+            "collapses again once the override is off"
+        );
+    }
+
+    /// Hard requirement: a watch refresh that rewrites one reviewed hunk's
+    /// body produces a fresh content id for it (the id excludes context
+    /// rows, so this fixture's `Add` row is what must actually change),
+    /// resurfacing it as an ordinary unreviewed hunk — while an untouched
+    /// reviewed hunk elsewhere in the same file stays collapsed. Mirrors
+    /// `apply_refresh_drops_a_fold_when_a_new_hunk_splits_its_gap`'s shape.
+    #[test]
+    fn apply_refresh_resurfaces_only_the_hunk_whose_content_was_rewritten() {
+        let mut app = reviewed_fixture_app();
+        app.mark_file_reviewed();
+        assert_eq!(app.reviewed_progress(), Some((2, 2)));
+
+        let mut rewritten = reviewed_fixture_file();
+        rewritten.hunks[0].rows[0].text = "added one EDITED".to_owned();
+        app.apply_refresh(vec![rewritten]);
+
+        assert_eq!(
+            app.reviewed_progress(),
+            Some((1, 2)),
+            "the rewritten hunk's fresh id is unreviewed; the untouched one stays reviewed"
+        );
+        assert!(
+            app.rows
+                .iter()
+                .any(|r| matches!(r, RenderRow::HunkHeader { hunk_idx: 0, .. })),
+            "the rewritten hunk resurfaces with an ordinary header"
+        );
+        assert!(
+            app.rows
+                .iter()
+                .any(|r| matches!(r, RenderRow::ReviewedHunk { hunk_idx: 1, .. })),
+            "the untouched hunk stays collapsed"
+        );
+    }
+
+    /// The accepted surprise carried over from `apply_unit_filter`'s own
+    /// docs (epic decision #1): `z o` fully expanding a Between gap merges
+    /// two hunks into one (`splice_gap`'s `Between` arm concatenates their
+    /// rows), producing a brand-new hunk id neither previous mark
+    /// protects. Both marks go stale (inert, never pruned — see
+    /// `crate::reviewed::store`'s module docs) and the merged hunk
+    /// resurfaces unreviewed. Documented, not fixed.
+    #[test]
+    fn fully_expanding_a_between_gap_merges_two_reviewed_hunks_into_one_unreviewed_one() {
+        let mut app = reviewed_fixture_app();
+        app.mark_file_reviewed();
+        assert_eq!(app.reviewed_progress(), Some((2, 2)));
+
+        // `reviewed_fixture_file`'s first hunk is a pure insertion at new
+        // line 1 with `old_lines: 0`, which itself produces a *leading*
+        // gap (`gap_idx` 0) ahead of the Between gap (`gap_idx` 1) this
+        // test actually wants — find it by position, not by "the first
+        // Gap row on screen."
+        app.cursor = find_row(&app, |r| matches!(r, RenderRow::Gap { gap_idx: 1, .. }));
+        let disk: Vec<String> = (1..=10)
+            .map(|n| match n {
+                1 => "added one".to_owned(),
+                10 => "added two".to_owned(),
+                n => format!("line {n}"),
+            })
+            .collect();
+        let refs: Vec<&str> = disk.iter().map(String::as_str).collect();
+        assert_eq!(app.expand_gap(0, 1, &refs), ExpandOutcome::Revealed);
+
+        assert_eq!(
+            app.reviewed_progress(),
+            Some((0, 1)),
+            "the merge produced one brand-new, unreviewed hunk id"
+        );
+        assert!(
+            app.rows
+                .iter()
+                .any(|r| matches!(r, RenderRow::HunkHeader { .. }))
         );
     }
 

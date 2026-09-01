@@ -150,6 +150,27 @@ diff whose new side is the live working tree (a plain `ktmr diff`) — fold
 rows still show everywhere else (staged, a revision diff, `ktmr log`), `zo`
 there just explains why it can't expand.
 
+Mark the hunk under the cursor reviewed with `r` — it collapses to a
+one-line `✓ reviewed · N lines` marker and the cursor jumps to the next
+*unreviewed* hunk, so working top to bottom through a large diff is just
+repeated `r`. `R` toggles a hunk's mark without moving the cursor (the
+correction key); `m f` marks every hunk in the current file, `m a` every
+hunk currently on screen (respecting an active [review
+unit](/katamari/review-units/) scope). `zo` on a collapsed marker peeks at
+it without unmarking; `zc` folds it back; `z R` shows or hides every
+reviewed hunk's content at once. The status bar's `reviewed r/total`
+counter appears once anything is marked. Marks are content-addressed —
+keyed on a hunk's own changed lines, not its line numbers or position — so
+they survive an unrelated edit shifting things around, persist in
+`.katamari/reviewed.jsonl` across restarts, and are shared across every
+scope pointing at the same repo (working tree, `--staged`, a revision,
+`--pr`); the one thing they don't survive is the hunk's *own* content
+changing, which is the point — an agent's rewrite makes that hunk
+unreviewed again automatically, with nothing to remember to re-check by
+hand. `ktmr reviewed list`/`ktmr reviewed clear` are the CLI-side view and
+reset; marking itself is TUI-only, deliberately, so nothing but an actual
+human keypress can mark a hunk reviewed.
+
 Leave a review comment on the current line with `c`, then `C-s` to save. With
 a visual selection active (`V`, above), `c` instead comments the whole
 selection as one range, as long as it resolves to a contiguous run of

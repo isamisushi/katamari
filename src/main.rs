@@ -10,6 +10,7 @@ mod highlight;
 mod keymap;
 mod lsp;
 mod procguard;
+mod reviewed;
 mod skill;
 mod ui;
 mod update;
@@ -26,6 +27,7 @@ use diff::{
     DiffFile, DiffLineKind, RenderRow, SideBySideRow, SideCell, flatten, flatten_side_by_side,
     parse_unified_diff,
 };
+use reviewed::store::ReviewedStore;
 use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
@@ -268,6 +270,16 @@ enum Command {
         #[command(subcommand)]
         action: CommentsCommand,
     },
+    /// Reads reviewed-hunk marks left in the TUI (`r`/`R`/`m f`/`m a`) —
+    /// operates on `<repo_root>/.katamari/reviewed.jsonl`. Deliberately no
+    /// `mark`/`unmark` subcommand here: marking is explicit-keypress-only
+    /// inside `ktmr diff` (see `crate::reviewed`'s module docs) — a CLI
+    /// mutator would let an agent silently "review" its own hunks, which
+    /// defeats the entire point of the feature.
+    Reviewed {
+        #[command(subcommand)]
+        action: ReviewedCommand,
+    },
     /// Installs the bundled `katamari-review` Claude Code skill into the
     /// current repository (or, with `--user`, into `$HOME` once for every
     /// repository), so an agent working in it picks up the
@@ -333,9 +345,10 @@ enum Command {
     /// install. With no flags, only *reports* every piece of state and its
     /// location — nothing is removed without an explicit flag, because the
     /// state mixes disposable caches with things that are expensive
-    /// (managed language servers) or irreplaceable (review comments).
-    /// Review comments are never included in `--all`; removing them takes
-    /// the dedicated flag, every time.
+    /// (managed language servers) or irreplaceable (review comments,
+    /// reviewed-hunk marks). Review comments and reviewed-hunk marks are
+    /// never included in `--all`; removing either takes its own dedicated
+    /// flag, every time.
     Reset {
         /// Remove the regenerable caches: this repository's grouping cache
         /// (`.katamari/groups.jsonl`) and the state directory holding the
@@ -363,8 +376,16 @@ enum Command {
         /// implies it.
         #[arg(long)]
         comments: bool,
-        /// Everything except `--comments`: caches, `[units]` config, and
-        /// managed servers.
+        /// Remove this repository's reviewed-hunk marks
+        /// (`.katamari/reviewed.jsonl`). Own flag, excluded from `--all`
+        /// for the same reason `--comments` is: a reviewer's own progress
+        /// through a diff, not a regenerable cache — `ktmr reviewed clear`
+        /// does the same removal (this flag exists so `reset` stays the
+        /// one place that enumerates every piece of katamari's state).
+        #[arg(long)]
+        reviewed: bool,
+        /// Everything except `--comments`/`--reviewed`: caches, `[units]`
+        /// config, and managed servers.
         #[arg(long)]
         all: bool,
     },
@@ -457,6 +478,21 @@ enum CommentsCommand {
     Resolve { id: String },
     /// Marks a resolved comment open again.
     Reopen { id: String },
+}
+
+#[derive(Subcommand)]
+enum ReviewedCommand {
+    /// Lists every currently reviewed hunk: a human-readable table by
+    /// default, or one JSON object per line with `--json`.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Removes `.katamari/reviewed.jsonl` outright, resetting every mark.
+    /// Unlike `ktmr comments`, there is no `resolve`/`reopen`-style
+    /// tombstone here — see `crate::reviewed::store`'s module docs on why a
+    /// destructive reset is safe for this particular file.
+    Clear,
 }
 
 /// `ktmr comments list/export`'s `--status` filter. `Open` is the default
@@ -602,6 +638,7 @@ fn main() -> Result<()> {
             timeout_secs,
         } => acp::check::run(prompt, adapter, timeout_secs).map_err(|e| anyhow::anyhow!(e)),
         Command::Comments { action } => run_comments(action),
+        Command::Reviewed { action } => run_reviewed(action),
         Command::Skill { action } => run_skill(action),
         Command::Lsp { action } => run_lsp(action),
         Command::Doctor {
@@ -615,8 +652,9 @@ fn main() -> Result<()> {
             units_config,
             servers,
             comments,
+            reviewed,
             all,
-        } => run_reset(cache, units_config, servers, comments, all),
+        } => run_reset(cache, units_config, servers, comments, reviewed, all),
     }
 }
 
@@ -1368,6 +1406,57 @@ fn run_comments_list(json: bool, status: StatusFilter) -> Result<()> {
     Ok(())
 }
 
+fn run_reviewed(action: ReviewedCommand) -> Result<()> {
+    match action {
+        ReviewedCommand::List { json } => run_reviewed_list(json),
+        ReviewedCommand::Clear => run_reviewed_clear(),
+    }
+}
+
+/// `ktmr reviewed list` — mirrors [`run_comments_list`]'s shape: a plain
+/// table by default, one JSON object per line with `--json`. No
+/// `--status` filter (unlike comments): every entry in this log is,
+/// definitionally, currently reviewed — there's no open/resolved axis to
+/// filter on.
+fn run_reviewed_list(json: bool) -> Result<()> {
+    let repo_root = comments_repo_root()?;
+    let store = ReviewedStore::new(&repo_root);
+    let entries = store.load()?;
+
+    if json {
+        for entry in &entries {
+            println!("{}", serde_json::to_string(entry)?);
+        }
+        return Ok(());
+    }
+
+    if entries.is_empty() {
+        println!("(no reviewed hunks — {})", store.path().display());
+        return Ok(());
+    }
+    println!("{:<18} {:<12} path", "hunk_id", "marked_at");
+    for entry in &entries {
+        println!(
+            "{:<18} {:<12} {}",
+            entry.hunk_id, entry.marked_at, entry.path
+        );
+    }
+    Ok(())
+}
+
+fn run_reviewed_clear() -> Result<()> {
+    let repo_root = comments_repo_root()?;
+    let store = ReviewedStore::new(&repo_root);
+    let count = store.load()?.len();
+    store.clear()?;
+    println!(
+        "cleared {count} reviewed hunk mark{} ({})",
+        if count == 1 { "" } else { "s" },
+        store.path().display()
+    );
+    Ok(())
+}
+
 fn run_comments_export(format: ExportFormat, status: StatusFilter) -> Result<()> {
     let repo_root = comments_repo_root()?;
     let filtered: Vec<Comment> = CommentStore::new(&repo_root)
@@ -1982,6 +2071,7 @@ fn run_reset(
     units_config: bool,
     servers: bool,
     comments: bool,
+    reviewed: bool,
     all: bool,
 ) -> Result<()> {
     let (cache, units_config, servers) = if all {
@@ -2001,12 +2091,13 @@ fn run_reset(
 
     let groups_path = in_repo("groups.jsonl");
     let comments_path = in_repo("comments.jsonl");
+    let reviewed_path = in_repo("reviewed.jsonl");
     let repo_config = in_repo("config.toml");
     let home_config = config::home_config_path();
     let servers_dir = lsp::install::prefix_dir();
     let state_dir = update::state_dir();
 
-    if !(cache || units_config || servers || comments) {
+    if !(cache || units_config || servers || comments || reviewed) {
         println!("katamari state (nothing removed — pass a flag to remove):\n");
         report_target("grouping cache", groups_path.as_deref(), "--cache");
         report_target(
@@ -2026,7 +2117,12 @@ fn run_reset(
         );
         report_target("managed LSP servers", Some(&servers_dir), "--servers");
         report_target("review comments", comments_path.as_deref(), "--comments");
-        println!("\n`--all` = everything above except review comments.");
+        report_target(
+            "reviewed-hunk marks",
+            reviewed_path.as_deref(),
+            "--reviewed",
+        );
+        println!("\n`--all` = everything above except review comments and reviewed-hunk marks.");
         return Ok(());
     }
 
@@ -2043,6 +2139,9 @@ fn run_reset(
     }
     if comments {
         remove_path("review comments", comments_path.as_deref())?;
+    }
+    if reviewed {
+        remove_path("reviewed-hunk marks", reviewed_path.as_deref())?;
     }
 
     // A `.katamari/` left holding nothing but its own self-ignoring
@@ -2562,6 +2661,14 @@ fn format_render_row(files: &[DiffFile], row: RenderRow) -> String {
                 Some(n) => format!("  GAP {n} unchanged\n"),
                 None => "  GAP unchanged (to EOF)\n".to_owned(),
             }
+        }
+        // `--dump`/`--dump-side-by-side` always render `flatten`'s raw
+        // output, never the reviewed-collapse pass (that's `App`-only
+        // derived state) — so this arm is unreachable in practice, but the
+        // match must still be exhaustive.
+        RenderRow::ReviewedHunk { file_idx, hunk_idx } => {
+            let hunk = &files[file_idx].hunks[hunk_idx];
+            format!("  REVIEWED {} lines\n", hunk.rows.len())
         }
     }
 }

@@ -31,6 +31,11 @@ table below never has to live in your head.
 | Top / bottom | `gg` / `G` | `M-<` / `M->` |
 | Next / prev hunk | `]c` / `[c` | `M-n` / `M-p` |
 | Expand / collapse fold | `zo` / `zc` | `zo` / `zc` |
+| Mark hunk reviewed / advance | `r` | `r` |
+| Toggle hunk reviewed | `R` | `R` |
+| Mark file reviewed | `m f` | `m f` |
+| Mark visible reviewed | `m a` | `m a` |
+| Show/hide all reviewed expanded | `z R` | `z R` |
 | Next / prev file | `]f` / `[f` | `C-x n` / `C-x p` |
 | Next / prev diagnostic | `]d` / `[d` | `M-g M-n` / `M-g M-p` |
 | Hover | `K` | `C-h` |

@@ -55,7 +55,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, keymap: &Keymap) {
         .skip(app.files_scroll_offset)
         .take(viewport)
         .map(|(idx, row)| {
-            let mut line = render_row(row, &app.files, width);
+            let mut line = render_row(row, &app.files, &app.reviewed_by_file, width);
             if idx == app.files_selection {
                 // Reversed while focused (the classic "this is where your
                 // cursor is" treatment); bold-only while `Diff` owns focus,
@@ -86,14 +86,23 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App, keymap: &Keymap) {
 /// (disclosure glyph or status badge), the label — truncated by display
 /// width (req 11: CJK/deep paths never split a grapheme or blow past
 /// `width`) — and, when it fits *without* truncating the label, a droppable
-/// suffix (a file's `+A -D` stat, or a directory's `(N)` descendant count).
-fn render_row(row: &VisibleRow, files: &[DiffFile], width: usize) -> Line<'static> {
+/// suffix (a file's `+A -D` stat plus, when it has any reviewed hunks, a
+/// trailing `n/m✓` count, or a directory's `(N)` descendant count).
+/// `reviewed_by_file` is [`App::reviewed_by_file`] — threaded through
+/// rather than read off `app` directly so this stays a plain function of
+/// its inputs, the same reason `files` already is.
+fn render_row(
+    row: &VisibleRow,
+    files: &[DiffFile],
+    reviewed_by_file: &[(usize, usize)],
+    width: usize,
+) -> Line<'static> {
     let capped_indent =
         (row.depth * INDENT_WIDTH).min(width.saturating_sub(MARKER_WIDTH + MIN_LABEL_WIDTH));
     let available = width.saturating_sub(capped_indent + MARKER_WIDTH);
 
     let (marker, marker_style) = marker_for(row, files);
-    let suffix = suffix_for(row, files);
+    let suffix = suffix_for(row, files, reviewed_by_file);
 
     let full_label_width = display_width(&row.label);
     let (label, suffix_spans) = match &suffix {
@@ -136,7 +145,11 @@ fn marker_for(row: &VisibleRow, files: &[DiffFile]) -> (String, Style) {
 /// The droppable suffix text (for the fit check) and its styled spans (for
 /// rendering) — `None` is never returned; every row kind has one, unlike
 /// the marker, which is always shown regardless of fit.
-fn suffix_for(row: &VisibleRow, files: &[DiffFile]) -> Option<(String, Vec<Span<'static>>)> {
+fn suffix_for(
+    row: &VisibleRow,
+    files: &[DiffFile],
+    reviewed_by_file: &[(usize, usize)],
+) -> Option<(String, Vec<Span<'static>>)> {
     match &row.kind {
         VisibleKind::Directory {
             descendant_files, ..
@@ -150,11 +163,34 @@ fn suffix_for(row: &VisibleRow, files: &[DiffFile]) -> Option<(String, Vec<Span<
         }
         VisibleKind::File { file_idx } => {
             let (added, deleted) = files[*file_idx].stat();
-            let text = format!("+{added} -{deleted}");
-            let spans = vec![
+            let mut text = format!("+{added} -{deleted}");
+            let mut spans = vec![
                 Span::styled(format!("+{added} "), Style::default().fg(Color::Green)),
                 Span::styled(format!("-{deleted}"), Style::default().fg(Color::Red)),
             ];
+            // Only when the file has hunks at all worth a reviewed count —
+            // a binary file's `reviewed_by_file` entry is always `(0, 0)`
+            // (see `App::rederive`'s `enumerate_hunks` pass, which never
+            // enumerates a binary file's absent hunks), so this stays out
+            // of the way for exactly the files that already show no `z o`
+            // fold affordance either.
+            if let Some(&(reviewed, total)) = reviewed_by_file.get(*file_idx)
+                && total > 0
+            {
+                let mark = if reviewed == total { "\u{2713}" } else { "" };
+                let suffix = format!(" \u{b7} {reviewed}/{total}{mark}");
+                text.push_str(&suffix);
+                spans.push(Span::styled(
+                    suffix,
+                    Style::default()
+                        .fg(if reviewed == total {
+                            Color::Green
+                        } else {
+                            Color::DarkGray
+                        })
+                        .add_modifier(Modifier::DIM),
+                ));
+            }
             Some((text, spans))
         }
     }
@@ -299,6 +335,69 @@ mod tests {
         let buffer = draw(&app, &keymap, 40, 8);
         let contents = buffer_text(&buffer);
         assert!(contents.contains("(2)"), "src has two changed descendants");
+    }
+
+    fn app_with_a_hunk(path: &str) -> App {
+        use crate::diff::{DiffHunk, DiffLineKind, DiffRow};
+        let file = DiffFile {
+            old_path: Some(path.to_owned()),
+            new_path: Some(path.to_owned()),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                known_eof: false,
+                rows: vec![DiffRow {
+                    kind: DiffLineKind::Add,
+                    text: "x".to_owned(),
+                    old_line: None,
+                    new_line: Some(1),
+                }],
+            }],
+            ..Default::default()
+        };
+        App::new("repo".to_owned(), PathBuf::from("/repo"), vec![file])
+    }
+
+    #[test]
+    fn suffix_for_a_file_with_no_hunks_omits_the_reviewed_count() {
+        let files = vec![DiffFile {
+            old_path: Some("a.rs".to_owned()),
+            new_path: Some("a.rs".to_owned()),
+            ..Default::default()
+        }];
+        let row = VisibleRow {
+            id: crate::ui::file_tree::NodeId {
+                path: "a.rs".to_owned(),
+                is_directory: false,
+            },
+            depth: 0,
+            label: "a.rs".to_owned(),
+            kind: VisibleKind::File { file_idx: 0 },
+        };
+        let (text, _) = suffix_for(&row, &files, &[(0, 0)]).unwrap();
+        assert_eq!(text, "+0 -0", "no hunks — no reviewed count appended");
+    }
+
+    #[test]
+    fn per_file_suffix_shows_the_reviewed_count_and_a_checkmark_once_fully_reviewed() {
+        let mut app = app_with_a_hunk("a.rs");
+        let keymap = Keymap::from_bindings(&vim_preset(false));
+
+        let before = buffer_text(&draw(&app, &keymap, 30, 8));
+        assert!(
+            before.contains("0/1") && !before.contains("\u{2713}"),
+            "unreviewed: count shows but no checkmark yet:\n{before}"
+        );
+
+        app.mark_file_reviewed();
+        let after = buffer_text(&draw(&app, &keymap, 30, 8));
+        assert!(
+            after.contains("1/1") && after.contains("\u{2713}"),
+            "fully reviewed: count and checkmark both show:\n{after}"
+        );
     }
 
     /// req 11: a CJK (double-width) label narrower than the pane still

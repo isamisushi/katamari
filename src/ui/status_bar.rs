@@ -109,6 +109,30 @@ pub fn render(
         ));
     }
 
+    // Same slot family as `unit_filter` just above (standing session state
+    // over the current derived view) — placed right after it since the two
+    // compose the same way `scope_label`/`unit_filter` do: a unit-filtered
+    // view's progress already reflects just that unit (see
+    // `App::reviewed_progress`'s docs). Gated on `reviewed > 0`, not just
+    // `total > 0`, matching every other standing-state span on this line
+    // (`unit_filter`/`watch_mode`/`VISUAL`): none of them show an
+    // inert/zero baseline, only an actual state worth flagging. This line
+    // has no wrap of its own (unlike the hint rows below it — see
+    // `wrap_for_area`), so an unconditional "reviewed 0/N" on every
+    // ordinary diff would routinely crowd a lower-priority, more
+    // important `status_note` off the fixed-width area at a realistic
+    // terminal width, before the reviewer has pressed `r` even once.
+    if let Some((reviewed, total)) = app.reviewed_progress()
+        && reviewed > 0
+    {
+        spans.push(Span::styled(
+            format!("· reviewed {reviewed}/{total} "),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     if app.watch_mode {
         spans.push(Span::styled(
             "· \u{29BF} watch ", // ⦿ — BULLSEYE
@@ -149,4 +173,73 @@ pub fn render(
     let mut lines = vec![Line::from(spans)];
     lines.extend(hints::render_lines(&wrapped));
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diff::{DiffFile, DiffHunk, DiffLineKind, DiffRow};
+    use ratatui::backend::TestBackend;
+    use std::path::PathBuf;
+
+    fn app_with_a_hunk() -> App {
+        let file = DiffFile {
+            old_path: Some("a.rs".to_owned()),
+            new_path: Some("a.rs".to_owned()),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                known_eof: false,
+                rows: vec![DiffRow {
+                    kind: DiffLineKind::Add,
+                    text: "x".to_owned(),
+                    old_line: None,
+                    new_line: Some(1),
+                }],
+            }],
+            ..Default::default()
+        };
+        App::new("repo".to_owned(), PathBuf::from("/repo"), vec![file])
+    }
+
+    fn buffer_text(app: &App) -> String {
+        let backend = TestBackend::new(80, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, frame.area(), app, Layout::Unified, None, None, &[]);
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn reviewed_progress_is_absent_for_a_diff_with_no_hunks() {
+        let app = App::new("repo".to_owned(), PathBuf::from("/repo"), Vec::new());
+        assert!(!buffer_text(&app).contains("reviewed"));
+    }
+
+    #[test]
+    fn reviewed_progress_is_hidden_until_something_is_actually_marked() {
+        let mut app = app_with_a_hunk();
+        assert!(
+            !buffer_text(&app).contains("reviewed"),
+            "an all-unreviewed diff shows no baseline noise, matching \
+             unit_filter/watch_mode's own only-when-active convention"
+        );
+        app.mark_file_reviewed();
+        assert!(
+            buffer_text(&app).contains("reviewed 1/1"),
+            "reflects the fresh mark with no extra wiring"
+        );
+    }
 }

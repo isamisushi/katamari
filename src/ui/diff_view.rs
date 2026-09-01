@@ -339,7 +339,11 @@ fn hit_row_for(row: RenderRow, line: LineHit) -> HitRow {
         },
         RenderRow::FileHeader { .. }
         | RenderRow::BinaryNotice { .. }
-        | RenderRow::HunkHeader { .. } => HitRow::Structural {
+        | RenderRow::HunkHeader { .. }
+        // A click just moves the cursor there, the same as any other
+        // structural row — it never auto-expands, matching `Gap`'s own
+        // asymmetry where a click isn't the same as `z o`.
+        | RenderRow::ReviewedHunk { .. } => HitRow::Structural {
             flat_idx: line.row_idx,
         },
     }
@@ -695,6 +699,9 @@ fn render_row(
         RenderRow::Gap { file_idx, gap_idx } => {
             single(gap_line(app, file_idx, gap_idx, width, is_cursor))
         }
+        RenderRow::ReviewedHunk { file_idx, hunk_idx } => single(reviewed_hunk_line(
+            app, file_idx, hunk_idx, width, is_cursor,
+        )),
     }
 }
 
@@ -735,6 +742,33 @@ fn gap_line(
             .add_modifier(Modifier::DIM),
         is_cursor,
     );
+    Line::from(Span::styled(pad_or_truncate(&text, width), style))
+}
+
+/// A collapsed reviewed-hunk marker row: same full-width, no-gutter,
+/// never-wraps shape as [`gap_line`], but green rather than dim gray — a
+/// gap reads as "git hid this," a reviewed marker as "you did this." Reads
+/// `app.files[file_idx].hunks[hunk_idx].rows.len()` directly (no
+/// `app.gap_cache`-style precomputed lookup needed) since a hunk's row
+/// count is already a plain field, not something worth re-deriving through
+/// an intermediate cache the way a gap's line count is.
+fn reviewed_hunk_line(
+    app: &App,
+    file_idx: usize,
+    hunk_idx: usize,
+    width: usize,
+    is_cursor: bool,
+) -> Line<'static> {
+    let n = app
+        .files
+        .get(file_idx)
+        .and_then(|f| f.hunks.get(hunk_idx))
+        .map_or(0, |h| h.rows.len());
+    let text = format!(
+        "\u{2713} reviewed \u{b7} {n} line{}",
+        if n == 1 { "" } else { "s" }
+    );
+    let style = cursor_style(Style::default().fg(Color::Green), is_cursor);
     Line::from(Span::styled(pad_or_truncate(&text, width), style))
 }
 
@@ -2074,6 +2108,83 @@ mod tests {
             true,
         ));
         assert_eq!(lines.len(), 1);
+    }
+
+    // -- Reviewed-hunk marker row ----------------------------------------
+
+    #[test]
+    fn reviewed_hunk_line_shows_a_checkmark_and_the_hunks_own_line_count() {
+        let app = app_with_a_gap(10); // two 3-row hunks
+        let line = reviewed_hunk_line(&app, 0, 0, 40, false);
+        assert_eq!(line_text(&line).trim(), "\u{2713} reviewed \u{b7} 3 lines");
+    }
+
+    #[test]
+    fn reviewed_hunk_line_uses_the_singular_for_a_one_row_hunk() {
+        // Built directly rather than reusing `app_with_a_gap` (always
+        // 3-row hunks) so this pins the singular/plural boundary precisely.
+        let file = DiffFile {
+            old_path: Some("f.txt".to_owned()),
+            new_path: Some("f.txt".to_owned()),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                header: String::new(),
+                known_eof: false,
+                rows: vec![row(DiffLineKind::Context, "x", Some(1), Some(1))],
+            }],
+            ..Default::default()
+        };
+        let one_row_app = App::new("repo".to_owned(), PathBuf::from("/repo"), vec![file]);
+        let line = reviewed_hunk_line(&one_row_app, 0, 0, 40, false);
+        assert_eq!(line_text(&line).trim(), "\u{2713} reviewed \u{b7} 1 line");
+    }
+
+    #[test]
+    fn reviewed_hunk_line_pads_to_the_exact_requested_width() {
+        let app = app_with_a_gap(10);
+        let line = reviewed_hunk_line(&app, 0, 0, 50, false);
+        assert_eq!(display_width(&line_text(&line)), 50);
+    }
+
+    #[test]
+    fn render_row_never_produces_more_than_one_visual_row_for_a_reviewed_hunk() {
+        let app = app_with_a_gap(10);
+        let mut highlighter = LineHighlighter::new();
+        let diagnostics = DiagnosticsStore::new();
+        let comments = CommentIndex::default();
+        let lines = lines_only(render_row(
+            &app,
+            RenderRow::ReviewedHunk {
+                file_idx: 0,
+                hunk_idx: 0,
+            },
+            5,
+            false,
+            10, // deliberately narrow — must truncate, never wrap
+            &mut highlighter,
+            &diagnostics,
+            &comments,
+            true,
+        ));
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn hit_row_for_a_reviewed_hunk_is_structural_a_click_just_moves_the_cursor() {
+        let hit = hit_row_for(
+            RenderRow::ReviewedHunk {
+                file_idx: 0,
+                hunk_idx: 0,
+            },
+            LineHit {
+                row_idx: 3,
+                content_start_col: 0,
+            },
+        );
+        assert!(matches!(hit, HitRow::Structural { flat_idx: 3 }));
     }
 
     // -- Issue #5: search-match rendering -------------------------------

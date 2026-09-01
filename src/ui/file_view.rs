@@ -338,6 +338,14 @@ impl FileView {
             | Action::ToggleComments
             | Action::ExpandFold
             | Action::CollapseFold
+            // Reviewed-hunk state is a diff-view-only concept for the same
+            // reason `ExpandFold`/`AddComment` are: a single opened file has
+            // no hunks of its own to mark.
+            | Action::MarkHunkReviewed
+            | Action::ToggleHunkReviewed
+            | Action::MarkFileReviewed
+            | Action::MarkVisibleReviewed
+            | Action::ToggleShowReviewed
             | Action::OpenSearch
             | Action::NextMatch
             | Action::PrevMatch

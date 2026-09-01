@@ -345,7 +345,15 @@ pub fn diff_view_items(keymap: &Keymap, expanded: bool) -> Vec<HintItem> {
         // search is already confirmed, at which point the prompt echo (and
         // the "search wrapped"/"no matches" notes) are the discoverability
         // signal, not the status bar's hint row; `?`'s help window is where
-        // they're documented (see `ui::help::describe`).
+        // they're documented (see `ui::help::describe`). `r`/`R`/`m f`/
+        // `m a`/`z R` (reviewed-hunk state) join that same no-hint-item
+        // treatment for a different reason: the 3-line hint budget is
+        // already fully committed at a realistic terminal width (see
+        // `every_view_keeps_the_toggle_visible_in_both_states` and
+        // `fold_and_help_hints_do_not_push_quit_off_the_status_bar_at_a_realistic_width`
+        // below) — the status bar's own "reviewed r/total" progress span
+        // is the ambient signal that the feature exists, and `?` is where
+        // the keys themselves are documented.
         HintItem::for_actions(keymap, &[Action::OpenSearch], "search"),
         HintItem::for_actions(keymap, &[Action::AddComment], "comment"),
         HintItem::for_actions(keymap, &[Action::ToggleSidebar], "sidebar"),

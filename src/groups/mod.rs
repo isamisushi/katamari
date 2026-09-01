@@ -374,6 +374,32 @@ mod tests {
         assert_eq!(ids_before, ids_after);
     }
 
+    /// The reviewed-hunk feature (`crate::reviewed`) leans on this id being
+    /// stable not just across line-number shifts (the test above) but
+    /// across reordering too — a rebase or an unrelated commit reordering
+    /// files/hunks must not silently drop a reviewer's marks. The
+    /// *content* hash of any one hunk never depends on its neighbors'
+    /// positions, only on its own path and changed rows.
+    #[test]
+    fn hunk_ids_are_a_set_unaffected_by_reordering_files_or_hunks_within_one() {
+        let files = sample_diff(); // [src/a.rs (2 hunks), Cargo.lock (1 hunk)]
+        let ids_before: std::collections::HashSet<String> =
+            enumerate_hunks(&files).into_iter().map(|h| h.id).collect();
+
+        let mut reordered = files;
+        reordered.reverse(); // Cargo.lock first, src/a.rs second
+        reordered[1].hunks.reverse(); // src/a.rs's own two hunks swapped
+
+        let ids_after: std::collections::HashSet<String> = enumerate_hunks(&reordered)
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+        assert_eq!(
+            ids_before, ids_after,
+            "the set of hunk ids must be identical regardless of file/hunk order"
+        );
+    }
+
     #[test]
     fn identical_changes_in_one_file_get_distinct_ids() {
         let files = parse_unified_diff(concat!(

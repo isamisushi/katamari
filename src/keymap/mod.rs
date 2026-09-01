@@ -335,6 +335,37 @@ pub enum Action {
     /// — see that match arm's docs); a harmless no-op when no turn is
     /// running.
     CancelAgentTurn,
+    /// Marks the hunk under the cursor reviewed and advances to the next
+    /// *unreviewed* hunk — `r`. A pure content-addressed mark (see
+    /// `crate::reviewed`'s module docs), not a scroll or a view toggle, so
+    /// `ui::mod`'s event loop intercepts this rather than forwarding it
+    /// through `App::update`: persisting the mark needs the repo root and
+    /// the reviewed-state store, neither of which `App` owns — the same
+    /// reasoning `AddComment` already gives for why it isn't a pure
+    /// `App::update` arm either. "Next unreviewed" falls out for free once
+    /// a marked hunk stops having a `HunkHeader` row at all: this reuses
+    /// the exact `NextHunk` jump predicate, no new navigation logic needed.
+    MarkHunkReviewed,
+    /// Flips the cursor's hunk between reviewed and not — `R`, the explicit
+    /// correction tool. Unlike `MarkHunkReviewed` this never advances the
+    /// cursor (it's a fix-up, not a flow-forward action), and it's the only
+    /// one of the five reviewed-state actions that can *un*mark something.
+    ToggleHunkReviewed,
+    /// Marks every hunk in the cursor's current file reviewed — `m f`.
+    MarkFileReviewed,
+    /// Marks every hunk currently visible reviewed — `m a`. Respects an
+    /// active semantic-unit filter automatically, since it only ever
+    /// touches `App::files`' already-narrowed hunk set, never the full
+    /// diff.
+    MarkVisibleReviewed,
+    /// Shows or hides every reviewed hunk's content, globally — `z R`, the
+    /// third child under the `z` fold prefix alongside `z o`/`z c`. Unlike
+    /// those two, this *is* a pure state flip `App::update` handles
+    /// directly (mirroring `ToggleComments`): while it's on, `rederive`
+    /// skips the reviewed-collapse pass entirely, so there is no
+    /// `RenderRow::ReviewedHunk` row left for a per-hunk `z o`/`z c` to act
+    /// on — they naturally no-op with zero special-casing.
+    ToggleShowReviewed,
 }
 
 /// One key press, normalized for matching: the SHIFT modifier is dropped
@@ -769,6 +800,11 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("N", Action::PrevMatch),
         ("z o", Action::ExpandFold),
         ("z c", Action::CollapseFold),
+        ("z R", Action::ToggleShowReviewed),
+        ("r", Action::MarkHunkReviewed),
+        ("R", Action::ToggleHunkReviewed),
+        ("m f", Action::MarkFileReviewed),
+        ("m a", Action::MarkVisibleReviewed),
         ("a", Action::AskAgent),
         ("A", Action::ToggleAgentPanel),
         ("p", Action::PushCommentsToAgent),
@@ -892,6 +928,14 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         // fit to be worth a different binding here).
         ("z o", Action::ExpandFold),
         ("z c", Action::CollapseFold),
+        // Same rule as `z o`/`z c` just above: reviewed-hunk state has no
+        // emacs convention of its own either, so all five actions reuse
+        // vim's keys verbatim.
+        ("z R", Action::ToggleShowReviewed),
+        ("r", Action::MarkHunkReviewed),
+        ("R", Action::ToggleHunkReviewed),
+        ("m f", Action::MarkFileReviewed),
+        ("m a", Action::MarkVisibleReviewed),
         // Same vim-keys-for-things-with-no-emacs-identity rule as `V`/`y`
         // above: the resident-agent actions have no emacs convention of
         // their own to defer to, so this preset reuses vim's `a`/`A`/`p`
@@ -985,6 +1029,11 @@ pub fn action_name(action: Action) -> &'static str {
         Action::ToggleAgentPanel => "toggle-agent-panel",
         Action::PushCommentsToAgent => "push-comments-to-agent",
         Action::CancelAgentTurn => "cancel-agent-turn",
+        Action::MarkHunkReviewed => "mark-hunk-reviewed",
+        Action::ToggleHunkReviewed => "toggle-hunk-reviewed",
+        Action::MarkFileReviewed => "mark-file-reviewed",
+        Action::MarkVisibleReviewed => "mark-visible-reviewed",
+        Action::ToggleShowReviewed => "toggle-show-reviewed",
     }
 }
 
@@ -1044,6 +1093,11 @@ pub fn action_by_name(name: &str) -> Option<Action> {
         "toggle-agent-panel" => Action::ToggleAgentPanel,
         "push-comments-to-agent" => Action::PushCommentsToAgent,
         "cancel-agent-turn" => Action::CancelAgentTurn,
+        "mark-hunk-reviewed" => Action::MarkHunkReviewed,
+        "toggle-hunk-reviewed" => Action::ToggleHunkReviewed,
+        "mark-file-reviewed" => Action::MarkFileReviewed,
+        "mark-visible-reviewed" => Action::MarkVisibleReviewed,
+        "toggle-show-reviewed" => Action::ToggleShowReviewed,
         _ => return None,
     })
 }
@@ -1462,6 +1516,11 @@ mod tests {
             Action::ToggleAgentPanel,
             Action::PushCommentsToAgent,
             Action::CancelAgentTurn,
+            Action::MarkHunkReviewed,
+            Action::ToggleHunkReviewed,
+            Action::MarkFileReviewed,
+            Action::MarkVisibleReviewed,
+            Action::ToggleShowReviewed,
         ];
         for action in all {
             let name = action_name(action);
@@ -1642,7 +1701,7 @@ mod tests {
     /// `open_help_binds_to_plain_question_mark_in_both_presets` test.
     #[test]
     fn every_vim_and_emacs_binding_covers_every_action_exactly_once() {
-        const ACTION_COUNT: usize = 50;
+        const ACTION_COUNT: usize = 55;
         for ci_distinguishable in [false, true] {
             for preset in [
                 vim_preset(ci_distinguishable),

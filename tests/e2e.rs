@@ -57,6 +57,8 @@ mod pr_diff;
 mod range_comment;
 #[path = "e2e/rendering.rs"]
 mod rendering;
+#[path = "e2e/reviewed.rs"]
+mod reviewed;
 #[path = "e2e/scope_menu.rs"]
 mod scope_menu;
 #[path = "e2e/search.rs"]
