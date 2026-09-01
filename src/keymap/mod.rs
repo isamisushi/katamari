@@ -142,6 +142,21 @@ pub enum Action {
     /// the exact key handling once it's open (`j`/`k`/Enter/Esc, not this
     /// action again).
     OpenScopeMenu,
+    /// Swaps the live root diff to "this branch vs its detected base" —
+    /// `ktmr diff --branch`'s mid-session, no-menu-navigation twin (see
+    /// [`crate::vcs::base::detect_base`] for the git/jj/config detection
+    /// this runs fresh on every press, and
+    /// `crate::ui::scope_menu::ScopeMenuEntry::BranchVsBase` for the same
+    /// swap reached through the `o` menu instead). Bound unconditionally in
+    /// both presets, like [`ToggleTimeline`](Action::ToggleTimeline): the
+    /// key is always live, and a press with nothing detected (no base) or
+    /// nothing to review (`HEAD` already equals it) reports that in the
+    /// status bar rather than doing nothing silently. `ui::mod`'s event
+    /// loop intercepts this the same way it intercepts `OpenScopeMenu`
+    /// (gated to [`crate::ui::view::View::Diff`] at root): applying the
+    /// swap is a real git/jj subprocess call `App::update` has no business
+    /// making.
+    ReviewBranchVsBase,
     /// Opens [`crate::ui::units_panel`]'s overlay — the diff's hunks
     /// grouped into semantic units by the user's own agent CLI (see
     /// [`crate::groups`]) — or closes it when already open. `ui::mod`'s
@@ -740,6 +755,7 @@ pub fn vim_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("L", Action::ToggleLogView),
         ("I", Action::ToggleLspInspector),
         ("o", Action::OpenScopeMenu),
+        ("B", Action::ReviewBranchVsBase),
         ("u", Action::ToggleUnits),
         ("U", Action::RegenerateUnits),
         (".", Action::ToggleHints),
@@ -837,6 +853,7 @@ pub fn emacs_preset(ci_distinguishable: bool) -> Vec<(KeySeq, Action)> {
         ("L", Action::ToggleLogView),
         ("I", Action::ToggleLspInspector),
         ("o", Action::OpenScopeMenu),
+        ("B", Action::ReviewBranchVsBase),
         // Same vim-keys-for-things-with-no-emacs-identity rule as `q`/`b`/
         // `s`: semantic units have no emacs convention to defer to.
         ("u", Action::ToggleUnits),
@@ -948,6 +965,7 @@ pub fn action_name(action: Action) -> &'static str {
         Action::ToggleLogView => "toggle-log-view",
         Action::ToggleLspInspector => "toggle-lsp-inspector",
         Action::OpenScopeMenu => "open-scope-menu",
+        Action::ReviewBranchVsBase => "review-branch-vs-base",
         Action::ToggleUnits => "toggle-units",
         Action::RegenerateUnits => "regenerate-units",
         Action::ToggleHints => "toggle-hints",
@@ -1006,6 +1024,7 @@ pub fn action_by_name(name: &str) -> Option<Action> {
         "toggle-log-view" => Action::ToggleLogView,
         "toggle-lsp-inspector" => Action::ToggleLspInspector,
         "open-scope-menu" => Action::OpenScopeMenu,
+        "review-branch-vs-base" => Action::ReviewBranchVsBase,
         "toggle-units" => Action::ToggleUnits,
         "regenerate-units" => Action::RegenerateUnits,
         "toggle-hints" => Action::ToggleHints,
@@ -1423,6 +1442,7 @@ mod tests {
             Action::ToggleLogView,
             Action::ToggleLspInspector,
             Action::OpenScopeMenu,
+            Action::ReviewBranchVsBase,
             Action::AddComment,
             Action::ToggleComments,
             Action::ExpandFold,
@@ -1622,7 +1642,7 @@ mod tests {
     /// `open_help_binds_to_plain_question_mark_in_both_presets` test.
     #[test]
     fn every_vim_and_emacs_binding_covers_every_action_exactly_once() {
-        const ACTION_COUNT: usize = 49;
+        const ACTION_COUNT: usize = 50;
         for ci_distinguishable in [false, true] {
             for preset in [
                 vim_preset(ci_distinguishable),

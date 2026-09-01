@@ -52,6 +52,7 @@ Run inside any git repository:
 ktmr diff              # working tree vs HEAD, refreshed live by default
 ktmr diff --staged     # staged (index) changes vs HEAD
 ktmr diff --pr 123     # a GitHub pull request, via your logged-in `gh`
+ktmr diff --branch     # this branch vs its detected base, live-refreshed
 ```
 
 Inside the diff: `j`/`k` move, `K` hovers the identifier under the cursor,
@@ -59,8 +60,8 @@ Inside the diff: `j`/`k` move, `K` hovers the identifier under the cursor,
 comment on the current line (or a `V` visual range), `a` asks a resident
 agent session about the line or selection, `u` groups the diff into
 ordered review units. `o` opens a popup to switch scope mid-session
-(working tree, staged, a revision, another PR) without restarting; `?`
-opens a filterable list of every live binding.
+(working tree, staged, branch vs base, a revision, another PR) without
+restarting; `?` opens a filterable list of every live binding.
 
 Point an agent at what you left:
 

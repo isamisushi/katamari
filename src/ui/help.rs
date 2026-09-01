@@ -71,6 +71,7 @@ pub fn describe(action: Action) -> (&'static str, &'static str) {
         Action::ExpandFold => ("Diff", "Expand a collapsed context gap"),
         Action::CollapseFold => ("Diff", "Collapse an expanded context gap"),
         Action::OpenScopeMenu => ("Diff", "Open the scope-picker popup"),
+        Action::ReviewBranchVsBase => ("Diff", "Review this branch against its base"),
         Action::ToggleVisualLine => ("Diff", "Start, extend, or cancel visual-line selection"),
         Action::YankSelection => (
             "Diff",
@@ -152,6 +153,7 @@ const ALL_ACTIONS: &[Action] = &[
     Action::ExpandFold,
     Action::CollapseFold,
     Action::OpenScopeMenu,
+    Action::ReviewBranchVsBase,
     Action::ToggleVisualLine,
     Action::YankSelection,
     Action::Hover,

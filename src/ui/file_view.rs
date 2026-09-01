@@ -325,6 +325,9 @@ impl FileView {
             | Action::ToggleRangeSelect
             | Action::ToggleDirectory
             | Action::OpenScopeMenu
+            // Same reason as `OpenScopeMenu` just above: `FileView` has no
+            // "branch vs base" concept of its own to swap onto either.
+            | Action::ReviewBranchVsBase
             // Same bucket as `ToggleLspInspector`: reachable from any view,
             // needs the agent handle `App`/`FileView` don't own — see
             // `crate::acp::session`.

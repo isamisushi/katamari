@@ -174,6 +174,90 @@ impl GitSource {
         Ok(Some(id))
     }
 
+    /// `vcs::base::detect_base`'s second-priority fallback (after a
+    /// colocated jj repo's own `trunk()`): `git symbolic-ref -q --short
+    /// refs/remotes/origin/HEAD`, which prints e.g. `"origin/main"` for a
+    /// normal clone. Purely local — it reads a ref file under `.git`, no
+    /// network touched — and `Ok(None)` on failure (a fresh `git init`, or a
+    /// clone whose remote never got an advertised default branch set, e.g.
+    /// via `git remote set-head origin -a`) rather than an `Err`, the same
+    /// "doesn't resolve is unsurprising, not a failure" stance
+    /// [`Self::resolve`] already takes.
+    pub fn origin_head_branch(&self) -> Result<Option<String>> {
+        let output = self
+            .git_command()
+            .args(["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"])
+            .output()
+            .context("failed to run `git symbolic-ref`")?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let name = String::from_utf8(output.stdout)
+            .context("git symbolic-ref produced non-UTF-8 output")?
+            .trim()
+            .to_owned();
+        Ok((!name.is_empty()).then_some(name))
+    }
+
+    /// `git rev-list --count <base>..<head>` — deliberately the *two*-dot,
+    /// ahead-only form, not three-dot: three-dot's count is the *symmetric*
+    /// ahead-plus-behind total (empirically verified while researching
+    /// `vcs::base`: `2` on a fixture where two-dot correctly gave `1`),
+    /// which is the wrong number for "+N commits" on top of `base`. Feeds
+    /// [`crate::vcs::base::DetectedBase::ahead`], both for the scope-menu/
+    /// empty-state gate (`ahead == 0` — no entry, no hint) and the status-
+    /// bar label's `(+N)`.
+    pub fn ahead_count(&self, base: &str, head: &str) -> Result<usize> {
+        let output = self
+            .git_command()
+            .args(["rev-list", "--count", &format!("{base}..{head}")])
+            .output()
+            .context("failed to run `git rev-list`")?;
+        if !output.status.success() {
+            bail!(
+                "git rev-list --count {base}..{head} failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        String::from_utf8(output.stdout)
+            .context("git rev-list produced non-UTF-8 output")?
+            .trim()
+            .parse::<usize>()
+            .context("git rev-list --count produced a non-numeric result")
+    }
+
+    /// The checked-out branch's name for display — `git branch
+    /// --show-current`, which prints an *empty string with a successful
+    /// exit code* on a detached `HEAD` (verified empirically; unlike
+    /// `symbolic-ref`, it never fails), turned into the literal `"HEAD"`
+    /// here rather than surfaced as a blank status-bar label. Display only:
+    /// `vcs::base`'s diff-arg/ahead-count formulas always compare against
+    /// the symbolic ref `"HEAD"` directly, never whatever branch name
+    /// happens to be checked out, so a detached `HEAD` never affects
+    /// correctness here, only what the branch-vs-base label reads.
+    pub fn current_branch_display(&self) -> Result<String> {
+        let output = self
+            .git_command()
+            .args(["branch", "--show-current"])
+            .output()
+            .context("failed to run `git branch --show-current`")?;
+        if !output.status.success() {
+            bail!(
+                "git branch --show-current failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let name = String::from_utf8(output.stdout)
+            .context("git branch --show-current produced non-UTF-8 output")?
+            .trim()
+            .to_owned();
+        Ok(if name.is_empty() {
+            "HEAD".to_owned()
+        } else {
+            name
+        })
+    }
+
     /// Issue #8: resolves `relative` (`HEAD`, `refs`, `packed-refs`, ...)
     /// against this repository's *actual* git directory via `git rev-parse
     /// --git-path <relative>`, never by hand-composing `<something>/.git/
@@ -781,6 +865,110 @@ mod tests {
         let diff = source.range_diff("HEAD~1..HEAD").unwrap();
 
         assert!(diff.contains("+two"), "diff:\n{diff}");
+    }
+
+    // ---- origin_head_branch / ahead_count / current_branch_display -----
+
+    /// Bare "upstream" + a push from a working clone — the minimal shape
+    /// `git clone` needs to populate `refs/remotes/origin/HEAD` on its own,
+    /// the same sequence `vcs::base`'s module docs and
+    /// `tests/support/fixture.rs::branch_ahead_of_main_repo` both build for
+    /// real E2E coverage. The bare repo's `HEAD` must be pointed at `main`
+    /// *before* the first push (a freshly `--bare`-init'd repo defaults to
+    /// `refs/heads/master`) — `git init -b main --bare` does that directly,
+    /// sidestepping the `symbolic-ref` dance a plain `--bare` init would
+    /// otherwise need.
+    fn init_upstream_and_clone() -> (TempDir, TempDir) {
+        let upstream = tempfile::tempdir().expect("create temp dir");
+        git(upstream.path(), &["init", "-q", "-b", "main", "--bare"]);
+
+        // Not `init_repo()`: that helper's plain `git init -q` takes
+        // whatever `init.defaultBranch` the host's git resolves to (often
+        // `master`, never guaranteed `main`) — this fixture needs the seed
+        // checked out on a branch literally named `main` so the push below
+        // lands on the same ref name the bare repo's `HEAD` already points
+        // at.
+        let seed = tempfile::tempdir().expect("create temp dir");
+        git(seed.path(), &["init", "-q", "-b", "main"]);
+        git(seed.path(), &["config", "user.email", "test@example.com"]);
+        git(seed.path(), &["config", "user.name", "Test"]);
+        std::fs::write(seed.path().join("a.txt"), "one\n").unwrap();
+        git(seed.path(), &["add", "a.txt"]);
+        git(seed.path(), &["commit", "-q", "-m", "first"]);
+        git(
+            seed.path(),
+            &["remote", "add", "origin", upstream.path().to_str().unwrap()],
+        );
+        git(seed.path(), &["push", "-q", "origin", "main"]);
+
+        let clone_dir = tempfile::tempdir().expect("create temp dir");
+        let status = Command::new("git")
+            .args([
+                "clone",
+                "-q",
+                upstream.path().to_str().unwrap(),
+                clone_dir.path().to_str().unwrap(),
+            ])
+            .status()
+            .expect("git must be on PATH for these tests");
+        assert!(status.success(), "git clone failed");
+        (upstream, clone_dir)
+    }
+
+    #[test]
+    fn origin_head_branch_reports_the_clones_default_branch() {
+        let (_upstream, clone_dir) = init_upstream_and_clone();
+        let source = GitSource::discover(clone_dir.path()).unwrap();
+        assert_eq!(
+            source.origin_head_branch().unwrap().as_deref(),
+            Some("origin/main")
+        );
+    }
+
+    #[test]
+    fn origin_head_branch_is_none_without_a_remote() {
+        let dir = init_repo();
+        git(dir.path(), &["commit", "-q", "-m", "init", "--allow-empty"]);
+        let source = GitSource::discover(dir.path()).unwrap();
+        assert_eq!(source.origin_head_branch().unwrap(), None);
+    }
+
+    #[test]
+    fn ahead_count_is_two_dot_not_three_dot() {
+        let (_upstream, clone_dir) = init_upstream_and_clone();
+        let root = clone_dir.path();
+        git(root, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(root.join("b.txt"), "two\n").unwrap();
+        git(root, &["add", "b.txt"]);
+        git(root, &["commit", "-q", "-m", "second"]);
+
+        let source = GitSource::discover(root).unwrap();
+        assert_eq!(source.ahead_count("origin/main", "HEAD").unwrap(), 1);
+    }
+
+    #[test]
+    fn ahead_count_is_zero_on_the_base_itself() {
+        let (_upstream, clone_dir) = init_upstream_and_clone();
+        let source = GitSource::discover(clone_dir.path()).unwrap();
+        assert_eq!(source.ahead_count("origin/main", "HEAD").unwrap(), 0);
+    }
+
+    #[test]
+    fn current_branch_display_reports_the_checked_out_branch() {
+        let dir = init_repo();
+        git(dir.path(), &["commit", "-q", "-m", "init", "--allow-empty"]);
+        git(dir.path(), &["checkout", "-q", "-b", "feature"]);
+        let source = GitSource::discover(dir.path()).unwrap();
+        assert_eq!(source.current_branch_display().unwrap(), "feature");
+    }
+
+    #[test]
+    fn current_branch_display_falls_back_to_head_when_detached() {
+        let dir = init_repo();
+        git(dir.path(), &["commit", "-q", "-m", "init", "--allow-empty"]);
+        git(dir.path(), &["checkout", "-q", "--detach", "HEAD"]);
+        let source = GitSource::discover(dir.path()).unwrap();
+        assert_eq!(source.current_branch_display().unwrap(), "HEAD");
     }
 
     // ---- parse_git_log / parse_git_decoration --------------------------

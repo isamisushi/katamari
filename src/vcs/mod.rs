@@ -3,6 +3,7 @@
 //! later milestones can add a `jj` backend behind the same trait without
 //! touching anything upstream of it.
 
+pub mod base;
 pub mod git;
 pub mod github;
 pub mod jj;

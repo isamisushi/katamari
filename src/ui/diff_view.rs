@@ -177,7 +177,13 @@ pub fn render_focusable(
 /// "working tree" would be actively wrong for those. The hint line's keys
 /// are read off `keymap`, not hardcoded `"o"`/`"q"` — a `[keys]` rebind or
 /// the emacs preset must still name the keys that actually work, same
-/// reasoning as [`crate::ui::hints::HintItem::for_actions`].
+/// reasoning as [`crate::ui::hints::HintItem::for_actions`]. A third hint
+/// part — "review this branch against `<base>` (+N commits)" — joins the
+/// other two only on a clean working tree with something detected ahead of
+/// it (`app.disk_is_new_side && app.branch_vs_base_hint`'s `ahead > 0`):
+/// dirty-tree sessions and every non-working-tree scope simply don't show
+/// it, matching [`App::branch_vs_base_hint`]'s own "only for the plain
+/// working-tree scope" scope.
 fn render_empty_state(frame: &mut Frame, inner: Rect, app: &App, keymap: &Keymap) {
     let headline = if app.disk_is_new_side {
         "working tree clean \u{2014} nothing to review"
@@ -196,6 +202,20 @@ fn render_empty_state(frame: &mut Frame, inner: Rect, app: &App, keymap: &Keymap
         keymap
             .binding_for(Action::Quit)
             .map(|seq| format!("{} quits", seq.compact_notation())),
+        app.disk_is_new_side
+            .then_some(app.branch_vs_base_hint.as_ref())
+            .flatten()
+            .filter(|hint| hint.ahead > 0)
+            .and_then(|hint| {
+                keymap.binding_for(Action::ReviewBranchVsBase).map(|seq| {
+                    format!(
+                        "{} review this branch against {} (+{} commits)",
+                        seq.compact_notation(),
+                        hint.base,
+                        hint.ahead,
+                    )
+                })
+            }),
     ]
     .into_iter()
     .flatten()

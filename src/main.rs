@@ -74,16 +74,16 @@ enum Command {
         /// Diff a single jj change against its parent(s) — `jj diff -r
         /// <revset>`'s equivalent. Requires a colocated jj repository (see
         /// `ktmr timeline`'s docs on what "colocated" means here).
-        #[arg(short = 'r', long, value_name = "REVSET", conflicts_with_all = ["from", "to", "range", "staged", "no_watch"])]
+        #[arg(short = 'r', long, value_name = "REVSET", conflicts_with_all = ["from", "to", "range", "staged", "no_watch", "branch"])]
         revision: Option<String>,
         /// Diff between two jj revisions — `jj diff --from/--to`'s
         /// equivalent. Either side left unset defaults to `@` (the working
         /// copy), matching jj's own `jj diff --help` documented behavior.
         /// Requires a colocated jj repository.
-        #[arg(long, value_name = "REVSET", conflicts_with_all = ["revision", "range", "staged", "no_watch"])]
+        #[arg(long, value_name = "REVSET", conflicts_with_all = ["revision", "range", "staged", "no_watch", "branch"])]
         from: Option<String>,
         /// See `--from`.
-        #[arg(long, value_name = "REVSET", conflicts_with_all = ["revision", "range", "staged", "no_watch"])]
+        #[arg(long, value_name = "REVSET", conflicts_with_all = ["revision", "range", "staged", "no_watch", "branch"])]
         to: Option<String>,
         /// Show a GitHub pull request's diff against its actual base,
         /// resolved and fetched through your own logged-in `gh` CLI —
@@ -94,10 +94,23 @@ enum Command {
         /// comments), like any other historical scope.
         #[arg(long, value_name = "NUMBER", conflicts_with_all = ["range", "staged", "revision", "from", "to", "no_watch"])]
         pr: Option<NonZeroU64>,
+        /// Reviews this branch against its detected base (`[diff] base` in
+        /// config, else a colocated jj repo's own `trunk()`, else git's
+        /// `origin/HEAD`, else a local `main`/`master` — see the
+        /// Configuration chapter's `[diff]` section) instead of the working
+        /// tree — the CLI twin of the scope menu's "Branch vs base" entry
+        /// and the `B` keybinding. Read-only, like any other historical
+        /// scope (no LSP, no live working-tree watch): an uncommitted edit
+        /// sitting in the working tree simply doesn't appear in this
+        /// scope's diff, since the new side is the branch's own `HEAD`
+        /// tree, never disk. Errors with the detection message when no base
+        /// can be found.
+        #[arg(long, conflicts_with_all = ["staged", "range", "revision", "from", "to", "pr", "no_watch"])]
+        branch: bool,
         /// Disable automatic live refresh for an interactive working-tree
         /// diff. Staged and historical scopes are already non-watching and
         /// cannot be combined with this opt-out.
-        #[arg(long, conflicts_with_all = ["staged", "range", "revision", "from", "to"])]
+        #[arg(long, conflicts_with_all = ["staged", "range", "revision", "from", "to", "branch"])]
         no_watch: bool,
         /// Runs the semantic-units grouping headlessly (cache first, then
         /// the agent CLI — exactly what `u` does in the TUI) and prints
@@ -524,6 +537,7 @@ fn main() -> Result<()> {
         from: None,
         to: None,
         pr: None,
+        branch: false,
         no_watch: false,
         dump_units: false,
         regroup: false,
@@ -539,6 +553,7 @@ fn main() -> Result<()> {
             from,
             to,
             pr,
+            branch,
             no_watch,
             dump_units,
             regroup,
@@ -553,6 +568,7 @@ fn main() -> Result<()> {
             from,
             to,
             pr,
+            branch,
             no_watch,
             dump_units,
             regroup,
@@ -617,6 +633,7 @@ fn run_diff(
     from: Option<String>,
     to: Option<String>,
     pr: Option<NonZeroU64>,
+    branch: bool,
     no_watch: bool,
     dump_units: bool,
     regroup: bool,
@@ -629,10 +646,11 @@ fn run_diff(
             || revision.is_some()
             || from.is_some()
             || to.is_some()
-            || pr.is_some())
+            || pr.is_some()
+            || branch)
     {
         bail!(
-            "--no-watch only supports the working tree; it cannot be combined with --staged, --pr, or a revision range"
+            "--no-watch only supports the working tree; it cannot be combined with --staged, --pr, --branch, or a revision range"
         );
     }
 
@@ -653,6 +671,13 @@ fn run_diff(
     // `--pr` is remote historical content fetched through `gh` — never the
     // local working tree, so it's non-interactive for the same reason a jj
     // revision diff is.
+    //
+    // `branch_revision_scope` is populated only by the `branch` arm below —
+    // `app::RevisionScope` construction happens after `App::new`, well
+    // past where `base` (and the jj-vs-git `text_arg` it implies) is still
+    // in scope, so this carries it across that gap the same way
+    // `scope_label`/`interactive` already do for every other arm.
+    let mut branch_revision_scope: Option<ui::app::RevisionScope> = None;
     let (diff_text, scope_label, interactive) = if let Some(number) = pr {
         (
             vcs::github::pull_request_diff(&repo_root, number)?,
@@ -674,6 +699,42 @@ fn run_diff(
             from.as_deref().unwrap_or("@"),
             to.as_deref().unwrap_or("@")
         );
+        (text, Some(label), false)
+    } else if branch {
+        // Soft-detect (`jj::resolve_jj_bin().and_then(JjRepo::detect)`),
+        // not `discover_jj_repo_at`, which hard-bails: `--branch` must work
+        // in a plain git repo too, exactly like `vcs::base::detect_base`'s
+        // own jj branch already assumes (see that function's docs).
+        let jj_repo = jj::resolve_jj_bin().and_then(|bin| jj::JjRepo::detect(&repo_root, bin));
+        let base = vcs::base::detect_base(&source, jj_repo.as_ref(), config.diff.base.as_deref())
+            .map_err(|e| anyhow::anyhow!(e))?;
+        // Same two formulas `ui::mod::apply_scope_swap`'s
+        // `ScopeChoice::BranchVsBase` arm uses — kept in agreement so the
+        // CLI flag and the mid-session scope-menu/keybinding entries never
+        // drift in what "branch vs base" actually diffs.
+        let (text_arg, text) = if base.via_jj {
+            let repo = jj_repo
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("no jj repository detected"))?;
+            let text_arg = format!("fork_point({} | @)", base.name);
+            let text = repo.revision_range_diff(Some(&text_arg), Some("@"))?;
+            (text_arg, text)
+        } else {
+            let text_arg = format!("{}...HEAD", base.name);
+            let text = source.range_diff(&text_arg)?;
+            (text_arg, text)
+        };
+        let head_display = if base.via_jj {
+            "@".to_owned()
+        } else {
+            source.current_branch_display()?
+        };
+        let label = vcs::base::branch_vs_base_label(&head_display, &base);
+        branch_revision_scope = Some(ui::app::RevisionScope {
+            text: text_arg,
+            via_jj: base.via_jj,
+            base: Some(base.name),
+        });
         (text, Some(label), false)
     } else {
         let text = match (staged, range.as_deref()) {
@@ -764,8 +825,14 @@ fn run_diff(
         && revision.is_none()
         && from.is_none()
         && to.is_none()
-        && pr.is_none();
+        && pr.is_none()
+        && !branch;
     app.scope_label = scope_label;
+    // `[diff] base`, carried onto every `App` regardless of which scope this
+    // session opened on — the scope menu/`B` keybinding need it later in
+    // the session even when this run started on a scope other than
+    // `--branch` itself (see `App::configured_base`'s docs).
+    app.configured_base = config.diff.base.clone();
     // Issue #8: recorded so a live session can watch this scope for an
     // amend moving it — see `ui::app::RevisionScope`'s docs. `--from`/
     // `--to` are conceptually moving too but excluded from V1 the same way
@@ -773,18 +840,41 @@ fn run_diff(
     // itself covers both a plain single revision (moving, if the text
     // itself is) and a two-sided range (never moving, via that same
     // classifier's `..` check) — no separate branch needed here for which
-    // of those it turned out to be.
+    // of those it turned out to be. `--branch` is the two-endpoint scope
+    // built above (`branch_revision_scope`, already carrying `base: Some`).
     app.revision_scope = if let Some(revset) = revision.as_deref() {
         Some(ui::app::RevisionScope {
             text: revset.to_owned(),
             via_jj: true,
+            base: None,
         })
+    } else if branch {
+        branch_revision_scope
     } else {
         range.as_deref().map(|range| ui::app::RevisionScope {
             text: range.to_owned(),
             via_jj: false,
+            base: None,
         })
     };
+    // The empty-state placeholder's live "review this branch" hint —
+    // populated only for the plain working-tree scope (every other scope
+    // either already *is* the branch-vs-base diff, or has no "clean tree,
+    // nothing to review" placeholder to begin with — see
+    // `App::branch_vs_base_hint`'s docs). Computed regardless of whether
+    // the tree turns out clean (cheap either way, and simpler than
+    // conditioning the call on emptiness that isn't known until after
+    // `parse_unified_diff` above already ran).
+    if app.disk_is_new_side {
+        let jj_repo = jj::resolve_jj_bin().and_then(|bin| jj::JjRepo::detect(&app.repo_root, bin));
+        app.branch_vs_base_hint =
+            vcs::base::detect_base(&source, jj_repo.as_ref(), config.diff.base.as_deref())
+                .ok()
+                .map(|base| ui::app::BranchVsBaseHint {
+                    base: base.name,
+                    ahead: base.ahead,
+                });
+    }
 
     if let Some(frames) = bench_render {
         return run_bench_render(app, frames);

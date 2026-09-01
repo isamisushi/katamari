@@ -768,17 +768,35 @@ struct PermissionPromptState {
 struct MovingScopeState {
     text: String,
     via_jj: bool,
+    /// Mirrors [`app::RevisionScope::base`]: `Some(base_name)` for a
+    /// `--branch`/scope-menu "Branch vs base" scope, whose target is
+    /// *two* independently-moving endpoints (`HEAD` and this base) rather
+    /// than the one every other `MovingScopeState` tracks. `text` still
+    /// holds the full diff-arg text either way (`"main...HEAD"` for git,
+    /// the jj `fork_point(...)` `--from` argument for jj — see
+    /// [`handle_moving_scope_refresh`]'s own two-endpoint branch for
+    /// exactly how each backend turns that back into a diff call), so this
+    /// field exists purely to tell [`seed_moving_scope`]/
+    /// [`handle_moving_scope_refresh`] *which* resolve-and-compare shape to
+    /// use, not to hold anything `text` doesn't already have.
+    base: Option<String>,
     /// The resolved commit/change-content id the scope named as of the
     /// last check — compared against a fresh resolve on every
     /// `AppEvent::RevisionChanged` tick in [`handle_moving_scope_refresh`]:
     /// unequal means the amend actually moved this scope's target; equal
     /// means some other watched ref path changed (an unrelated branch's
-    /// reflog, a `git add`) and this scope's own target didn't move.
-    /// `None` when the seed-time resolve itself failed (a transient
-    /// repository hiccup at scope-open): tracking stays alive rather than
-    /// silently disabling for the whole session, and the first successful
-    /// resolve re-runs the diff once — a redundant, anchor-preserving
-    /// refresh in the worst case, never a missed amend.
+    /// reflog, a `git add`) and this scope's own target didn't move. For a
+    /// two-endpoint (`base.is_some()`) scope this is a composite
+    /// `"{head_hash}:{base_hash}"` token instead of one plain id — either
+    /// side moving changes the token, which is exactly the "did *anything*
+    /// about this scope move" question the equality check below needs
+    /// answered; the two halves are never split back apart; only compared
+    /// for equality as a whole. `None` when the seed-time resolve itself
+    /// failed (a transient repository hiccup at scope-open, or — for a
+    /// two-endpoint scope — either side's resolve failing): tracking stays
+    /// alive rather than silently disabling for the whole session, and the
+    /// first successful resolve re-runs the diff once — a redundant,
+    /// anchor-preserving refresh in the worst case, never a missed amend.
     last_hash: Option<String>,
 }
 
@@ -811,6 +829,41 @@ fn seed_moving_scope(
     jj_repo: Option<&JjRepo>,
 ) -> Option<MovingScopeState> {
     let scope = scope?;
+
+    // A two-endpoint "Branch vs base" scope is unconditionally moving by
+    // construction — it's only ever built by `crate::vcs::base::detect_base`,
+    // which already knows both `HEAD` and `base` are symbolic — so this
+    // skips `is_moving_revision(&scope.text)` entirely rather than running
+    // it against `text`, which holds a *range* formula (`"main...HEAD"`,
+    // `"fork_point(main | @)"`) that check would wrongly reject via its own
+    // `..` heuristic (see that function's docs on why a range is always
+    // classified immutable — a boundary this scope deliberately steps
+    // around, not one it's subject to). Both endpoints are resolved
+    // independently and folded into one composite token — see
+    // `MovingScopeState::last_hash`'s docs — so either side moving is
+    // detected.
+    if let Some(base) = &scope.base {
+        let resolve = |rev: &str| -> Option<String> {
+            if scope.via_jj {
+                jj_repo?.resolve_commit_id(rev).ok().flatten()
+            } else {
+                git.resolve(rev).ok().flatten()
+            }
+        };
+        let head = resolve(if scope.via_jj { "@" } else { "HEAD" });
+        let based = resolve(base);
+        let last_hash = match (head, based) {
+            (Some(h), Some(b)) => Some(format!("{h}:{b}")),
+            _ => None,
+        };
+        return Some(MovingScopeState {
+            text: scope.text.clone(),
+            via_jj: scope.via_jj,
+            base: Some(base.clone()),
+            last_hash,
+        });
+    }
+
     if !crate::vcs::is_moving_revision(&scope.text) {
         return None;
     }
@@ -822,6 +875,7 @@ fn seed_moving_scope(
     Some(MovingScopeState {
         text: scope.text.clone(),
         via_jj: scope.via_jj,
+        base: None,
         last_hash,
     })
 }
@@ -1717,7 +1771,12 @@ fn event_loop(
                         match handle_revision_key(input, key) {
                             RevisionInputOutcome::Continue => {}
                             RevisionInputOutcome::Back => {
-                                scope_menu = Some(ScopeMenuState::new_list(jj_repo.is_some()));
+                                let branch_base = match stack.top() {
+                                    View::Diff(app) => detect_branch_vs_base(app, jj_repo.as_ref()),
+                                    _ => None,
+                                };
+                                scope_menu =
+                                    Some(ScopeMenuState::new_list(jj_repo.is_some(), branch_base));
                             }
                             RevisionInputOutcome::Submit(text) => {
                                 match scope_menu::parse_pr_number(&text) {
@@ -1767,7 +1826,12 @@ fn event_loop(
                         match handle_revision_key(input, key) {
                             RevisionInputOutcome::Continue => {}
                             RevisionInputOutcome::Back => {
-                                scope_menu = Some(ScopeMenuState::new_list(jj_repo.is_some()));
+                                let branch_base = match stack.top() {
+                                    View::Diff(app) => detect_branch_vs_base(app, jj_repo.as_ref()),
+                                    _ => None,
+                                };
+                                scope_menu =
+                                    Some(ScopeMenuState::new_list(jj_repo.is_some(), branch_base));
                             }
                             RevisionInputOutcome::Submit(text) => {
                                 let at_root = stack.is_at_root();
@@ -2463,6 +2527,14 @@ fn event_loop(
                     &mut pending_pointer_hover,
                     &observer,
                 );
+                // Piggybacks on the exact same tick: keeps
+                // `App::branch_vs_base_hint`'s `+N` current for a plain
+                // working-tree session left open while `main` moves — see
+                // `refresh_branch_vs_base_hint`'s own docs for why this is
+                // safe (and cheap) to call unconditionally here alongside
+                // `handle_moving_scope_refresh`, which this session's
+                // `moving_scope` is `None` for the whole time.
+                refresh_branch_vs_base_hint(stack, jj_repo.as_ref());
             }
             Ok(AppEvent::CommentsChanged) => {
                 // Issue #24 req 5's fifth cancellation hook, easy to miss
@@ -3344,11 +3416,19 @@ fn handle_action(
                     ScopeMenuEntry::PullRequest => {
                         *scope_menu = Some(ScopeMenuState::new_pr_input());
                     }
-                    ScopeMenuEntry::WorkingTree | ScopeMenuEntry::Staged => {
-                        let choice = if entry == ScopeMenuEntry::WorkingTree {
-                            ScopeChoice::WorkingTree
-                        } else {
-                            ScopeChoice::Staged
+                    ScopeMenuEntry::WorkingTree
+                    | ScopeMenuEntry::Staged
+                    | ScopeMenuEntry::BranchVsBase => {
+                        let choice = match entry {
+                            ScopeMenuEntry::WorkingTree => ScopeChoice::WorkingTree,
+                            ScopeMenuEntry::BranchVsBase => ScopeChoice::BranchVsBase,
+                            ScopeMenuEntry::Staged => ScopeChoice::Staged,
+                            ScopeMenuEntry::Log
+                            | ScopeMenuEntry::Timeline
+                            | ScopeMenuEntry::Revision
+                            | ScopeMenuEntry::PullRequest => {
+                                unreachable!("handled by this match's own outer arms above")
+                            }
                         };
                         let at_root = stack.is_at_root();
                         if let View::Diff(app) = stack.top_mut() {
@@ -4157,7 +4237,10 @@ fn handle_action(
             *help = Some(HelpState::new());
         }
         Action::OpenScopeMenu => match stack.top() {
-            View::Diff(_) => *scope_menu = Some(ScopeMenuState::new_list(jj_repo.is_some())),
+            View::Diff(app) => {
+                let branch_base = detect_branch_vs_base(app, jj_repo);
+                *scope_menu = Some(ScopeMenuState::new_list(jj_repo.is_some(), branch_base));
+            }
             View::File(_)
             | View::Timeline(_)
             | View::Log(_)
@@ -4166,6 +4249,55 @@ fn handle_action(
                 *goto_status = Some("scope: only available in the diff view".to_owned());
             }
         },
+        // `B`: the keybinding twin of the scope menu's "Branch vs base"
+        // entry (see `ScopeMenuEntry::BranchVsBase`'s Confirm handling
+        // just above, which this deliberately mirrors) and of the
+        // empty-state placeholder's own hint line
+        // (`diff_view::render_empty_state`) — all three affordances apply
+        // through this exact `ScopeChoice::BranchVsBase` arm of
+        // `apply_scope_swap`, so they can never drift in behavior. Bound
+        // unconditionally in both keymap presets (like `t`/`ToggleTimeline`,
+        // which also no-ops gracefully when there's nothing for it to do) —
+        // the *key* is always live; whether it actually has a base to swap
+        // to is decided fresh on every press via a real `detect_base` call,
+        // not cached from whenever the session started. Gated to
+        // `View::Diff` at root, same as `OpenScopeMenu` just above.
+        Action::ReviewBranchVsBase => {
+            let at_root = stack.is_at_root();
+            match stack.top_mut() {
+                View::Diff(app) => match apply_scope_swap(
+                    app,
+                    &ScopeChoice::BranchVsBase,
+                    at_root,
+                    watch_active,
+                    jj_repo,
+                    lsp_manager,
+                    highlighter,
+                    hover_state,
+                    refs_panel,
+                    context_menu,
+                    watch_paused,
+                    watch_status,
+                    moving_scope,
+                ) {
+                    Ok(()) => {
+                        *scope_menu = None;
+                        // Mirrors the scope-menu's own successful-swap
+                        // cleanup: a completed swap supersedes any PR fetch
+                        // still in flight.
+                        pr_scope.clear();
+                    }
+                    Err(e) => *goto_status = Some(format!("scope: {e}")),
+                },
+                View::File(_)
+                | View::Timeline(_)
+                | View::Log(_)
+                | View::LspInspector(_)
+                | View::Agent(_) => {
+                    *goto_status = Some("scope: only available in the diff view".to_owned());
+                }
+            }
+        }
         // Issue #14 (extended by #15's tree): Enter while `Files` has focus
         // either opens the selected file (jumps the diff cursor to its
         // header, hands focus to `Diff`, and records the jump in the
@@ -4515,6 +4647,31 @@ enum ScopeChoice {
     /// The free-form text a "Revision…" submission carried, untrimmed —
     /// [`apply_scope_swap`] trims it once, at the point it's actually used.
     Revision(String),
+    /// The scope-menu entry/`Action::ReviewBranchVsBase` keybinding's
+    /// synchronous twin of `--branch` — `apply_scope_swap` re-runs
+    /// `crate::vcs::base::detect_base` fresh at Confirm time (rather than
+    /// carrying whatever the menu detected when it opened) to avoid a
+    /// staleness window between menu-open and selection; this variant
+    /// carries no payload of its own for exactly that reason.
+    BranchVsBase,
+}
+
+/// The scope menu's "Branch vs base" row, freshly detected each time the
+/// menu (re)opens — cheap, local git/jj calls (see
+/// `crate::vcs::base::detect_base`'s own docs on why nothing here touches
+/// the network), the same cost class `detect_jj_repo` already pays once at
+/// session start. `None` both when nothing was detected at all and when a
+/// base *was* detected but `ahead == 0` (`HEAD` already equals it, or is
+/// behind it) — [`scope_menu::available_entries`] simply omits the entry
+/// either way, matching how `Timeline` is already conditionally absent
+/// rather than shown-and-disabled.
+fn detect_branch_vs_base(
+    app: &App,
+    jj_repo: Option<&JjRepo>,
+) -> Option<crate::vcs::base::DetectedBase> {
+    let git = GitSource::at(app.repo_root.clone());
+    let base = crate::vcs::base::detect_base(&git, jj_repo, app.configured_base.as_deref()).ok()?;
+    (base.ahead > 0).then_some(base)
 }
 
 /// Whether a scope swap that resolves at the session's root diff should
@@ -4566,10 +4723,10 @@ fn warm_up_diff(app: &App, lsp_manager: &LspManager) -> crate::lsp::manager::War
 /// leave a blank or half-updated diff on screen — the error is returned for
 /// the caller to show as a status-bar note instead, per the milestone spec.
 ///
-/// Issue #8: also records `app.revision_scope` (`Some` for `Revision`,
-/// `None` for `WorkingTree`/`Staged`) directly as a field assignment rather
-/// than through [`App::apply_scope_swap`]'s own parameter list (see that
-/// method's docs for why), and — only `at_root`, the same gate
+/// Issue #8: also records `app.revision_scope` (`Some` for `Revision`/
+/// `BranchVsBase`, `None` for `WorkingTree`/`Staged`) directly as a field
+/// assignment rather than through [`App::apply_scope_swap`]'s own parameter
+/// list (see that method's docs for why), and — only `at_root`, the same gate
 /// [`watch_pause_decision`] uses just below, since [`MovingScopeState`]
 /// only ever tracks the root diff — re-seeds `moving_scope` from the new
 /// scope via [`seed_moving_scope`]. A swap on a *pushed* diff still records
@@ -4596,50 +4753,110 @@ fn apply_scope_swap(
     moving_scope: &mut Option<MovingScopeState>,
 ) -> Result<(), String> {
     let git = GitSource::at(app.repo_root.clone());
-    let (result, interactive, scope_label): (anyhow::Result<String>, bool, Option<String>) =
-        match choice {
-            ScopeChoice::WorkingTree => (git.working_tree_diff(), true, None),
-            ScopeChoice::Staged => (git.staged_diff(), true, None),
-            ScopeChoice::Revision(input) => {
-                let revset = input.trim();
-                if revset.is_empty() {
-                    return Err("enter a revision first".to_owned());
-                }
-                // jj mode passes the whole string through as one revset to
-                // `jj diff -r` unvalidated, letting jj's own operators
-                // (`a..b`, `@-`, ...) work exactly as they do on the
-                // command line — see `crate::vcs::jj::JjRepo::revision_diff`'s
-                // docs, and this milestone's task notes for the empirical
-                // check that a DAG-range revset like `a..b` resolves to the
-                // combined diff from `a`'s side to `b`'s, not something
-                // unhelpful. git mode reuses `GitSource::range_diff`, which
-                // already accepts a plain rev or an `A..B`/`A...B` range
-                // (see `git::plan_range`) — no second parser needed here.
-                let result = match jj_repo {
-                    Some(repo) => repo.revision_diff(revset),
-                    None => git.range_diff(revset),
-                };
-                (result, false, Some(format!("r: {revset}")))
-            }
-        };
-    let text = result.map_err(|e| e.to_string())?;
-    // Only `WorkingTree`'s new side is genuinely the live working tree —
-    // `Staged`'s is the index, and `Revision`'s is historical (see
-    // `App::disk_is_new_side`'s docs for why this can't just reuse
-    // `interactive`, which is `true` for `Staged` too).
-    let payload = ScopeSwapPayload {
-        text,
-        interactive,
-        disk_is_new_side: matches!(choice, ScopeChoice::WorkingTree),
-        scope_label,
-        revision_scope: match choice {
-            ScopeChoice::Revision(input) => Some(app::RevisionScope {
-                text: input.trim().to_owned(),
-                via_jj: jj_repo.is_some(),
-            }),
-            ScopeChoice::WorkingTree | ScopeChoice::Staged => None,
+    let payload = match choice {
+        ScopeChoice::WorkingTree => ScopeSwapPayload {
+            text: git.working_tree_diff().map_err(|e| e.to_string())?,
+            interactive: true,
+            disk_is_new_side: true,
+            scope_label: None,
+            revision_scope: None,
+            is_working_tree: true,
         },
-        is_working_tree: matches!(choice, ScopeChoice::WorkingTree),
+        ScopeChoice::Staged => ScopeSwapPayload {
+            text: git.staged_diff().map_err(|e| e.to_string())?,
+            interactive: true,
+            disk_is_new_side: false,
+            scope_label: None,
+            revision_scope: None,
+            is_working_tree: false,
+        },
+        ScopeChoice::Revision(input) => {
+            let revset = input.trim();
+            if revset.is_empty() {
+                return Err("enter a revision first".to_owned());
+            }
+            // jj mode passes the whole string through as one revset to
+            // `jj diff -r` unvalidated, letting jj's own operators
+            // (`a..b`, `@-`, ...) work exactly as they do on the
+            // command line — see `crate::vcs::jj::JjRepo::revision_diff`'s
+            // docs, and this milestone's task notes for the empirical
+            // check that a DAG-range revset like `a..b` resolves to the
+            // combined diff from `a`'s side to `b`'s, not something
+            // unhelpful. git mode reuses `GitSource::range_diff`, which
+            // already accepts a plain rev or an `A..B`/`A...B` range
+            // (see `git::plan_range`) — no second parser needed here.
+            let text = match jj_repo {
+                Some(repo) => repo.revision_diff(revset),
+                None => git.range_diff(revset),
+            }
+            .map_err(|e| e.to_string())?;
+            ScopeSwapPayload {
+                text,
+                interactive: false,
+                disk_is_new_side: false,
+                scope_label: Some(format!("r: {revset}")),
+                revision_scope: Some(app::RevisionScope {
+                    text: revset.to_owned(),
+                    via_jj: jj_repo.is_some(),
+                    base: None,
+                }),
+                is_working_tree: false,
+            }
+        }
+        // `interactive: false`/`disk_is_new_side: false` below put this
+        // scope in the same bucket as `Revision`/a `--pr` diff for every
+        // downstream consumer: `App::hover_query` already returns `None`
+        // whenever `!interactive` (LSP is fully inert — no server is even
+        // warmed up for this scope's files), and `z o` already refuses to
+        // expand a fold without `disk_is_new_side` (this scope's new side
+        // is `base.name...HEAD`'s tree, not disk, even on a session opened
+        // over a dirty working tree — an uncommitted edit simply doesn't
+        // appear here). Comments are the one exception, and need no gate at
+        // all: `comments::build_index` always relocates against the
+        // repository's *current on-disk content*, independent of whichever
+        // scope's `diff_text` happens to be showing — already true for
+        // every historical scope, not something this one introduces.
+        ScopeChoice::BranchVsBase => {
+            let base =
+                crate::vcs::base::detect_base(&git, jj_repo, app.configured_base.as_deref())?;
+            // git: `range_diff` already accepts the full `"{base}...HEAD"`
+            // text as one passthrough argument (see `git::plan_range`). jj:
+            // `revision_diff` only ever takes one revset, so the
+            // `--from`/`--to` pair goes through `revision_range_diff`
+            // instead — `text` below is recorded as just the `--from` half
+            // (`RevisionScope::base`'s docs explain why), which
+            // `handle_moving_scope_refresh`'s own two-endpoint branch
+            // re-supplies `--to @` for on every later refresh.
+            let (text_arg, diff_result) = if base.via_jj {
+                let repo = jj_repo.ok_or_else(|| "no jj repository detected".to_owned())?;
+                let text_arg = format!("fork_point({} | @)", base.name);
+                let diff_result = repo.revision_range_diff(Some(&text_arg), Some("@"));
+                (text_arg, diff_result)
+            } else {
+                let text_arg = format!("{}...HEAD", base.name);
+                let diff_result = git.range_diff(&text_arg);
+                (text_arg, diff_result)
+            };
+            let text = diff_result.map_err(|e| e.to_string())?;
+            let head_display = if base.via_jj {
+                "@".to_owned()
+            } else {
+                git.current_branch_display().map_err(|e| e.to_string())?
+            };
+            let label = crate::vcs::base::branch_vs_base_label(&head_display, &base);
+            ScopeSwapPayload {
+                text,
+                interactive: false,
+                disk_is_new_side: false,
+                scope_label: Some(label),
+                revision_scope: Some(app::RevisionScope {
+                    text: text_arg,
+                    via_jj: base.via_jj,
+                    base: Some(base.name),
+                }),
+                is_working_tree: false,
+            }
+        }
     };
     finish_scope_swap(
         app,
@@ -4949,44 +5166,142 @@ fn handle_moving_scope_refresh(
     };
     let git = GitSource::at(app.repo_root.clone());
 
-    let resolved = if scope.via_jj {
-        match jj_repo {
-            Some(repo) => repo.resolve_commit_id(&scope.text),
-            None => Ok(None),
-        }
-    } else {
-        git.resolve(&scope.text)
-    };
-    let new_hash = match resolved {
-        Ok(Some(hash)) => hash,
-        Ok(None) => {
-            *watch_status = Some(WatchStatus::new(format!(
-                "scope: refresh check failed: {} no longer resolves",
-                scope.text
-            )));
-            return;
-        }
-        Err(e) => {
-            *watch_status = Some(WatchStatus::new(format!(
-                "scope: refresh check failed: {e}"
-            )));
-            return;
-        }
-    };
-    if scope.last_hash.as_deref() == Some(new_hash.as_str()) {
-        return; // some other watched ref path changed; this scope's own target didn't move
-    }
+    // A two-endpoint "Branch vs base" scope resolves *both* `HEAD` and
+    // `base` independently and folds them into one composite token (see
+    // `MovingScopeState::last_hash`'s docs) — and, unlike every other scope
+    // this function handles, recomputes `app.scope_label`'s `(+N)` on every
+    // change instead of leaving it untouched: a new commit landing on
+    // either side is exactly what makes that count stale. `new_label` is
+    // `None` for the ordinary single-revision path below, which keeps
+    // `app.scope_label` exactly as `App::apply_refresh` already leaves it
+    // (see this function's own docs on why `"r: HEAD"` stays that).
+    let (new_hash, diff_result, new_label): (String, anyhow::Result<String>, Option<String>) =
+        if let Some(base) = scope.base.clone() {
+            let head_rev = if scope.via_jj { "@" } else { "HEAD" };
+            let resolve_side = |git: &GitSource, jj_repo: Option<&JjRepo>, rev: &str| {
+                if scope.via_jj {
+                    match jj_repo {
+                        Some(repo) => repo.resolve_commit_id(rev),
+                        None => Ok(None),
+                    }
+                } else {
+                    git.resolve(rev)
+                }
+            };
+            let head = match resolve_side(&git, jj_repo, head_rev) {
+                Ok(Some(hash)) => hash,
+                Ok(None) => {
+                    *watch_status = Some(WatchStatus::new(format!(
+                        "scope: refresh check failed: {head_rev} no longer resolves"
+                    )));
+                    return;
+                }
+                Err(e) => {
+                    *watch_status = Some(WatchStatus::new(format!(
+                        "scope: refresh check failed: {e}"
+                    )));
+                    return;
+                }
+            };
+            let based = match resolve_side(&git, jj_repo, &base) {
+                Ok(Some(hash)) => hash,
+                Ok(None) => {
+                    *watch_status = Some(WatchStatus::new(format!(
+                        "scope: refresh check failed: {base} no longer resolves"
+                    )));
+                    return;
+                }
+                Err(e) => {
+                    *watch_status = Some(WatchStatus::new(format!(
+                        "scope: refresh check failed: {e}"
+                    )));
+                    return;
+                }
+            };
+            let new_hash = format!("{head}:{based}");
+            if scope.last_hash.as_deref() == Some(new_hash.as_str()) {
+                return; // neither HEAD nor base actually moved
+            }
 
-    // The same diff call the scope was opened with — see
-    // `apply_scope_swap`'s `ScopeChoice::Revision` arm, which this mirrors.
-    let diff_result = if scope.via_jj {
-        match jj_repo {
-            Some(repo) => repo.revision_diff(&scope.text),
-            None => Err(anyhow::anyhow!("no jj repository detected")),
-        }
-    } else {
-        git.range_diff(&scope.text)
-    };
+            // `scope.text` is the `--from`/`base...HEAD` half of the
+            // formula (see `RevisionScope::base`'s docs) — jj still needs
+            // `--to @` supplied explicitly (`revision_diff` alone only
+            // takes one revset), while git's `range_diff` already accepts
+            // the full `"{base}...HEAD"` text as one argument.
+            let diff_result = if scope.via_jj {
+                match jj_repo {
+                    Some(repo) => repo.revision_range_diff(Some(&scope.text), Some("@")),
+                    None => Err(anyhow::anyhow!("no jj repository detected")),
+                }
+            } else {
+                git.range_diff(&scope.text)
+            };
+
+            let ahead = if scope.via_jj {
+                jj_repo
+                    .and_then(|repo| repo.resolve_commit_id(&format!("{base}..@")).ok().flatten())
+                    .map(|ids| ids.lines().count())
+                    .unwrap_or(0)
+            } else {
+                git.ahead_count(&base, "HEAD").unwrap_or(0)
+            };
+            let head_display = if scope.via_jj {
+                "@".to_owned()
+            } else {
+                git.current_branch_display()
+                    .unwrap_or_else(|_| "HEAD".to_owned())
+            };
+            let label = crate::vcs::base::branch_vs_base_label(
+                &head_display,
+                &crate::vcs::base::DetectedBase {
+                    name: base,
+                    via_jj: scope.via_jj,
+                    ahead,
+                },
+            );
+            (new_hash, diff_result, Some(label))
+        } else {
+            let resolved = if scope.via_jj {
+                match jj_repo {
+                    Some(repo) => repo.resolve_commit_id(&scope.text),
+                    None => Ok(None),
+                }
+            } else {
+                git.resolve(&scope.text)
+            };
+            let new_hash = match resolved {
+                Ok(Some(hash)) => hash,
+                Ok(None) => {
+                    *watch_status = Some(WatchStatus::new(format!(
+                        "scope: refresh check failed: {} no longer resolves",
+                        scope.text
+                    )));
+                    return;
+                }
+                Err(e) => {
+                    *watch_status = Some(WatchStatus::new(format!(
+                        "scope: refresh check failed: {e}"
+                    )));
+                    return;
+                }
+            };
+            if scope.last_hash.as_deref() == Some(new_hash.as_str()) {
+                return; // some other watched ref path changed; this scope's own target didn't move
+            }
+
+            // The same diff call the scope was opened with — see
+            // `apply_scope_swap`'s `ScopeChoice::Revision` arm, which this
+            // mirrors.
+            let diff_result = if scope.via_jj {
+                match jj_repo {
+                    Some(repo) => repo.revision_diff(&scope.text),
+                    None => Err(anyhow::anyhow!("no jj repository detected")),
+                }
+            } else {
+                git.range_diff(&scope.text)
+            };
+            (new_hash, diff_result, None)
+        };
     let files = match diff_result {
         Ok(text) => parse_unified_diff(&text),
         Err(e) => {
@@ -5022,7 +5337,43 @@ fn handle_moving_scope_refresh(
     *context_menu = None;
 
     scope.last_hash = Some(new_hash);
+    if let Some(label) = new_label {
+        app.scope_label = Some(label);
+    }
     *watch_status = Some(WatchStatus::new(format!("updated: {} moved", scope.text)));
+}
+
+/// Keeps [`App::branch_vs_base_hint`]'s `+N` from going stale across a
+/// session left open while `main` moves — piggybacks on the same
+/// `AppEvent::RevisionChanged` ref-watcher tick
+/// [`handle_moving_scope_refresh`] already receives (that function's own
+/// docs note the watcher fires for a plain working-tree session too, even
+/// though `moving_scope` is `None` there the whole time, which is exactly
+/// what makes this cheap sibling call safe to make unconditionally
+/// alongside it). Only re-runs `crate::vcs::base::detect_base` and
+/// overwrites the field — no diff re-run, no [`App::apply_refresh`], purely
+/// refreshing the count [`crate::ui::diff_view::render_empty_state`] reads.
+///
+/// A no-op whenever the root diff isn't sitting on the plain working-tree
+/// scope this hint is for (`revision_scope.is_some()` — swapped to
+/// something else — or `!disk_is_new_side`, which never true for a
+/// non-working-tree root to begin with): every other scope has no
+/// "clean tree, nothing to review" placeholder for this to keep current.
+fn refresh_branch_vs_base_hint(stack: &mut ViewStack, jj_repo: Option<&JjRepo>) {
+    let View::Diff(app) = stack.root_mut() else {
+        return;
+    };
+    if app.revision_scope.is_some() || !app.disk_is_new_side {
+        return;
+    }
+    let git = GitSource::at(app.repo_root.clone());
+    app.branch_vs_base_hint =
+        crate::vcs::base::detect_base(&git, jj_repo, app.configured_base.as_deref())
+            .ok()
+            .map(|base| app::BranchVsBaseHint {
+                base: base.name,
+                ahead: base.ahead,
+            });
 }
 
 /// Keeps every language server in sync with the files a watch batch
@@ -6521,7 +6872,7 @@ mod tests {
             jump_from: None,
         });
         let help = help.then(HelpState::default);
-        let scope_menu = scope_menu.then(|| ScopeMenuState::new_list(false));
+        let scope_menu = scope_menu.then(|| ScopeMenuState::new_list(false, None));
         let units_setup = units_setup.then(|| {
             UnitsSetupState::new(vec![crate::groups::agent::AgentCli {
                 kind: crate::groups::agent::AgentKind::Claude,
@@ -7552,6 +7903,7 @@ mod tests {
         let mut moving_scope = Some(MovingScopeState {
             text: "nonexistent-branch".to_owned(),
             via_jj: false,
+            base: None,
             last_hash: Some("deadbeef".to_owned()),
         });
         let mut hover_state = hover_popup::HoverState::default();
@@ -7636,6 +7988,7 @@ mod tests {
         let mut moving_scope = Some(MovingScopeState {
             text: "HEAD".to_owned(),
             via_jj: false,
+            base: None,
             last_hash: None,
         });
         let mut hover_state = hover_popup::HoverState::default();

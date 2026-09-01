@@ -20,6 +20,7 @@
 //! and `ui::mod::handle_action`'s `Action::Confirm` handling for it.
 
 use crate::ui::text_input::{self, EditCommand, cursor_marked_line};
+use crate::vcs::base::DetectedBase;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -38,6 +39,14 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 pub enum ScopeMenuEntry {
     WorkingTree,
     Staged,
+    /// The branch-vs-base diff (`ktmr diff --branch`'s mid-session twin) —
+    /// only ever present when [`ScopeMenuList`] was built with a detected,
+    /// ahead-by-at-least-one [`DetectedBase`] (see [`available_entries`]'s
+    /// docs), so unlike every other variant here this one's [`Self::label`]
+    /// is never actually shown: [`render_list`] special-cases it to
+    /// interpolate the detected base's name in instead (see that
+    /// function's docs for why `.label()` can't do that itself).
+    BranchVsBase,
     Log,
     Timeline,
     Revision,
@@ -45,10 +54,17 @@ pub enum ScopeMenuEntry {
 }
 
 impl ScopeMenuEntry {
+    /// A static fallback label for every variant — the real, on-screen text
+    /// for every variant but [`ScopeMenuEntry::BranchVsBase`], whose actual
+    /// label needs a detected base name that isn't available to a
+    /// `Copy`/no-argument method like this one (see [`render_list`], the
+    /// method's only caller, for where that interpolation actually
+    /// happens).
     pub fn label(self) -> &'static str {
         match self {
             ScopeMenuEntry::WorkingTree => "Working tree",
             ScopeMenuEntry::Staged => "Staged",
+            ScopeMenuEntry::BranchVsBase => "Branch vs base",
             ScopeMenuEntry::Log => "Log — browse commits/changes",
             ScopeMenuEntry::Timeline => "Timeline (jj)",
             ScopeMenuEntry::Revision => "Revision…",
@@ -69,12 +85,23 @@ impl ScopeMenuEntry {
 /// parsing remotes to pre-judge that would rebuild exactly the GitHub
 /// knowledge `--pr` exists to not own — a repo where it can't work gets
 /// `gh`'s own explanation in the status bar instead of a hidden entry.
-pub fn available_entries(jj_available: bool) -> Vec<ScopeMenuEntry> {
-    let mut entries = vec![
-        ScopeMenuEntry::WorkingTree,
-        ScopeMenuEntry::Staged,
-        ScopeMenuEntry::Log,
-    ];
+///
+/// `branch_base` is `Some` only when `crate::vcs::base::detect_base`
+/// already succeeded *and* found at least one commit to review
+/// (`ahead > 0`) — both checks the caller (`ui::mod`, once per menu-open)
+/// already did, so `BranchVsBase` is simply absent otherwise: no base
+/// detected, or `HEAD` already equals it. Absent rather than shown-disabled
+/// for the same reason `Timeline` is conditionally absent rather than
+/// greyed — one fewer state for [`render_list`] to explain on screen.
+pub fn available_entries(
+    jj_available: bool,
+    branch_base: Option<&DetectedBase>,
+) -> Vec<ScopeMenuEntry> {
+    let mut entries = vec![ScopeMenuEntry::WorkingTree, ScopeMenuEntry::Staged];
+    if branch_base.is_some() {
+        entries.push(ScopeMenuEntry::BranchVsBase);
+    }
+    entries.push(ScopeMenuEntry::Log);
     if jj_available {
         entries.push(ScopeMenuEntry::Timeline);
     }
@@ -92,18 +119,29 @@ pub fn available_entries(jj_available: bool) -> Vec<ScopeMenuEntry> {
 pub struct ScopeMenuList {
     entries: Vec<ScopeMenuEntry>,
     selected: usize,
+    /// The detected base [`ScopeMenuEntry::BranchVsBase`] (when present)
+    /// stands for — carried alongside `entries` rather than re-detected at
+    /// render time (this type has no I/O of its own, see this module's
+    /// docs) so [`render_list`] can interpolate its name into the row's
+    /// label.
+    branch_base: Option<DetectedBase>,
 }
 
 impl ScopeMenuList {
-    pub fn new(jj_available: bool) -> Self {
+    pub fn new(jj_available: bool, branch_base: Option<DetectedBase>) -> Self {
         Self {
-            entries: available_entries(jj_available),
+            entries: available_entries(jj_available, branch_base.as_ref()),
             selected: 0,
+            branch_base,
         }
     }
 
     pub fn entries(&self) -> &[ScopeMenuEntry] {
         &self.entries
+    }
+
+    pub fn branch_base(&self) -> Option<&DetectedBase> {
+        self.branch_base.as_ref()
     }
 
     pub fn selected_index(&self) -> usize {
@@ -199,8 +237,8 @@ pub enum ScopeMenuState {
 }
 
 impl ScopeMenuState {
-    pub fn new_list(jj_available: bool) -> Self {
-        ScopeMenuState::List(ScopeMenuList::new(jj_available))
+    pub fn new_list(jj_available: bool, branch_base: Option<DetectedBase>) -> Self {
+        ScopeMenuState::List(ScopeMenuList::new(jj_available, branch_base))
     }
 
     pub fn new_revision_input() -> Self {
@@ -274,7 +312,20 @@ fn render_list(frame: &mut Frame, area: Rect, list: &ScopeMenuList) {
             if idx == list.selected_index() {
                 style = style.add_modifier(Modifier::BOLD | Modifier::REVERSED);
             }
-            Line::from(Span::styled(entry.label(), style))
+            // `.label()` is a static fallback everywhere but this one
+            // variant — see `ScopeMenuEntry::BranchVsBase`'s own docs for
+            // why the detected base's name can only be interpolated here,
+            // the one place that actually holds a `ScopeMenuList` (and
+            // therefore its carried `branch_base`) rather than a bare,
+            // `Copy` `ScopeMenuEntry`.
+            let label = match entry {
+                ScopeMenuEntry::BranchVsBase => list
+                    .branch_base()
+                    .map(|base| format!("Branch vs base ({})", base.name))
+                    .unwrap_or_else(|| entry.label().to_owned()),
+                other => other.label().to_owned(),
+            };
+            Line::from(Span::styled(label, style))
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
@@ -356,7 +407,7 @@ mod tests {
 
     #[test]
     fn available_entries_without_jj_excludes_timeline() {
-        let entries = available_entries(false);
+        let entries = available_entries(false, None);
         assert!(!entries.contains(&ScopeMenuEntry::Timeline), "{entries:?}");
         assert_eq!(
             entries,
@@ -372,7 +423,7 @@ mod tests {
 
     #[test]
     fn available_entries_with_jj_includes_timeline_before_revision() {
-        let entries = available_entries(true);
+        let entries = available_entries(true, None);
         assert_eq!(
             entries,
             vec![
@@ -380,6 +431,40 @@ mod tests {
                 ScopeMenuEntry::Staged,
                 ScopeMenuEntry::Log,
                 ScopeMenuEntry::Timeline,
+                ScopeMenuEntry::Revision,
+                ScopeMenuEntry::PullRequest,
+            ]
+        );
+    }
+
+    fn detected_base(ahead: usize) -> DetectedBase {
+        DetectedBase {
+            name: "main".to_owned(),
+            via_jj: false,
+            ahead,
+        }
+    }
+
+    #[test]
+    fn available_entries_without_a_detected_base_omits_branch_vs_base() {
+        let entries = available_entries(false, None);
+        assert!(
+            !entries.contains(&ScopeMenuEntry::BranchVsBase),
+            "{entries:?}"
+        );
+    }
+
+    #[test]
+    fn available_entries_with_a_detected_base_includes_branch_vs_base_before_log() {
+        let base = detected_base(3);
+        let entries = available_entries(false, Some(&base));
+        assert_eq!(
+            entries,
+            vec![
+                ScopeMenuEntry::WorkingTree,
+                ScopeMenuEntry::Staged,
+                ScopeMenuEntry::BranchVsBase,
+                ScopeMenuEntry::Log,
                 ScopeMenuEntry::Revision,
                 ScopeMenuEntry::PullRequest,
             ]
@@ -405,7 +490,7 @@ mod tests {
 
     #[test]
     fn move_down_and_up_clamp_at_the_list_bounds() {
-        let mut list = ScopeMenuList::new(false);
+        let mut list = ScopeMenuList::new(false, None);
         list.move_up(); // already at 0
         assert_eq!(list.selected_index(), 0);
 
@@ -417,13 +502,22 @@ mod tests {
 
     #[test]
     fn selected_entry_tracks_the_selected_index() {
-        let mut list = ScopeMenuList::new(true);
+        let mut list = ScopeMenuList::new(true, None);
         assert_eq!(list.selected_entry(), ScopeMenuEntry::WorkingTree);
         list.move_down();
         assert_eq!(list.selected_entry(), ScopeMenuEntry::Staged);
         list.move_down();
         list.move_down();
         assert_eq!(list.selected_entry(), ScopeMenuEntry::Timeline);
+    }
+
+    #[test]
+    fn selected_entry_reaches_branch_vs_base_when_a_base_is_detected() {
+        let mut list = ScopeMenuList::new(false, Some(detected_base(2)));
+        list.move_down(); // Staged
+        list.move_down(); // BranchVsBase
+        assert_eq!(list.selected_entry(), ScopeMenuEntry::BranchVsBase);
+        assert_eq!(list.branch_base().map(|b| b.name.as_str()), Some("main"));
     }
 
     // ---- RevisionInput / handle_revision_key -------------------------------

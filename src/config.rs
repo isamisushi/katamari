@@ -220,6 +220,28 @@ pub struct Config {
     /// from the *global* config file, never a repo-local one — unlike
     /// every other field on this struct.
     pub agent: AgentConfig,
+    /// `[diff]` — `ktmr diff --branch`/the scope-menu's "Branch vs base"
+    /// entry's base-detection override. See [`DiffConfig`]'s own docs.
+    pub diff: DiffConfig,
+}
+
+/// The `[diff]` table — currently just `base`, following [`AgentConfig`]'s
+/// exact single-field-table shape (a dedicated struct rather than a bare
+/// scalar on [`Config`]) so a second `[diff]`-scoped setting has somewhere
+/// to land later without a breaking reshape.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiffConfig {
+    /// Overrides `crate::vcs::base::detect_base`'s jj-trunk/`origin/HEAD`/
+    /// `main`/`master` fallback chain outright: when set, this is
+    /// authoritative — a value that doesn't resolve to a real ref/revset in
+    /// the repository is a hard error (`--branch`/the menu entry/the
+    /// keybinding all surface it as such), never a silent fallthrough to
+    /// the chain it would otherwise replace. Validated against whichever
+    /// backend `detect_base` ends up using (a jj revset in a colocated
+    /// repo, else a git ref) — `config.rs` has no `repo_root`/`GitSource`
+    /// of its own to validate with, so this is passed through unvalidated,
+    /// exactly like `agent.adapter`/`units.claude_model` already are.
+    pub base: Option<String>,
 }
 
 /// `[units] claude_model`'s default. The evergreen alias, not a pinned
@@ -317,6 +339,7 @@ impl Default for Config {
             units: UnitsConfig::default(),
             units_configured: false,
             agent: AgentConfig::default(),
+            diff: DiffConfig::default(),
         }
     }
 }
@@ -357,6 +380,7 @@ pub(crate) struct RawFile {
     skill: Option<RawSkill>,
     units: Option<RawUnits>,
     agent: Option<RawAgent>,
+    diff: Option<RawDiff>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -422,8 +446,14 @@ struct RawAgent {
     adapter: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawDiff {
+    base: Option<String>,
+}
+
 const TOP_LEVEL_KEYS: &[&str] = &[
-    "keymap", "keys", "lsp", "ui", "watch", "update", "skill", "units", "agent",
+    "keymap", "keys", "lsp", "ui", "watch", "update", "skill", "units", "agent", "diff",
 ];
 const LSP_KEYS: &[&str] = &["servers", "auto_install", "logging"];
 const LOGGING_KEYS: &[&str] = &[
@@ -460,6 +490,7 @@ const UNITS_KEYS: &[&str] = &[
     "codex_effort",
 ];
 const AGENT_KEYS: &[&str] = &["adapter"];
+const DIFF_KEYS: &[&str] = &["base"];
 
 /// Merges `overlay`'s present fields onto `base`, in place — the field-level
 /// (not whole-file) precedence rule the module docs describe: a file that
@@ -574,6 +605,19 @@ fn merge_raw(base: &mut RawFile, overlay: RawFile) {
         let base_agent = base.agent.get_or_insert_with(RawAgent::default);
         if overlay_agent.adapter.is_some() {
             base_agent.adapter = overlay_agent.adapter;
+        }
+    }
+    // Unlike `[agent]`, `[diff]` has no repo-local restriction: `base` only
+    // ever names a ref/revset to diff against, not an executable, so a repo
+    // committing its own `.katamari/config.toml` with `base = "develop"`
+    // for a non-`main`-named trunk is exactly the intended use, not a trust
+    // boundary the way `[agent].adapter` is. Repo-wins-per-field falls out
+    // of `load_merged`'s existing merge order (home, then the repo overlay
+    // on top) for free — no special-casing needed here.
+    if let Some(overlay_diff) = overlay.diff {
+        let base_diff = base.diff.get_or_insert_with(RawDiff::default);
+        if overlay_diff.base.is_some() {
+            base_diff.base = overlay_diff.base;
         }
     }
 }
@@ -779,6 +823,9 @@ fn warn_unknown_keys(path: &Path, table: &toml::Table, warnings: &mut Vec<String
     if let Some(agent) = table.get("agent").and_then(toml::Value::as_table) {
         warn_extra(path, "agent.", agent, AGENT_KEYS, warnings);
     }
+    if let Some(diff) = table.get("diff").and_then(toml::Value::as_table) {
+        warn_extra(path, "diff.", diff, DIFF_KEYS, warnings);
+    }
 }
 
 fn warn_extra(
@@ -848,6 +895,9 @@ fn finalize(raw: RawFile) -> Config {
     let agent = AgentConfig {
         adapter: raw.agent.unwrap_or_default().adapter,
     };
+    let diff = DiffConfig {
+        base: raw.diff.unwrap_or_default().base,
+    };
     Config {
         keymap,
         key_overrides: raw.keys.unwrap_or_default(),
@@ -875,6 +925,7 @@ fn finalize(raw: RawFile) -> Config {
         units,
         units_configured,
         agent,
+        diff,
     }
 }
 

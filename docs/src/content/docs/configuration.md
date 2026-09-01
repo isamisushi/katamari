@@ -95,6 +95,17 @@ mouse = true
 # only ever has anything to act on while `mouse` (above) is also true.
 mouse_hover = true
 
+[diff]
+# Overrides `ktmr diff --branch`/the scope menu's "Branch vs base" entry's
+# automatic base detection (jj trunk() / git origin/HEAD / local main /
+# local master — see the Quickstart chapter) outright. When set, this is
+# authoritative: a value that doesn't resolve to a real ref/revset in the
+# repository is a hard error, never a silent fallthrough to the chain it
+# replaces. Useful for a repo whose trunk isn't named "main" (or has no
+# `origin` remote at all) — safe to commit in a repo-local
+# .katamari/config.toml, unlike [agent] below.
+base = "develop"
+
 [watch]
 # Debounce window for live refresh: how long a burst of filesystem changes
 # must go quiet before the diff refreshes. Milliseconds, default 200.

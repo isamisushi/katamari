@@ -358,6 +358,45 @@ impl JjRepo {
         Ok((!ids.is_empty()).then_some(ids))
     }
 
+    /// `vcs::base::detect_base`'s jj-side trunk detection: the bookmark
+    /// name(s) currently pointing at `trunk()`, jj's own space-separated
+    /// rendering of however many local/remote-tracking bookmarks happen to
+    /// coincide on that commit — empirically, a colocated clone's
+    /// auto-imported local `main` *and* the tracked `main@origin` both land
+    /// on it at once (`"main main@origin"`), which is the common case, not
+    /// an edge case. Empty exactly when `trunk()` degenerates to jj's own
+    /// `root()` sentinel — no default-remote bookmark (`main`/`master`/
+    /// `trunk` on `origin`/`upstream`) ever resolved, jj's own documented
+    /// fallback (`jj help -k revsets`) — which `vcs::base` treats as "no jj
+    /// trunk detected" and falls through to git's own fallback chain,
+    /// rather than running a second, separate `trunk() ~ root()` query to
+    /// ask the same question. `vcs::base::trunk_bookmark_name` picks a
+    /// single clean name back out of whatever this returns.
+    pub fn trunk_bookmarks(&self) -> Result<String> {
+        let output = self
+            .readonly_command()
+            .args([
+                "log",
+                "-r",
+                "trunk()",
+                "--no-graph",
+                "-T",
+                "bookmarks ++ \"\\n\"",
+            ])
+            .output()
+            .context("failed to run `jj log`")?;
+        if !output.status.success() {
+            bail!(
+                "jj log -r trunk() failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8(output.stdout)
+            .context("jj log produced non-UTF-8 output")?
+            .trim()
+            .to_owned())
+    }
+
     /// Change ids are never abbreviated (see [`RevisionEntry::id`]'s docs on
     /// why); the visible `zzzzzzzz...` root commit — jj's fixed sentinel
     /// change id, 32 `z`s, always present as the ultimate ancestor of every
@@ -1068,6 +1107,127 @@ mod tests {
         assert_ne!(
             both, at,
             "the multi-match token must be distinguishable from any single member's"
+        );
+    }
+
+    // ---- trunk_bookmarks (vcs::base) ----------------------------------
+
+    #[test]
+    fn trunk_bookmarks_is_empty_without_a_remote() {
+        // `jj_fixture` colocates onto a bare `git init` with no remote and
+        // no pre-existing `main`/`master` branch — jj's own documented
+        // degenerate case, `trunk()` falling back to `root()`.
+        let Some(fx) = jj_fixture() else {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        };
+        assert_eq!(fx.repo.trunk_bookmarks().unwrap(), "");
+    }
+
+    /// A colocated clone of a bare "upstream" repo with a `main` branch —
+    /// `jj git init --colocate` auto-configures the `trunk()` revset alias
+    /// to `main@origin` at init time in this shape (empirically confirmed:
+    /// it prints "Setting the revset alias `trunk()` to `main@origin`"),
+    /// and colocation separately auto-imports the checked-out git branch as
+    /// a local `main` bookmark — so `trunk()`'s own `bookmarks` field
+    /// reports *both* names at once (`"main main@origin"`), the realistic
+    /// case `vcs::base::trunk_bookmark_name` has to pick a single clean name
+    /// out of.
+    fn jj_fixture_with_trunk() -> Option<JjFixture> {
+        let jj_bin = resolve_jj_bin()?;
+        let upstream = tempfile::tempdir().expect("create temp dir");
+        let status = Command::new("git")
+            .args(["init", "-q", "-b", "main", "--bare"])
+            .arg(upstream.path())
+            .status()
+            .expect("git must be on PATH");
+        assert!(status.success());
+
+        let seed = tempfile::tempdir().expect("create temp dir");
+        let seed_path = seed.path();
+        let status = Command::new("git")
+            .arg("init")
+            .arg("-q")
+            .arg("-b")
+            .arg("main")
+            .arg(seed_path)
+            .status()
+            .expect("git must be on PATH");
+        assert!(status.success());
+        std::fs::write(seed_path.join("seed.txt"), "hi\n").unwrap();
+        for args in [
+            vec!["-C", seed_path.to_str().unwrap(), "add", "-A"],
+            vec![
+                "-C",
+                seed_path.to_str().unwrap(),
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=Test",
+                "commit",
+                "-q",
+                "-m",
+                "seed",
+            ],
+            vec![
+                "-C",
+                seed_path.to_str().unwrap(),
+                "remote",
+                "add",
+                "origin",
+                upstream.path().to_str().unwrap(),
+            ],
+            vec![
+                "-C",
+                seed_path.to_str().unwrap(),
+                "push",
+                "-q",
+                "origin",
+                "main",
+            ],
+        ] {
+            let status = Command::new("git")
+                .args(&args)
+                .status()
+                .expect("git must be on PATH");
+            assert!(status.success(), "git {args:?} failed");
+        }
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path();
+        let status = Command::new("git")
+            .args(["clone", "-q"])
+            .arg(upstream.path())
+            .arg(path)
+            .status()
+            .expect("git must be on PATH");
+        assert!(status.success());
+        jj_git_init_colocate(&jj_bin, path);
+        jj_cmd(
+            &jj_bin,
+            path,
+            &["config", "set", "--repo", "user.name", "Test"],
+        );
+        jj_cmd(
+            &jj_bin,
+            path,
+            &["config", "set", "--repo", "user.email", "test@example.com"],
+        );
+
+        let repo = JjRepo::detect(path, jj_bin).expect("jj git init --colocate makes a .jj dir");
+        Some(JjFixture { _dir: dir, repo })
+    }
+
+    #[test]
+    fn trunk_bookmarks_names_the_default_branch_when_a_remote_is_colocated() {
+        let Some(fx) = jj_fixture_with_trunk() else {
+            eprintln!("skipping: jj not on PATH");
+            return;
+        };
+        let bookmarks = fx.repo.trunk_bookmarks().unwrap();
+        assert!(
+            bookmarks.split_whitespace().any(|b| b == "main"),
+            "expected a plain `main` bookmark among {bookmarks:?}"
         );
     }
 

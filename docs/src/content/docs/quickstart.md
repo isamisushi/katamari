@@ -12,6 +12,7 @@ ktmr diff --staged     # staged (index) changes vs HEAD
 ktmr diff <rev>        # one commit's own changes
 ktmr diff <a>..<b>     # a revision range
 ktmr diff --pr 123     # a GitHub pull request, via your logged-in `gh`
+ktmr diff --branch     # this branch vs its detected base (main/origin/HEAD/[diff] base)
 ```
 
 `--no-watch` is a working-tree-only opt-out; staged and pinned historical
@@ -60,6 +61,25 @@ comments are unavailable on it — and the status bar labels it
 `PR #123`, so what's on screen is never ambiguous. Also reachable
 mid-session: the scope menu (`o`) has a **GitHub PR…** entry that asks
 for the number and fetches in the background.
+
+`ktmr diff --branch` reviews the current branch against its automatically
+detected base — no manual `main..HEAD` typing. Detection tries, in order: a
+configured `[diff] base` (see [Configuration](/katamari/configuration/)),
+then a colocated jj repo's own `trunk()`, then git's locally recorded
+`origin/HEAD`, then a local `main`, then a local `master` — the first one
+found wins, purely from refs already on disk (no network, no fetch). Like
+`--pr`, it's read-only (no LSP, no comments) and labeled in the status bar
+(`<branch> vs <base> (+N)`); unlike `--pr`, it *does* live-refresh — a new
+commit landing on either the branch or the base while the session is open
+re-diffs and updates the `(+N)` count with no keypress, the same way `-r
+HEAD` follows an amend. An uncommitted edit in the working tree simply
+doesn't show here, since the diff's new side is the branch's own `HEAD`
+tree, not disk. When a clean working tree has nothing of its own to review
+but the branch is ahead of its base, the empty-state placeholder names the
+key that opens it (`B` by default) right alongside `o`/`q`; the same swap
+is also reachable mid-session as the scope menu's **Branch vs base
+(`<base>`)** entry, present only when a base was actually detected and
+there's at least one commit to review.
 
 `ktmr log` opens a browsable revision history instead of a single diff: jj
 changes (including the working copy, `@`, as a real entry) in a colocated jj
@@ -221,6 +241,11 @@ session is reviewing without restarting `ktmr diff` with new CLI flags.
 - **Working tree** / **Staged** swap the current diff in place (cursor
   resets to the top; anchor restoration across two unrelated diffs
   wouldn't mean anything).
+- **Branch vs base (`<base>`)** — `ktmr diff --branch`'s mid-session twin
+  (see above), the base's name filled in from the same detection.
+  Present only when a base was actually detected and the branch is ahead
+  of it by at least one commit; absent otherwise, the same way
+  **Timeline (jj)** is absent without a colocated jj repo.
 - **Log** / **Timeline (jj)** (the latter only offered in a colocated jj
   repo) open the same views `L`/`t` do — listed here too, purely for
   discoverability.

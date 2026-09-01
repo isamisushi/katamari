@@ -48,6 +48,7 @@ table below never has to live in your head.
 | Toggle log view | `L` | `L` |
 | Toggle LSP inspector | `I` | `I` |
 | Open scope menu | `o` | `o` |
+| Review branch vs base | `B` | `B` |
 | Toggle units panel | `u` | `u` |
 | Regenerate units | `U` | `U` |
 | Open help | `?` | `?` |

@@ -266,6 +266,34 @@ pub struct RevisionScope {
     /// produced this diff can't be inferred from the session's jj-detection
     /// state alone.
     pub via_jj: bool,
+    /// `Some(base_name)` marks a `--branch`/scope-menu "Branch vs base"
+    /// scope — a *two*-endpoint moving scope (`HEAD` and this base can each
+    /// independently move, unlike every other `RevisionScope` today, which
+    /// tracks one symbolic text) — `None` everywhere else, including every
+    /// pre-existing single-revision/range construction site, which is the
+    /// entire point of this being an addition rather than a replacement:
+    /// zero behavior change for them. `text` still holds this scope's full
+    /// diff-arg/label text (`"main...HEAD"` for git, or the jj
+    /// `fork_point(...)`/`"@"` pair encoded via
+    /// `crate::vcs::base::DetectedBase`'s own formulas) — `base` exists
+    /// purely so `ui::mod::seed_moving_scope`/`handle_moving_scope_refresh`
+    /// know to resolve *both* endpoints independently rather than treating
+    /// `text` as one single symbolic revision the way every other scope's
+    /// refresh does (a `..`/`...`-bearing `text` fails
+    /// `crate::vcs::is_moving_revision`'s own `..` check, and a raw
+    /// `rev-parse --verify` against a three-dot range fails outright — see
+    /// this field's introduction for the empirical confirmation).
+    pub base: Option<String>,
+}
+
+/// [`App::branch_vs_base_hint`]'s payload — a trimmed, display-ready
+/// projection of [`crate::vcs::base::DetectedBase`] (no `via_jj`: the
+/// placeholder's hint text reads the same regardless of which backend
+/// detected it, so there's nothing for `render_empty_state` to branch on).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchVsBaseHint {
+    pub base: String,
+    pub ahead: usize,
 }
 
 /// All state the UI needs to render a frame and respond to input.
@@ -390,6 +418,27 @@ pub struct App {
     /// it — this field is what makes that refresh possible in the first
     /// place, not what's shown on screen.
     pub revision_scope: Option<RevisionScope>,
+    /// `[diff] base`, carried onto `App` the same way `units_config` is
+    /// (set once by `main.rs` after construction, read wherever a
+    /// `--branch`-shaped detection needs to run again later in the session
+    /// — the scope-menu open, `Action::ReviewBranchVsBase`, the empty-state
+    /// hint's live refresh) — see `crate::vcs::base::detect_base`'s
+    /// `configured` parameter, which this feeds every one of those call
+    /// sites without threading `Config` itself through the event loop.
+    /// `None` (the default) means "no override; use the jj-trunk/
+    /// origin-HEAD/main/master fallback chain", exactly like an absent
+    /// `[diff] base` table.
+    pub configured_base: Option<String>,
+    /// The plain working-tree scope's live `--branch` affordance — `Some`
+    /// only when `main.rs` constructed this `App` for the default
+    /// working-tree diff (see [`Self::disk_is_new_side`]'s docs: every
+    /// other scope has no "clean tree, nothing to review" placeholder to
+    /// begin with), refreshed on every `AppEvent::RevisionChanged` tick so
+    /// a session left open while `main` moves doesn't show a stale `+N`.
+    /// Read only by [`crate::ui::diff_view::render_empty_state`], which
+    /// stays pure (no I/O) by reading this pre-computed field rather than
+    /// calling `crate::vcs::base::detect_base` itself on every frame.
+    pub branch_vs_base_hint: Option<BranchVsBaseHint>,
     /// The merged `[units]` config (agent CLI preference, model/effort
     /// tuning), carried on `App` the same way `layout`/`scope_label` are:
     /// set once by `main.rs` after construction, read whenever `u`/`U`
@@ -562,6 +611,8 @@ impl App {
             disk_is_new_side: false,
             scope_label: None,
             revision_scope: None,
+            configured_base: None,
+            branch_vs_base_hint: None,
             units_config: crate::config::UnitsConfig::default(),
             units_prompt_needed: false,
             expanded_folds: HashMap::new(),
@@ -1722,6 +1773,11 @@ impl App {
             | Action::ToggleLogView
             | Action::ToggleLspInspector
             | Action::OpenScopeMenu
+            // Same reason as `OpenScopeMenu` just above: applying it is a
+            // real git/jj subprocess call (`crate::vcs::base::detect_base`
+            // plus the diff itself), which `ui::mod::handle_action`
+            // intercepts before this match ever sees it.
+            | Action::ReviewBranchVsBase
             | Action::ToggleUnits
             | Action::RegenerateUnits
             | Action::ToggleHints

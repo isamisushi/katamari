@@ -782,3 +782,119 @@ fn lsp_readiness_repo_inner(
 
     FixtureRepo { dir }
 }
+
+/// A bare "upstream" repository with `HEAD` pointed at `main` — deliberately
+/// via `git init -b main --bare` rather than a plain `--bare` init followed
+/// by a `symbolic-ref` fixup: a freshly `--bare`-init'd repo otherwise
+/// defaults to `refs/heads/master` (confirmed empirically), and that default
+/// would stick permanently once the first push landed on it under the wrong
+/// name. `dir` receives the clone (the `FixtureRepo` a test actually opens
+/// `ktmr diff` against); `upstream`/`seed` are dropped once this returns —
+/// `git clone` already copied every object it needs and wrote
+/// `refs/remotes/origin/HEAD`/`refs/remotes/origin/main` as *local* refs, so
+/// nothing later ever touches either directory again (verified by hand
+/// while building this fixture: `git symbolic-ref -q --short
+/// refs/remotes/origin/HEAD` still resolves correctly from the clone alone).
+fn clone_of_a_freshly_pushed_main(root: &Path) {
+    let upstream = tempfile::Builder::new()
+        .prefix("katamari-e2e-upstream-")
+        .tempdir()
+        .expect("failed to create fixture tempdir");
+    git(upstream.path(), &["init", "-q", "-b", "main", "--bare"]);
+
+    let seed = tempfile::Builder::new()
+        .prefix("katamari-e2e-seed-")
+        .tempdir()
+        .expect("failed to create fixture tempdir");
+    git(seed.path(), &["init", "-q", "-b", "main"]);
+    std::fs::write(seed.path().join("notes.txt"), "alpha\nbeta\ngamma\n").unwrap();
+    git(seed.path(), &["add", "-A"]);
+    git(seed.path(), &["commit", "-q", "-m", "first"]);
+    git(
+        seed.path(),
+        &["remote", "add", "origin", upstream.path().to_str().unwrap()],
+    );
+    git(seed.path(), &["push", "-q", "origin", "main"]);
+
+    let status = Command::new("git")
+        .args(["clone", "-q"])
+        .arg(upstream.path())
+        .arg(root)
+        .status()
+        .expect("git must be on PATH for these tests");
+    assert!(status.success(), "git clone failed into {}", root.display());
+}
+
+/// [`clone_of_a_freshly_pushed_main`]'s clone, with a `feature` branch
+/// checked out two real commits ahead of `main` — `tests/e2e/branch_scope.rs`'s
+/// main fixture for `--branch`/the scope-menu's "Branch vs base" entry/the
+/// `B` keybinding. Clean working tree throughout, the same
+/// dirty-tree-could-let-`git add -A`-sweep-in-something-unintended reasoning
+/// [`clean_repo`]'s own docs give: every edit below is a real commit, never
+/// left uncommitted. `FEATURE_MARKER_ONE`/`FEATURE_MARKER_TWO` exist only on
+/// `feature`, one per commit — unambiguous witnesses for "is the branch-vs-base
+/// diff (not `main`'s own empty diff against itself) actually on screen,"
+/// and for telling the two commits' own content apart when a test needs to.
+pub fn branch_ahead_of_main_repo() -> FixtureRepo {
+    let dir = tempfile::Builder::new()
+        .prefix("katamari-e2e-repo-")
+        .tempdir()
+        .expect("failed to create fixture tempdir");
+    clone_of_a_freshly_pushed_main(dir.path());
+
+    let root = dir.path();
+    git(root, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(
+        root.join("notes.txt"),
+        "alpha\nbeta\ngamma\nFEATURE_MARKER_ONE\n",
+    )
+    .unwrap();
+    git(root, &["commit", "-q", "-am", "feature commit one"]);
+    std::fs::write(
+        root.join("notes.txt"),
+        "alpha\nbeta\ngamma\nFEATURE_MARKER_ONE\nFEATURE_MARKER_TWO\n",
+    )
+    .unwrap();
+    git(root, &["commit", "-q", "-am", "feature commit two"]);
+
+    FixtureRepo { dir }
+}
+
+/// [`branch_ahead_of_main_repo`]'s jj-colocated counterpart: the same clone
+/// (`main` pushed to a real "upstream", `origin/HEAD` auto-set) with `jj git
+/// init --colocate` layered on top and a `feature` bookmark advanced one
+/// real `jj commit` past `trunk()` — `jj git init --colocate` auto-detects
+/// and pins the `trunk()` revset alias to `main@origin` at init time in
+/// exactly this shape (empirically confirmed while building
+/// `vcs::jj::JjRepo::trunk_bookmarks`'s own unit tests: it prints "Setting
+/// the revset alias `trunk()` to `main@origin`"), so no extra `jj bookmark
+/// track` step is needed here the way an untracked-remote-bookmark repo
+/// would require. `jj_available()`'s own docs explain why every caller must
+/// skip (not fail) when `jj` isn't on `PATH`.
+pub fn jj_branch_ahead_of_trunk_repo() -> FixtureRepo {
+    let dir = tempfile::Builder::new()
+        .prefix("katamari-e2e-repo-")
+        .tempdir()
+        .expect("failed to create fixture tempdir");
+    clone_of_a_freshly_pushed_main(dir.path());
+    let root = dir.path();
+
+    jj_git_init_colocate(root);
+    jj(
+        root,
+        &["config", "set", "--repo", "user.name", "katamari e2e"],
+    );
+    jj(
+        root,
+        &["config", "set", "--repo", "user.email", "e2e@katamari.test"],
+    );
+    std::fs::write(
+        root.join("notes.txt"),
+        "alpha\nbeta\ngamma\nJJ_FEATURE_MARKER\n",
+    )
+    .unwrap();
+    jj(root, &["commit", "-m", "feature commit"]);
+    jj(root, &["bookmark", "set", "feature", "-r", "@-"]);
+
+    FixtureRepo { dir }
+}
