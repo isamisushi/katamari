@@ -476,6 +476,19 @@ pub struct App {
     /// origin-HEAD/main/master fallback chain", exactly like an absent
     /// `[diff] base` table.
     pub configured_base: Option<String>,
+    /// `[diff] agent_workspaces`/`agent_workspace_extra`, resolved once by
+    /// `main.rs` (`crate::vcs::git::resolve_agent_workspace_prefixes`) and
+    /// carried on `App` the same way `configured_base` is — read wherever a
+    /// live session constructs a fresh `GitSource` and needs
+    /// `working_tree_diff` to filter agent-workspace content exactly the
+    /// way this session's config says to, rather than trusting
+    /// `GitSource::at`/`discover`'s own hardcoded-default seed (which would
+    /// silently ignore a `agent_workspaces = false`/extended list). Defaults
+    /// to the same built-in list `GitSource` itself defaults to, so a
+    /// nested diff pane built without going through `main.rs`'s config load
+    /// (a `LogView`-opened diff, a test) still filters the built-in set —
+    /// see `crate::vcs::git::DEFAULT_AGENT_WORKSPACE_PREFIXES`.
+    pub agent_workspace_prefixes: Vec<PathBuf>,
     /// The plain working-tree scope's live `--branch` affordance — `Some`
     /// only when `main.rs` constructed this `App` for the default
     /// working-tree diff (see [`Self::disk_is_new_side`]'s docs: every
@@ -697,6 +710,7 @@ impl App {
             scope_label: None,
             revision_scope: None,
             configured_base: None,
+            agent_workspace_prefixes: crate::vcs::git::resolve_agent_workspace_prefixes(true, &[]),
             branch_vs_base_hint: None,
             units_config: crate::config::UnitsConfig::default(),
             units_prompt_needed: false,

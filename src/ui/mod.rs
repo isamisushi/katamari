@@ -380,6 +380,11 @@ pub fn run(
     // hovering first — see `LspManager::warm_up`'s docs for why hovering
     // alone isn't enough to make that happen promptly.
     let startup_status = warm_up_root(stack.top(), &lsp_manager);
+    // Computed here (repo_root/disk_is_new_side/agent_workspace_prefixes
+    // are all already set by the time `App` reaches this function — nothing
+    // below mutates any of them) but not folded into `startup_status` until
+    // the `.or()` chain further down, alongside every other startup note.
+    let agent_workspace_note = agent_workspace_exclusion_note(stack.top());
 
     // M5: detected once, regardless of watch mode — `Action::ToggleTimeline`
     // needs this even when the root watcher isn't active, since existing jj
@@ -437,6 +442,7 @@ pub fn run(
         .or(reviewed_watch_status)
         .or(comments_startup_status)
         .or(revision_watch_status)
+        .or(agent_workspace_note)
         .or(available_update.as_ref().map(update::status_bar_notice));
 
     let result = event_loop(
@@ -511,7 +517,12 @@ fn start_watch(stack: &mut ViewStack, app_tx: Sender<AppEvent>, quiet: Duration)
     };
     app.watch_mode = true;
     let (watch_tx, watch_rx) = mpsc::channel::<WatchSignal>();
-    watch::spawn(app.repo_root.clone(), watch_tx, quiet);
+    watch::spawn(
+        app.repo_root.clone(),
+        watch_tx,
+        quiet,
+        app.agent_workspace_prefixes.clone(),
+    );
     spawn_watch_forwarder(watch_rx, app_tx);
     None
 }
@@ -664,6 +675,50 @@ fn spawn_revision_forwarder(rx: Receiver<()>, tx: Sender<AppEvent>) {
             }
         }
     });
+}
+
+/// A one-time startup note when [`crate::vcs::git::GitSource::untracked_files`]'s
+/// agent-workspace filtering actually hid something from this session's
+/// root diff — so filtering is never *silent*: a reviewer sees both the
+/// count and which configured prefix(es) it came from, right where every
+/// other startup note (LSP warm-up, watch/comments-watcher failures) shows
+/// up. Gated on [`App::disk_is_new_side`] (only `true` for the plain
+/// working-tree root scope — the one that actually calls
+/// [`GitSource::working_tree_diff`] at all; `--staged`/`--branch`/`-r`/
+/// `--pr` never touch [`GitSource::untracked_files`], see that method's own
+/// docs), so this never fires for a scope where nothing was ever filtered.
+///
+/// Pays for one extra `git ls-files` listing
+/// ([`GitSource::untracked_exclusion_summary`]'s own docs) — a one-time,
+/// startup-only cost, not repeated on every watch refresh, matching the
+/// note's own one-time scope: a later in-session rescope back onto the
+/// working-tree via the scope menu doesn't re-show it, even though
+/// filtering is still silently active there too (an accepted gap, not a
+/// gap this note tries to close everywhere `working_tree_diff` runs).
+fn agent_workspace_exclusion_note(view: &View) -> Option<String> {
+    let View::Diff(app) = view else {
+        return None;
+    };
+    if !app.disk_is_new_side {
+        return None;
+    }
+    let git = GitSource::at(app.repo_root.clone())
+        .with_agent_workspace_prefixes(app.agent_workspace_prefixes.clone());
+    let summary = git.untracked_exclusion_summary().ok()?;
+    if summary.count == 0 {
+        return None;
+    }
+    let prefixes = summary
+        .prefixes
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let noun = if summary.count == 1 { "file" } else { "files" };
+    Some(format!(
+        "agent workspace: hid {} untracked {noun} under {prefixes} (see [diff] in config to include or disable)",
+        summary.count
+    ))
 }
 
 /// Proactively opens whichever files `view` starts out showing —
@@ -5005,7 +5060,8 @@ fn apply_scope_swap(
     watch_status: &mut Option<WatchStatus>,
     moving_scope: &mut Option<MovingScopeState>,
 ) -> Result<(), String> {
-    let git = GitSource::at(app.repo_root.clone());
+    let git = GitSource::at(app.repo_root.clone())
+        .with_agent_workspace_prefixes(app.agent_workspace_prefixes.clone());
     let payload = match choice {
         ScopeChoice::WorkingTree => ScopeSwapPayload {
             text: git.working_tree_diff().map_err(|e| e.to_string())?,
@@ -5300,7 +5356,10 @@ fn handle_watch_refresh(
         hook.before_refresh(&app.repo_root);
     }
 
-    let files = match GitSource::discover(&app.repo_root).and_then(|s| s.working_tree_diff()) {
+    let files = match GitSource::discover(&app.repo_root)
+        .map(|s| s.with_agent_workspace_prefixes(app.agent_workspace_prefixes.clone()))
+        .and_then(|s| s.working_tree_diff())
+    {
         Ok(diff_text) => parse_unified_diff(&diff_text),
         Err(e) => {
             *watch_status = Some(WatchStatus::new(format!("watch: refresh failed: {e}")));
@@ -5647,7 +5706,8 @@ fn refresh_branch_vs_base_hint(
     if app.revision_scope.is_some() || !app.disk_is_new_side {
         return;
     }
-    let git = GitSource::at(app.repo_root.clone());
+    let git = GitSource::at(app.repo_root.clone())
+        .with_agent_workspace_prefixes(app.agent_workspace_prefixes.clone());
     app.branch_vs_base_hint =
         crate::vcs::base::detect_base(&git, jj_repo, app.configured_base.as_deref())
             .ok()

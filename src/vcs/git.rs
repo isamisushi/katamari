@@ -56,6 +56,101 @@ fn path_from_bytes(bytes: &[u8]) -> PathBuf {
 /// commit to diff against.
 const EMPTY_TREE_OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
+/// Repo-relative path prefixes an AI coding agent commonly checks out a
+/// disposable worktree under, *inside* the very repository being reviewed —
+/// excluded from [`GitSource::untracked_files`] (and therefore
+/// [`GitSource::working_tree_diff`]) by default, and from the file
+/// watcher's registration/event filtering ([`crate::watch::spawn`]'s
+/// `agent_workspace_prefixes` parameter threads this same list through).
+/// Only ever prunes *untracked* content: a file under one of these paths
+/// that's actually committed still reviews normally (see this module's
+/// `a_committed_file_under_an_agent_workspace_prefix_still_reviews` test) —
+/// the point is hiding a throwaway worktree's regenerated junk
+/// (`node_modules`, build output, a second `target/`), not the worktree
+/// itself if a reviewer chose to commit something there.
+///
+/// A pruned/abandoned worktree already loses its own `.git` (or never had
+/// one un-gitignored), so [`crate::watch`]'s existing nested-checkout rule
+/// stops protecting it the moment that happens — and unlike a `.gitignore`
+/// entry, a reviewer can't be relied on to have added one for a directory
+/// some *other* tool created without asking. This list is the non-negatable
+/// (no `.gitignore` `!`-pattern can re-admit it — see
+/// [`crate::watch::HARDCODED_EXCLUDES`] for the same stance on `.git`/
+/// `target`/`node_modules`) backstop for exactly that gap.
+///
+/// Per-entry provenance (verified against each tool's own docs while this
+/// feature was designed, not guessed):
+/// - `.claude/worktrees/` — Claude Code's current, official default (its
+///   docs tell users to gitignore this path, which is exactly the case this
+///   list exists for: the moment a worktree gets pruned *without* that
+///   gitignore entry, or the directory has already been un-gitignored,
+///   nothing else protects it).
+/// - `.claude/worktree/` (singular) — kept alongside the plural form even
+///   though it conflicts with Claude Code's current docs: this shipped on a
+///   bug report describing the singular form in the wild (an older version,
+///   or a wrapper tool), and an unused prefix costs nothing.
+/// - `.codex/worktree(s)/` — speculative insurance, not an observed Codex
+///   CLI convention: Codex's real worktree root
+///   (`$CODEX_HOME/worktrees`) lives *outside* any repo entirely, so these
+///   two entries are here only in case some wrapper or future version ever
+///   checks one out in-repo instead. Deliberately not `.cursor/worktrees/`
+///   — Cursor's docs confirm a `.cursor/worktrees.json` *config* file at the
+///   repo root but never state where the checkout directories themselves
+///   land, so there's nothing confirmed to pin; a Cursor user who confirms
+///   one can add it via `[diff] agent_workspace_extra` instead.
+pub(crate) const DEFAULT_AGENT_WORKSPACE_PREFIXES: &[&str] = &[
+    ".claude/worktrees",
+    ".claude/worktree",
+    ".codex/worktrees",
+    ".codex/worktree",
+];
+
+/// Turns `[diff] agent_workspaces`/`agent_workspace_extra` (see
+/// [`crate::config::DiffConfig`]) into the concrete prefix list
+/// [`GitSource::with_agent_workspace_prefixes`]/`watch::spawn` actually
+/// filter against — plain primitives rather than `&DiffConfig` itself, so
+/// neither this module nor `watch` has to depend on `crate::config`'s
+/// types. `enabled = false` collapses to an empty list rather than a
+/// separate on/off flag threaded everywhere downstream: an empty prefix
+/// list is already exactly "nothing is excluded" to every consumer
+/// ([`matches_agent_workspace_prefix`] over an empty slice is always
+/// `false`), so this is the one place that distinction gets resolved.
+pub fn resolve_agent_workspace_prefixes(enabled: bool, extra: &[String]) -> Vec<PathBuf> {
+    if !enabled {
+        return Vec::new();
+    }
+    DEFAULT_AGENT_WORKSPACE_PREFIXES
+        .iter()
+        .map(PathBuf::from)
+        .chain(extra.iter().map(PathBuf::from))
+        .collect()
+}
+
+/// Whether `relative` (already repo-root-relative, as every path this is
+/// called against already is — [`GitSource::untracked_files`]'s own output,
+/// or `watch`'s `path.strip_prefix(repo_root)`) falls under one of
+/// `prefixes`. Component-wise via [`Path::starts_with`], deliberately never
+/// a raw string prefix check: `prefixes` is a list of *path* prefixes
+/// (`.claude/worktrees` is two components), and a naive `str::starts_with`
+/// would false-positive a sibling directory that merely shares the same
+/// leading characters (`.claude/worktrees2/` must never match
+/// `.claude/worktrees`) — see this module's own boundary test.
+pub fn matches_agent_workspace_prefix(relative: &Path, prefixes: &[PathBuf]) -> bool {
+    prefixes.iter().any(|prefix| relative.starts_with(prefix))
+}
+
+/// [`GitSource::untracked_exclusion_summary`]'s result: how many untracked
+/// paths `agent_workspace_prefixes` hid from [`GitSource::untracked_files`],
+/// and which of the configured prefixes actually matched at least one of
+/// them (in list order, each named at most once) — enough for `ui::run`'s
+/// one-time startup note to name both the count and *where* the hidden
+/// content lives, not just that something was hidden.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UntrackedExclusionSummary {
+    pub count: usize,
+    pub prefixes: Vec<PathBuf>,
+}
+
 /// A [`DiffSource`] backed by an installed `git` binary invoked as a
 /// subprocess. Holds nothing but the resolved repository root, so it stays
 /// cheap to construct and safe to recreate per command — [`Clone`] for the
@@ -64,6 +159,18 @@ const EMPTY_TREE_OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 #[derive(Clone)]
 pub struct GitSource {
     repo_root: PathBuf,
+    /// Repo-relative path prefixes [`Self::untracked_files`] hides —
+    /// defaulted to [`DEFAULT_AGENT_WORKSPACE_PREFIXES`] by both
+    /// [`Self::discover`] and [`Self::at`] so every one of this type's many
+    /// construction sites gets "filter agent workspaces by default" for
+    /// free, with zero signature changes at any of them. A caller that must
+    /// honor a *non-default* `[diff] agent_workspaces`/`agent_workspace_extra`
+    /// config (disabled, or an extended list) needs
+    /// [`Self::with_agent_workspace_prefixes`] instead — see that method's
+    /// docs; a new call site that constructs a fresh `GitSource` and calls
+    /// `working_tree_diff`/`log` without going through it will silently
+    /// disagree with a user's config the moment it's non-default.
+    agent_workspace_prefixes: Vec<PathBuf>,
 }
 
 impl GitSource {
@@ -92,6 +199,7 @@ impl GitSource {
             .to_owned();
         Ok(Self {
             repo_root: PathBuf::from(root),
+            agent_workspace_prefixes: resolve_agent_workspace_prefixes(true, &[]),
         })
     }
 
@@ -103,7 +211,25 @@ impl GitSource {
     /// way it always would, the first time a command actually runs against
     /// it.
     pub fn at(repo_root: PathBuf) -> Self {
-        Self { repo_root }
+        Self {
+            repo_root,
+            agent_workspace_prefixes: resolve_agent_workspace_prefixes(true, &[]),
+        }
+    }
+
+    /// Overrides the built-in default [`Self::discover`]/[`Self::at`] seed
+    /// [`Self::agent_workspace_prefixes`] with — the door a session that
+    /// must honor a non-default `[diff] agent_workspaces`/
+    /// `agent_workspace_extra` config uses, via
+    /// [`crate::vcs::git::resolve_agent_workspace_prefixes`]. Takes `self`
+    /// by value and returns it (builder-style) rather than `&mut self`
+    /// purely so every call site can stay a one-line expression
+    /// (`GitSource::at(root).with_agent_workspace_prefixes(prefixes)`)
+    /// alongside the existing `at`/`discover` constructors, matching how
+    /// those already read.
+    pub fn with_agent_workspace_prefixes(mut self, prefixes: Vec<PathBuf>) -> Self {
+        self.agent_workspace_prefixes = prefixes;
+        self
     }
 
     /// The repository root this instance was resolved against — infallible,
@@ -335,19 +461,12 @@ impl GitSource {
         String::from_utf8(output.stdout).context("git diff produced non-UTF-8 output")
     }
 
-    /// Paths under `--exclude-standard` (i.e. not gitignored) that exist on
-    /// disk but aren't tracked, relative to the repo root. `-z` NUL-delimits
-    /// the output instead of the default newline-delimited, quoted-for-shell
-    /// format, so filenames with unusual bytes (spaces, non-ASCII) come back
-    /// exactly as they are on disk rather than octal-escaped.
-    ///
-    /// `pub(crate)` (not just this file's own callers) so [`crate::doctor`]'s
-    /// extension scan can union this with [`Self::tracked_files`] — katamari
-    /// reviews untracked files too (that's the whole point of
-    /// [`Self::untracked_diff`]), so a language server health check that
-    /// only looked at tracked files would miss "new file, LSP silent," the
-    /// issue that motivated the doctor command in the first place.
-    pub(crate) fn untracked_files(&self) -> Result<Vec<PathBuf>> {
+    /// The raw `git ls-files --others --exclude-standard -z` listing,
+    /// before [`Self::agent_workspace_prefixes`] filtering — split out so
+    /// [`Self::untracked_files`] and [`Self::untracked_exclusion_summary`]
+    /// (which needs to see what got filtered *out*, not just what's left)
+    /// share one subprocess-invocation-and-parse rather than drifting apart.
+    fn all_untracked_paths(&self) -> Result<Vec<PathBuf>> {
         let output = self
             .git_command()
             .args(["ls-files", "--others", "--exclude-standard", "-z"])
@@ -361,6 +480,65 @@ impl GitSource {
             );
         }
         Ok(paths_from_nul_delimited(&output.stdout))
+    }
+
+    /// Paths under `--exclude-standard` (i.e. not gitignored) that exist on
+    /// disk but aren't tracked, relative to the repo root — minus anything
+    /// under [`Self::agent_workspace_prefixes`] (default: an agent CLI's
+    /// disposable in-repo worktree; see [`DEFAULT_AGENT_WORKSPACE_PREFIXES`]).
+    /// Untracked-only: a *committed* file living under one of those prefixes
+    /// is never touched here at all (this method has nothing to do with
+    /// tracked content — see [`Self::tracked_files`]), so a reviewer who
+    /// deliberately committed something inside an agent workspace still sees
+    /// it exactly like any other tracked change.
+    ///
+    /// `pub(crate)` (not just this file's own callers) so [`crate::doctor`]'s
+    /// extension scan can union this with [`Self::tracked_files`] — katamari
+    /// reviews untracked files too (that's the whole point of
+    /// [`Self::untracked_diff`]), so a language server health check that
+    /// only looked at tracked files would miss "new file, LSP silent," the
+    /// issue that motivated the doctor command in the first place.
+    pub(crate) fn untracked_files(&self) -> Result<Vec<PathBuf>> {
+        Ok(self
+            .all_untracked_paths()?
+            .into_iter()
+            .filter(|p| !matches_agent_workspace_prefix(p, &self.agent_workspace_prefixes))
+            .collect())
+    }
+
+    /// How much [`Self::untracked_files`]' agent-workspace filtering
+    /// actually hid, right now — a second `git ls-files` listing (paying for
+    /// one extra subprocess call, the same "pay a little extra for a count,
+    /// separately from the full diff text" trade-off
+    /// [`Self::working_tree_change_count`] already makes for [`Self::log`]'s
+    /// badge) rather than reshaping [`Self::untracked_files`]'s return type,
+    /// which several callers ([`Self::working_tree_diff`],
+    /// [`Self::working_tree_change_count`], [`crate::doctor`]'s extension
+    /// scan) all unpack as a bare `Vec<PathBuf>` today. Used once, at TUI
+    /// startup, for the "N files hidden under <prefix>" status note — see
+    /// `ui::mod::run`'s startup_status chain — never on every refresh, so
+    /// the extra subprocess call is a one-time session-start cost, not a
+    /// per-keystroke one.
+    pub fn untracked_exclusion_summary(&self) -> Result<UntrackedExclusionSummary> {
+        if self.agent_workspace_prefixes.is_empty() {
+            return Ok(UntrackedExclusionSummary::default());
+        }
+        let mut count = 0;
+        let mut prefixes: Vec<PathBuf> = Vec::new();
+        for path in self.all_untracked_paths()? {
+            let Some(prefix) = self
+                .agent_workspace_prefixes
+                .iter()
+                .find(|prefix| path.starts_with(prefix))
+            else {
+                continue;
+            };
+            count += 1;
+            if !prefixes.contains(prefix) {
+                prefixes.push(prefix.clone());
+            }
+        }
+        Ok(UntrackedExclusionSummary { count, prefixes })
     }
 
     /// Every path git considers tracked (`git ls-files --cached`), relative
@@ -1137,5 +1315,219 @@ mod tests {
             std::fs::read_to_string(dir.path().join(".git").join("HEAD")).unwrap(),
             "a plain (non-worktree) repo's git-path HEAD is just .git/HEAD"
         );
+    }
+
+    // ---- matches_agent_workspace_prefix / resolve_agent_workspace_prefixes --
+
+    #[test]
+    fn matches_agent_workspace_prefix_matches_a_direct_and_a_nested_descendant() {
+        let prefixes = vec![PathBuf::from(".claude/worktrees")];
+        assert!(matches_agent_workspace_prefix(
+            &PathBuf::from(".claude/worktrees/agentA/README.md"),
+            &prefixes
+        ));
+        // Nested arbitrarily deep — the whole point is hiding *everything*
+        // a worktree regenerates underneath it, not just its top level.
+        assert!(matches_agent_workspace_prefix(
+            &PathBuf::from(".claude/worktrees/agentA/node_modules/pkg/index.js"),
+            &prefixes
+        ));
+    }
+
+    /// The boundary case a raw string-prefix check would get wrong: a
+    /// sibling directory that merely shares the same leading characters
+    /// must never match. `Path::starts_with` is component-wise, so
+    /// `.claude/worktreesX` shares no component with `.claude/worktrees`
+    /// past `.claude` and correctly fails to match.
+    #[test]
+    fn matches_agent_workspace_prefix_does_not_match_a_sibling_with_a_shared_string_prefix() {
+        let prefixes = vec![PathBuf::from(".claude/worktrees")];
+        assert!(!matches_agent_workspace_prefix(
+            &PathBuf::from(".claude/worktreesX/file.txt"),
+            &prefixes
+        ));
+        assert!(!matches_agent_workspace_prefix(
+            &PathBuf::from(".claude/worktree/file.txt"),
+            &[PathBuf::from(".claude/worktrees")],
+        ));
+    }
+
+    /// A trailing slash on the configured prefix string (an easy typo in
+    /// `agent_workspace_extra`, e.g. `"vendor/agent/"`) must match exactly
+    /// like the same prefix without one — `PathBuf`'s own component
+    /// splitting never produces an empty trailing component from it.
+    #[test]
+    fn matches_agent_workspace_prefix_ignores_a_trailing_slash_on_the_prefix() {
+        let prefixes = vec![PathBuf::from("vendor/agent/")];
+        assert!(matches_agent_workspace_prefix(
+            &PathBuf::from("vendor/agent/scratch.txt"),
+            &prefixes
+        ));
+    }
+
+    #[test]
+    fn resolve_agent_workspace_prefixes_disabled_is_always_empty() {
+        assert!(resolve_agent_workspace_prefixes(false, &[]).is_empty());
+        assert!(
+            resolve_agent_workspace_prefixes(false, &["extra/one".to_owned()]).is_empty(),
+            "disabled must win over an extra list too, not just the built-in default"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_workspace_prefixes_enabled_appends_extra_after_the_built_ins() {
+        let resolved = resolve_agent_workspace_prefixes(true, &["vendor/agent".to_owned()]);
+        let built_ins: Vec<PathBuf> = DEFAULT_AGENT_WORKSPACE_PREFIXES
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        assert!(
+            resolved.starts_with(&built_ins),
+            "the built-in list must stay intact, not be replaced: {resolved:?}"
+        );
+        assert!(resolved.contains(&PathBuf::from("vendor/agent")));
+    }
+
+    // ---- GitSource agent-workspace filtering ----------------------------
+
+    #[test]
+    fn untracked_files_excludes_agent_workspace_content_by_default() {
+        let dir = init_repo();
+        git(dir.path(), &["commit", "-q", "-m", "init", "--allow-empty"]);
+        std::fs::create_dir_all(dir.path().join(".claude/worktrees/agentA")).unwrap();
+        std::fs::write(
+            dir.path().join(".claude/worktrees/agentA/junk.txt"),
+            "regenerated build junk\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("ordinary.txt"), "a real new file\n").unwrap();
+
+        let source = GitSource::discover(dir.path()).unwrap();
+        let files = source.untracked_files().unwrap();
+
+        assert!(
+            files.contains(&PathBuf::from("ordinary.txt")),
+            "an ordinary untracked file must still be listed: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.starts_with(".claude/worktrees")),
+            "agent-workspace content must be filtered out by default: {files:?}"
+        );
+    }
+
+    /// Hard requirement: this filtering is untracked-only. A file that's
+    /// actually committed under an agent-workspace prefix (a reviewer chose
+    /// to commit something there, deliberately or not) is tracked content —
+    /// `working_tree_diff` never routes tracked changes through
+    /// `untracked_files` at all (see that method's own docs), so its
+    /// modification must show up in the diff exactly like any other tracked
+    /// edit.
+    #[test]
+    fn a_committed_file_under_an_agent_workspace_prefix_still_reviews() {
+        let dir = init_repo();
+        std::fs::create_dir_all(dir.path().join(".claude/worktrees/agentA")).unwrap();
+        std::fs::write(
+            dir.path().join(".claude/worktrees/agentA/README.md"),
+            "one\n",
+        )
+        .unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(
+            dir.path(),
+            &["commit", "-q", "-m", "commit a worktree file on purpose"],
+        );
+
+        std::fs::write(
+            dir.path().join(".claude/worktrees/agentA/README.md"),
+            "one\ntwo\n",
+        )
+        .unwrap();
+
+        let source = GitSource::discover(dir.path()).unwrap();
+        let diff = source.working_tree_diff().unwrap();
+
+        assert!(
+            diff.contains("+two"),
+            "a tracked edit under an agent-workspace prefix must still appear: {diff}"
+        );
+    }
+
+    #[test]
+    fn with_agent_workspace_prefixes_empty_disables_the_filtering() {
+        let dir = init_repo();
+        git(dir.path(), &["commit", "-q", "-m", "init", "--allow-empty"]);
+        std::fs::create_dir_all(dir.path().join(".claude/worktrees/agentA")).unwrap();
+        std::fs::write(
+            dir.path().join(".claude/worktrees/agentA/junk.txt"),
+            "junk\n",
+        )
+        .unwrap();
+
+        let source = GitSource::discover(dir.path())
+            .unwrap()
+            .with_agent_workspace_prefixes(Vec::new());
+        let files = source.untracked_files().unwrap();
+
+        assert!(
+            files.contains(&PathBuf::from(".claude/worktrees/agentA/junk.txt")),
+            "an empty prefix list (agent_workspaces = false) must disable filtering: {files:?}"
+        );
+    }
+
+    #[test]
+    fn untracked_exclusion_summary_reports_count_and_matched_prefixes() {
+        let dir = init_repo();
+        git(dir.path(), &["commit", "-q", "-m", "init", "--allow-empty"]);
+        std::fs::create_dir_all(dir.path().join(".claude/worktrees/agentA")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".claude/worktree/agentB")).unwrap();
+        std::fs::write(dir.path().join(".claude/worktrees/agentA/a.txt"), "junk\n").unwrap();
+        std::fs::write(dir.path().join(".claude/worktree/agentB/b.txt"), "junk\n").unwrap();
+        std::fs::write(dir.path().join("ordinary.txt"), "kept\n").unwrap();
+
+        let source = GitSource::discover(dir.path()).unwrap();
+        let summary = source.untracked_exclusion_summary().unwrap();
+
+        assert_eq!(summary.count, 2, "{summary:?}");
+        assert!(
+            summary
+                .prefixes
+                .contains(&PathBuf::from(".claude/worktrees"))
+        );
+        assert!(
+            summary
+                .prefixes
+                .contains(&PathBuf::from(".claude/worktree"))
+        );
+    }
+
+    #[test]
+    fn untracked_exclusion_summary_is_zero_when_nothing_is_excluded() {
+        let dir = init_repo();
+        git(dir.path(), &["commit", "-q", "-m", "init", "--allow-empty"]);
+        std::fs::write(dir.path().join("ordinary.txt"), "kept\n").unwrap();
+
+        let source = GitSource::discover(dir.path()).unwrap();
+        let summary = source.untracked_exclusion_summary().unwrap();
+
+        assert_eq!(summary, UntrackedExclusionSummary::default());
+    }
+
+    #[test]
+    fn untracked_exclusion_summary_is_zero_when_filtering_is_disabled() {
+        let dir = init_repo();
+        git(dir.path(), &["commit", "-q", "-m", "init", "--allow-empty"]);
+        std::fs::create_dir_all(dir.path().join(".claude/worktrees/agentA")).unwrap();
+        std::fs::write(
+            dir.path().join(".claude/worktrees/agentA/junk.txt"),
+            "junk\n",
+        )
+        .unwrap();
+
+        let source = GitSource::discover(dir.path())
+            .unwrap()
+            .with_agent_workspace_prefixes(Vec::new());
+        let summary = source.untracked_exclusion_summary().unwrap();
+
+        assert_eq!(summary, UntrackedExclusionSummary::default());
     }
 }

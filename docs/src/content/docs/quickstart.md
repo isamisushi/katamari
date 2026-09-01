@@ -22,12 +22,17 @@ re-resolves live, so amending the commit it points at (`git commit
 --amend`, `jj describe`/`squash`) updates the open diff in place, cursor
 and scroll preserved. A diff opened by commit hash never changes.
 
-Live refresh never watches gitignored paths or nested checkouts (a linked
-git worktree, a vendored repo — anything with its own `.git`) living inside
-the repository it's reviewing, so an editor's build output and an agent
-working in a sibling worktree under, say, `.claude/worktree/` never trigger
-a refresh of their own; edits to the repository's own tracked and untracked
-files still do.
+Live refresh never watches gitignored paths, nested checkouts (a linked git
+worktree, a vendored repo — anything with its own `.git`), or a known agent
+CLI worktree path (`.claude/worktrees/` and friends — see `[diff]` in the
+Configuration chapter for the full list and how to extend or disable it)
+living inside the repository it's reviewing — the last one covers even a
+*pruned* worktree that's already lost its own `.git`, which the
+nested-checkout rule alone can't catch. An editor's build output and an
+agent working in one of these never triggers a refresh of its own, and
+untracked content there is hidden from the diff too (a status-bar note
+says so, once, when it happens); edits to the repository's own tracked and
+untracked files elsewhere still do.
 
 In a colocated jj repository (see [jj colocated setup](/katamari/jj-colocated-setup/)),
 `ktmr diff` also takes jj revsets, matching `jj diff`'s own flags so jj

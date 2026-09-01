@@ -693,10 +693,21 @@ fn run_diff(
     }
 
     let cwd = std::env::current_dir()?;
-    let source = GitSource::discover(&cwd)?;
+    let mut source = GitSource::discover(&cwd)?;
     let repo_root = source.repo_root()?;
     let config = config::load_merged(&repo_root);
     config::install(&config);
+    // Resolved once, right after config loads (before `source` is used for
+    // anything that actually consults it — `untracked_files`, transitively
+    // via `working_tree_diff`) so every scope this function can open on
+    // sees a `source` that already honors `[diff] agent_workspaces`/
+    // `agent_workspace_extra`, not `GitSource::discover`'s own built-in-only
+    // default.
+    let agent_workspace_prefixes = vcs::git::resolve_agent_workspace_prefixes(
+        config.diff.agent_workspaces,
+        &config.diff.agent_workspace_extra,
+    );
+    source = source.with_agent_workspace_prefixes(agent_workspace_prefixes.clone());
 
     // `revision`/`from`/`to` are jj-only and mutually exclusive with
     // `staged`/`range`/`no_watch` (see `Command::Diff`'s `conflicts_with_all`
@@ -871,6 +882,14 @@ fn run_diff(
     // the session even when this run started on a scope other than
     // `--branch` itself (see `App::configured_base`'s docs).
     app.configured_base = config.diff.base.clone();
+    // `[diff] agent_workspaces`/`agent_workspace_extra`, threaded onto `App`
+    // for the same reason `configured_base` is just above: a mid-session
+    // rescope/refresh (`ui::mod`'s `apply_scope_swap`/`handle_watch_refresh`/
+    // `refresh_branch_vs_base_hint`) constructs its own fresh `GitSource`
+    // and must read this rather than trust that type's hardcoded-default
+    // seed, or a user's non-default config would apply inconsistently
+    // across the session.
+    app.agent_workspace_prefixes = agent_workspace_prefixes;
     // Issue #8: recorded so a live session can watch this scope for an
     // amend moving it — see `ui::app::RevisionScope`'s docs. `--from`/
     // `--to` are conceptually moving too but excluded from V1 the same way
@@ -1281,7 +1300,17 @@ fn run_watch_check(dir: PathBuf, flushes: usize, timeout_secs: u64) -> Result<()
     println!("watching: {}", repo_root.display());
 
     let (tx, rx) = std::sync::mpsc::channel();
-    watch::spawn(repo_root, tx, watch::DEBOUNCE_QUIET);
+    // No `Config` in scope for a headless smoke test like this one — the
+    // built-in default list, exactly like a real session with no `[diff]`
+    // overrides would get from `GitSource::discover`'s own default seed
+    // (see that type's docs).
+    let agent_workspace_prefixes = vcs::git::resolve_agent_workspace_prefixes(true, &[]);
+    watch::spawn(
+        repo_root,
+        tx,
+        watch::DEBOUNCE_QUIET,
+        agent_workspace_prefixes,
+    );
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     let mut seen = 0usize;

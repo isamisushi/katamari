@@ -105,6 +105,24 @@ mouse_hover = true
 # `origin` remote at all) — safe to commit in a repo-local
 # .katamari/config.toml, unlike [agent] below.
 base = "develop"
+# Whether an agent CLI's own disposable in-repo worktree (e.g. a pruned
+# .claude/worktrees/<name>/ that's lost its .git, so the nested-checkout
+# rule below no longer protects it) is hidden from both the working-tree
+# diff and the live-refresh watcher. Default true. The built-in list:
+# .claude/worktrees/ (Claude Code's current documented default),
+# .claude/worktree/ (an older/alternate singular form, kept as harmless
+# insurance), and .codex/worktree(s)/ (speculative — Codex's real worktree
+# root lives outside any repo, so these are insurance too, not an observed
+# convention). Untracked-only either way: a file you actually commit under
+# one of these paths always reviews normally, filtering on or off.
+agent_workspaces = true
+# Extra repo-relative path prefixes appended to (never replacing) the
+# built-in list above — for a tool it doesn't cover, or a convention of
+# your own. Default empty. Merges by concatenation across the home and
+# repo config layers (unlike `base`'s plain override-wins), so a global
+# entry set once in ~/.config/katamari/config.toml survives a repo that
+# also sets its own.
+# agent_workspace_extra = ["vendor/agent-scratch"]
 
 [watch]
 # Debounce window for live refresh: how long a burst of filesystem changes

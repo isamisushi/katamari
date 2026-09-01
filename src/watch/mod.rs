@@ -4,9 +4,11 @@
 //! kept separate: [`debounce`] owns purely the "when has this burst of
 //! events settled" arithmetic (independently unit-testable, no clock or
 //! thread of its own); this module owns turning raw `notify` events into
-//! [`ChangedPath`]s (filtering out `.git/`, build output, and gitignored
-//! paths along the way) and running that pipeline on its own thread; the
-//! caller (`ui::mod`) owns what a flushed batch actually triggers.
+//! [`ChangedPath`]s (filtering out `.git/`, build output, gitignored paths,
+//! and an agent CLI's own in-repo worktree — see
+//! [`crate::vcs::git::DEFAULT_AGENT_WORKSPACE_PREFIXES`] — along the way)
+//! and running that pipeline on its own thread; the caller (`ui::mod`) owns
+//! what a flushed batch actually triggers.
 //!
 //! Registration (getting `notify` to actually watch the right set of
 //! directories) is platform-split — see [`WatchSession::start`]'s call
@@ -126,9 +128,27 @@ pub enum WatchSignal {
 /// continuous stream of writes, a concern orthogonal to how snappy an
 /// ordinary quiet-period flush feels, which is the only thing `quiet`
 /// tunes.
-pub fn spawn(repo_root: PathBuf, tx: Sender<WatchSignal>, quiet: Duration) {
+///
+/// `agent_workspace_prefixes` is `crate::vcs::git::resolve_agent_workspace_prefixes`'s
+/// output (built-in list by default, empty when `[diff] agent_workspaces =
+/// false`, extended when `agent_workspace_extra` is set) — threaded through
+/// exactly like `quiet` (config's `[watch] debounce_ms`) is: resolved once
+/// by the caller (`ui::mod::start_watch`, from `App::agent_workspace_prefixes`),
+/// then carried unchanged for the life of the session. Filters both the
+/// registration walk (never watch a known agent worktree at all — see
+/// [`walk_descends`]) and every individual event ([`is_excluded`]), the same
+/// two layers [`HARDCODED_EXCLUDES`] already backs, for the same reason: a
+/// pruned worktree with no `.git` left has lost the nested-checkout rule's
+/// protection, and can't be relied on to be gitignored either (some other
+/// tool created it without asking).
+pub fn spawn(
+    repo_root: PathBuf,
+    tx: Sender<WatchSignal>,
+    quiet: Duration,
+    agent_workspace_prefixes: Vec<PathBuf>,
+) {
     std::thread::spawn(move || {
-        let session = match WatchSession::start(repo_root) {
+        let session = match WatchSession::start(repo_root, agent_workspace_prefixes) {
             Ok(session) => session,
             Err(e) => {
                 let _ = tx.send(WatchSignal::Failed(e));
@@ -179,6 +199,9 @@ pub fn spawn(repo_root: PathBuf, tx: Sender<WatchSignal>, quiet: Duration) {
 struct WatchSession {
     repo_root: PathBuf,
     ignore: Gitignore,
+    /// See [`spawn`]'s docs on where this comes from and why it's carried
+    /// unchanged for the session's life, exactly like `ignore`.
+    agent_workspace_prefixes: Vec<PathBuf>,
     notify_rx: mpsc::Receiver<notify::Result<Event>>,
     #[cfg_attr(any(target_os = "macos", target_os = "windows"), allow(dead_code))]
     watcher: RecommendedWatcher,
@@ -187,7 +210,7 @@ struct WatchSession {
 }
 
 impl WatchSession {
-    fn start(repo_root: PathBuf) -> notify::Result<Self> {
+    fn start(repo_root: PathBuf, agent_workspace_prefixes: Vec<PathBuf>) -> notify::Result<Self> {
         let ignore = build_ignore(&repo_root);
         let (notify_tx, notify_rx) = mpsc::channel();
         let mut watcher = notify::recommended_watcher(move |res| {
@@ -195,10 +218,11 @@ impl WatchSession {
         })?;
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            register(&repo_root, &ignore, &mut watcher)?;
+            register(&repo_root, &ignore, &agent_workspace_prefixes, &mut watcher)?;
             Ok(Self {
                 repo_root,
                 ignore,
+                agent_workspace_prefixes,
                 notify_rx,
                 watcher,
             })
@@ -210,10 +234,12 @@ impl WatchSession {
             // on one of them (an ordinary mtime bump, say) doesn't look
             // "new" to `maybe_register_new_dir` and trigger a redundant
             // re-walk — see that field's docs.
-            let registered_dirs = register(&repo_root, &ignore, &mut watcher)?;
+            let registered_dirs =
+                register(&repo_root, &ignore, &agent_workspace_prefixes, &mut watcher)?;
             Ok(Self {
                 repo_root,
                 ignore,
+                agent_workspace_prefixes,
                 notify_rx,
                 watcher,
                 registered_dirs,
@@ -239,7 +265,12 @@ impl WatchSession {
             match self.notify_rx.recv_timeout(POLL_TICK) {
                 Ok(Ok(event)) => {
                     for (path, kind) in classify(&event) {
-                        if is_excluded(&self.repo_root, &path, &self.ignore) {
+                        if is_excluded(
+                            &self.repo_root,
+                            &path,
+                            &self.ignore,
+                            &self.agent_workspace_prefixes,
+                        ) {
                             continue;
                         }
                         // Captured before either record below, so a new
@@ -353,8 +384,8 @@ impl WatchSession {
         if !path.is_dir() {
             return;
         }
-        if !walk_descends(&self.repo_root, path) {
-            return; // hardcoded-excluded, or a nested checkout — see `walk_descends`
+        if !walk_descends(&self.repo_root, path, &self.agent_workspace_prefixes) {
+            return; // hardcoded-excluded, an agent workspace, or a nested checkout — see `walk_descends`
         }
         if self.registered_dirs.contains(path) {
             return; // already registered/walked this session
@@ -363,6 +394,7 @@ impl WatchSession {
             &self.repo_root,
             path,
             &self.ignore,
+            &self.agent_workspace_prefixes,
             &mut self.watcher,
             &mut self.registered_dirs,
         )
@@ -407,19 +439,39 @@ fn is_hardcoded_excluded(repo_root: &Path, path: &Path) -> bool {
 
 /// Whether `path` (absolute, somewhere under `repo_root`) should never
 /// reach the debounce window at all: inside a [`HARDCODED_EXCLUDES`]
-/// directory, or matched by the repository's root `.gitignore`. Paths
-/// outside `repo_root` entirely (shouldn't happen — the watch is rooted
-/// there — but `notify`'s platform backends have occasionally been known to
-/// report a symlink-resolved path that doesn't share the watched root's
-/// prefix) fail open rather than being silently dropped, since a missed
-/// refresh is a worse failure mode than an extra one.
-fn is_excluded(repo_root: &Path, path: &Path, ignore: &Gitignore) -> bool {
+/// directory, under one of `agent_workspace_prefixes`, or matched by the
+/// repository's root `.gitignore`. Paths outside `repo_root` entirely
+/// (shouldn't happen — the watch is rooted there — but `notify`'s platform
+/// backends have occasionally been known to report a symlink-resolved path
+/// that doesn't share the watched root's prefix) fail open rather than
+/// being silently dropped, since a missed refresh is a worse failure mode
+/// than an extra one.
+///
+/// The agent-workspace check sits alongside the hardcoded-exclude one,
+/// before the gitignore lookup and independent of it — like
+/// [`HARDCODED_EXCLUDES`], it's not a `.gitignore` concept and must never
+/// be reachable by a `!`-negation the way a plain gitignore match is (see
+/// [`crate::vcs::git::DEFAULT_AGENT_WORKSPACE_PREFIXES`]'s own docs on why
+/// a reviewer can't be relied on to have gitignored a tool-created
+/// directory in the first place). This is the *only* layer that ever runs
+/// on macOS/Windows (see the module docs — their native recursive watch
+/// skips [`walk_admits`]/[`walk_descends`] entirely), so the check has to
+/// live here, not just in the registration walk.
+fn is_excluded(
+    repo_root: &Path,
+    path: &Path,
+    ignore: &Gitignore,
+    agent_workspace_prefixes: &[PathBuf],
+) -> bool {
     if is_hardcoded_excluded(repo_root, path) {
         return true;
     }
     let Ok(relative) = path.strip_prefix(repo_root) else {
         return false;
     };
+    if crate::vcs::git::matches_agent_workspace_prefix(relative, agent_workspace_prefixes) {
+        return true;
+    }
     let is_dir = path.is_dir();
     matches!(
         ignore.matched_path_or_any_parents(relative, is_dir),
@@ -443,6 +495,7 @@ fn is_excluded(repo_root: &Path, path: &Path, ignore: &Gitignore) -> bool {
 fn register(
     repo_root: &Path,
     _ignore: &Gitignore,
+    _agent_workspace_prefixes: &[PathBuf],
     watcher: &mut RecommendedWatcher,
 ) -> notify::Result<()> {
     watcher.watch(repo_root, RecursiveMode::Recursive)
@@ -469,31 +522,49 @@ fn register(
 fn register(
     repo_root: &Path,
     ignore: &Gitignore,
+    agent_workspace_prefixes: &[PathBuf],
     watcher: &mut RecommendedWatcher,
 ) -> notify::Result<std::collections::HashSet<PathBuf>> {
     let mut registered_dirs = std::collections::HashSet::new();
-    register_subtree(repo_root, repo_root, ignore, watcher, &mut registered_dirs)?;
+    register_subtree(
+        repo_root,
+        repo_root,
+        ignore,
+        agent_workspace_prefixes,
+        watcher,
+        &mut registered_dirs,
+    )?;
     Ok(registered_dirs)
 }
 
 /// Whether the filtered registration walk should descend into `path` at
 /// all — independent of whether `path` itself ends up with its own watch
-/// (that's [`walk_admits`], below). Only two reasons ever prune descent
-/// here, and both share the property that no `.gitignore` negation could
-/// ever reverse them: a [`HARDCODED_EXCLUDES`] name (not a gitignore
-/// concept at all — [`is_excluded`] never lets a pattern override these
-/// either) and a nested checkout's own `.git` boundary (a different
-/// repository entirely, not this one's ignore rules to interpret). A plain
-/// gitignore-matched directory is deliberately *not* pruned here — see the
-/// module docs and [`walk_admits`]'s: a directory-level exclude alone must
-/// never stop the walk from reaching a `!`-negated descendant, or that
-/// negation becomes unreachable regardless of how correctly `walk_admits`
-/// would answer for the descendant directly.
-fn walk_descends(repo_root: &Path, path: &Path) -> bool {
+/// (that's [`walk_admits`], below). Only three reasons ever prune descent
+/// here, and all three share the property that no `.gitignore` negation
+/// could ever reverse them: a [`HARDCODED_EXCLUDES`] name, an
+/// `agent_workspace_prefixes` match (neither is a gitignore concept at all
+/// — [`is_excluded`] never lets a pattern override either), and a nested
+/// checkout's own `.git` boundary (a different repository entirely, not
+/// this one's ignore rules to interpret). A plain gitignore-matched
+/// directory is deliberately *not* pruned here — see the module docs and
+/// [`walk_admits`]'s: a directory-level exclude alone must never stop the
+/// walk from reaching a `!`-negated descendant, or that negation becomes
+/// unreachable regardless of how correctly `walk_admits` would answer for
+/// the descendant directly. An agent workspace never needs that same
+/// carve-out — there's no negation mechanism for it to preserve — so
+/// pruning descent into one outright (never even walking as far as a
+/// hypothetical `node_modules/` underneath it) is strictly cheaper, not
+/// just equally correct.
+fn walk_descends(repo_root: &Path, path: &Path, agent_workspace_prefixes: &[PathBuf]) -> bool {
     if path == repo_root {
         return true;
     }
     if is_hardcoded_excluded(repo_root, path) {
+        return false;
+    }
+    if let Ok(relative) = path.strip_prefix(repo_root)
+        && crate::vcs::git::matches_agent_workspace_prefix(relative, agent_workspace_prefixes)
+    {
         return false;
     }
     !path.join(".git").exists()
@@ -531,11 +602,16 @@ fn walk_descends(repo_root: &Path, path: &Path) -> bool {
 ///   `is_excluded` has no way to know that on its own (it only ever sees
 ///   one path at a time, never "does this directory's own listing contain
 ///   a `.git`").
-fn walk_admits(repo_root: &Path, path: &Path, ignore: &Gitignore) -> bool {
+fn walk_admits(
+    repo_root: &Path,
+    path: &Path,
+    ignore: &Gitignore,
+    agent_workspace_prefixes: &[PathBuf],
+) -> bool {
     if path == repo_root {
         return true;
     }
-    if is_excluded(repo_root, path, ignore) {
+    if is_excluded(repo_root, path, ignore, agent_workspace_prefixes) {
         return false;
     }
     !path.join(".git").exists()
@@ -574,11 +650,18 @@ fn walk_admits(repo_root: &Path, path: &Path, ignore: &Gitignore) -> bool {
 /// hardcoded-excludes it, nothing gitignores it by default) —
 /// `WalkBuilder`'s own default would otherwise silently stop watching it.
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn walk_watchable_dirs(repo_root: &Path, walk_root: &Path) -> Vec<PathBuf> {
+fn walk_watchable_dirs(
+    repo_root: &Path,
+    walk_root: &Path,
+    agent_workspace_prefixes: &[PathBuf],
+) -> Vec<PathBuf> {
     let mut builder = WalkBuilder::new(walk_root);
     builder.standard_filters(false).hidden(false);
     let root = repo_root.to_path_buf();
-    builder.filter_entry(move |entry| walk_descends(&root, entry.path()));
+    // Cloned into the closure (owned, not borrowed) for the same reason
+    // `root` already is: `WalkBuilder::filter_entry` needs `'static`.
+    let prefixes = agent_workspace_prefixes.to_vec();
+    builder.filter_entry(move |entry| walk_descends(&root, entry.path(), &prefixes));
     builder
         .build()
         .filter_map(Result::ok)
@@ -625,16 +708,17 @@ fn register_subtree(
     repo_root: &Path,
     dir: &Path,
     ignore: &Gitignore,
+    agent_workspace_prefixes: &[PathBuf],
     watcher: &mut RecommendedWatcher,
     seen: &mut std::collections::HashSet<PathBuf>,
 ) -> notify::Result<()> {
     seen.insert(dir.to_path_buf());
-    if walk_admits(repo_root, dir, ignore) {
+    if walk_admits(repo_root, dir, ignore, agent_workspace_prefixes) {
         watcher.watch(dir, RecursiveMode::NonRecursive)?;
     }
-    for path in walk_watchable_dirs(repo_root, dir) {
+    for path in walk_watchable_dirs(repo_root, dir, agent_workspace_prefixes) {
         seen.insert(path.clone());
-        if walk_admits(repo_root, &path, ignore) {
+        if walk_admits(repo_root, &path, ignore, agent_workspace_prefixes) {
             let _ = watcher.watch(&path, RecursiveMode::NonRecursive);
         }
     }
@@ -1319,7 +1403,7 @@ mod tests {
         ] {
             let path = dir.path().join(sub);
             assert!(
-                is_excluded(dir.path(), &path, &ignore),
+                is_excluded(dir.path(), &path, &ignore, &[]),
                 "{sub} should be excluded"
             );
         }
@@ -1334,17 +1418,20 @@ mod tests {
         assert!(is_excluded(
             dir.path(),
             &dir.path().join("debug.log"),
-            &ignore
+            &ignore,
+            &[]
         ));
         assert!(is_excluded(
             dir.path(),
             &dir.path().join("build/output.txt"),
-            &ignore
+            &ignore,
+            &[]
         ));
         assert!(!is_excluded(
             dir.path(),
             &dir.path().join("src/main.rs"),
-            &ignore
+            &ignore,
+            &[]
         ));
     }
 
@@ -1355,7 +1442,7 @@ mod tests {
         let ignore = build_ignore(dir.path());
         let path = dir.path().join("src").join("main.rs");
         write(dir.path(), "src/main.rs", "fn main() {}");
-        assert!(!is_excluded(dir.path(), &path, &ignore));
+        assert!(!is_excluded(dir.path(), &path, &ignore, &[]));
     }
 
     /// `build_ignore`'s second source ([`GitignoreBuilder`]'s docs): a
@@ -1370,7 +1457,8 @@ mod tests {
         assert!(is_excluded(
             dir.path(),
             &dir.path().join("scratch.local"),
-            &ignore
+            &ignore,
+            &[]
         ));
     }
 
@@ -1389,11 +1477,17 @@ mod tests {
         write(dir.path(), ".gitignore", "build/\n!build/keep/\n");
         write(dir.path(), "build/keep/file.txt", "content\n");
         let ignore = build_ignore(dir.path());
-        assert!(is_excluded(dir.path(), &dir.path().join("build"), &ignore));
+        assert!(is_excluded(
+            dir.path(),
+            &dir.path().join("build"),
+            &ignore,
+            &[]
+        ));
         assert!(!is_excluded(
             dir.path(),
             &dir.path().join("build/keep/file.txt"),
-            &ignore
+            &ignore,
+            &[]
         ));
     }
 
@@ -1408,7 +1502,7 @@ mod tests {
         // `path == repo_root` fast path must win regardless.
         write(dir.path(), ".gitignore", "*\n");
         let ignore = build_ignore(dir.path());
-        assert!(walk_admits(dir.path(), dir.path(), &ignore));
+        assert!(walk_admits(dir.path(), dir.path(), &ignore, &[]));
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1418,7 +1512,12 @@ mod tests {
         write(dir.path(), ".gitignore", "build/\n");
         std::fs::create_dir_all(dir.path().join("build")).unwrap();
         let ignore = build_ignore(dir.path());
-        assert!(!walk_admits(dir.path(), &dir.path().join("build"), &ignore));
+        assert!(!walk_admits(
+            dir.path(),
+            &dir.path().join("build"),
+            &ignore,
+            &[]
+        ));
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1434,7 +1533,7 @@ mod tests {
         // below.
         std::fs::write(worktree.join(".git"), "gitdir: /somewhere/else\n").unwrap();
         let ignore = build_ignore(dir.path());
-        assert!(!walk_admits(dir.path(), &worktree, &ignore));
+        assert!(!walk_admits(dir.path(), &worktree, &ignore, &[]));
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1444,7 +1543,7 @@ mod tests {
         let vendored = dir.path().join("vendored-repo");
         std::fs::create_dir_all(vendored.join(".git")).unwrap();
         let ignore = build_ignore(dir.path());
-        assert!(!walk_admits(dir.path(), &vendored, &ignore));
+        assert!(!walk_admits(dir.path(), &vendored, &ignore, &[]));
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1454,7 +1553,7 @@ mod tests {
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
         let ignore = build_ignore(dir.path());
-        assert!(walk_admits(dir.path(), &src, &ignore));
+        assert!(walk_admits(dir.path(), &src, &ignore, &[]));
     }
 
     /// Finding #2, at the `walk_descends` level directly: a plain
@@ -1469,7 +1568,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), ".gitignore", "build/\n");
         std::fs::create_dir_all(dir.path().join("build")).unwrap();
-        assert!(walk_descends(dir.path(), &dir.path().join("build")));
+        assert!(walk_descends(dir.path(), &dir.path().join("build"), &[]));
     }
 
     /// `walk_descends`'s two real pruning reasons — a hardcoded exclude and
@@ -1485,9 +1584,9 @@ mod tests {
         std::fs::create_dir_all(&worktree).unwrap();
         std::fs::write(worktree.join(".git"), "gitdir: /elsewhere\n").unwrap();
 
-        assert!(!walk_descends(dir.path(), &dir.path().join("target")));
-        assert!(!walk_descends(dir.path(), &worktree));
-        assert!(walk_descends(dir.path(), dir.path()));
+        assert!(!walk_descends(dir.path(), &dir.path().join("target"), &[]));
+        assert!(!walk_descends(dir.path(), &worktree, &[]));
+        assert!(walk_descends(dir.path(), dir.path(), &[]));
     }
 
     /// End-to-end proof of Finding #2's fix at the walk level: given the
@@ -1507,7 +1606,7 @@ mod tests {
         std::fs::write(dir.path().join("build/keep/file.txt"), "content\n").unwrap();
         let ignore = build_ignore(dir.path());
 
-        let visited = walk_watchable_dirs(dir.path(), dir.path());
+        let visited = walk_watchable_dirs(dir.path(), dir.path(), &[]);
         assert!(
             visited.contains(&dir.path().join("build")),
             "the walk must still visit build/ to reach its negated child"
@@ -1517,12 +1616,89 @@ mod tests {
             "the negated descendant must be visited: {visited:?}"
         );
 
-        assert!(!walk_admits(dir.path(), &dir.path().join("build"), &ignore));
+        assert!(!walk_admits(
+            dir.path(),
+            &dir.path().join("build"),
+            &ignore,
+            &[]
+        ));
         assert!(walk_admits(
             dir.path(),
             &dir.path().join("build/keep"),
-            &ignore
+            &ignore,
+            &[]
         ));
+    }
+
+    // ---- agent-workspace prefix pruning ----------------------------------
+
+    /// The scenario this feature actually exists for: a pruned/abandoned
+    /// agent worktree that's lost its `.git` (so the nested-checkout rule no
+    /// longer protects it — contrast with
+    /// `walk_admits_skips_a_nested_checkout_with_a_dot_git_file` above) and
+    /// was never gitignored either (so `is_excluded`'s gitignore check has
+    /// nothing to match). Without the dedicated prefix check, neither
+    /// `walk_admits` nor `walk_descends` would exclude it at all.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn walk_admits_and_walk_descends_skip_an_agent_workspace_prefix_with_no_dot_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().join(".claude").join("worktrees").join("agentA");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(worktree.join("regenerated.txt"), "junk\n").unwrap();
+        let ignore = build_ignore(dir.path());
+        let prefixes = vec![PathBuf::from(".claude/worktrees")];
+
+        assert!(!walk_admits(dir.path(), &worktree, &ignore, &prefixes));
+        assert!(
+            !walk_descends(dir.path(), &worktree, &prefixes),
+            "descent must be pruned outright — unlike a gitignore match, an \
+             agent-workspace prefix has no negation to preserve reachability for"
+        );
+    }
+
+    /// The boundary case from the shared task requirements: a sibling
+    /// directory that merely shares the configured prefix's leading
+    /// characters must never be excluded.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[test]
+    fn walk_admits_does_not_skip_a_directory_that_only_shares_a_string_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let sibling = dir.path().join(".claude").join("worktrees2");
+        std::fs::create_dir_all(&sibling).unwrap();
+        let ignore = build_ignore(dir.path());
+        let prefixes = vec![PathBuf::from(".claude/worktrees")];
+
+        assert!(walk_admits(dir.path(), &sibling, &ignore, &prefixes));
+        assert!(walk_descends(dir.path(), &sibling, &prefixes));
+    }
+
+    /// [`is_excluded`]'s own coverage of the same rule — the layer that's
+    /// the *only* one running at all on macOS/Windows (see the module
+    /// docs), so it can't rely on `walk_admits`/`walk_descends` ever having
+    /// run first.
+    #[test]
+    fn is_excluded_skips_an_agent_workspace_prefix_regardless_of_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join(".claude")
+            .join("worktrees")
+            .join("agentA")
+            .join("deep")
+            .join("regenerated.txt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "junk\n").unwrap();
+        // No `.gitignore` at all — proves this is independent of the
+        // gitignore lookup, not riding along with it.
+        let ignore = build_ignore(dir.path());
+        let prefixes = vec![PathBuf::from(".claude/worktrees")];
+
+        assert!(is_excluded(dir.path(), &path, &ignore, &prefixes));
+        assert!(
+            !is_excluded(dir.path(), &path, &ignore, &[]),
+            "an empty prefix list (agent_workspaces = false) must disable this"
+        );
     }
 
     // ---- WatchSession::maybe_register_new_dir (Finding #1) ----------------
@@ -1564,7 +1740,7 @@ mod tests {
         std::fs::create_dir_all(&staged).unwrap();
 
         let (tx, rx) = mpsc::channel();
-        spawn(dir.path().to_path_buf(), tx, DEBOUNCE_QUIET);
+        spawn(dir.path().to_path_buf(), tx, DEBOUNCE_QUIET, Vec::new());
 
         // Drain the guaranteed startup catch-up flush (see `spawn`'s docs)
         // so it can't be mistaken for either flush this test waits on.
@@ -1605,7 +1781,7 @@ mod tests {
     #[test]
     fn a_directory_already_registered_this_session_is_not_rewalked() {
         let dir = tempfile::tempdir().unwrap();
-        let mut session = WatchSession::start(dir.path().to_path_buf()).unwrap();
+        let mut session = WatchSession::start(dir.path().to_path_buf(), Vec::new()).unwrap();
         let sub = dir.path().join("subdir");
         std::fs::create_dir_all(&sub).unwrap();
 

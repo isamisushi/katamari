@@ -225,11 +225,11 @@ pub struct Config {
     pub diff: DiffConfig,
 }
 
-/// The `[diff]` table — currently just `base`, following [`AgentConfig`]'s
-/// exact single-field-table shape (a dedicated struct rather than a bare
-/// scalar on [`Config`]) so a second `[diff]`-scoped setting has somewhere
-/// to land later without a breaking reshape.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// The `[diff]` table — `base` plus the agent-workspace exclusion knobs,
+/// following [`AgentConfig`]'s exact single-field-table shape (a dedicated
+/// struct rather than bare scalars on [`Config`]) so a further `[diff]`-
+/// scoped setting has somewhere to land later without a breaking reshape.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffConfig {
     /// Overrides `crate::vcs::base::detect_base`'s jj-trunk/`origin/HEAD`/
     /// `main`/`master` fallback chain outright: when set, this is
@@ -242,6 +242,35 @@ pub struct DiffConfig {
     /// of its own to validate with, so this is passed through unvalidated,
     /// exactly like `agent.adapter`/`units.claude_model` already are.
     pub base: Option<String>,
+    /// Whether an agent CLI's disposable in-repo worktree (e.g. a pruned
+    /// `.claude/worktrees/<name>/` with no `.git` left) is hidden from the
+    /// working-tree diff and the live-refresh watcher — see
+    /// `crate::vcs::git::DEFAULT_AGENT_WORKSPACE_PREFIXES` for the exact
+    /// list. Default `true`; an explicit `false` disables the whole
+    /// feature, the same override-wins-if-set shape `base` already has.
+    /// Untracked-only regardless: a committed file under one of these
+    /// prefixes always reviews normally, this flag included — see
+    /// `crate::vcs::git::GitSource::untracked_files`'s docs.
+    pub agent_workspaces: bool,
+    /// Extra repo-relative path prefixes appended to (never replacing) the
+    /// built-in agent-workspace list — for a tool this list doesn't already
+    /// cover, or a project-specific convention of your own. Default empty.
+    /// Merges by *concatenation* across the home/repo config layers, unlike
+    /// `base`'s plain overlay-wins-if-set: a global "always exclude this"
+    /// entry set once in `~/.config/katamari/config.toml` must not be
+    /// silently dropped just because some repo also sets its own repo-local
+    /// extra — see [`merge_raw`]'s `[diff]` arm.
+    pub agent_workspace_extra: Vec<String>,
+}
+
+impl Default for DiffConfig {
+    fn default() -> Self {
+        Self {
+            base: None,
+            agent_workspaces: true,
+            agent_workspace_extra: Vec::new(),
+        }
+    }
 }
 
 /// `[units] claude_model`'s default. The evergreen alias, not a pinned
@@ -450,6 +479,8 @@ struct RawAgent {
 #[serde(default)]
 struct RawDiff {
     base: Option<String>,
+    agent_workspaces: Option<bool>,
+    agent_workspace_extra: Option<Vec<String>>,
 }
 
 const TOP_LEVEL_KEYS: &[&str] = &[
@@ -490,7 +521,7 @@ const UNITS_KEYS: &[&str] = &[
     "codex_effort",
 ];
 const AGENT_KEYS: &[&str] = &["adapter"];
-const DIFF_KEYS: &[&str] = &["base"];
+const DIFF_KEYS: &[&str] = &["base", "agent_workspaces", "agent_workspace_extra"];
 
 /// Merges `overlay`'s present fields onto `base`, in place — the field-level
 /// (not whole-file) precedence rule the module docs describe: a file that
@@ -613,11 +644,31 @@ fn merge_raw(base: &mut RawFile, overlay: RawFile) {
     // for a non-`main`-named trunk is exactly the intended use, not a trust
     // boundary the way `[agent].adapter` is. Repo-wins-per-field falls out
     // of `load_merged`'s existing merge order (home, then the repo overlay
-    // on top) for free — no special-casing needed here.
+    // on top) for free — no special-casing needed here. `agent_workspaces`
+    // is the same plain overlay-wins-if-set shape as `base`.
+    //
+    // `agent_workspace_extra` is deliberately different: it *concatenates*
+    // across layers (home's list, then the repo's appended after) rather
+    // than the repo wholesale replacing the home file's list, the one
+    // `[diff]` field that isn't a plain overlay. A global "always exclude
+    // this" entry set once in `~/.config/katamari/config.toml` must survive
+    // a repo that also sets its own repo-local extra — the same additive
+    // spirit `keys`'s `HashMap::extend` merge above already takes for a
+    // different reason (there, per-key overlay-wins; here, whole-list
+    // append, since there's no per-entry key to overlay by).
     if let Some(overlay_diff) = overlay.diff {
         let base_diff = base.diff.get_or_insert_with(RawDiff::default);
         if overlay_diff.base.is_some() {
             base_diff.base = overlay_diff.base;
+        }
+        if overlay_diff.agent_workspaces.is_some() {
+            base_diff.agent_workspaces = overlay_diff.agent_workspaces;
+        }
+        if let Some(overlay_extra) = overlay_diff.agent_workspace_extra {
+            base_diff
+                .agent_workspace_extra
+                .get_or_insert_with(Vec::new)
+                .extend(overlay_extra);
         }
     }
 }
@@ -895,8 +946,11 @@ fn finalize(raw: RawFile) -> Config {
     let agent = AgentConfig {
         adapter: raw.agent.unwrap_or_default().adapter,
     };
+    let raw_diff = raw.diff.unwrap_or_default();
     let diff = DiffConfig {
-        base: raw.diff.unwrap_or_default().base,
+        base: raw_diff.base,
+        agent_workspaces: raw_diff.agent_workspaces.unwrap_or(true),
+        agent_workspace_extra: raw_diff.agent_workspace_extra.unwrap_or_default(),
     };
     Config {
         keymap,
@@ -1954,6 +2008,106 @@ mod tests {
         assert!(
             ruby.root_markers.is_empty(),
             "the kebab-case typo `root-markers` must not populate `root_markers`"
+        );
+    }
+
+    // ---- [diff] agent_workspaces / agent_workspace_extra ----------------
+
+    #[test]
+    fn diff_agent_workspaces_defaults_to_true_with_no_config_at_all() {
+        assert!(finalize(RawFile::default()).diff.agent_workspaces);
+    }
+
+    #[test]
+    fn diff_agent_workspaces_false_is_a_plain_override_wins_if_set_field() {
+        let mut base = RawFile {
+            diff: Some(RawDiff {
+                base: None,
+                agent_workspaces: Some(true),
+                agent_workspace_extra: None,
+            }),
+            ..RawFile::default()
+        };
+        // A repo file that only sets `agent_workspaces` shouldn't need to
+        // repeat `base` for it to survive the merge — same "field-level,
+        // not whole-table" precedence every other `[section]` merge already
+        // has.
+        let overlay = RawFile {
+            diff: Some(RawDiff {
+                base: None,
+                agent_workspaces: Some(false),
+                agent_workspace_extra: None,
+            }),
+            ..RawFile::default()
+        };
+        merge_raw(&mut base, overlay);
+        let config = finalize(base);
+        assert!(!config.diff.agent_workspaces);
+    }
+
+    #[test]
+    fn diff_agent_workspace_extra_concatenates_across_home_and_repo_layers() {
+        // The one `[diff]` field that isn't a plain overlay: a global
+        // "always exclude this" entry set once at the home layer must not
+        // be silently dropped just because a repo file also sets its own
+        // extra list — see `merge_raw`'s `[diff]` arm docs.
+        let mut base = RawFile {
+            diff: Some(RawDiff {
+                base: None,
+                agent_workspaces: None,
+                agent_workspace_extra: Some(vec!["global/always-hide".to_owned()]),
+            }),
+            ..RawFile::default()
+        };
+        let overlay = RawFile {
+            diff: Some(RawDiff {
+                base: None,
+                agent_workspaces: None,
+                agent_workspace_extra: Some(vec!["repo/local-extra".to_owned()]),
+            }),
+            ..RawFile::default()
+        };
+        merge_raw(&mut base, overlay);
+        let config = finalize(base);
+        assert_eq!(
+            config.diff.agent_workspace_extra,
+            vec![
+                "global/always-hide".to_owned(),
+                "repo/local-extra".to_owned()
+            ],
+            "the home layer's entry must survive alongside the repo layer's, in order"
+        );
+    }
+
+    #[test]
+    fn diff_agent_workspace_extra_defaults_to_empty() {
+        assert!(
+            finalize(RawFile::default())
+                .diff
+                .agent_workspace_extra
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn diff_keys_recognizes_the_two_new_agent_workspace_fields() {
+        for key in ["base", "agent_workspaces", "agent_workspace_extra"] {
+            assert!(DIFF_KEYS.contains(&key), "{key} should be recognized");
+        }
+    }
+
+    #[test]
+    fn diff_table_round_trips_through_a_real_repo_config_file() {
+        let repo = fixture_repo();
+        write_repo_config(
+            &repo,
+            "[diff]\nagent_workspaces = false\nagent_workspace_extra = [\"vendor/agent\"]\n",
+        );
+        let config = load_merged(&repo);
+        assert!(!config.diff.agent_workspaces);
+        assert_eq!(
+            config.diff.agent_workspace_extra,
+            vec!["vendor/agent".to_owned()]
         );
     }
 }

@@ -284,6 +284,58 @@ pub fn negated_gitignore_repo() -> FixtureRepo {
     FixtureRepo { dir }
 }
 
+/// The agent-workspace exclusion's own fixture (`tests/e2e/agent_workspace.rs`):
+/// a `.claude/worktrees/agentA/` directory with **no** `.git` at all (a
+/// pruned/abandoned worktree — the nested-checkout rule's own protection is
+/// gone the moment that happens, unlike [`nested_checkout_repo`]'s) and
+/// **not** gitignored either (the realistic gap this feature exists to
+/// patch — see `crate::vcs::git::DEFAULT_AGENT_WORKSPACE_PREFIXES`'s own
+/// docs), so only the dedicated prefix-matching mechanism can ever hide it;
+/// unlike [`watch_filtering_repo`]'s own (gitignored) nested checkout, an
+/// un-gitignored one's content really would otherwise leak into every
+/// `ktmr diff`.
+///
+/// Three distinct pieces of content, all present *before* the session ever
+/// spawns (the initial registration walk — not dynamic re-registration —
+/// is what must prune the directory, same reasoning as
+/// [`watch_filtering_repo`]'s), so one sequenced session can prove every
+/// hard requirement at once:
+///
+/// - `regenerated.txt`, untracked, under the prefix — hidden by default,
+///   must reappear when `[diff] agent_workspaces = false`.
+/// - `committed.txt`, committed *inside* the prefixed directory, then given
+///   an uncommitted edit — untracked-only filtering means a tracked change
+///   under an agent-workspace prefix must always review normally,
+///   regardless of the filtering setting (see
+///   `GitSource::untracked_files`'s own docs).
+/// - `tracked.txt`, an ordinary tracked file *outside* the prefix, also
+///   given an uncommitted edit — the positive control a watcher test
+///   measures a real refresh's latency against before trusting a bounded
+///   negative wait on the prefixed directory (the `moving_scope.rs`-style
+///   idiom `tests/e2e/watch_filtering.rs`'s own gitignore test already
+///   uses).
+pub fn agent_workspace_repo() -> FixtureRepo {
+    let dir = init_repo();
+    let root = dir.path();
+
+    std::fs::write(root.join("tracked.txt"), "alpha\nbeta\ngamma\n").unwrap();
+    let worktree = root.join(".claude").join("worktrees").join("agentA");
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join("committed.txt"), "one\n").unwrap();
+    git(root, &["add", "-A"]);
+    git(root, &["commit", "-q", "-m", "initial commit"]);
+
+    std::fs::write(root.join("tracked.txt"), "alpha, updated\nbeta\ngamma\n").unwrap();
+    std::fs::write(worktree.join("committed.txt"), "one\ntwo\n").unwrap();
+    std::fs::write(
+        worktree.join("regenerated.txt"),
+        "junk a build daemon regenerated\n",
+    )
+    .unwrap();
+
+    FixtureRepo { dir }
+}
+
 /// Whether `jj` is on `PATH` — [`python3_available`]'s jj-side counterpart,
 /// the same self-skip pattern for the same reason: `jj` is mise-managed
 /// (`mise.toml`'s `[tools]` pins a version), so it resolves in this
