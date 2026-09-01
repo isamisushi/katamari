@@ -1312,6 +1312,43 @@ impl App {
         restored.overlay_survives
     }
 
+    /// As [`Self::apply_refresh`], but `None` (no-op — nothing touched, not
+    /// even the anchor capture) when `files`, once canonicalized the same
+    /// way [`Self::files`] always is in the common case, is byte-for-byte
+    /// identical to what's already on screen. Exists for `ui::mod`'s plain-
+    /// working-tree ref-watcher refresh: unlike a moving *revision* scope,
+    /// whose refresh can cheaply check a single resolved commit hash before
+    /// ever re-running the diff (see `MovingScopeState::last_hash`), the
+    /// working tree has no one target commit to hash — `HEAD` moving is only
+    /// ever a *reason* a re-diff might differ, not a guarantee it will (a
+    /// `git fetch` elsewhere in the repo fires the same broad `refs/` watch
+    /// this scope's refresh piggybacks on without touching `HEAD`, let alone
+    /// the tree). So this compares the diff's own *content* after paying for
+    /// the re-diff, rather than a hash before it — cheaper to get right than
+    /// threading a second `last_hash`-shaped field through every scope-swap
+    /// call site that can land on or leave the working-tree scope.
+    ///
+    /// Deliberately compares against [`Self::files`] (the *derived* view),
+    /// not `pristine_files`: [`Self::rederive`]'s own fast path empties
+    /// `pristine_files` via `mem::take` whenever there's no fold/unit-filter
+    /// state to splice (watch mode's steady state), moving its content into
+    /// `files` instead rather than paying for a clone — comparing against
+    /// `pristine_files` here would almost always compare against an empty
+    /// vec regardless of what's actually on screen. The one known cost of
+    /// comparing against `files` instead: while a fold is expanded, `files`
+    /// carries spliced-in content a fresh, foldless `files` argument can
+    /// never structurally match, so this reports "changed" (and pays for a
+    /// full, harmless-but-unnecessary [`Self::apply_refresh`]) on every tick
+    /// for as long as any fold stays open — correct, just not the cheapest
+    /// path for that one combination.
+    pub fn apply_refresh_if_changed(&mut self, files: Vec<DiffFile>) -> Option<bool> {
+        let canonical = Self::canonicalize(files.clone());
+        if canonical == self.files {
+            return None;
+        }
+        Some(self.apply_refresh(files))
+    }
+
     /// [`Self::apply_refresh`]'s pruning pass, run against the *old*
     /// `pristine_files` (still in place — this runs before they're
     /// replaced) and the incoming `new_files`: drops any recorded

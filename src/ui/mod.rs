@@ -2528,13 +2528,29 @@ fn event_loop(
                     &observer,
                 );
                 // Piggybacks on the exact same tick: keeps
-                // `App::branch_vs_base_hint`'s `+N` current for a plain
-                // working-tree session left open while `main` moves — see
-                // `refresh_branch_vs_base_hint`'s own docs for why this is
-                // safe (and cheap) to call unconditionally here alongside
-                // `handle_moving_scope_refresh`, which this session's
-                // `moving_scope` is `None` for the whole time.
-                refresh_branch_vs_base_hint(stack, jj_repo.as_ref());
+                // `App::branch_vs_base_hint`'s `+N` current, *and* re-runs
+                // the plain working-tree scope's own diff (a `git commit`
+                // moves `HEAD` without touching any tracked file on disk,
+                // so the file-system watcher never notices — see
+                // `refresh_branch_vs_base_hint`'s own docs), for a plain
+                // working-tree session left open while `main` moves or a
+                // dirty tree gets committed away. Safe to call
+                // unconditionally here alongside `handle_moving_scope_refresh`,
+                // which this session's `moving_scope` is `None` for the
+                // whole time.
+                refresh_branch_vs_base_hint(
+                    stack,
+                    jj_repo.as_ref(),
+                    highlighter,
+                    &mut hover_state,
+                    &mut refs_panel,
+                    &mut context_menu,
+                    &mut watch_status,
+                    live_search,
+                    &mut pointer_hover,
+                    &mut pending_pointer_hover,
+                    &observer,
+                );
             }
             Ok(AppEvent::CommentsChanged) => {
                 // Issue #24 req 5's fifth cancellation hook, easy to miss
@@ -5344,22 +5360,50 @@ fn handle_moving_scope_refresh(
 }
 
 /// Keeps [`App::branch_vs_base_hint`]'s `+N` from going stale across a
-/// session left open while `main` moves — piggybacks on the same
+/// session left open while `main` moves, *and* keeps the plain working-tree
+/// scope's own diff itself current — piggybacks on the same
 /// `AppEvent::RevisionChanged` ref-watcher tick
 /// [`handle_moving_scope_refresh`] already receives (that function's own
 /// docs note the watcher fires for a plain working-tree session too, even
 /// though `moving_scope` is `None` there the whole time, which is exactly
 /// what makes this cheap sibling call safe to make unconditionally
-/// alongside it). Only re-runs `crate::vcs::base::detect_base` and
-/// overwrites the field — no diff re-run, no [`App::apply_refresh`], purely
-/// refreshing the count [`crate::ui::diff_view::render_empty_state`] reads.
+/// alongside it).
+///
+/// The diff re-run exists because `.git/` sits in
+/// [`crate::watch::HARDCODED_EXCLUDES`] — the *file-system* watcher that
+/// otherwise keeps this scope live never fires for a `git commit` that
+/// touches no tracked working-tree file (the ordinary `git add -A && git
+/// commit`), even though committing away every uncommitted change is
+/// exactly the moment this scope should flip to the "nothing to review"
+/// placeholder. The ref-watcher *does* fire for that commit (it moves
+/// `HEAD`), so re-running `working_tree_diff` here and applying it via
+/// [`App::apply_refresh_if_changed`] — a no-op unless the content actually
+/// differs from what's on screen, since this tick also fires for ref
+/// changes with nothing to do with this scope's own tree or `HEAD` at all —
+/// is the one thing that can notice in time.
 ///
 /// A no-op whenever the root diff isn't sitting on the plain working-tree
-/// scope this hint is for (`revision_scope.is_some()` — swapped to
-/// something else — or `!disk_is_new_side`, which never true for a
-/// non-working-tree root to begin with): every other scope has no
-/// "clean tree, nothing to review" placeholder for this to keep current.
-fn refresh_branch_vs_base_hint(stack: &mut ViewStack, jj_repo: Option<&JjRepo>) {
+/// scope this hint (and this refresh) are for (`revision_scope.is_some()` —
+/// swapped to something else — or `!disk_is_new_side`, which is never true
+/// for a non-working-tree root to begin with): every other scope has no
+/// "clean tree, nothing to review" placeholder to keep current, and its own
+/// moving-scope machinery (if any) is `handle_moving_scope_refresh`'s job.
+#[allow(clippy::too_many_arguments)] // mirrors `handle_watch_refresh`'s own
+// justification: each parameter is a distinct piece of session state one
+// refresh cycle touches.
+fn refresh_branch_vs_base_hint(
+    stack: &mut ViewStack,
+    jj_repo: Option<&JjRepo>,
+    highlighter: &mut LineHighlighter,
+    hover_state: &mut hover_popup::HoverState,
+    refs_panel: &mut Option<RefsPanelState>,
+    context_menu: &mut Option<ContextMenuState>,
+    watch_status: &mut Option<WatchStatus>,
+    live_search: Option<(&str, &refresh::Anchor)>,
+    pointer_hover: &mut pointer_hover::PointerHoverState,
+    pending_pointer_hover: &mut Option<PendingHover>,
+    observer: &crate::lsp::ObservationHandle,
+) {
     let View::Diff(app) = stack.root_mut() else {
         return;
     };
@@ -5374,6 +5418,38 @@ fn refresh_branch_vs_base_hint(stack: &mut ViewStack, jj_repo: Option<&JjRepo>) 
                 base: base.name,
                 ahead: base.ahead,
             });
+
+    match git.working_tree_diff() {
+        Ok(diff_text) => {
+            let files = parse_unified_diff(&diff_text);
+            if let Some(overlay_survives) = app.apply_refresh_if_changed(files) {
+                // Same cancellation/overlay/status handling
+                // `handle_watch_refresh` applies for its own file-triggered
+                // refresh — this is that same tick's git-ref-triggered
+                // sibling, reaching the identical "content actually changed"
+                // branch by a different route.
+                cancel_pending_pointer_hover(pointer_hover, pending_pointer_hover, observer);
+                if let Some((query, origin)) = live_search {
+                    app.recompute_search_live(query, origin);
+                }
+                hover_state.bump_generation_for_refresh();
+                highlighter.clear_cache();
+                if !overlay_survives {
+                    if hover_state.is_open() {
+                        hover_state.close();
+                    }
+                    if refs_panel.is_some() {
+                        *refs_panel = None;
+                    }
+                }
+                *context_menu = None;
+                *watch_status = Some(WatchStatus::new("updated: working tree changed".to_owned()));
+            }
+        }
+        Err(e) => {
+            *watch_status = Some(WatchStatus::new(format!("scope: refresh failed: {e}")));
+        }
+    }
 }
 
 /// Keeps every language server in sync with the files a watch batch

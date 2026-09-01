@@ -178,6 +178,77 @@ fn a_new_commit_on_the_feature_branch_refreshes_the_open_scope_live() {
     assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
 }
 
+/// A reviewer-found gap: committing away a dirty working tree with nothing
+/// else touched (`git add -A && git commit`, the ordinary case) must still
+/// flip the plain working-tree scope to the empty-state placeholder — and
+/// bring the branch-vs-base hint line up with it — even though `.git/` sits
+/// in the file-system watcher's own excludes and a commit alone touches no
+/// tracked file on disk. Only the ref-watcher's `AppEvent::RevisionChanged`
+/// tick (which the commit's `refs/heads/feature` update does fire) can
+/// notice this transition; see `refresh_branch_vs_base_hint`'s docs in
+/// `ui::mod` for why that tick has to re-run the working-tree diff itself,
+/// not just the hint's `+N` count.
+#[test]
+fn committing_away_a_dirty_tree_shows_the_placeholder_and_hint_with_no_file_touch() {
+    let repo = fixture::branch_ahead_of_main_repo();
+    const MARKER: &str = "UNCOMMITTED_EDIT_MARKER";
+    std::fs::write(
+        repo.path().join("notes.txt"),
+        format!("alpha\nbeta\ngamma\nFEATURE_MARKER_ONE\nFEATURE_MARKER_TWO\n{MARKER}\n"),
+    )
+    .expect("failed to dirty the fixture's tracked file");
+
+    // Plain `ktmr diff`, not `--branch` — the default working-tree scope
+    // this hint/refresh actually belongs to. Wider than the suite's default
+    // 100 columns for the same reason
+    // `clean_tree_placeholder_shows_the_hint_and_b_swaps_to_the_branch_diff`
+    // is: the hint line clips mid-word at the default width.
+    let mut h = Harness::spawn(
+        repo.path(),
+        SpawnOptions {
+            cols: 160,
+            ..Default::default()
+        },
+    );
+    h.wait_for_text(MARKER);
+
+    // Commit exactly what's dirty and nothing more — no other write to any
+    // tracked file, so the file-system watcher has nothing to say about
+    // this at all.
+    fixture::git(repo.path(), &["add", "-A"]);
+    fixture::git(
+        repo.path(),
+        &["commit", "-q", "-m", "commit away the dirty edit"],
+    );
+
+    // No key sent — only the ref-watcher -> re-diff pipeline can notice the
+    // tree just went clean. Waited for as one combined condition (not a
+    // "wait for the headline, then snapshot-assert the rest") so a run
+    // under parallel test-suite load, where the placeholder's first frame
+    // and the hint's `+N` landing can be split across two redraws of the
+    // very same already-computed state, never trips a spurious failure —
+    // both fields are set together inside one `refresh_branch_vs_base_hint`
+    // call, so this converges the moment that call has run at all.
+    h.wait_until(Duration::from_secs(10), |screen| {
+        let contents = screen.contents();
+        contents.contains("nothing to review")
+            && contents.contains("review this branch against origin/main (+3 commits)")
+    });
+    let contents = h.screen_contents();
+    assert!(
+        contents.contains("nothing to review"),
+        "expected the placeholder to fully render, not just its headline; screen:\n{contents}"
+    );
+    assert!(
+        contents.contains("review this branch against origin/main (+3 commits)"),
+        "expected the hint's ahead-count to include the just-committed change; screen:\n{contents}"
+    );
+
+    h.send(Key::Char('q'));
+    let status = h.wait_exit(DEFAULT_WAIT);
+    assert!(status.success(), "ktmr should exit 0 on q, got {status:?}");
+}
+
 /// Issue #8's own jj angle, extended to this scope: a colocated repo's
 /// `--branch` resolves its base through `trunk()` (which wins outright over
 /// `origin/HEAD` in `vcs::base::detect_base`'s precedence — see that

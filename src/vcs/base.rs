@@ -76,6 +76,17 @@ pub fn detect_base(
         trunk_bookmark_name(&bookmarks)
     });
     let origin_head = git.origin_head_branch().map_err(|e| e.to_string())?;
+    // `origin_head_branch` only reads the *symref file* under
+    // `refs/remotes/origin/HEAD` — it never checks that the ref it points
+    // at still exists. A stale/pruned remote-tracking branch (the local
+    // repo's `origin/HEAD` symref was never refreshed with `git remote
+    // set-head origin -a` after the upstream default branch moved or was
+    // deleted) would otherwise be handed to `pick_base` as a seemingly-good
+    // candidate, only to hard-fail downstream in `ahead_count`'s `git
+    // rev-list` with raw git stderr — instead of falling through to the
+    // already-verified-present `main`/`master` below, same as an unset
+    // `origin/HEAD` already does.
+    let origin_head = origin_head.filter(|name| git.resolve(name).ok().flatten().is_some());
     let main_exists = git.resolve("main").map_err(|e| e.to_string())?.is_some();
     let master_exists = git.resolve("master").map_err(|e| e.to_string())?.is_some();
 
@@ -366,6 +377,37 @@ mod tests {
         let (_dir, git) = init_repo_with_a_branch();
         let base = detect_base(&git, None, None).unwrap();
         assert_eq!(base.name, "main");
+        assert!(!base.via_jj);
+        assert_eq!(base.ahead, 1);
+    }
+
+    #[test]
+    fn stale_origin_head_falls_through_to_local_main_instead_of_hard_failing() {
+        // A dangling `refs/remotes/origin/HEAD` symref — the ref file
+        // itself exists (so `origin_head_branch` happily reports
+        // `"origin/main"`) but its target, `refs/remotes/origin/main`, was
+        // pruned/deleted server-side and the local symref was never
+        // refreshed via `git remote set-head origin -a`. This is the exact
+        // shape a routine "default branch renamed" or "stale local clone"
+        // situation leaves behind, with no real remote needed to reproduce
+        // it: `symbolic-ref` only ever writes the ref file, it never
+        // requires the target to resolve.
+        let (dir, git) = init_repo_with_a_branch();
+        self::git(
+            dir.path(),
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        // `refs/remotes/origin/main` itself is never created, so the
+        // symref's target is dangling — `origin_head_branch` still returns
+        // `Some("origin/main")`, but it must not resolve to anything.
+        assert_eq!(git.resolve("origin/main").unwrap(), None);
+
+        let base = detect_base(&git, None, None).unwrap();
+        assert_eq!(base.name, "main", "should fall through to local main");
         assert!(!base.via_jj);
         assert_eq!(base.ahead, 1);
     }
