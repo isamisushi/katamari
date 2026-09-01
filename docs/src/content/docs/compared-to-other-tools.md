@@ -98,12 +98,17 @@ below).
 A few smaller things worth knowing before you commit to it for a given
 repo or platform: LSP support is six languages and a hard stop — Rust,
 TypeScript/JavaScript, Python, Go, Kotlin, Java, plus a hand-written
-`[lsp.servers.<id>]` entry for anything else with no auto-install; Windows
-support is WSL-only, no native build; and hover/go-to-definition/
-diagnostics and comment-composing only work on a live working-tree diff
-(or a moving ref like `HEAD`/`@`) — a fixed commit, `--staged`, a jj range,
-or a `--pr` scope is read-only for those (asking the agent still works
-everywhere, including a historical or PR diff).
+`[lsp.servers.<id>]` entry for anything else with no auto-install;
+reviewed-hunk marks are content-addressed except in one fully-degenerate
+case — a hunk whose changed lines *and* surrounding context are
+byte-identical to another hunk elsewhere in the same file falls back to
+position-based disambiguation, and can still shift under an insertion the
+same way the old scheme always did for every duplicate; Windows support is
+WSL-only, no native build; and hover/go-to-definition/diagnostics and
+comment-composing only work on a live working-tree diff (or a moving ref
+like `HEAD`/`@`) — a fixed commit, `--staged`, a jj range, or a `--pr`
+scope is read-only for those (asking the agent still works everywhere,
+including a historical or PR diff).
 
 None of this is a hedge — it's the same list a week of actual use would
 turn up, and pointing you at the tool that's actually built for the job

@@ -97,9 +97,10 @@ and the scope-menu popup (`o`) for switching mid-session.
   lists, addresses, and resolves via `ktmr comments`, picked up live with
   no restart
 - **Reviewed-hunk state** (`r`/`R`) — mark a hunk reviewed and it
-  collapses, content-addressed so the mark survives a rebase or reorder:
-  remember what you've reviewed — only what the agent rewrote comes back,
-  kept in `.katamari/reviewed.jsonl`
+  collapses to a one-line marker, content-addressed so it survives a
+  rebase or reorder in the overwhelming majority of cases — only the hunk
+  an agent actually rewrites resurfaces unreviewed, kept in
+  `.katamari/reviewed.jsonl`
 - **Semantic review units** (`u`) — turn a tangled diff into a stack you
   can actually read, without touching a branch: hunks grouped into
   ordered, stacked-PR-like units through the `claude`/`codex` CLI you

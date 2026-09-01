@@ -45,8 +45,9 @@ leaving the terminal.
 - **Reviewed-hunk state** (`r`/`R`) — mark the hunk under the cursor
   reviewed and it collapses to a one-line marker; the mark is
   content-addressed, keyed on the hunk's own changed lines rather than its
-  position, so it survives a rebase or reorder and only the hunk an agent
-  actually rewrites resurfaces unreviewed — persisted in
+  position, so it survives a rebase or reorder in the overwhelming
+  majority of cases, and only the hunk an agent actually rewrites
+  resurfaces unreviewed — persisted in
   `.katamari/reviewed.jsonl`, explicit-keypress-only, never inferred from
   scroll (see [Quickstart](/katamari/quickstart/))
 - **Semantic review units** — turn a tangled diff into a stack you can
