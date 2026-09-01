@@ -382,8 +382,15 @@ pub fn run(
     let startup_status = warm_up_root(stack.top(), &lsp_manager);
     // Computed here (repo_root/disk_is_new_side/agent_workspace_prefixes
     // are all already set by the time `App` reaches this function — nothing
-    // below mutates any of them) but not folded into `startup_status` until
-    // the `.or()` chain further down, alongside every other startup note.
+    // below mutates any of them) but deliberately kept out of
+    // `startup_status`'s `.or()` chain below: that chain picks one note
+    // *once*, at this instant, and permanently discards the rest, which is
+    // fine for the others (all pure FYIs) but wrong for this one — it's a
+    // security-relevant disclosure (see its own docs) that must never be
+    // silently swallowed just because some unrelated watcher happened to
+    // fail to start in the same session. `event_loop` gets it as its own
+    // parameter and keeps it in its own status-bar slot instead, so it's
+    // re-checked every frame rather than decided once and possibly lost.
     let agent_workspace_note = agent_workspace_exclusion_note(stack.top());
 
     // M5: detected once, regardless of watch mode — `Action::ToggleTimeline`
@@ -442,7 +449,6 @@ pub fn run(
         .or(reviewed_watch_status)
         .or(comments_startup_status)
         .or(revision_watch_status)
-        .or(agent_workspace_note)
         .or(available_update.as_ref().map(update::status_bar_notice));
 
     let result = event_loop(
@@ -455,6 +461,7 @@ pub fn run(
         &app_rx,
         &lsp_manager,
         startup_status,
+        agent_workspace_note,
         pre_refresh_hook,
         watch_startup_status,
         jj_repo,
@@ -680,9 +687,16 @@ fn spawn_revision_forwarder(rx: Receiver<()>, tx: Sender<AppEvent>) {
 /// A one-time startup note when [`crate::vcs::git::GitSource::untracked_files`]'s
 /// agent-workspace filtering actually hid something from this session's
 /// root diff — so filtering is never *silent*: a reviewer sees both the
-/// count and which configured prefix(es) it came from, right where every
-/// other startup note (LSP warm-up, watch/comments-watcher failures) shows
-/// up. Gated on [`App::disk_is_new_side`] (only `true` for the plain
+/// count and which configured prefix(es) it came from. Kept in its own
+/// status-bar slot in `event_loop` rather than sharing the other startup
+/// notices' single `.or()`-selected one (LSP warm-up, watch/comments-watcher
+/// failures): unlike those, this is a security-relevant disclosure — a
+/// repo-local `[diff] agent_workspace_extra`/`agent_workspaces = false`
+/// (see `DiffConfig`'s docs on why that's honored at all) is the one config
+/// value in this file able to make a reviewer's own repo hide content from
+/// them, so it must never lose out to an unrelated notice (e.g. a watcher
+/// failing to start) that happened to also fire this session. Gated on
+/// [`App::disk_is_new_side`] (only `true` for the plain
 /// working-tree root scope — the one that actually calls
 /// [`GitSource::working_tree_diff`] at all; `--staged`/`--branch`/`-r`/
 /// `--pr` never touch [`GitSource::untracked_files`], see that method's own
@@ -1045,6 +1059,7 @@ fn event_loop(
     app_rx: &Receiver<AppEvent>,
     lsp_manager: &LspManager,
     startup_status: Option<String>,
+    agent_workspace_note: Option<String>,
     pre_refresh_hook: Option<Box<dyn PreRefreshHook>>,
     initial_watch_status: Option<String>,
     jj_repo: Option<JjRepo>,
@@ -1085,6 +1100,16 @@ fn event_loop(
     let mut jump_stack = JumpStack::new();
     let mut diagnostics = DiagnosticsStore::new();
     let mut lsp_status: Option<String> = startup_status;
+    // Its own slot, deliberately separate from `lsp_status`: unlike every
+    // other startup note, this one is a security-relevant disclosure (see
+    // `agent_workspace_exclusion_note`'s docs), so it must be re-checked
+    // every frame in `status_note` below rather than folded into a single
+    // once-decided `.or()` that could permanently discard it in favor of
+    // an unrelated notice (e.g. a watcher failing to start) that happened
+    // to also be `Some` at startup. Never overwritten after this — there's
+    // nothing that supersedes it the way a live LSP event supersedes
+    // `lsp_status`.
+    let agent_workspace_status = agent_workspace_note;
     let mut goto_status: Option<String> = None;
     let mut watch_status: Option<WatchStatus> = initial_watch_status.map(WatchStatus::new);
     // Keyed by `(LangKey, workspace_root)` — a full server *instance*, not
@@ -1558,7 +1583,8 @@ fn event_loop(
             .or_else(|| goto_status.clone())
             .or_else(|| units_status.clone())
             .or_else(|| lsp_status.clone())
-            .or_else(|| watch_status.as_ref().map(|s| s.text.clone()));
+            .or_else(|| watch_status.as_ref().map(|s| s.text.clone()))
+            .or_else(|| agent_workspace_status.clone());
         // Issue #23 req 5: a disabled entry's reason (e.g. "LSP: rust-
         // analyzer is starting") must flip live while the menu just sits
         // open, not freeze on whatever it said the frame it opened —

@@ -251,6 +251,22 @@ pub struct DiffConfig {
     /// Untracked-only regardless: a committed file under one of these
     /// prefixes always reviews normally, this flag included — see
     /// `crate::vcs::git::GitSource::untracked_files`'s docs.
+    ///
+    /// Honored from a repo-local `.katamari/config.toml` exactly like
+    /// `base`, unlike `[agent].adapter` — a conscious choice, not an
+    /// oversight, despite `false` here being able to make a reviewed repo's
+    /// own untracked content *disappear* from review rather than merely
+    /// picking which ref to diff against: `[agent].adapter` is restricted
+    /// to the home file because it's an unrestricted shell command a
+    /// cloned repo could point at anything, a risk this boolean doesn't
+    /// share (it only ever narrows an already-untracked-only, already-
+    /// documented default exclusion list back to nothing). The mitigation
+    /// for the concealment risk that *does* exist is disclosure, not a
+    /// scope restriction: `ui::run`'s startup note names the exclusion
+    /// every session it fires (own status-bar slot, not foldable into
+    /// silence by another notice — see `ui::mod::agent_workspace_exclusion_note`),
+    /// so a value shipped inside the repo being reviewed can narrow what's
+    /// hidden but can never do so invisibly.
     pub agent_workspaces: bool,
     /// Extra repo-relative path prefixes appended to (never replacing) the
     /// built-in agent-workspace list — for a tool this list doesn't already
@@ -260,6 +276,15 @@ pub struct DiffConfig {
     /// entry set once in `~/.config/katamari/config.toml` must not be
     /// silently dropped just because some repo also sets its own repo-local
     /// extra — see [`merge_raw`]'s `[diff]` arm.
+    ///
+    /// Same repo-local trust decision as `agent_workspaces` just above
+    /// (see its docs): a repo-committed entry here can only ever *add* to
+    /// what's excluded from review, and every exclusion it causes is named
+    /// in the same always-shown startup note — never a silent one. An
+    /// entry that's empty or whitespace-only after trimming is dropped by
+    /// `crate::vcs::git::resolve_agent_workspace_prefixes` rather than
+    /// turned into a prefix that (via `Path::starts_with("")`) would match,
+    /// and hide, every untracked path in the repo.
     pub agent_workspace_extra: Vec<String>,
 }
 
@@ -646,6 +671,16 @@ fn merge_raw(base: &mut RawFile, overlay: RawFile) {
     // of `load_merged`'s existing merge order (home, then the repo overlay
     // on top) for free — no special-casing needed here. `agent_workspaces`
     // is the same plain overlay-wins-if-set shape as `base`.
+    //
+    // `agent_workspaces`/`agent_workspace_extra` extend that same
+    // repo-safe treatment to a field that, unlike `base`, can make a
+    // reviewed repo's own untracked content vanish from the diff a
+    // reviewer sees — a conscious call, not the same case as `base`
+    // reused without re-checking it: see `DiffConfig::agent_workspaces`'s
+    // docs for why it doesn't need `[agent].adapter`'s home-only
+    // restriction (it can only narrow an already-documented, untracked-
+    // only default exclusion, and every exclusion it causes is always
+    // named in `ui::run`'s startup note, never silently).
     //
     // `agent_workspace_extra` is deliberately different: it *concatenates*
     // across layers (home's list, then the repo's appended after) rather

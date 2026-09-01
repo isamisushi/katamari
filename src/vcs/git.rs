@@ -115,6 +115,18 @@ pub(crate) const DEFAULT_AGENT_WORKSPACE_PREFIXES: &[&str] = &[
 /// list is already exactly "nothing is excluded" to every consumer
 /// ([`matches_agent_workspace_prefix`] over an empty slice is always
 /// `false`), so this is the one place that distinction gets resolved.
+///
+/// A blank (or whitespace-only, after trimming) entry in `extra` is
+/// dropped rather than turned into a `PathBuf::from("")`: `Path::starts_with`
+/// treats an empty path as a prefix of *every* path (an empty component
+/// sequence is trivially a prefix of any sequence), so admitting one here
+/// would silently hide every untracked file in the repo — a single
+/// mistyped `agent_workspace_extra = [""]` (easy to produce by starting
+/// from the documented example and deleting its contents) would otherwise
+/// black out the entire review with no error and no indication anything
+/// was filtered. `matches_agent_workspace_prefix` also refuses to match on
+/// an empty prefix as a second, independent backstop, in case some other
+/// caller ever builds a prefix list without going through this function.
 pub fn resolve_agent_workspace_prefixes(enabled: bool, extra: &[String]) -> Vec<PathBuf> {
     if !enabled {
         return Vec::new();
@@ -122,7 +134,13 @@ pub fn resolve_agent_workspace_prefixes(enabled: bool, extra: &[String]) -> Vec<
     DEFAULT_AGENT_WORKSPACE_PREFIXES
         .iter()
         .map(PathBuf::from)
-        .chain(extra.iter().map(PathBuf::from))
+        .chain(
+            extra
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+        )
         .collect()
 }
 
@@ -135,8 +153,18 @@ pub fn resolve_agent_workspace_prefixes(enabled: bool, extra: &[String]) -> Vec<
 /// would false-positive a sibling directory that merely shares the same
 /// leading characters (`.claude/worktrees2/` must never match
 /// `.claude/worktrees`) — see this module's own boundary test.
+///
+/// Guards against an empty `prefix` explicitly rather than relying on
+/// [`resolve_agent_workspace_prefixes`] alone to keep one out:
+/// `Path::starts_with("")` is `true` for every path, so a stray empty
+/// `PathBuf` here would otherwise match — and hide — the entire repo's
+/// untracked content. See this module's
+/// `matches_agent_workspace_prefix_never_matches_everything_for_an_empty_prefix`
+/// test.
 pub fn matches_agent_workspace_prefix(relative: &Path, prefixes: &[PathBuf]) -> bool {
-    prefixes.iter().any(|prefix| relative.starts_with(prefix))
+    prefixes
+        .iter()
+        .any(|prefix| !prefix.as_os_str().is_empty() && relative.starts_with(prefix))
 }
 
 /// [`GitSource::untracked_exclusion_summary`]'s result: how many untracked
@@ -1363,6 +1391,47 @@ mod tests {
             &PathBuf::from("vendor/agent/scratch.txt"),
             &prefixes
         ));
+    }
+
+    /// Regression test for a real "hide the entire review" bug: an empty
+    /// (or whitespace-only) `agent_workspace_extra` entry must never turn
+    /// into a prefix that matches every path.
+    #[test]
+    fn matches_agent_workspace_prefix_never_matches_everything_for_an_empty_prefix() {
+        let prefixes = vec![PathBuf::from("")];
+        assert!(!matches_agent_workspace_prefix(
+            &PathBuf::from("src/main.rs"),
+            &prefixes
+        ));
+        assert!(!matches_agent_workspace_prefix(
+            &PathBuf::from("ordinary_new_file.txt"),
+            &prefixes
+        ));
+    }
+
+    #[test]
+    fn resolve_agent_workspace_prefixes_drops_blank_extra_entries() {
+        // A single "" entry must not silently become a match-everything
+        // prefix (see the `matches_agent_workspace_prefix` test above) —
+        // and neither should a whitespace-only one, or one padded with
+        // whitespace around real content.
+        let resolved = resolve_agent_workspace_prefixes(
+            true,
+            &[String::new(), "   ".to_owned(), " vendor/agent ".to_owned()],
+        );
+        assert!(
+            !resolved.contains(&PathBuf::from("")),
+            "blank entries must be dropped, not turned into an empty PathBuf: {resolved:?}"
+        );
+        assert!(
+            resolved.contains(&PathBuf::from("vendor/agent")),
+            "a real entry surrounded by whitespace must still be kept, trimmed: {resolved:?}"
+        );
+        assert_eq!(
+            resolved.len(),
+            DEFAULT_AGENT_WORKSPACE_PREFIXES.len() + 1,
+            "only the one real entry should survive: {resolved:?}"
+        );
     }
 
     #[test]

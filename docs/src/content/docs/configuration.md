@@ -115,13 +115,31 @@ base = "develop"
 # root lives outside any repo, so these are insurance too, not an observed
 # convention). Untracked-only either way: a file you actually commit under
 # one of these paths always reviews normally, filtering on or off.
+#
+# Honored from a repo-local .katamari/config.toml like `base` above, unlike
+# [agent] below — a deliberate choice, not an oversight: this field can
+# only narrow an already-documented, untracked-only default exclusion (it
+# can never widen it into hiding tracked content, and `false` disables
+# filtering, it can't invent new filtering), and every session where
+# something is actually hidden gets a status-bar note naming the count and
+# the matched prefix(es) — the concealment risk a repo-local value like
+# this could otherwise pose is met with disclosure, not a scope
+# restriction.
 agent_workspaces = true
 # Extra repo-relative path prefixes appended to (never replacing) the
 # built-in list above — for a tool it doesn't cover, or a convention of
 # your own. Default empty. Merges by concatenation across the home and
 # repo config layers (unlike `base`'s plain override-wins), so a global
 # entry set once in ~/.config/katamari/config.toml survives a repo that
-# also sets its own.
+# also sets its own. Same repo-local trust decision as agent_workspaces
+# just above: any prefix added here still only narrows what's shown, and
+# still always shows up in the same startup note. Matching is a
+# component-wise, case-sensitive prefix check (Path::starts_with) with no
+# normalization — a case mismatch (a typo, or a case-insensitive
+# filesystem) simply fails to match rather than filtering anything, so
+# double-check the casing against what `git status` actually reports. A
+# blank or whitespace-only entry is dropped rather than kept (an empty
+# prefix would otherwise match, and hide, every untracked path).
 # agent_workspace_extra = ["vendor/agent-scratch"]
 
 [watch]
