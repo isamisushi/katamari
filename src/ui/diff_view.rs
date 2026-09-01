@@ -700,7 +700,13 @@ fn render_row(
             single(gap_line(app, file_idx, gap_idx, width, is_cursor))
         }
         RenderRow::ReviewedHunk { file_idx, hunk_idx } => single(reviewed_hunk_line(
-            app, file_idx, hunk_idx, width, is_cursor,
+            app,
+            file_idx,
+            hunk_idx,
+            width,
+            is_cursor,
+            diagnostics,
+            comments,
         )),
     }
 }
@@ -752,24 +758,117 @@ fn gap_line(
 /// `app.gap_cache`-style precomputed lookup needed) since a hunk's row
 /// count is already a plain field, not something worth re-deriving through
 /// an intermediate cache the way a gap's line count is.
+///
+/// Collapsing a hunk hides every row inside it, comments and diagnostics
+/// anchored there included — with nothing rendered for either, a reviewer
+/// had no way to tell a mark had just swallowed an open comment thread or
+/// an LSP error. `diagnostics`/`comments` let this append a short badge
+/// (`· N comments`, `· error`/`· warning`) summarizing what's hidden, the
+/// same "reserve room, worst case wins" spirit [`diagnostic_glyph_span`]/
+/// [`comment_marker_span`] already use for an ordinary content row's
+/// gutter — this just spells it out in text instead of a single glyph,
+/// since a whole hunk's worth of rows can carry more than one of each.
 fn reviewed_hunk_line(
     app: &App,
     file_idx: usize,
     hunk_idx: usize,
     width: usize,
     is_cursor: bool,
+    diagnostics: &DiagnosticsStore,
+    comments: &CommentIndex,
 ) -> Line<'static> {
     let n = app
         .files
         .get(file_idx)
         .and_then(|f| f.hunks.get(hunk_idx))
         .map_or(0, |h| h.rows.len());
-    let text = format!(
+    let mut text = format!(
         "\u{2713} reviewed \u{b7} {n} line{}",
         if n == 1 { "" } else { "s" }
     );
-    let style = cursor_style(Style::default().fg(Color::Green), is_cursor);
+
+    let comment_count = reviewed_hunk_comment_count(app, file_idx, hunk_idx, comments);
+    if comment_count > 0 {
+        text.push_str(&format!(
+            " \u{b7} {comment_count} comment{}",
+            if comment_count == 1 { "" } else { "s" }
+        ));
+    }
+    let severity = reviewed_hunk_diagnostic_severity(app, file_idx, hunk_idx, diagnostics);
+    if let Some(severity) = severity {
+        text.push_str(" \u{b7} ");
+        text.push_str(match severity {
+            DiagnosticSeverity::ERROR => "error",
+            DiagnosticSeverity::WARNING => "warning",
+            _ => "diagnostic",
+        });
+    }
+
+    // The whole marker takes on the worst thing it's hiding: red for a
+    // buried error, yellow for a buried warning, cyan for a buried comment
+    // with no diagnostic, plain green (the ordinary "you did this," nothing
+    // else to know about) otherwise — matching `diagnostic_glyph_span`'s own
+    // severity-to-color mapping so a reviewer already used to the gutter
+    // reads this the same way.
+    let color = match severity {
+        Some(DiagnosticSeverity::ERROR) => Color::Red,
+        Some(_) => Color::Yellow,
+        None if comment_count > 0 => Color::Cyan,
+        None => Color::Green,
+    };
+    let style = cursor_style(Style::default().fg(color), is_cursor);
     Line::from(Span::styled(pad_or_truncate(&text, width), style))
+}
+
+/// The most severe diagnostic anchored to any row of `file_idx`'s
+/// `hunk_idx`, if any — what [`reviewed_hunk_line`]'s badge summarizes,
+/// computed the same "most severe wins" way [`row_diagnostic_severity`]
+/// does for one row, just folded (via `Iterator::min`, since
+/// `DiagnosticSeverity`'s `Ord` runs `ERROR` least — see
+/// `DiagnosticsStore::severity_at`'s docs) across every row the collapse
+/// hid.
+fn reviewed_hunk_diagnostic_severity(
+    app: &App,
+    file_idx: usize,
+    hunk_idx: usize,
+    diagnostics: &DiagnosticsStore,
+) -> Option<DiagnosticSeverity> {
+    let file = app.files.get(file_idx)?;
+    let hunk = file.hunks.get(hunk_idx)?;
+    hunk.rows
+        .iter()
+        .filter_map(|row| row_diagnostic_severity(app, file, row, diagnostics))
+        .min()
+}
+
+/// How many distinct comments are anchored (after relocation) to any row of
+/// `file_idx`'s `hunk_idx` — what [`reviewed_hunk_line`]'s badge counts. A
+/// `HashSet` of ids rather than a running sum: a range comment spanning
+/// several of the hunk's rows is indexed at every line it covers (see
+/// [`CommentIndex::at`]'s docs), and must still count once here, not once
+/// per covered row.
+fn reviewed_hunk_comment_count(
+    app: &App,
+    file_idx: usize,
+    hunk_idx: usize,
+    comments: &CommentIndex,
+) -> usize {
+    let Some(file) = app.files.get(file_idx) else {
+        return 0;
+    };
+    let Some(hunk) = file.hunks.get(hunk_idx) else {
+        return 0;
+    };
+    let path = file.display_path();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for row in &hunk.rows {
+        if let Some(line) = row.new_line {
+            for annotation in comments.at(path, line) {
+                seen.insert(annotation.id.as_str());
+            }
+        }
+    }
+    seen.len()
 }
 
 /// The most severe diagnostic touching `row`'s current-file line, if any —
@@ -1336,6 +1435,7 @@ mod tests {
     use crate::diff::{DiffFile, DiffHunk, DiffLineKind, DiffRow, SideBySideRow, SideCell};
     use crate::keymap::{KeySeq, vim_preset};
     use crate::lsp::DiagnosticsStore;
+    use lsp_types::{Diagnostic, Position, Range};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
     use std::path::{Path, PathBuf};
@@ -2115,7 +2215,76 @@ mod tests {
     #[test]
     fn reviewed_hunk_line_shows_a_checkmark_and_the_hunks_own_line_count() {
         let app = app_with_a_gap(10); // two 3-row hunks
-        let line = reviewed_hunk_line(&app, 0, 0, 40, false);
+        let diagnostics = DiagnosticsStore::new();
+        let comments = CommentIndex::default();
+        let line = reviewed_hunk_line(&app, 0, 0, 40, false, &diagnostics, &comments);
+        assert_eq!(line_text(&line).trim(), "\u{2713} reviewed \u{b7} 3 lines");
+    }
+
+    /// Regression test: collapsing a hunk used to hide an open comment
+    /// anchored inside it completely — no marker, no count, nothing to tell
+    /// a reviewer it was there. The marker row must now say so.
+    #[test]
+    fn reviewed_hunk_line_shows_a_badge_for_a_hidden_comment() {
+        let app = app_with_a_gap(10); // hunk 0: "f.txt" new lines 1-3
+        let diagnostics = DiagnosticsStore::new();
+        let lines: Vec<&str> = vec!["x", "x", "x"];
+        let comment = range_comment(
+            "id1",
+            "f.txt",
+            &lines,
+            2,
+            2,
+            "look here",
+            CommentStatus::Open,
+        );
+        let index = comments::build_index(Path::new("/repo"), std::slice::from_ref(&comment));
+        let line = reviewed_hunk_line(&app, 0, 0, 60, false, &diagnostics, &index);
+        assert_eq!(
+            line_text(&line).trim(),
+            "\u{2713} reviewed \u{b7} 3 lines \u{b7} 1 comment"
+        );
+    }
+
+    /// As above, but a diagnostic hidden inside the collapsed hunk — and
+    /// both at once, to pin the ordering and that the worse of the two
+    /// (an error) decides the marker's color.
+    #[test]
+    fn reviewed_hunk_line_shows_a_badge_for_a_hidden_diagnostic() {
+        let app = app_with_a_gap(10);
+        let comments = CommentIndex::default();
+        let mut diagnostics = DiagnosticsStore::new();
+        diagnostics.set(
+            PathBuf::from("/repo/f.txt"),
+            vec![Diagnostic {
+                range: Range {
+                    start: Position {
+                        line: 1, // 0-based — new_line 2
+                        character: 0,
+                    },
+                    end: Position {
+                        line: 1,
+                        character: 1,
+                    },
+                },
+                severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+                message: "boom".to_owned(),
+                ..Default::default()
+            }],
+        );
+        let line = reviewed_hunk_line(&app, 0, 0, 60, false, &diagnostics, &comments);
+        assert_eq!(
+            line_text(&line).trim(),
+            "\u{2713} reviewed \u{b7} 3 lines \u{b7} error"
+        );
+    }
+
+    #[test]
+    fn reviewed_hunk_line_omits_the_badge_when_nothing_is_hidden() {
+        let app = app_with_a_gap(10);
+        let diagnostics = DiagnosticsStore::new();
+        let comments = CommentIndex::default();
+        let line = reviewed_hunk_line(&app, 0, 0, 60, false, &diagnostics, &comments);
         assert_eq!(line_text(&line).trim(), "\u{2713} reviewed \u{b7} 3 lines");
     }
 
@@ -2138,14 +2307,18 @@ mod tests {
             ..Default::default()
         };
         let one_row_app = App::new("repo".to_owned(), PathBuf::from("/repo"), vec![file]);
-        let line = reviewed_hunk_line(&one_row_app, 0, 0, 40, false);
+        let diagnostics = DiagnosticsStore::new();
+        let comments = CommentIndex::default();
+        let line = reviewed_hunk_line(&one_row_app, 0, 0, 40, false, &diagnostics, &comments);
         assert_eq!(line_text(&line).trim(), "\u{2713} reviewed \u{b7} 1 line");
     }
 
     #[test]
     fn reviewed_hunk_line_pads_to_the_exact_requested_width() {
         let app = app_with_a_gap(10);
-        let line = reviewed_hunk_line(&app, 0, 0, 50, false);
+        let diagnostics = DiagnosticsStore::new();
+        let comments = CommentIndex::default();
+        let line = reviewed_hunk_line(&app, 0, 0, 50, false, &diagnostics, &comments);
         assert_eq!(display_width(&line_text(&line)), 50);
     }
 

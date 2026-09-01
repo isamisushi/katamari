@@ -146,6 +146,16 @@ enum AppEvent {
     /// agent resolving comments via `ktmr comments resolve` shouldn't need
     /// an unrelated file edit to make the reviewer's session notice.
     CommentsChanged,
+    /// `.katamari/reviewed.jsonl` changed on disk — forwarded by
+    /// [`crate::watch::spawn_reviewed_watcher`], `CommentsChanged`'s
+    /// sibling and, like it, unconditional regardless of root live-refresh
+    /// mode. Unlike a comments reload, this always re-derives `App::rows`
+    /// (a reviewed mark collapses rows the way a comment never does) —
+    /// see [`crate::ui::app::App::reload_reviewed`]. The one way anything
+    /// outside this same process comes to write that file: a second
+    /// `ktmr diff` session (or `ktmr reviewed clear`) open against the
+    /// same repository.
+    ReviewedChanged,
     /// Issue #8: a watched git-dir path (`HEAD`, a ref, a reflog,
     /// `packed-refs`) changed on disk — forwarded by
     /// [`crate::watch::spawn_revision_watcher`], which like
@@ -406,6 +416,11 @@ pub fn run(
     // way, right before comments loads — see `start_reviewed`'s own docs
     // on why this mutates `App` directly instead of returning state.
     let reviewed_startup_status = start_reviewed(stack);
+    // ...and watched live the same unconditional way `start_comments`
+    // below is — see `AppEvent::ReviewedChanged`'s docs on why two
+    // concurrently open sessions on the same repo need this to converge
+    // without a restart.
+    let reviewed_watch_status = start_reviewed_watch(stack.top(), app_tx.clone());
 
     // M6: a root diff's comments are loaded and watched unconditionally —
     // unlike the working-tree watcher above, this has nothing to do with
@@ -419,6 +434,7 @@ pub fn run(
     // claimed this session's one startup status slot.
     let startup_status = startup_status
         .or(reviewed_startup_status)
+        .or(reviewed_watch_status)
         .or(comments_startup_status)
         .or(revision_watch_status)
         .or(available_update.as_ref().map(update::status_bar_notice));
@@ -551,11 +567,14 @@ fn spawn_comments_forwarder(rx: Receiver<()>, tx: Sender<AppEvent>) {
 /// [`crate::ui::app::App::set_reviewed`]) rather than handing loaded state
 /// back to the caller — a comment never changes `App::rows`' shape, but a
 /// reviewed mark does (the collapse pass), so `App` has to know about it
-/// up front. No live watcher: unlike comments, nothing outside this same
-/// process ever writes `reviewed.jsonl` (marking is TUI-only, see
-/// `crate::reviewed`'s module docs), so there's no concurrent writer to
-/// watch for. Returns a status-bar note only on an I/O error reading the
-/// log — the same "don't silently not-load" principle `start_watch`/
+/// up front. Marking itself is still TUI-only (see `crate::reviewed`'s
+/// module docs) — nothing but a human keypress in *some* session ever
+/// appends to `reviewed.jsonl` — but "no writer but this process" was never
+/// true the way the pre-fix version of this doc comment claimed: a second
+/// concurrently open `ktmr diff` session against the same repository is
+/// itself such a writer, which is exactly what [`start_reviewed_watch`]
+/// exists to notice. Returns a status-bar note only on an I/O error reading
+/// the log — the same "don't silently not-load" principle `start_watch`/
 /// `start_comments` already follow.
 fn start_reviewed(stack: &mut ViewStack) -> Option<String> {
     let View::Diff(app) = stack.root_mut() else {
@@ -570,6 +589,40 @@ fn start_reviewed(stack: &mut ViewStack) -> Option<String> {
             "reviewed: failed to load .katamari/reviewed.jsonl: {e}"
         )),
     }
+}
+
+/// Starts the live watcher for `.katamari/reviewed.jsonl` — unconditional,
+/// for every session with a [`View::Diff`] root, mirroring [`start_comments`]
+/// exactly (its own watcher setup, its own forwarder thread, its own
+/// failure-as-status-bar-note handling) but against
+/// [`watch::spawn_reviewed_watcher`] and [`AppEvent::ReviewedChanged`]
+/// instead. See that event variant's docs for why this needs to be a
+/// distinct watcher/signal rather than folded into the comments one.
+fn start_reviewed_watch(view: &View, app_tx: Sender<AppEvent>) -> Option<String> {
+    let View::Diff(app) = view else {
+        return None;
+    };
+    let (tx, rx) = mpsc::channel::<()>();
+    match watch::spawn_reviewed_watcher(app.repo_root.clone(), tx) {
+        Ok(()) => {
+            spawn_reviewed_forwarder(rx, app_tx);
+            None
+        }
+        Err(e) => Some(format!("reviewed watch: failed to start: {e}")),
+    }
+}
+
+/// As [`spawn_comments_forwarder`], relaying [`watch::spawn_reviewed_watcher`]'s
+/// bare `()` signals onto the shared [`AppEvent`] channel as
+/// [`AppEvent::ReviewedChanged`].
+fn spawn_reviewed_forwarder(rx: Receiver<()>, tx: Sender<AppEvent>) {
+    std::thread::spawn(move || {
+        for () in rx {
+            if tx.send(AppEvent::ReviewedChanged).is_err() {
+                break;
+            }
+        }
+    });
 }
 
 /// Issue #8: starts the ref-watcher behind a moving historical scope's live
@@ -2611,6 +2664,29 @@ fn event_loop(
                         Err(e) => {
                             watch_status =
                                 Some(WatchStatus::new(format!("comments: reload failed: {e}")));
+                        }
+                    }
+                }
+            }
+            Ok(AppEvent::ReviewedChanged) => {
+                // As `CommentsChanged` — a reviewed reload collapses or
+                // resurfaces hunks (`App::reload_reviewed` re-runs the
+                // collapse pass), reflowing every row below the change
+                // under a stationary pointer just as much as a comment
+                // reload's inline block resize does.
+                cancel_pending_pointer_hover(
+                    &mut pointer_hover,
+                    &mut pending_pointer_hover,
+                    &observer,
+                );
+                if let View::Diff(app) = stack.root_mut() {
+                    match ReviewedStore::new(&app.repo_root).load() {
+                        Ok(entries) => {
+                            app.reload_reviewed(entries.into_iter().map(|e| e.hunk_id).collect());
+                        }
+                        Err(e) => {
+                            watch_status =
+                                Some(WatchStatus::new(format!("reviewed: reload failed: {e}")));
                         }
                     }
                 }

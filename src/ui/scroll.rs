@@ -120,6 +120,35 @@ pub fn scroll_by(
     shifted.clamp(0, max as isize) as usize
 }
 
+/// The half-open range of logical row indices that are at least partially
+/// on screen right now: starting at `scroll_offset`, walking forward while
+/// the *visual* rows accumulated so far stay under `viewport_height` — the
+/// same accumulation `ui::diff_view::render_unified`'s own draw loop
+/// performs (`while lines.len() < viewport_height && idx < rows.len()`),
+/// generalized here so a caller that needs "which rows is the reviewer
+/// actually looking at" (e.g. `App::mark_visible_reviewed`, scoping a bulk
+/// action to what's on screen rather than the whole derived diff) doesn't
+/// have to re-derive that loop itself or drag a `Frame` into `App`. A row
+/// whose first visual line lands within the viewport is included even if a
+/// later wrapped line of it would run past the bottom edge — exactly the
+/// partial-row truncation the renderer itself already applies, not a
+/// stricter "fully visible" test.
+pub fn visible_range(
+    scroll_offset: usize,
+    viewport_height: usize,
+    total_rows: usize,
+    row_height: impl Fn(usize) -> usize,
+) -> std::ops::Range<usize> {
+    let start = scroll_offset.min(total_rows);
+    let mut idx = start;
+    let mut total = 0usize;
+    while idx < total_rows && total < viewport_height {
+        total += height_of(&row_height, idx);
+        idx += 1;
+    }
+    start..idx
+}
+
 /// `Action::HalfPageDown`'s destination: `cursor` moved forward by
 /// [`half_page`]'s *visual*-row budget, landing on whichever logical row
 /// that visual distance reaches rather than always advancing by the same
@@ -300,6 +329,34 @@ mod tests {
     #[test]
     fn half_page_down_wrapped_clamps_to_the_last_row_even_mid_tall_row() {
         assert_eq!(half_page_down(3, 3, 6, mixed_heights), 3);
+    }
+
+    // ---- visible_range --------------------------------------------------
+
+    #[test]
+    fn visible_range_covers_exactly_a_full_viewport_of_uniform_rows() {
+        assert_eq!(visible_range(0, 5, 100, uniform), 0..5);
+        assert_eq!(visible_range(20, 5, 100, uniform), 20..25);
+    }
+
+    #[test]
+    fn visible_range_stops_early_when_fewer_rows_remain_than_the_viewport() {
+        assert_eq!(visible_range(97, 10, 100, uniform), 97..100);
+    }
+
+    #[test]
+    fn visible_range_is_empty_when_the_offset_is_past_every_row() {
+        assert_eq!(visible_range(100, 10, 100, uniform), 100..100);
+    }
+
+    #[test]
+    fn visible_range_includes_a_row_that_only_starts_within_the_viewport() {
+        // Row 3 (index 3) is 4 visual rows tall; a 5-row viewport starting
+        // at offset 2 fits rows 2 (1) and 3 (4) exactly, so row 3 is
+        // included even though none of the caller's business logic cares
+        // that its later wrapped lines would spill past the bottom edge —
+        // matching `render_unified`'s own "starts in view" truncation.
+        assert_eq!(visible_range(2, 5, 10, mixed_heights), 2..4);
     }
 
     // ---- scroll_by ----------------------------------------------------

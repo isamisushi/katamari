@@ -353,10 +353,12 @@ pub enum Action {
     ToggleHunkReviewed,
     /// Marks every hunk in the cursor's current file reviewed — `m f`.
     MarkFileReviewed,
-    /// Marks every hunk currently visible reviewed — `m a`. Respects an
-    /// active semantic-unit filter automatically, since it only ever
-    /// touches `App::files`' already-narrowed hunk set, never the full
-    /// diff.
+    /// Marks every hunk currently on screen reviewed — `m a`: scoped to
+    /// whatever's actually visible in the diff pane's current scroll
+    /// position, not the whole (possibly unit-filtered) derived diff — see
+    /// `App::mark_visible_reviewed`'s docs. Respects an active semantic-unit
+    /// filter too, for the same reason `MarkFileReviewed` does: a
+    /// filtered-out hunk has no row on screen to begin with.
     MarkVisibleReviewed,
     /// Shows or hides every reviewed hunk's content, globally — `z R`, the
     /// third child under the `z` fold prefix alongside `z o`/`z c`. Unlike

@@ -128,8 +128,16 @@ impl ReviewedStore {
 
     /// Creates `.katamari/` (and its self-ignoring `.gitignore`) via the
     /// held [`CommentStore`] — see that method's own docs for why the
-    /// `.gitignore` exists at all.
-    fn ensure_dir(&self) -> Result<(), StoreError> {
+    /// `.gitignore` exists at all. `pub` so [`crate::watch::spawn_reviewed_watcher`]
+    /// can seed the directory the same way [`spawn_comments_watcher`]'s
+    /// session does through `CommentStore`'s own `ensure_dir` — a session
+    /// that never marks anything is otherwise the first to create
+    /// `.katamari/` via a comment, and the watcher needs the directory to
+    /// exist before it can register a watch on it regardless of which
+    /// happens first.
+    ///
+    /// [`spawn_comments_watcher`]: crate::watch::spawn_comments_watcher
+    pub fn ensure_dir(&self) -> Result<(), StoreError> {
         self.comments.ensure_dir().map_err(|e| StoreError::Write {
             path: self.path.clone(),
             source: io::Error::other(e.to_string()),

@@ -744,6 +744,96 @@ impl CommentsWatchSession {
     }
 }
 
+/// Watches `<repo_root>/.katamari/` for changes to `reviewed.jsonl` and
+/// sends a signal on `tx` each time it does — the concurrent-session
+/// counterpart to [`spawn_comments_watcher`], added after a reviewer caught
+/// live that two `ktmr diff` sessions open on the same repository (e.g. one
+/// on the working tree, one on `--pr N`) never converged on each other's
+/// reviewed marks without a restart, even though the reviewed-hunk feature's
+/// own design point is marks "shared across every scope pointing at the
+/// same repo." Deliberately its own session against the same `.katamari/`
+/// directory `spawn_comments_watcher` already watches, rather than teaching
+/// that session to watch two filenames and dispatch by which one fired: the
+/// two signals mean different things downstream (a comments reload never
+/// touches `App::rows`' shape; a reviewed reload always does, since it
+/// re-runs the collapse pass — see [`crate::ui::app::App::reload_reviewed`]),
+/// so keeping them as distinct channel variants the caller already branches
+/// on outweighs the cost of one extra `notify` registration on a directory
+/// that's already cheap to watch (a handful of small JSONL files, not a
+/// working tree).
+pub fn spawn_reviewed_watcher(repo_root: PathBuf, tx: Sender<()>) -> notify::Result<()> {
+    let session = ReviewedWatchSession::start(repo_root)?;
+    std::thread::spawn(move || session.run(tx));
+    Ok(())
+}
+
+struct ReviewedWatchSession {
+    reviewed_path: PathBuf,
+    notify_rx: mpsc::Receiver<notify::Result<Event>>,
+    _watcher: RecommendedWatcher,
+}
+
+impl ReviewedWatchSession {
+    fn start(repo_root: PathBuf) -> notify::Result<Self> {
+        // Mirrors `CommentsWatchSession::start`: the watched directory and
+        // target filename come from `ReviewedStore::path` rather than being
+        // hardcoded again here, for the same "one place owns the on-disk
+        // layout decision" reason.
+        let store = crate::reviewed::store::ReviewedStore::new(&repo_root);
+        let reviewed_path = store.path().to_path_buf();
+        let dir = reviewed_path
+            .parent()
+            .expect("reviewed.jsonl always has a parent")
+            .to_path_buf();
+        store
+            .ensure_dir()
+            .map_err(|e| notify::Error::generic(&e.to_string()))?;
+
+        let (notify_tx, notify_rx) = mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |res| {
+            let _ = notify_tx.send(res);
+        })?;
+        watcher.watch(&dir, RecursiveMode::NonRecursive)?;
+        Ok(Self {
+            reviewed_path,
+            notify_rx,
+            _watcher: watcher,
+        })
+    }
+
+    /// As [`CommentsWatchSession::run`] — same debounce/defer-not-drop
+    /// shape, reusing [`COMMENTS_DEBOUNCE`] rather than a near-duplicate
+    /// constant, since a reviewed-hunk mark is exactly the same "tiny,
+    /// infrequent write" cost class a comment-log append is.
+    fn run(self, tx: Sender<()>) {
+        let mut last_sent: Option<Instant> = None;
+        let mut deferred = false;
+        let target_name = self.reviewed_path.file_name();
+        loop {
+            match self.notify_rx.recv_timeout(POLL_TICK) {
+                Ok(Ok(event)) => {
+                    let touches_reviewed =
+                        matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_))
+                            && event.paths.iter().any(|p| p.file_name() == target_name);
+                    if touches_reviewed {
+                        deferred = true;
+                    }
+                }
+                Ok(Err(_)) => {}
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+            if deferred && last_sent.is_none_or(|t| t.elapsed() >= COMMENTS_DEBOUNCE) {
+                last_sent = Some(Instant::now());
+                deferred = false;
+                if tx.send(()).is_err() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 /// Issue #8: a git-dir path this module watches for a *moving revision*
 /// scope (`ktmr diff -r HEAD`, the scope menu's "Revision…") possibly
 /// pointing at a different commit — resolved once at watch-start via
@@ -1127,6 +1217,82 @@ mod tests {
 
         let (tx, _rx) = mpsc::channel::<()>();
         spawn_comments_watcher(root.to_path_buf(), tx).expect("failed to start comments watcher");
+
+        assert_eq!(
+            std::fs::read_to_string(root.join(".katamari").join(".gitignore")).unwrap(),
+            "*\n"
+        );
+    }
+
+    /// Regression coverage for the concurrent-session bug a reviewer caught
+    /// live: two `ktmr diff` sessions open on the same repo never converged
+    /// on each other's reviewed marks because nothing watched
+    /// `reviewed.jsonl` at all. Mirrors
+    /// [`a_comments_write_inside_the_debounce_window_is_deferred_not_dropped`]
+    /// exactly, against [`spawn_reviewed_watcher`] instead.
+    #[test]
+    fn a_reviewed_write_inside_the_debounce_window_is_deferred_not_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".katamari")).unwrap();
+        let reviewed = root.join(".katamari/reviewed.jsonl");
+
+        let (tx, rx) = mpsc::channel::<()>();
+        spawn_reviewed_watcher(root.to_path_buf(), tx).expect("failed to start reviewed watcher");
+
+        std::fs::write(
+            &reviewed,
+            "{\"hunk_id\":\"one\",\"path\":\"a\",\"marked_at\":0}\n",
+        )
+        .unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the first write must forward on the leading edge"
+        );
+
+        std::fs::write(
+            &reviewed,
+            "{\"hunk_id\":\"one\",\"path\":\"a\",\"marked_at\":0}\n\
+             {\"hunk_id\":\"two\",\"path\":\"b\",\"marked_at\":0}\n",
+        )
+        .unwrap();
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "a write landing inside the debounce window must still produce \
+             a (deferred) signal, not vanish"
+        );
+    }
+
+    /// A change to `comments.jsonl` alone must never wake the reviewed
+    /// watcher (and, by the same filename-filtered logic in the other
+    /// direction, a `reviewed.jsonl` write must never wake the comments
+    /// watcher — both sessions share one directory registration but filter
+    /// by target filename, see each session's own `run` docs).
+    #[test]
+    fn a_reviewed_watcher_ignores_writes_to_comments_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".katamari")).unwrap();
+
+        let (tx, rx) = mpsc::channel::<()>();
+        spawn_reviewed_watcher(root.to_path_buf(), tx).expect("failed to start reviewed watcher");
+
+        std::fs::write(root.join(".katamari/comments.jsonl"), "{\"id\":\"one\"}\n").unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(500)),
+            Err(RecvTimeoutError::Timeout),
+            "a comments.jsonl write must not trigger a reviewed signal"
+        );
+    }
+
+    #[test]
+    fn reviewed_watcher_starting_on_a_fresh_repo_seeds_the_katamari_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(!root.join(".katamari").exists());
+
+        let (tx, _rx) = mpsc::channel::<()>();
+        spawn_reviewed_watcher(root.to_path_buf(), tx).expect("failed to start reviewed watcher");
 
         assert_eq!(
             std::fs::read_to_string(root.join(".katamari").join(".gitignore")).unwrap(),

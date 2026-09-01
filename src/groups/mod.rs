@@ -107,27 +107,148 @@ fn fnv1a<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> u64 {
 /// a context-width setting or a neighboring hunk merging changes its
 /// context rows, but neither touches what the hunk actually changes, so
 /// neither should change its identity (a grouping cached before such a
-/// shift keeps matching after it). Two byte-identical changes in the same
-/// file are disambiguated by an occurrence counter folded into the hash —
-/// duplicate ids would make "every hunk in exactly one unit" ambiguous.
+/// shift keeps matching after it).
+///
+/// Two byte-identical changes in the same file are disambiguated by a rank
+/// folded into the hash — duplicate ids would make "every hunk in exactly
+/// one unit" ambiguous, and (more importantly, see below) would let
+/// [`crate::reviewed`] silently transfer a reviewed mark onto the wrong
+/// occurrence. That rank is **not** simply "the *n*-th time this content is
+/// seen while walking `file.hunks` in order" — an earlier version of this
+/// function did exactly that, and it quietly broke the one property this
+/// whole scheme exists for: a hunk's id is supposed to depend only on that
+/// hunk, never on what else happens to be in the file. Iteration order is
+/// position in the *current* parse, so inserting or deleting an unrelated
+/// same-content hunk anywhere earlier in the file shifted every later
+/// occurrence's rank by one — a reviewed mark keyed on rank 1 would silently
+/// point at whatever new content now happened to be the second occurrence,
+/// not the hunk a human actually reviewed (see the katamari-review-state
+/// design notes, and `App::mark_current_hunk_reviewed`'s callers, for why
+/// that's worse than merely losing the mark: it actively mislabels new,
+/// never-reviewed content as already-reviewed).
+///
+/// Instead, only a hunk whose *changed* rows actually collide with
+/// another's in the same file pays for anything beyond that plain content
+/// hash at all — an ordinary, non-duplicated hunk (the overwhelming
+/// majority in any real diff) gets exactly `fnv1a(changed_hash, 0u32)`,
+/// bit-for-bit the same id this function has always produced for it, so a
+/// toolchain upgrade to this fix doesn't invalidate a single existing mark
+/// or cached grouping outside the narrow duplicate case it's actually
+/// fixing. For a hunk that *does* collide, its own **surrounding context**
+/// — every row of the hunk, changed and unchanged alike, hashed separately
+/// — is folded directly into the id as a value, not used to *count*
+/// anything. That distinction matters: **any** scheme that assigns a
+/// disambiguator as "how many colliding occurrences sort before me" is
+/// vulnerable to the exact same bug regardless of what the sort key is —
+/// inserting a new colliding occurrence can always land "before" an
+/// existing one in *some* total order (by file position, by `old_start`,
+/// even by a context hash's raw numeric value), bumping the existing one's
+/// count and so its id; an earlier draft of this fix tried ranking by
+/// context instead of embedding it and still had exactly this problem.
+/// Embedding the context hash's actual *value* sidesteps counting entirely:
+/// two hunks only ever collide when their changed rows *and* their context
+/// rows are both byte-identical, and whether that's true of any two
+/// *specific* hunks never depends on whether a third hunk exists. Context
+/// text is practically always enough to tell two occurrences of the same
+/// changed line apart (`+dup` sitting between different neighboring lines
+/// in two places), which is why this closes the bug for the case that
+/// actually matters. Only the fully degenerate residual — changed rows
+/// *and* every context row byte-identical, i.e. the same code, context
+/// included, truly duplicated verbatim elsewhere in the file — still falls
+/// back to a position-based rank (old-side anchor, then array position) to
+/// keep ids distinct at all; *that* narrow case can still shift under an
+/// insertion, same as the old scheme always did for every duplicate, but
+/// there is no remaining hash left to fold in that would tell such hunks
+/// apart.
 pub fn enumerate_hunks(files: &[DiffFile]) -> Vec<HunkMeta> {
     let mut out = Vec::new();
     for (file_idx, file) in files.iter().enumerate() {
         let path = file.display_path();
-        let mut seen_in_file: std::collections::HashMap<u64, u32> =
+
+        // The id-defining hash: path plus changed rows only, exactly as
+        // before — every stability guarantee in this function's docs is
+        // about *this* hash, so it must stay untouched by anything below.
+        let changed_hashes: Vec<u64> = file
+            .hunks
+            .iter()
+            .map(|hunk| {
+                fnv1a(
+                    std::iter::once(path.as_bytes()).chain(hunk.rows.iter().filter_map(|row| {
+                        (row.kind != DiffLineKind::Context).then_some(row.text.as_bytes())
+                    })),
+                )
+            })
+            .collect();
+
+        let mut group_size: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        for &h in &changed_hashes {
+            *group_size.entry(h).or_insert(0) += 1;
+        }
+
+        // The disambiguation hash — every row, context included — computed
+        // only for a hunk whose `changed_hash` actually collides with
+        // another's (`None` otherwise), so an ordinary hunk's id below
+        // never depends on context at all. Folded directly into the id as
+        // a value below, never used to rank/count — see this function's
+        // docs on why that distinction is the actual fix.
+        let context_hashes: Vec<Option<u64>> = file
+            .hunks
+            .iter()
+            .enumerate()
+            .map(|(i, hunk)| {
+                (group_size[&changed_hashes[i]] > 1).then(|| {
+                    fnv1a(
+                        std::iter::once(path.as_bytes())
+                            .chain(hunk.rows.iter().map(|row| row.text.as_bytes())),
+                    )
+                })
+            })
+            .collect();
+
+        // The only remaining source of a collision: two hunks whose
+        // `(changed_hash, context_hash)` pair is *itself* identical (see
+        // the doc comment above). Rank those specific collisions by
+        // old-side position as a last resort — `order` walks the hunks in
+        // that fallback order; `rank` then records, for each hunk, how many
+        // earlier-in-`order` hunks shared its full pair. Every hunk with a
+        // unique pair (every non-colliding hunk, and any colliding one
+        // whose context alone already distinguishes it) gets rank 0.
+        let mut order: Vec<usize> = (0..file.hunks.len()).collect();
+        order.sort_by_key(|&i| {
+            (
+                changed_hashes[i],
+                context_hashes[i],
+                file.hunks[i].old_start,
+                file.hunks[i].new_start,
+                i,
+            )
+        });
+        let mut rank = vec![0u32; file.hunks.len()];
+        let mut seen_in_file: std::collections::HashMap<(u64, Option<u64>), u32> =
             std::collections::HashMap::new();
-        for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
-            let mut content_hash = fnv1a(std::iter::once(path.as_bytes()).chain(
-                hunk.rows.iter().filter_map(|row| {
-                    (row.kind != DiffLineKind::Context).then_some(row.text.as_bytes())
-                }),
-            ));
-            let occurrence = seen_in_file.entry(content_hash).or_insert(0);
-            content_hash = fnv1a([
-                &content_hash.to_le_bytes()[..],
-                &occurrence.to_le_bytes()[..],
-            ]);
+        for &i in &order {
+            let occurrence = seen_in_file
+                .entry((changed_hashes[i], context_hashes[i]))
+                .or_insert(0);
+            rank[i] = *occurrence;
             *occurrence += 1;
+        }
+
+        for (hunk_idx, _) in file.hunks.iter().enumerate() {
+            let content_hash = match context_hashes[hunk_idx] {
+                // Untouched formula for the ordinary, non-colliding case —
+                // see this function's docs on why bit-for-bit stability
+                // here matters.
+                None => fnv1a([
+                    &changed_hashes[hunk_idx].to_le_bytes()[..],
+                    &0u32.to_le_bytes()[..],
+                ]),
+                Some(context_hash) => fnv1a([
+                    &changed_hashes[hunk_idx].to_le_bytes()[..],
+                    &context_hash.to_le_bytes()[..],
+                    &rank[hunk_idx].to_le_bytes()[..],
+                ]),
+            };
             out.push(HunkMeta {
                 id: format!("{content_hash:016x}"),
                 file: path.to_owned(),
@@ -416,6 +537,76 @@ mod tests {
         let hunks = enumerate_hunks(&files);
         assert_eq!(hunks.len(), 2);
         assert_ne!(hunks[0].id, hunks[1].id);
+    }
+
+    /// The bug a reviewer caught live in the reviewed-hunk feature: the old
+    /// occurrence-counter disambiguation ranked duplicate-content hunks by
+    /// their position in `file.hunks` at derivation time, so inserting a
+    /// brand-new same-content hunk *earlier* in the file silently reassigned
+    /// an already-reviewed hunk's id onto the new, never-seen occurrence —
+    /// mislabeling unrelated content as reviewed rather than merely losing
+    /// the mark. Each occurrence here carries distinct surrounding context
+    /// (realistic — git includes it by default), so embedding that context
+    /// hash's own value into the id (see [`enumerate_hunks`]'s docs) must
+    /// keep each pre-existing occurrence's id fixed regardless of what gets
+    /// inserted or removed around it, purely because each one's own
+    /// neighborhood never changes.
+    #[test]
+    fn duplicate_content_ids_survive_a_same_content_hunk_inserted_earlier_in_the_file() {
+        let before = parse_unified_diff(concat!(
+            "diff --git a/x.rs b/x.rs\n",
+            "--- a/x.rs\n",
+            "+++ b/x.rs\n",
+            "@@ -19,2 +19,3 @@\n",
+            " before twenty\n",
+            "+dup\n",
+            " after twenty\n",
+            "@@ -49,2 +50,3 @@\n",
+            " before fifty\n",
+            "+dup\n",
+            " after fifty\n",
+        ));
+        let ids_before: Vec<String> = enumerate_hunks(&before).into_iter().map(|h| h.id).collect();
+        assert_eq!(ids_before.len(), 2);
+        assert_ne!(ids_before[0], ids_before[1]);
+
+        // An unrelated later edit: a third, brand-new occurrence of the
+        // identical changed line — in its own distinct neighborhood — lands
+        // even earlier in the file (old line 2).
+        let after = parse_unified_diff(concat!(
+            "diff --git a/x.rs b/x.rs\n",
+            "--- a/x.rs\n",
+            "+++ b/x.rs\n",
+            "@@ -1,2 +1,3 @@\n",
+            " before two\n",
+            "+dup\n",
+            " after two\n",
+            "@@ -19,2 +20,3 @@\n",
+            " before twenty\n",
+            "+dup\n",
+            " after twenty\n",
+            "@@ -49,2 +51,3 @@\n",
+            " before fifty\n",
+            "+dup\n",
+            " after fifty\n",
+        ));
+        let hunks_after = enumerate_hunks(&after);
+        let ids_after: Vec<String> = hunks_after.iter().map(|h| h.id.clone()).collect();
+        assert_eq!(ids_after.len(), 3);
+
+        // The two pre-existing occurrences (now hunks 1 and 2 by file
+        // position) must keep exactly the ids they had before — not shift
+        // onto the new occurrence's identity just because it now sorts
+        // ahead of them by old-side position.
+        assert_eq!(
+            ids_after[1..],
+            ids_before,
+            "the original two occurrences' ids must be unaffected by the new one inserted ahead of them"
+        );
+        assert!(
+            !ids_before.contains(&ids_after[0]),
+            "the brand-new occurrence must not collide with either original id"
+        );
     }
 
     #[test]

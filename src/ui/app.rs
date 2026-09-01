@@ -1682,6 +1682,30 @@ impl App {
         self.resolve_and_set_selection(None);
     }
 
+    /// Reconciles `self.reviewed` with `ids` freshly re-read from
+    /// `.katamari/reviewed.jsonl` — the live-watcher counterpart to
+    /// [`Self::set_reviewed`], called by `ui::mod`'s event loop whenever
+    /// another concurrently open session against the same repo (or `ktmr
+    /// reviewed clear`) touches the file mid-review. Replaces `self.reviewed`
+    /// wholesale rather than only adding new ids, since the file on disk is
+    /// authoritative either way this reload fires — a remote mark or a
+    /// remote unmark.
+    ///
+    /// Unlike `set_reviewed`, which seeds a brand-new session and can safely
+    /// reset the cursor to the top, this must not yank the reviewer's
+    /// current scroll position out from under them just because someone
+    /// else marked a hunk in another terminal — the cursor's flat index is
+    /// simply clamped back into range instead, the same "structural, not
+    /// worth a precise-target rebuild" fallback [`Self::apply_bulk_mark`]
+    /// already uses for its own bulk-collapse.
+    pub fn reload_reviewed(&mut self, ids: HashSet<String>) {
+        self.reviewed = ids;
+        self.rederive();
+        self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
+        self.clamp_scroll();
+        self.recompute_search();
+    }
+
     /// `(file_idx, hunk_idx, hunk_id)` for whichever hunk the cursor
     /// currently sits within, resolved via one fresh
     /// [`crate::groups::enumerate_hunks`] lookup — `None` off a
@@ -1794,14 +1818,46 @@ impl App {
         newly
     }
 
-    /// As [`Self::mark_file_reviewed`], over every hunk currently in
-    /// `self.files` — respects an active unit filter automatically, since
-    /// it only ever reads the already-narrowed derived view, never
-    /// [`Self::full_files`].
+    /// As [`Self::mark_file_reviewed`], but scoped to whatever's actually
+    /// on screen right now — `m a`'s documented contract (keymap/help/
+    /// quickstart all say "every hunk currently visible"/"on screen"), not
+    /// the whole derived diff. A hunk counts as visible when any of its
+    /// `HunkHeader`/`Line` rows falls in [`scroll::visible_range`]'s window
+    /// over `self.rows`, the same accumulation the renderer itself uses to
+    /// decide what's on screen — so this can never mark a hunk the reviewer
+    /// never scrolled to, which a whole-file/whole-diff scope (this
+    /// function's behavior before this fix) silently did. Respects an
+    /// active unit filter too, for the same reason [`Self::mark_file_reviewed`]
+    /// does: a filtered-out hunk has no row in `self.rows` at all, so it can
+    /// never land in the visible set to begin with.
     pub fn mark_visible_reviewed(&mut self) -> Vec<(String, String)> {
+        let visible = scroll::visible_range(
+            self.scroll_offset,
+            self.viewport_height,
+            self.rows.len(),
+            |i| self.row_visual_height(i),
+        );
+        let mut on_screen: std::collections::HashSet<(usize, usize)> =
+            std::collections::HashSet::new();
+        for idx in visible {
+            match self.rows[idx] {
+                RenderRow::HunkHeader { file_idx, hunk_idx }
+                | RenderRow::Line {
+                    file_idx, hunk_idx, ..
+                } => {
+                    on_screen.insert((file_idx, hunk_idx));
+                }
+                RenderRow::FileHeader { .. }
+                | RenderRow::BinaryNotice { .. }
+                | RenderRow::Gap { .. }
+                | RenderRow::ReviewedHunk { .. } => {}
+            }
+        }
         let newly: Vec<(String, String)> = crate::groups::enumerate_hunks(&self.files)
             .into_iter()
-            .filter(|m| !self.reviewed.contains(&m.id))
+            .filter(|m| {
+                on_screen.contains(&(m.file_idx, m.hunk_idx)) && !self.reviewed.contains(&m.id)
+            })
             .map(|m| (m.id, m.file))
             .collect();
         self.apply_bulk_mark(&newly);
@@ -2567,11 +2623,40 @@ impl App {
     /// `(file, new_line)` carries a diagnostic, wrapping around the end of
     /// the row list — `Action::NextDiagnostic`/`PrevDiagnostic`. A no-op
     /// when no row in the diff has one.
+    ///
+    /// A landing on a collapsed [`RenderRow::ReviewedHunk`] marker (see
+    /// [`Self::row_has_diagnostic`]'s docs on why that can be a match at
+    /// all) auto-expands that one hunk first — the same "reveal without
+    /// unmarking" [`Self::expand_reviewed_hunk_at_cursor`] does for `z o` —
+    /// and re-lands on the diagnostic's own now-real `Line` row rather than
+    /// leaving the cursor on the marker with the diagnostic still hidden
+    /// underneath it.
     pub fn jump_to_diagnostic(&mut self, diagnostics: &DiagnosticsStore, forward: bool) {
         let Some(target) = self.find_diagnostic_row(diagnostics, forward) else {
             return;
         };
         self.cursor = target;
+        if let RenderRow::ReviewedHunk { file_idx, hunk_idx } = self.rows[target] {
+            self.expand_reviewed_hunk_at_cursor();
+            let mut landing = None;
+            for idx in 0..self.rows.len() {
+                if let RenderRow::Line {
+                    file_idx: f,
+                    hunk_idx: h,
+                    ..
+                } = self.rows[idx]
+                    && f == file_idx
+                    && h == hunk_idx
+                    && self.row_has_diagnostic(idx, diagnostics)
+                {
+                    landing = Some(idx);
+                    break;
+                }
+            }
+            if let Some(idx) = landing {
+                self.cursor = idx;
+            }
+        }
         self.active_symbol = 0;
         self.scroll_offset = scroll::center(self.cursor, self.viewport_height, |i| {
             self.row_visual_height(i)
@@ -2580,21 +2665,15 @@ impl App {
         self.sync_files_selection();
     }
 
-    fn find_diagnostic_row(&self, diagnostics: &DiagnosticsStore, forward: bool) -> Option<usize> {
-        if self.rows.is_empty() {
-            return None;
-        }
-        let has_diagnostic = |idx: usize| -> bool {
-            let RenderRow::Line {
-                file_idx,
-                hunk_idx,
-                row_idx,
-            } = self.rows[idx]
-            else {
-                return false;
-            };
-            let file = &self.files[file_idx];
-            let row = &file.hunks[hunk_idx].rows[row_idx];
+    /// Whether `self.rows[idx]` carries a diagnostic `]d`/`[d` should stop
+    /// on: a `Line` row whose own `(file, new_line)` has one, the ordinary
+    /// case — or a collapsed [`RenderRow::ReviewedHunk`] marker standing in
+    /// for a hunk that has one *inside* it, so a diagnostic buried under a
+    /// reviewed-and-collapsed hunk is still reachable rather than silently
+    /// skipped (see [`Self::mark_current_hunk_reviewed`]'s callers: nothing
+    /// else re-checks a hunk's own diagnostics once it's collapsed).
+    fn row_has_diagnostic(&self, idx: usize, diagnostics: &DiagnosticsStore) -> bool {
+        let row_has = |file: &DiffFile, row: &crate::diff::DiffRow| -> bool {
             let Some((relative, line)) = lsp_target(row, file) else {
                 return false;
             };
@@ -2602,7 +2681,30 @@ impl App {
                 .severity_at(&self.repo_root.join(relative), line)
                 .is_some()
         };
+        match self.rows[idx] {
+            RenderRow::Line {
+                file_idx,
+                hunk_idx,
+                row_idx,
+            } => {
+                let file = &self.files[file_idx];
+                row_has(file, &file.hunks[hunk_idx].rows[row_idx])
+            }
+            RenderRow::ReviewedHunk { file_idx, hunk_idx } => {
+                let file = &self.files[file_idx];
+                file.hunks[hunk_idx]
+                    .rows
+                    .iter()
+                    .any(|row| row_has(file, row))
+            }
+            _ => false,
+        }
+    }
 
+    fn find_diagnostic_row(&self, diagnostics: &DiagnosticsStore, forward: bool) -> Option<usize> {
+        if self.rows.is_empty() {
+            return None;
+        }
         let len = self.rows.len();
         (1..len)
             .map(|step| {
@@ -2612,7 +2714,7 @@ impl App {
                     (self.cursor + len - step) % len
                 }
             })
-            .find(|idx| has_diagnostic(*idx))
+            .find(|idx| self.row_has_diagnostic(*idx, diagnostics))
     }
 
     fn jump_to(&mut self, is_target: impl Fn(&RenderRow) -> bool) {
@@ -3121,7 +3223,14 @@ impl App {
 /// the unit (its content is no longer what the grouping described). The
 /// rare surprise this accepts: an expansion big enough to merge two hunks
 /// concatenates their changed rows into one new id, which drops the merged
-/// hunk from the unit until the filter is cleared.
+/// hunk from the unit until the filter is cleared. A second, narrower
+/// residual surprise lives one level deeper, in `enumerate_hunks` itself:
+/// two hunks whose changed rows *and* every context row are byte-identical
+/// (not merely their changed rows — that case is handled, see that
+/// function's docs) fall back to old-side position for disambiguation, and
+/// an insertion elsewhere in the file can still shift that. Both are
+/// "documented, not fixed" the same way; see `enumerate_hunks`'s docs for
+/// why the second one is narrow enough to accept.
 fn apply_unit_filter(files: &mut Vec<DiffFile>, ids: &HashSet<String>) {
     let keep: HashSet<(usize, usize)> = crate::groups::enumerate_hunks(files)
         .into_iter()
@@ -4958,6 +5067,66 @@ index 1111111..2222222 100644\n\
         );
     }
 
+    /// Regression coverage for the live-watcher fix: a mark that arrived
+    /// from a concurrently open session (or `ktmr reviewed clear`) must
+    /// collapse/resurface the right hunks and must not reset the cursor to
+    /// the top of the diff the way startup's `set_reviewed` safely can.
+    #[test]
+    fn reload_reviewed_applies_a_remote_mark_without_resetting_the_cursor() {
+        let mut app = reviewed_fixture_app();
+        let hunk1_header = find_row(&app, |r| {
+            matches!(r, RenderRow::HunkHeader { hunk_idx: 1, .. })
+        });
+        app.cursor = hunk1_header;
+        assert_eq!(app.reviewed_progress(), Some((0, 2)));
+
+        // Another session marked hunk 0 reviewed and this one's watcher
+        // just reloaded the file.
+        let hunk0_id = crate::groups::enumerate_hunks(&app.files)[0].id.clone();
+        app.reload_reviewed(HashSet::from([hunk0_id.clone()]));
+
+        assert!(app.reviewed.contains(&hunk0_id));
+        assert_eq!(app.reviewed_progress(), Some((1, 2)));
+        // `reload_reviewed`'s documented contract is "clamp the flat index
+        // back into range," not "re-anchor to the same content" — hunk 0
+        // collapsing shifts every later row's index down by one, so the
+        // cursor's *raw* value is preserved (still comfortably in range
+        // here), not re-targeted at hunk 1's header specifically. The
+        // property this test actually guards is the one `set_reviewed`
+        // gets wrong for a live reload: never snapping back to the top.
+        assert_eq!(
+            app.cursor, hunk1_header,
+            "the cursor's flat index must be preserved, not recomputed"
+        );
+        assert_ne!(
+            app.cursor, 0,
+            "must not reset to the top of the diff the way `set_reviewed` safely can at startup"
+        );
+    }
+
+    /// As above, but the remote change is an unmark (`ktmr reviewed clear`,
+    /// or another session's `R`) — a hunk this session had collapsed must
+    /// resurface as an ordinary, expanded, unreviewed hunk.
+    #[test]
+    fn reload_reviewed_applies_a_remote_unmark() {
+        let mut app = reviewed_fixture_app();
+        app.cursor = find_row(&app, |r| {
+            matches!(r, RenderRow::HunkHeader { hunk_idx: 0, .. })
+        });
+        app.mark_current_hunk_reviewed();
+        assert_eq!(app.reviewed_progress(), Some((1, 2)));
+
+        app.reload_reviewed(HashSet::new());
+
+        assert_eq!(app.reviewed_progress(), Some((0, 2)));
+        assert!(
+            app.rows
+                .iter()
+                .any(|r| matches!(r, RenderRow::HunkHeader { hunk_idx: 0, .. })),
+            "hunk 0 must resurface as an ordinary header row"
+        );
+    }
+
     #[test]
     fn marking_works_the_same_on_a_non_interactive_historical_app() {
         let mut app = reviewed_fixture_app();
@@ -5079,6 +5248,11 @@ index 1111111..2222222 100644\n\
             total: 1,
             hunk_ids: file0_ids.clone(),
         });
+        // Tall enough that every row of the (already unit-filtered) derived
+        // diff is on screen — this test is about the unit-filter scoping,
+        // not the viewport scoping `mark_visible_reviewed_only_marks_hunks_actually_on_screen`
+        // below covers.
+        app.set_viewport_height(50);
 
         let pairs = app.mark_visible_reviewed();
         assert_eq!(
@@ -5091,6 +5265,117 @@ index 1111111..2222222 100644\n\
             !app.reviewed.contains(&file1_id),
             "the other file's hunk sits outside the filter and must be untouched"
         );
+    }
+
+    /// A file with several one-line insert hunks, spread far enough apart
+    /// (old-side line numbers 5/15/25/35) that a real terminal would need to
+    /// scroll through several screens to see them all — the fixture the two
+    /// viewport-scoping regression tests below build on.
+    fn spread_hunks_fixture_app() -> App {
+        use crate::diff::{DiffHunk, DiffLineKind, DiffRow};
+        let mk_hunk = |start: u32, text: &str| DiffHunk {
+            old_start: start,
+            old_lines: 0,
+            new_start: start,
+            new_lines: 1,
+            header: String::new(),
+            known_eof: false,
+            rows: vec![DiffRow {
+                kind: DiffLineKind::Add,
+                text: text.to_owned(),
+                old_line: None,
+                new_line: Some(start),
+            }],
+        };
+        let file = DiffFile {
+            old_path: Some("f.txt".to_owned()),
+            new_path: Some("f.txt".to_owned()),
+            hunks: vec![
+                mk_hunk(5, "hunk zero"),
+                mk_hunk(15, "hunk one"),
+                mk_hunk(25, "hunk two"),
+                mk_hunk(35, "hunk three"),
+            ],
+            ..Default::default()
+        };
+        App::new("repo".to_owned(), PathBuf::from("/repo"), vec![file])
+    }
+
+    /// Regression test for the bug where `m a` marked the *entire* derived
+    /// diff regardless of what a short terminal actually had scrolled into
+    /// view — directly contradicting its own keymap/help/quickstart docs
+    /// ("every hunk currently visible"/"on screen"). The viewport is sized
+    /// to [`find_row`]'s own result (hunk 1's `HunkHeader` row) rather than a
+    /// hand-counted literal, so this doesn't depend on exactly how many rows
+    /// `flatten`/`file_gaps` happen to emit ahead of it (a leading gap or
+    /// not) — only that hunk 1's header row is the first one excluded.
+    #[test]
+    fn mark_visible_reviewed_only_marks_hunks_actually_on_screen() {
+        let mut app = spread_hunks_fixture_app();
+        let hunk1_header = find_row(&app, |r| {
+            matches!(r, RenderRow::HunkHeader { hunk_idx: 1, .. })
+        });
+        app.set_viewport_height(hunk1_header);
+        assert_eq!(
+            app.scroll_offset, 0,
+            "sanity: nothing has scrolled yet, so the viewport starts at row 0"
+        );
+
+        let hunk0_id = crate::groups::enumerate_hunks(&app.files)[0].id.clone();
+        let pairs = app.mark_visible_reviewed();
+
+        assert_eq!(
+            pairs.len(),
+            1,
+            "only hunk 0 has any row within [0, hunk 1's header row)"
+        );
+        assert_eq!(pairs[0].0, hunk0_id);
+        assert!(app.reviewed.contains(&hunk0_id));
+        assert_eq!(
+            app.reviewed.len(),
+            1,
+            "hunks 1-3, never scrolled into view, must stay unmarked"
+        );
+        assert!(
+            app.rows
+                .iter()
+                .any(|r| matches!(r, RenderRow::HunkHeader { hunk_idx: 1, .. })),
+            "hunk 1 must still be a real, unreviewed HunkHeader row"
+        );
+    }
+
+    /// As the test above, but scrolled: `mark_visible_reviewed` must track
+    /// `scroll_offset`, not just the top of the diff. `scroll_offset` is set
+    /// directly (a `pub` field, safe here since nothing between that
+    /// assignment and the `mark_visible_reviewed()` call re-derives it —
+    /// see `App::clamp_scroll`'s docs on why going through
+    /// `set_viewport_height` instead, in either order, would fight this:
+    /// with the cursor still at its default `0`, `clamp_scroll` treats any
+    /// `scroll_offset` set ahead of it as "the cursor scrolled above view"
+    /// and snaps straight back to `0`).
+    #[test]
+    fn mark_visible_reviewed_follows_the_current_scroll_position() {
+        let mut app = spread_hunks_fixture_app();
+        let hunk1_header = find_row(&app, |r| {
+            matches!(r, RenderRow::HunkHeader { hunk_idx: 1, .. })
+        });
+        let hunk2_header = find_row(&app, |r| {
+            matches!(r, RenderRow::HunkHeader { hunk_idx: 2, .. })
+        });
+        app.set_viewport_height(hunk2_header - hunk1_header);
+        app.scroll_offset = hunk1_header;
+
+        let hunk1_id = crate::groups::enumerate_hunks(&app.files)[1].id.clone();
+        let pairs = app.mark_visible_reviewed();
+
+        assert_eq!(
+            pairs.len(),
+            1,
+            "only hunk 1 has any row within [hunk 1's header row, hunk 2's)"
+        );
+        assert_eq!(pairs[0].0, hunk1_id);
+        assert!(app.reviewed.contains(&hunk1_id));
+        assert_eq!(app.reviewed.len(), 1);
     }
 
     #[test]
@@ -5141,6 +5426,100 @@ index 1111111..2222222 100644\n\
             RenderRow::ReviewedHunk { hunk_idx: 0, .. }
         ));
         assert_eq!(app.reviewed_progress(), Some((1, 2)));
+    }
+
+    /// A diagnostic on `f.txt` at 0-based line `line0` (`new_line - 1`,
+    /// matching [`lsp_target`]'s convention) — the minimal fixture the two
+    /// tests below need, built directly rather than through a real LSP
+    /// round trip.
+    fn diagnostics_with_one_at(line0: u32) -> DiagnosticsStore {
+        let mut diagnostics = DiagnosticsStore::new();
+        diagnostics.set(
+            PathBuf::from("/repo/f.txt"),
+            vec![lsp_types::Diagnostic {
+                range: lsp_types::Range {
+                    start: lsp_types::Position {
+                        line: line0,
+                        character: 0,
+                    },
+                    end: lsp_types::Position {
+                        line: line0,
+                        character: 1,
+                    },
+                },
+                severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+                message: "boom".to_owned(),
+                ..Default::default()
+            }],
+        );
+        diagnostics
+    }
+
+    /// Regression test: a diagnostic anchored to a line inside a collapsed
+    /// reviewed hunk used to be invisible to `]d`/`[d` entirely —
+    /// `find_diagnostic_row` only ever matched a `RenderRow::Line`, so a
+    /// hunk collapsed by `r` silently fell out of diagnostic cycling with no
+    /// indication anything was hidden. `jump_to_diagnostic` must now land on
+    /// it by auto-expanding the marker, the same "reveal without unmarking"
+    /// `z o` already does.
+    #[test]
+    fn jump_to_diagnostic_auto_expands_a_reviewed_hunk_marker_hiding_one() {
+        let mut app = reviewed_fixture_app();
+        // Mark hunk 1 ("added two", new_line 10) reviewed; leave hunk 0
+        // alone so the forward search below has to pass over it first.
+        app.cursor = find_row(&app, |r| {
+            matches!(r, RenderRow::HunkHeader { hunk_idx: 1, .. })
+        });
+        app.mark_current_hunk_reviewed();
+        // Sanity: hunk 1 really did collapse (panics via `find_row`'s own
+        // `.expect` otherwise).
+        find_row(&app, |r| {
+            matches!(r, RenderRow::ReviewedHunk { hunk_idx: 1, .. })
+        });
+
+        let diagnostics = diagnostics_with_one_at(9); // new_line 10 - 1
+        app.cursor = 0;
+        app.jump_to_diagnostic(&diagnostics, true);
+
+        assert!(
+            matches!(app.rows[app.cursor], RenderRow::Line { hunk_idx: 1, .. }),
+            "must land on hunk 1's own (now-expanded) line, not its collapsed marker: {:?}",
+            app.rows[app.cursor]
+        );
+        assert_eq!(
+            app.reviewed_progress(),
+            Some((1, 2)),
+            "auto-expanding to reach the diagnostic must not unmark the hunk"
+        );
+    }
+
+    /// As the test above, but the reviewed hunk hides *no* diagnostic (only
+    /// an ordinary, still-expanded hunk does) — the marker must not be
+    /// treated as a false-positive match.
+    #[test]
+    fn jump_to_diagnostic_skips_a_reviewed_hunk_marker_with_nothing_hidden_inside_it() {
+        let mut app = reviewed_fixture_app();
+        app.cursor = find_row(&app, |r| {
+            matches!(r, RenderRow::HunkHeader { hunk_idx: 0, .. })
+        });
+        app.mark_current_hunk_reviewed(); // collapses hunk 0, cursor advances to hunk 1's header
+
+        // The diagnostic sits on hunk 1 (still an ordinary, expanded
+        // `Line` row) — hunk 0's collapsed marker hides nothing.
+        let diagnostics = diagnostics_with_one_at(9);
+        app.cursor = 0;
+        app.jump_to_diagnostic(&diagnostics, true);
+
+        assert!(matches!(
+            app.rows[app.cursor],
+            RenderRow::Line { hunk_idx: 1, .. }
+        ));
+        assert!(
+            app.rows
+                .iter()
+                .any(|r| matches!(r, RenderRow::ReviewedHunk { hunk_idx: 0, .. })),
+            "hunk 0 must stay collapsed — its marker hid no diagnostic to expand for"
+        );
     }
 
     #[test]
